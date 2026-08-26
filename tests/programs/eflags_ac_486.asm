@@ -1,5 +1,5 @@
-; The 386 keeps EFLAGS.AC reserved and clear. 486-class detection commonly
-; distinguishes the CPUs by trying to toggle this bit through POPFD.
+; The 486 adds writable EFLAGS.AC. CPU detection commonly distinguishes it
+; from the 386 by toggling this bit through POPFD.
 
 BITS 16
 org 0
@@ -28,7 +28,7 @@ start:
 
     xor edx, ebx
     test edx, AC_BIT
-    jnz .fail
+    jz .fail
 
     mov al, 0x01
     out STATUS_PORT, al

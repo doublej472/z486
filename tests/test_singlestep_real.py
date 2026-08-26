@@ -218,6 +218,23 @@ def apply_mask(value, mask):
     return value & mask
 
 
+def decode_opcode_and_width(nbytes, init_regs):
+    """Return the opcode position and effective operand width."""
+    prefixes = {0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3}
+    idx = 0
+    has_data_override = False
+    while idx < len(nbytes) and nbytes[idx] in prefixes:
+        has_data_override |= nbytes[idx] == 0x66
+        idx += 1
+
+    data32 = bool(init_regs.get('d', 0))
+    if has_data_override:
+        data32 = not data32
+
+    opcode = nbytes[idx] if idx < len(nbytes) else None
+    return idx, opcode, data32
+
+
 def get_shxd_count_width(nbytes, init_regs):
     """Return (count, width) for SHLD/SHRD or (None, None) if not SHxD."""
     if not nbytes:
@@ -257,13 +274,14 @@ def get_shxd_count_width(nbytes, init_regs):
     return count, width
 
 
-def run_test(test, global_mask, notrace=False):
+def run_test(test, global_mask, cpu_mode='486', notrace=False):
     """
     Run a single test case through the testbench.
 
     Args:
         test: Test case dictionary
         global_mask: Global register mask (or None)
+        cpu_mode: Architecture whose documented results are expected
         notrace: If True, disable FST tracing (default: False)
 
     Returns:
@@ -278,6 +296,9 @@ def run_test(test, global_mask, notrace=False):
 
     # Calculate expected number of reads (for timeout)
     nbytes = test.get('bytes', [])
+    _, opcode, data32 = decode_opcode_and_width(nbytes, init_regs)
+    is_pushfd = cpu_mode == '486' and opcode == 0x9C and data32
+    is_popfd = cpu_mode == '486' and opcode == 0x9D and data32
     reads = 0
     if nbytes:
         reads = (len(nbytes) + 3) // 4  # Round up to 32-bit reads
@@ -442,6 +463,17 @@ def run_test(test, global_mask, notrace=False):
         # regardless of whether the instruction branched or fell through.
         if reg == 'eip' and nbytes and nbytes[0] != 0xF4:
             got_val = got_val + 1
+
+        # The captures come from a 386, where AC is reserved. For z486 POPFD,
+        # derive the architectural AC result from the dword on the stack.
+        if reg == 'eflags' and is_popfd:
+            stack_addr = ((init_regs.get('ss', 0) << 4) +
+                          (init_regs.get('esp', 0) & 0xFFFF)) & 0xFFFFFFFF
+            init_mem = dict(init.get('ram', []))
+            if all(stack_addr + offset in init_mem for offset in range(4)):
+                popped = sum(init_mem[stack_addr + offset] << (8 * offset)
+                             for offset in range(4))
+                expected_val = (expected_val & ~0x00040000) | (popped & 0x00040000)
 
         # Apply mask if available
         mask_val = None
@@ -649,6 +681,17 @@ def run_test(test, global_mask, notrace=False):
             continue
 
         got_val = mem_results.get(addr)
+
+        # The 386 reference PUSHFD image has AC clear. A 486 stores the live
+        # AC bit in byte 2 of the pushed dword.
+        if is_pushfd:
+            final_esp = final_regs.get('esp', init_regs.get('esp', 0))
+            ac_addr = ((init_regs.get('ss', 0) << 4) +
+                       (final_esp & 0xFFFF) + 2) & 0xFFFFFFFF
+            if addr == ac_addr:
+                expected_val = ((expected_val & ~0x04) |
+                                ((init_regs.get('eflags', 0) >> 16) & 0x04))
+
         if got_val is None:
             errors.append(f"RAM @{addr:08x} not found in results")
             ok = False
@@ -841,12 +884,12 @@ def is_fault_test(test):
 
 def run_test_parallel(args):
     """Wrapper for parallel execution - each worker runs in its own process."""
-    test, global_mask, moo_file_name, test_idx = args
+    test, global_mask, moo_file_name, test_idx, cpu_mode = args
     # Each worker needs to be in the correct directory
     os.chdir(str(TESTS))
     try:
         # Disable tracing for parallel runs (faster + no trace file conflicts)
-        ok, errors, out = run_test(test, global_mask, notrace=True)
+        ok, errors, out = run_test(test, global_mask, cpu_mode, notrace=True)
         return (moo_file_name, test_idx, ok, errors)
     except Exception as e:
         return (moo_file_name, test_idx, False, [f"Exception: {str(e)}"])
@@ -1249,6 +1292,10 @@ def main():
         '--skip-fault', action='store_true',
         help='Skip fault/exception tests and LOCK-prefixed tests'
     )
+    ap.add_argument(
+        '--cpu', choices=('386', '486'), default='486',
+        help='Expected CPU architecture (default: 486)'
+    )
     args = ap.parse_args()
 
     VERBOSE = args.verbose
@@ -1332,7 +1379,7 @@ def main():
 
         # Prepare arguments for parallel execution
         test_args = [
-            (test, global_mask, moo_file.name, test_idx)
+            (test, global_mask, moo_file.name, test_idx, args.cpu)
             for test, global_mask, moo_file, test_idx in test_metadata
         ]
 
@@ -1389,7 +1436,7 @@ def main():
 
         for test, global_mask, moo_file, test_idx in test_metadata:
             try:
-                ok, errors, out = run_test(test, global_mask)
+                ok, errors, out = run_test(test, global_mask, args.cpu)
             except Exception as e:
                 print(f"Error running test: {e}")
                 ok = False

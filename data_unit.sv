@@ -269,7 +269,7 @@ function automatic logic [31:0] read_alu_source(input logic [5:0] field);
         ALUSRC_TMPH: read_alu_source = slctr;
         ALUSRC_PROTUN: read_alu_source = protun;
         ALUSRC_ALLONES: read_alu_source = 32'hffff_ffff;
-        ALUSRC_FLAGS_MASK: read_alu_source = 32'h0003_7fd7;
+        ALUSRC_FLAGS_MASK: read_alu_source = 32'h0007_7fd7;
         ALUSRC_CONST_4000: read_alu_source = 32'h4000;
         ALUSRC_CONST_N200: read_alu_source = 32'hffff_fdff;
         ALUSRC_CONST_8: read_alu_source = 32'd8;
@@ -302,7 +302,11 @@ function automatic logic [31:0] read_alu_source(input logic [5:0] field);
         ALUSRC_CONST_NEG1: read_alu_source = 32'hffff_ffff;
         ALUSRC_CONST_NEG2: read_alu_source = 32'hffff_fffe;
         ALUSRC_CONST_NEG4: read_alu_source = 32'hffff_fffc;
-        ALUSRC_MASK16: read_alu_source = 32'h0000_ffff;
+        // Native 386 PUSHFD first masks EFLAGS to 16 bits. Preserve the full
+        // value for z486; the following FLAGS_MASK step filters reserved bits.
+        ALUSRC_MASK16: read_alu_source =
+            (instr.opcode == 8'h9c && instr.data32) ? 32'hffff_ffff :
+                                                      32'h0000_ffff;
         ALUSRC_CONST_0: read_alu_source = 32'd0;
         ALUSRC_WORDSZ: read_alu_source = is_dword ? 32'd4 :
                                          op_size == 2'd0 ? 32'd1 : 32'd2;
@@ -941,6 +945,11 @@ always_ff @(posedge clk) begin
                 eflags[7:0] <= (dest_value[7:0] & 8'hD5) | 8'h02;
 
             if (dest == DEST_FLAGS) begin
+                // POPFD's microcode forces BITS16 before FLAGS writeback;
+                // retain the decoded width for the 486-only AC bit.
+                if (instr.data32)
+                    eflags[18] <= dest_value[18];
+
                 if (pe) begin
                     eflags[7:0]   <= (dest_value[7:0] & 8'hD5) | 8'h02;
                     eflags[8]     <= dest_value[8];
@@ -960,7 +969,7 @@ always_ff @(posedge clk) begin
             end
 
             if (dest == DEST_EFLAGS)
-                eflags <= (dest_value & 32'h0003_7fd5) | 32'h0000_0002;
+                eflags <= (dest_value & 32'h0007_7fd5) | 32'h0000_0002;
         end
 
         if (clear_rf)
