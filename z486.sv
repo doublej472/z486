@@ -401,10 +401,12 @@ reg        vipt_load_wb_valid_r;       // Registered load retires in WB
 reg        vipt_load_ex_probed_r;      // EX token owns valid cache/TLB prereads
 reg [31:0] vipt_load_wb_data_r;
 reg [2:0]  vipt_load_wb_dst_r;
+reg [7:0]  vipt_load_wb_dst_onehot_r;
 reg [1:0]  vipt_load_wb_size_r;
 reg        vipt_load_wb_is_alu_r;
 reg [4:0]  vipt_load_wb_alu_op_r;
 reg        vipt_load_rom_shadow_r;     // Held D2 load owns the resident 019 RD
+reg        vipt_load_overlap_r;        // Plain-load successor owns EX while load completes
 wire       vipt_load_slow_busy = vipt_load_slow_req_r || vipt_load_slow_wait_r;
 wire       vipt_load_busy = vipt_load_ex_r.valid || vipt_load_replay_r.valid ||
                             vipt_load_slow_busy || vipt_load_wb_valid_r;
@@ -490,10 +492,23 @@ wire       d2_vipt_pipe_ready = d2_vipt_candidate &&
                                 vipt_load_ex_probed_r &&
                                 !vipt_load_replay_r.valid &&
                                 !vipt_load_slow_busy && !single_step;
+// Once a plain load has finalized as a hit, its successor may enter EX on the
+// same edge. Data operands consume the following WB value through forwarding;
+// an EA dependency is held by d2_vipt_ea_hazard for exactly one hit cycle.
+// Misses retain the precise slow-path interlock.
+wire       d2_plain_load_overlap_ready = vipt_load_ex_r.valid &&
+                                vipt_load_ex_probed_r &&
+                                vipt_load_ex_hit &&
+                                !vipt_load_ex_r.is_alu &&
+                                !d2_vipt_candidate &&
+                                !d2_vipt_ea_hazard &&
+                                !vipt_load_replay_r.valid &&
+                                !vipt_load_slow_busy && !single_step;
 assign     d2_ready = d2_ready_base &&
                       !vipt_load_replay_r.valid && !vipt_load_slow_busy &&
                       (!d2_vipt_candidate || d2_vipt_load) &&
-                      (!vipt_load_ex_r.valid || d2_vipt_pipe_ready);
+                      (!vipt_load_ex_r.valid || d2_vipt_pipe_ready ||
+                       d2_plain_load_overlap_ready);
 assign     i_issue = d2_valid && d2_ready;
 
 wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
@@ -523,10 +538,14 @@ wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight)
 wire       d2_release_hold = d2_valid && (d2_waited_r || d2_stale_slot_r);
 // A blocked direct load leaves the Jcc ROM delay word resident after the
 // synthetic branch uStep. Keep its stale PREF from redirecting the frontend.
+wire       vipt_load_overlap_wb = vipt_load_overlap_r &&
+                     vipt_load_wb_valid_r && !vipt_load_ex_r.valid &&
+                     !vipt_load_replay_r.valid && !vipt_load_slow_busy;
+wire       vipt_load_exec_block = vipt_load_busy && !vipt_load_overlap_wb;
 wire       uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) &&
                      !stall_wio && !stall_d2 && !stall_x87_direct && !stall_invlpg &&
                      !d2_release_hold && !throttle_parked_r && !recipe_slot_stale &&
-                     !vipt_load_busy &&
+                     !vipt_load_exec_block &&
                      !(vipt_load_rom_shadow_r && recipe_state.jcc);
 wire       uc_exec_writeback = uc_exec;  // local copies for reducing fanout
 wire       uc_exec_shift = uc_exec;
@@ -549,21 +568,56 @@ wire       decq_has2;         // i_bus2 is valid
 wire [7:0] d2_ea_read_mask = i_bus.ea_base_onehot |
                              i_bus.ea_index_onehot |
                              (i_bus.stack_op ? 8'h10 : 8'h00);
+// Plain-load WB data is forwarded into the D2 EA reader.  M3's private ALU
+// result deliberately is not, so a dependent EA must wait through its WB
+// commit edge before reading the architectural GPR.
+wire [7:0] vipt_load_wb_alu_dst_mask =
+    (vipt_load_wb_valid_r && vipt_load_wb_is_alu_r)
+        ? vipt_load_wb_dst_onehot_r : 8'h00;
 wire [7:0] vipt_pending_dst_mask =
     (vipt_load_ex_r.valid     ? vipt_load_ex_r.dst_onehot     : 8'h00) |
     (vipt_load_replay_r.valid ? vipt_load_replay_r.dst_onehot : 8'h00) |
-    (vipt_load_slow_busy      ? vipt_load_slow_r.dst_onehot   : 8'h00);
+    (vipt_load_slow_busy      ? vipt_load_slow_r.dst_onehot   : 8'h00) |
+    vipt_load_wb_alu_dst_mask;
 assign d2_vipt_ea_hazard = |(d2_ea_read_mask & vipt_pending_dst_mask);
 
 dec_entry_t d2_entry;         // entry completing D2 this cycle (AGU/i_entry source)
 ea_dec_t    d2_agu_dec;       // EA decode for d2_entry
 
-// A normal boundary uses i_entry. Chaining launches the successor on the
-// predecessor's transfer/execute edge and may overlap issue.
-assign d2_start = i_entry || chain_start;
-wire [11:0] d2_start_entry_arch = chain_start
-                      ? chain_entry
-                      : (decq_empty ? d1_issue_entry_point : i_bus.entry_point);
+// An immediate register ALU instruction may have a resident D2 skeleton before
+// its literal payload completes.  During the first uStep of an independent
+// two-uStep shift, launch its already-qualified entry point without waiting
+// for that payload.
+// D2->EX remains gated by d2_push, so this only overlaps the synchronous ROM
+// lookup; it does not combine literal decode or operand execution into this
+// cycle.  ADC/SBB and a destination alias retain the normal dependency path.
+wire [2:0] prestart_shift_widx = (op_size == 2'd0)
+                                ? {1'b0, i.dst_reg_sel[1:0]}
+                                : i.dst_reg_sel;
+wire [2:0] prestart_alu_widx = (i_bus.operand_size == 2'd0)
+                             ? {1'b0, i_bus.dst_reg_sel[1:0]}
+                             : i_bus.dst_reg_sel;
+wire [2:0] prestart_alu_group = i_bus.modrm[5:3];
+wire shift_alu_prestart = recipe_state.hardwired &&
+    recipe_state.multi_ustep &&
+    (recipe_state.commit_sel == RECIPE_COMMIT_SHIFT) && uc_exec &&
+    (uc_next[10:8] == 3'b000) && !decq_empty && !d2_valid &&
+    (i_bus.entry_point == 12'h023) && i_bus.has_modrm &&
+    (i_bus.modrm[7:6] == 2'b11) &&
+    (i_bus.rep_lock == PREFIX_NOREPLOCK) &&
+    (prestart_alu_group != 3'b010) &&
+    (prestart_alu_group != 3'b011) &&
+    (prestart_alu_group != 3'b111) &&
+    (prestart_alu_widx != prestart_shift_widx) &&
+    !q_flush && !throttle_hold && !interrupt_pending && !tf_active_r &&
+    !single_step && !any_fault_issue;
+
+// A normal boundary uses i_entry. Chaining and the narrow D1 prestart launch
+// a successor early, while its completed D2 payload still owns issue.
+assign d2_start = i_entry || chain_start || shift_alu_prestart;
+wire [11:0] d2_start_entry_arch = chain_start ? chain_entry :
+                      shift_alu_prestart ? i_bus.entry_point :
+                      (decq_empty ? d1_issue_entry_point : i_bus.entry_point);
 // D1 resolves qualified overlays. Keep live CR0/x87 state out of the D2 ROM
 // address; unsafe cases branch to the generated fallback after i_issue.
 assign d2_start_entry = d2_start_entry_arch;
@@ -955,7 +1009,7 @@ always_ff @(posedge clk) begin
             stack_init_pending <= i_bus.stack_op;
         end
 
-        if (chain_start)
+        if (chain_start || shift_alu_prestart)
             d2_valid_r <= 1'b1;
 
         if (!stall) begin
@@ -1030,7 +1084,7 @@ assign dcache_vipt_resolve_phys_addr = vipt_resolve_phys;
 
 // A synthetic RNI is required only when the direct pipeline drains. Interior
 // load boundaries are represented by their D2 issue and WB commit tokens.
-assign vipt_load_retire = vipt_load_wb_valid_r &&
+assign vipt_load_retire = vipt_load_wb_valid_r && !vipt_load_overlap_r &&
                           !vipt_load_ex_r.valid &&
                           !vipt_load_replay_r.valid &&
                           !vipt_load_slow_busy;
@@ -1046,12 +1100,19 @@ always_ff @(posedge clk) begin
         vipt_load_ex_probed_r <= 1'b0;
         vipt_load_wb_data_r <= 32'd0;
         vipt_load_wb_dst_r <= 3'd0;
+        vipt_load_wb_dst_onehot_r <= 8'd0;
         vipt_load_wb_size_r <= 2'd2;
         vipt_load_wb_is_alu_r <= 1'b0;
         vipt_load_wb_alu_op_r <= 5'd0;
         vipt_load_rom_shadow_r <= 1'b0;
+        vipt_load_overlap_r <= 1'b0;
     end else begin
         vipt_load_wb_valid_r <= 1'b0;
+
+        if (vipt_load_wb_valid_r)
+            vipt_load_overlap_r <= 1'b0;
+        if (i_issue && d2_plain_load_overlap_ready)
+            vipt_load_overlap_r <= 1'b1;
 
         if (i_rni_delay && d2_vipt_candidate)
             vipt_load_rom_shadow_r <= 1'b1;
@@ -1077,6 +1138,7 @@ always_ff @(posedge clk) begin
                     dcache_vipt_resolve_data, vipt_load_ex_r.lane,
                     vipt_load_ex_r.mem_size, vipt_load_ex_r.result_kind);
                 vipt_load_wb_dst_r <= vipt_load_ex_r.dst;
+                vipt_load_wb_dst_onehot_r <= vipt_load_ex_r.dst_onehot;
                 vipt_load_wb_size_r <= vipt_load_ex_r.write_size;
                 vipt_load_wb_is_alu_r <= vipt_load_ex_r.is_alu;
                 vipt_load_wb_alu_op_r <= vipt_load_ex_r.alu_op;
@@ -1138,6 +1200,7 @@ always_ff @(posedge clk) begin
                 OPR_R, 2'd0, vipt_load_slow_r.mem_size,
                 vipt_load_slow_r.result_kind);
             vipt_load_wb_dst_r <= vipt_load_slow_r.dst;
+            vipt_load_wb_dst_onehot_r <= vipt_load_slow_r.dst_onehot;
             vipt_load_wb_size_r <= vipt_load_slow_r.write_size;
             vipt_load_wb_is_alu_r <= vipt_load_slow_r.is_alu;
             vipt_load_wb_alu_op_r <= vipt_load_slow_r.alu_op;
@@ -1150,6 +1213,7 @@ always_ff @(posedge clk) begin
             vipt_load_slow_wait_r <= 1'b0;
             vipt_load_wb_valid_r <= 1'b0;
             vipt_load_ex_probed_r <= 1'b0;
+            vipt_load_overlap_r <= 1'b0;
         end
     end
 end
@@ -1677,7 +1741,7 @@ wire iack_busop = uc_p_iack;        // IACK bus operation (interrupt acknowledge
 // waiting for literals. It is not an EX uop yet and must not issue its bus op.
 assign mem_op_eligible = core_live && !mem_servicing &&
                          !stall_d2 && !d2_release_hold &&
-                         !throttle_parked_r && !vipt_load_busy &&
+                         !throttle_parked_r && !vipt_load_exec_block &&
                          !vipt_load_rom_shadow_r &&
                          !(i_rni_delay && d2_vipt_candidate);
 // A failed protection test redirects after its third architectural delay uop.
@@ -2201,7 +2265,7 @@ microsequencer microsequencer_inst (
     .d2_valid(d2_valid),
     .seq_advance(seq_advance),
     .macro_entry_valid(i_entry_raw),
-    .chain_entry_valid(chain_start),
+    .chain_entry_valid(chain_start || shift_alu_prestart),
     .uc_exec(uc_exec),
     .repeat_active(repeat_active),
     .prot_redirect_prev(prot_redirect_prev),

@@ -26,9 +26,9 @@ typedef struct packed {
     logic uses_ea;     // consumes EA/moffs/IND at i_issue (LEA, loads, stores):
                        // never chain INTO — base/index GPRs may be written by
                        // the still-executing predecessor
-    logic reads_dst;   // EX-cycle GPR sources; DSTREG/SRCREG readers can use
-    logic reads_src;   //   registered load-WB forwarding when chained
-    logic reads_ecx;   // implicit ECX reader (not covered by that bypass)
+    logic reads_dst;   // EX-cycle GPR data sources; all hardwired DSTREG,
+    logic reads_src;   //   SRCREG, and implicit ECX readers use load-WB bypass
+    logic reads_ecx;
     logic writes_srcreg; // LEA: the entry word writes SRCREG (modrm reg field)
                        //   via uc_dest - the EA chain-into gate must see it
     logic op_byte;     // operand size is byte (precomputed: byte selectors

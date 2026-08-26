@@ -142,6 +142,14 @@ PATCHES = [
     Patch(0x9C8, "INVLPG m extension: blank RNI delay slot",
           copy_from=0x030),
 
+    # Opcode 90 is architecturally XCHG EAX,EAX, but does not need the shared
+    # three-word XCHG r,EAX routine.  D1 redirects only that opcode to a blank
+    # hardwired RNI word; 91-97 retain the original exchange path.
+    Patch(0x9C9, "NOP extension: blank hardwired RNI word",
+          copy_from=0x030, fields=dict(op=0)),
+    Patch(0x9CA, "NOP extension: blank RNI delay slot",
+          copy_from=0x030),
+
     # D8 m32 arithmetic and D9 /0 FLD use a paging-owned demand read and post
     # the completed operand directly to the integrated x87. Dynamic CR0/x87
     # eligibility falls back to the original 4D7 routine.
@@ -318,6 +326,8 @@ PATCHES = [
 # usteps.  A memory ustep may hold for completion, absorbing legacy DLY/JMP
 # plumbing without increasing the target step count.
 HARDWIRED_RECIPES = [
+    Recipe("nop", 0x9C9, EarlyKind.NONE,
+           ((0x9C9,),), ((0x9C9,),), "none", "reclaim"),
     Recipe("mov-r-r", 0x003, EarlyKind.NONE,
            ((0x003, 0x004),), ((0x003,),), "alu-dst", "reclaim", ("src",)),
     Recipe("mov-r-imm", 0x005, EarlyKind.NONE,
@@ -669,6 +679,12 @@ def render_recipe_svh(words: list[int]) -> str:
             "        end",
         ]
     lines += [
+        "        12'h0B6: begin",
+        "            if (opcode == 8'h90)",
+        "                recipe_effective_entry = 12'h9C9;",
+        "        end",
+    ]
+    lines += [
         "        default: ;",
         "    endcase",
         "endfunction",
@@ -767,6 +783,9 @@ def render_recipe_svh(words: list[int]) -> str:
         "           (e.opcode == 8'h83)) ? e.modrm[5:3] : e.opcode[5:3];",
         "    if (e.rep_lock == PREFIX_NOREPLOCK) begin",
         "        unique case (e.entry_point)",
+        f"            {recipe_entries('nop')}: begin",
+        "                r.hardwired = 1'b1;",
+        "            end",
         f"            {recipe_entries('mov-r-r')}: begin",
         "                r.hardwired = 1'b1; r.commit_sel = RECIPE_COMMIT_ALU;",
         "                r.reads_src = 1'b1;",

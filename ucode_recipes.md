@@ -7,6 +7,7 @@ hold while its request completes.
 
 | recipe | entry | early | target usteps | legacy paths | commit | slot | hazards |
 | --- | ---: | --- | --- | --- | --- | --- | --- |
+| `nop` | `9C9` | `NONE` | `9C9` | `9C9` | `none` | `reclaim` | - |
 | `mov-r-r` | `003` | `NONE` | `003` | `003 004` | `alu-dst` | `reclaim` | src |
 | `mov-r-imm` | `005` | `NONE` | `005` | `005 006` | `alu-dst` | `reclaim` | - |
 | `alu-r-r` | `01D` | `NONE` | `01D` | `01D 01E` | `alu-dst/flags` | `reclaim` | dst, src, flags-adc-sbb |
@@ -42,7 +43,7 @@ hold while its request completes.
 | `push-imm` | `09D` | `STACK` | `09D` | `09D 09E` | `store/esp` | `retain` | stack |
 | `pop-r` | `09F` | `STACK` | `09F 0A0` | `09F 0A0 0A1` | `mem-dst/esp` | `retain` | stack |
 
-Recipes: 34. Native microcode remains 37-bit.
+Recipes: 35. Native microcode remains 37-bit.
 The generated 40-bit ROM image stores the D2 early kind in bits 39:37.
 
 ## Qualified overlays

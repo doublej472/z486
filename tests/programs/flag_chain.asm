@@ -139,6 +139,17 @@ start:
     cmp eax, 0xF0123456
     jne fail
 
+    ; A pending shift commits on the issue edge of a dependent shift separated
+    ; by one independent instruction.  The younger shift reads the committed
+    ; value in EX and must not require another D2 bubble.
+    mov edx, 0x12345678
+    mov ebp, 0x9ABCDEF0
+    shld edx, ebp, 16
+    add edi, 2
+    shld edx, ebp, 6
+    cmp edx, 0x9E26AF26
+    jne fail
+
     mov ax, 0x8000
     mov dx, 0
     shld ax, dx, 1       ; CF=1

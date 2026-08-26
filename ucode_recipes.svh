@@ -24,6 +24,10 @@ function automatic logic [11:0] recipe_effective_entry(
             if ((opcode == 8'hD8) || ((opcode == 8'hD9) && (modrm[5:3] == 3'd0)))
                 recipe_effective_entry = 12'h9C5;
         end
+        12'h0B6: begin
+            if (opcode == 8'h90)
+                recipe_effective_entry = 12'h9C9;
+        end
         default: ;
     endcase
 endfunction
@@ -45,7 +49,7 @@ endfunction
 
 function automatic logic [2:0] recipe_early_kind(input logic [11:0] entry);
     unique case (entry)
-        12'h003, 12'h005, 12'h01D, 12'h01F, 12'h021, 12'h023, 12'h025, 12'h0F9, 12'h0FC, 12'h0FF, 12'h102, 12'h105, 12'h1E8, 12'h1F0: recipe_early_kind = RECIPE_EARLY_NONE;
+        12'h003, 12'h005, 12'h01D, 12'h01F, 12'h021, 12'h023, 12'h025, 12'h0F9, 12'h0FC, 12'h0FF, 12'h102, 12'h105, 12'h1E8, 12'h1F0, 12'h9C9: recipe_early_kind = RECIPE_EARLY_NONE;
         12'h0B9: recipe_early_kind = RECIPE_EARLY_EA;
         12'h019, 12'h027, 12'h02C, 12'h031, 12'h035, 12'h1EB, 12'h1F3, 12'h9C5: recipe_early_kind = RECIPE_EARLY_LOAD;
         12'h013, 12'h015: recipe_early_kind = RECIPE_EARLY_STORE;
@@ -104,6 +108,9 @@ function automatic recipe_meta_t recipe_metadata(input dec_entry_t e);
            (e.opcode == 8'h83)) ? e.modrm[5:3] : e.opcode[5:3];
     if (e.rep_lock == PREFIX_NOREPLOCK) begin
         unique case (e.entry_point)
+            12'h9C9: begin
+                r.hardwired = 1'b1;
+            end
             12'h003: begin
                 r.hardwired = 1'b1; r.commit_sel = RECIPE_COMMIT_ALU;
                 r.reads_src = 1'b1;

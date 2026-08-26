@@ -84,6 +84,10 @@ wire [31:0] dcache_cpu_dout;
 wire        dcache_cpu_ready;
 wire        dcache_cpu_resp_valid;
 wire        dcache_stores_drained;
+wire [31:0] dcache_store_patch_addr;
+wire [31:0] dcache_store_patch_data;
+wire  [3:0] dcache_store_patch_be;
+wire        dcache_store_patch_valid;
 wire [31:0] dcache_mem_addr;
 wire [31:0] dcache_mem_din;
 wire  [3:0] dcache_mem_be;
@@ -158,11 +162,27 @@ wire ext_dcache_accept = ext_valid_r && ready && (ext_src_r == EXT_SRC_DCACHE);
 wire ext_icache_accept = ext_valid_r && ready && (ext_src_r == EXT_SRC_ICACHE);
 wire direct_rd_resp_now = resp_valid &&
                           (direct_rd_pending || (ext_direct_accept && !ext_write_r));
-wire icache_write_snoop = dcache_cpu_req && dcache_req_write && dcache_cpu_ready;
 logic       icache_write_snoop_pending;
 logic [31:0] icache_write_snoop_addr_r;
 logic [31:0] icache_write_snoop_data_r;
 logic  [3:0] icache_write_snoop_be_r;
+// Normally the I-cache consumes the D-cache's registered S_LOOKUP store
+// directly.  The one-entry pending slot only resolves an external invalidate
+// collision (or holds the following store while an older pending patch is
+// consumed), preserving invalidate priority without returning to live paging
+// request signals.
+wire icache_write_patch_valid = !snoop_valid &&
+                                (icache_write_snoop_pending ||
+                                 dcache_store_patch_valid);
+wire [31:0] icache_write_patch_addr = icache_write_snoop_pending
+                                    ? icache_write_snoop_addr_r
+                                    : dcache_store_patch_addr;
+wire [31:0] icache_write_patch_data = icache_write_snoop_pending
+                                    ? icache_write_snoop_data_r
+                                    : dcache_store_patch_data;
+wire [3:0] icache_write_patch_be = icache_write_snoop_pending
+                                 ? icache_write_snoop_be_r
+                                 : dcache_store_patch_be;
 
 wire normal_req_accepted = dcache_cpu_req ? dcache_cpu_ready : ext_direct_accept;
 wire normal_req_complete = dcache_cpu_resp_valid ||
@@ -215,12 +235,14 @@ always_ff @(posedge clk) begin
         icache_write_snoop_data_r <= 32'h0;
         icache_write_snoop_be_r <= 4'h0;
     end else begin
-        if (icache_write_snoop) begin
-            // Keep dcache write finalization off the icache RAM write path.
+        if (dcache_store_patch_valid &&
+            (snoop_valid || icache_write_snoop_pending)) begin
+            // The pending patch, when present, is consumed on this edge. Keep
+            // the newly accepted store for the following cycle.
             icache_write_snoop_pending <= 1'b1;
-            icache_write_snoop_addr_r <= dcache_req_phys_addr;
-            icache_write_snoop_data_r <= dcache_req_wdata;
-            icache_write_snoop_be_r <= dcache_req_be;
+            icache_write_snoop_addr_r <= dcache_store_patch_addr;
+            icache_write_snoop_data_r <= dcache_store_patch_data;
+            icache_write_snoop_be_r <= dcache_store_patch_be;
         end else if (icache_write_snoop_pending && !snoop_valid) begin
             icache_write_snoop_pending <= 1'b0;
         end
@@ -308,6 +330,10 @@ l1_cache #(
     .cpu_ready(dcache_cpu_ready),
     .cpu_resp_valid(dcache_cpu_resp_valid),
     .stores_drained(dcache_stores_drained),
+    .store_patch_addr(dcache_store_patch_addr),
+    .store_patch_data(dcache_store_patch_data),
+    .store_patch_be(dcache_store_patch_be),
+    .store_patch_valid(dcache_store_patch_valid),
     .vipt_probe_offset(dcache_vipt_probe_offset),
     .vipt_probe_valid(dcache_vipt_probe_valid),
     .vipt_probe_ready(dcache_vipt_probe_ready),
@@ -350,10 +376,10 @@ l1_icache #(
     .mem_valid(icache_mem_valid),
     .mem_ready(icache_mem_ready),
     .mem_resp_valid(icache_mem_resp_valid),
-    .patch_addr(icache_write_snoop_addr_r),
-    .patch_data(icache_write_snoop_data_r),
-    .patch_be(icache_write_snoop_be_r),
-    .patch_valid(icache_write_snoop_pending),
+    .patch_addr(icache_write_patch_addr),
+    .patch_data(icache_write_patch_data),
+    .patch_be(icache_write_patch_be),
+    .patch_valid(icache_write_patch_valid),
     .invalidate_addr(snoop_addr),
     .invalidate_valid(snoop_valid),
     .cache_enable(1'b1)

@@ -23,6 +23,12 @@ MALIAS   equ 0x1040
 MCROSS   equ 0x1051
 TARGET   equ 0x2100
 MCOLD    equ 0x3000
+MCHAIN_BASE equ 0x3fc0
+MCHAIN_SRC  equ 0x4008
+MORDER      equ 0x4080
+MLOAD       equ 0x4084
+MCOUNT      equ 0x4088
+MPTR        equ 0x408c
 
 start:
     mov dword [M3], 3
@@ -37,6 +43,11 @@ start:
     mov dword [TARGET], 0x51a7c001
     mov dword [MCROSS], 0x10203040
     mov dword [MCOLD], 0x11111111
+    mov dword [MCHAIN_SRC], 0x1234
+    mov dword [MORDER], 0x11112222
+    mov dword [MLOAD], 0x12345678
+    mov dword [MCOUNT], 4
+    mov dword [MPTR], TARGET
 
     ; Drain stores and warm the aligned direct-hit source lines.
     times 32 nop
@@ -49,6 +60,9 @@ start:
     mov edx, [MWORD]
     mov edx, [MDELTA]
     mov edx, [TARGET]
+    mov edx, [MLOAD]
+    mov edx, [MCOUNT]
+    mov edx, [MPTR]
     times 8 nop
 
     ; 1. Every arithmetic/logical opcode in the register,memory class.
@@ -157,6 +171,70 @@ start:
     cmp eax, 0x11111113
     jne fail8
 
+    ; 9. M3 WB must interlock a dependent D2 EA while an intervening M1
+    ; supplies the next M3 destination. Doom hits this after the title screen.
+    mov ebp, esp
+    mov esp, 0x2000
+    push dword 0x40
+    mov ecx, [esp]
+    mov ecx, [MCHAIN_SRC]
+    times 8 nop
+    mov eax, MCHAIN_BASE
+    add eax, [esp]
+    mov edx, [esp]
+    add edx, [eax + 8]
+    mov esp, ebp
+    cmp edx, 0x1274
+    jne fail9
+
+    ; 10. A load with the same page-offset DWORD as the preceding store must
+    ; replay past the cache patch and observe the newly stored bytes.
+    mov eax, 0x55667788
+    mov [MORDER], eax
+    mov ebx, [MORDER]
+    cmp ebx, eax
+    jne fail10
+
+    ; 11. i486 load-use behavior: GPR data consumers use registered WB
+    ; forwarding without a bubble. Pointer consumers wait one cycle and then
+    ; use the same value through the D2 EA forwarding path.
+    mov eax, [MLOAD]
+    shl eax, 1
+    cmp eax, 0x2468acf0
+    jne fail11
+
+    mov eax, [MLOAD]
+    mov edx, 0x9abcdef0
+    shld eax, edx, 8
+    cmp eax, 0x3456789a
+    jne fail11
+
+    mov eax, 0x12345678
+    mov edx, [MLOAD]
+    shld eax, edx, 8
+    cmp eax, 0x34567812
+    jne fail11
+
+    mov ebx, 0x56789abc
+    mov esi, 0xdef01234
+    mov ecx, 17
+    mov ecx, [MCOUNT]
+    shrd ebx, esi, cl
+    cmp ebx, 0x456789ab
+    jne fail11
+
+    mov eax, 0x100
+    mov ecx, 17
+    mov ecx, [MCOUNT]
+    sar eax, cl
+    cmp eax, 0x10
+    jne fail11
+
+    mov esi, [MPTR]
+    mov ebx, [esi]
+    cmp ebx, 0x51a7c001
+    jne fail11
+
 pass:
     mov al, STATUS_PASS
     mov dx, STATUS_PORT
@@ -180,6 +258,12 @@ fail6: mov eax, 6
 fail7: mov eax, 7
     jmp fail
 fail8: mov eax, 8
+    jmp fail
+fail9: mov eax, 9
+    jmp fail
+fail10: mov eax, 10
+    jmp fail
+fail11: mov eax, 11
 fail:
     mov dx, DATA_PORT
     out dx, eax

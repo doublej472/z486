@@ -138,7 +138,7 @@ obj_dir_x87/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(CPP_PR
 	@echo "Build complete: obj_dir_x87/Vtb_protected_mode"
 
 obj_dir_quake/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(CPP_QUAKE_SNAPSHOT_SRCS)
-	@echo "Building 64MB x87 Quake snapshot replay..."
+	@echo "Building 64MB workload snapshot replay..."
 	cp -f ../*.hex .
 	$(VERILATOR) $(VFLAGS_NOTRACE) --Mdir obj_dir_quake \
 		-GENABLE_X87=1 -GMEM_SIZE=67108864 --top-module tb_protected_mode \
@@ -146,7 +146,7 @@ obj_dir_quake/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(CPP_
 	@echo "Build complete: obj_dir_quake/Vtb_protected_mode"
 
 obj_dir_quake_trace/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(CPP_QUAKE_SNAPSHOT_SRCS)
-	@echo "Building trace-enabled 64MB x87 Quake snapshot replay..."
+	@echo "Building trace-enabled 64MB workload snapshot replay..."
 	cp -f ../*.hex .
 	$(VERILATOR) $(VFLAGS_FST) --Mdir obj_dir_quake_trace \
 		-GENABLE_X87=1 -GMEM_SIZE=67108864 --top-module tb_protected_mode \

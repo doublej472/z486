@@ -230,10 +230,12 @@ always_comb begin
         end
 
         PW_WAIT_PDE: begin
-            if (!mem_ready) begin
-                mem_rd = 1'b1;
-                mem_addr = pde_addr;
-            end
+            // Hold request intent stable through the response cycle. The
+            // paging-unit pending bit prevents reissue, so feeding mem_ready
+            // back into these outputs only creates a cache-response control
+            // path into unrelated request registers.
+            mem_rd = 1'b1;
+            mem_addr = pde_addr;
         end
 
         PW_READ_PTE: begin
@@ -242,10 +244,8 @@ always_comb begin
         end
 
         PW_WAIT_PTE: begin
-            if (!mem_ready) begin
-                mem_rd = 1'b1;
-                mem_addr = pte_addr;
-            end
+            mem_rd = 1'b1;
+            mem_addr = pte_addr;
         end
 
         PW_CHECK_PERM: begin
@@ -259,11 +259,9 @@ always_comb begin
         end
 
         PW_WAIT_WR_PDE: begin
-            if (!mem_ready) begin
-                mem_wr = 1'b1;
-                mem_addr = pde_addr;
-                mem_wdata = pde | (32'h1 << PTE_A);
-            end
+            mem_wr = 1'b1;
+            mem_addr = pde_addr;
+            mem_wdata = pde | (32'h1 << PTE_A);
         end
 
         PW_WRITE_PTE: begin
@@ -274,11 +272,10 @@ always_comb begin
         end
 
         PW_WAIT_WR_PTE: begin
-            if (!mem_ready) begin
-                mem_wr = 1'b1;
-                mem_addr = pte_addr;
-                mem_wdata = pte | (32'h1 << PTE_A) | (saved_is_write ? (32'h1 << PTE_D) : 32'h0);
-            end
+            mem_wr = 1'b1;
+            mem_addr = pte_addr;
+            mem_wdata = pte | (32'h1 << PTE_A) |
+                        (saved_is_write ? (32'h1 << PTE_D) : 32'h0);
         end
 
         PW_DONE: begin

@@ -166,27 +166,13 @@ wire [2:0] issue_load_dst = issue_load_is_movx
 wire [2:0] issue_load_widx = wide_widx(issue_load_dst,
                                       !issue_load_is_movx &&
                                       (issue_instr.operand_size == 2'd0));
-wire load_conf1 = hazard_uses(next_ea, next_instr, 1'b1,
-                              issue_load_widx);
-wire issue_load_byte = !issue_load_is_movx &&
-                       (issue_instr.operand_size == 2'd0);
-wire load_fwd_conf1 =
-    (next_recipe.reads_dst &&
-     gpr_overlap(issue_load_dst, issue_load_byte,
-                 next_instr.dst_reg_sel, next_recipe.op_byte)) ||
-    (next_recipe.reads_src &&
-     gpr_overlap(issue_load_dst, issue_load_byte,
-                 next_instr.src_reg_sel, next_recipe.op_byte));
-// DSTREG/SRCREG readers have a registered WB bypass.  ECX-special and other
-// implicit readers retain the interlock until they gain their own narrow path.
-wire load_ecx_conf1 = next_recipe.reads_ecx && (issue_load_widx == 3'd1);
-wire load_unforwarded_conf1 = load_conf1 &&
-                              (!load_fwd_conf1 || load_ecx_conf1);
-// A plain direct load forwards registered cache data.  A direct ALU result
-// would instead cross the private ALU and a successor ALU/EA in one cycle;
-// keep independent overlap, but interlock that dependent successor until M3
-// commits.  Direct ALU recipes are the load-pipe class that writes flags.
-wire load_alu_result_conf1 = issue_recipe.writes_flags && load_fwd_conf1;
+wire load_data_conf1 = next_instr.recipe_gpr_read_mask[issue_load_widx];
+// Match the i486 load-use rule. Registered cache data forwards to every
+// hardwired GPR data input without a bubble. An EA base/index waits one cycle,
+// then uses the D2 WB bypass; a miss naturally extends that interlock. M3's
+// private ALU result is later than plain load WB, so any dependent data use
+// must also wait for architectural commit.
+wire load_alu_result_conf1 = issue_recipe.writes_flags && load_data_conf1;
 
 wire shift_set = recipe_rni && uc_exec && (recipe_state.commit_sel == RECIPE_COMMIT_SHIFT);
 wire shift_hazard = shift_set || shift_commit.valid;
@@ -194,7 +180,14 @@ wire [2:0] shift_hreg = shift_set ? exec_instr.dst_reg_sel : shift_commit.dst;
 wire [1:0] shift_hsize = shift_set ? op_size : shift_commit.size;
 wire [2:0] shift_widx = wide_widx(shift_hreg, shift_hsize == 2'd0);
 wire shift_conf1 = hazard_uses(next_ea, next_instr, shift_hazard, shift_widx);
-wire shift_confN = hazard_uses(issue_ea, issue_instr, shift_hazard, shift_widx);
+// A shift captured on this edge is not architectural until the following WB
+// edge, so its dependent D2 head must wait.  An already-pending shift commits
+// on the current issue edge; the new instruction reads its operands one cycle
+// later and therefore needs no additional register dependency bubble.  D2 EA
+// reads already have the pending-shift bypass in the Data Unit.
+wire shift_confN = hazard_uses(
+    issue_ea, issue_instr, shift_set,
+    wide_widx(exec_instr.dst_reg_sel, op_size == 2'd0));
 
 wire next_chain_safe = decq_has2 && next_recipe.hardwired &&
     (!next_recipe.reads_flags || !issue_recipe.writes_flags || next_recipe.jcc) &&
@@ -202,8 +195,10 @@ wire next_chain_safe = decq_has2 && next_recipe.hardwired &&
 // A direct ALU predecessor has not produced its result or flags at the D2
 // chain point. Plain-load register consumers use WB forwarding; dependent M3
 // register and flag consumers wait for architectural commit.
-wire next_load_chain_safe = next_chain_safe && !load_unforwarded_conf1 &&
-    !load_alu_result_conf1 &&
+// A pointer-dependent successor may launch its ROM entry immediately; the
+// registered D2 EA mask below issue supplies the one-cycle pointer interlock.
+// Only an M3 data result, which has no WB forwarding path, blocks the launch.
+wire next_load_chain_safe = next_chain_safe && !load_alu_result_conf1 &&
     !(issue_recipe.writes_flags && next_recipe.reads_flags);
 
 wire loaduse_conflict =

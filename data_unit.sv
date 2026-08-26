@@ -158,6 +158,7 @@ end
 logic [31:0] shift_setup_result;
 logic [1:0]  shift_data_size;
 logic        shift_count_nonzero;
+logic        shift_bit_test_cf;
 
 logic        muldiv_sigma_write;
 logic [31:0] muldiv_sigma_value;
@@ -356,14 +357,14 @@ end
 
 function automatic logic [31:0] read_alu_source(input logic [5:0] field);
     case (field)
-        ALUSRC_EAX: read_alu_source = eax;
-        ALUSRC_ECX: read_alu_source = ecx;
-        ALUSRC_EDX: read_alu_source = edx;
-        ALUSRC_EBX: read_alu_source = ebx;
-        ALUSRC_ESP: read_alu_source = esp;
-        ALUSRC_EBP: read_alu_source = ebp;
-        ALUSRC_ESI: read_alu_source = esi;
-        ALUSRC_EDI: read_alu_source = edi;
+        ALUSRC_EAX: read_alu_source = read_gpr_load_forwarded(3'd0, 2'd2);
+        ALUSRC_ECX: read_alu_source = read_gpr_load_forwarded(3'd1, 2'd2);
+        ALUSRC_EDX: read_alu_source = read_gpr_load_forwarded(3'd2, 2'd2);
+        ALUSRC_EBX: read_alu_source = read_gpr_load_forwarded(3'd3, 2'd2);
+        ALUSRC_ESP: read_alu_source = read_gpr_load_forwarded(3'd4, 2'd2);
+        ALUSRC_EBP: read_alu_source = read_gpr_load_forwarded(3'd5, 2'd2);
+        ALUSRC_ESI: read_alu_source = read_gpr_load_forwarded(3'd6, 2'd2);
+        ALUSRC_EDI: read_alu_source = read_gpr_load_forwarded(3'd7, 2'd2);
         ALUSRC_IMM8: read_alu_source = instr.has_modrm ? instr.immediate : instr.displacement;
         ALUSRC_IMM: read_alu_source = instr.immediate;
         ALUSRC_TMPB: read_alu_source = tmpb;
@@ -429,13 +430,13 @@ endfunction
 
 function automatic logic [31:0] read_source(input logic [5:0] field);
     case (field)
-        SRC_EAX: read_source = eax;
-        SRC_ECX: read_source = ecx;
-        SRC_EDX: read_source = edx;
-        SRC_ESP: read_source = esp;
-        SRC_EBP: read_source = ebp;
-        SRC_ESI: read_source = esi;
-        SRC_EDI: read_source = edi;
+        SRC_EAX: read_source = read_gpr_load_forwarded(3'd0, 2'd2);
+        SRC_ECX: read_source = read_gpr_load_forwarded(3'd1, 2'd2);
+        SRC_EDX: read_source = read_gpr_load_forwarded(3'd2, 2'd2);
+        SRC_ESP: read_source = read_gpr_load_forwarded(3'd4, 2'd2);
+        SRC_EBP: read_source = read_gpr_load_forwarded(3'd5, 2'd2);
+        SRC_ESI: read_source = read_gpr_load_forwarded(3'd6, 2'd2);
+        SRC_EDI: read_source = read_gpr_load_forwarded(3'd7, 2'd2);
         SRC_EIP: read_source = eip;
         SRC_EFLAGS: read_source = eflags;
         SRC_CR0: read_source = cr0;
@@ -470,15 +471,15 @@ function automatic logic [31:0] read_source(input logic [5:0] field);
         SRC_LDTR: read_source = {16'd0, ldtr};
         SRC_TR: read_source = {16'd0, tr};
         SRC_SLCTR: read_source = {16'd0, slctr[15:3], 3'b000};
-        SRC_eAX_AL: read_source = read_gpr_value(3'd0, op_size_src);
-        SRC_eDX_AH: read_source = read_gpr_value(
+        SRC_eAX_AL: read_source = read_gpr_load_forwarded(3'd0, op_size_src);
+        SRC_eDX_AH: read_source = read_gpr_load_forwarded(
             op_size_src == 2'd0 ? 3'd4 : 3'd2, op_size_src);
         SRC_OPR_R: read_source = opr_r;
         SRC_IRF2: read_source = ind;
         SRC_EA: read_source = ea;
-        SRC_eCX: read_source = ecx;
-        SRC_IRF: read_source = read_gpr_value(countr[2:0],
-                                              op_size_src == 2'd2 ? 2'd2 : 2'd1);
+        SRC_eCX: read_source = read_gpr_load_forwarded(3'd1, 2'd2);
+        SRC_IRF: read_source = read_gpr_load_forwarded(
+            countr[2:0], op_size_src == 2'd2 ? 2'd2 : 2'd1);
         SRC_USTEP_SEG_INDEX: read_source = {24'd0, 5'b10100, seg_reg_sel};
         SRC_FOP: read_source = {21'd0, instr.fop};
         SRC_SEGREG: begin
@@ -568,7 +569,7 @@ function automatic logic [31:0] read_memory_write_source(input logic [5:0] field
                 default: read_memory_write_source = 32'd0;
             endcase
         end
-        SRC_IRF: read_memory_write_source = read_gpr_value(
+        SRC_IRF: read_memory_write_source = read_gpr_load_forwarded(
             countr[2:0], op_size_src == 2'd2 ? 2'd2 : 2'd1);
         default: read_memory_write_source = 32'd0;
     endcase
@@ -1012,7 +1013,7 @@ always_ff @(posedge clk) begin
         end
         if (!instr_start && exec) begin
             case (aluop)
-                ALUJMP_BITTST: uc_flags[0] <= shift_result[0];
+                ALUJMP_BITTST: uc_flags[0] <= shift_bit_test_cf;
                 default: ;
             endcase
         end
@@ -1067,7 +1068,7 @@ always_ff @(posedge clk) begin
                         default: ;
                     endcase
                 end
-                ALUJMP_BITTST: eflags[0] <= shift_result[0];
+                ALUJMP_BITTST: eflags[0] <= shift_bit_test_cf;
                 ALUJMP_DIV5: begin
                     eflags[0] <= 1'b0;
                     if (instr.div_quotient_zf)
@@ -1301,12 +1302,12 @@ shifter shifter_inst (
     .op_size(op_size),
     .alu_dst(alu_dst),
     .alu_src(alu_src),
-    .gpr_dst_src_size(read_gpr_value(dst_reg_sel_r, srcreg_size)),
-    .gpr_src_op_size(read_gpr_value(src_reg_sel_r, op_size)),
-    .gpr_dst_shift_size(read_gpr_value(dst_reg_sel_r, shift_data_size)),
-    .gpr_src_shift_size(read_gpr_value(src_reg_sel_r, shift_data_size)),
+    .gpr_dst_src_size(read_gpr_load_forwarded(dst_reg_sel_r, srcreg_size)),
+    .gpr_src_op_size(read_gpr_load_forwarded(src_reg_sel_r, op_size)),
+    .gpr_dst_shift_size(read_gpr_load_forwarded(dst_reg_sel_r, shift_data_size)),
+    .gpr_src_shift_size(read_gpr_load_forwarded(src_reg_sel_r, shift_data_size)),
     .immediate(instr.immediate),
-    .ecx(ecx),
+    .ecx(read_gpr_load_forwarded(3'd1, 2'd2)),
     .sigma(sigma),
     .tmpb(tmpb),
     .tmpc(tmpc),
@@ -1317,6 +1318,7 @@ shifter shifter_inst (
     .data_size(shift_data_size),
     .result(shift_result),
     .setup_result(shift_setup_result),
+    .bit_test_cf(shift_bit_test_cf),
     .count_nonzero(shift_count_nonzero),
     .flags_commit(sh_flags_commit),
     .flags_we_zsp(sh_flags_we_zsp),

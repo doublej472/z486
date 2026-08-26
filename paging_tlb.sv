@@ -144,16 +144,12 @@ reg [36:0] vipt_tlb_q;
 always_ff @(posedge clk) begin
     if (vipt_preread) begin
         vipt_linear_r <= vipt_linear_addr;
-        // Record only collisions with the synchronous RAM read here. Validity
-        // is selected in EX from the registered index, keeping its 32:1 mux
-        // out of the D2 preread register input.
-        vipt_hazard_r <= invalidate_all ||
-                         (invalidate_page &&
-                          vipt_preread_index == invalidate_vpn[4:0]) ||
-                         (update_valid &&
-                          vipt_preread_index == update_vpn[4:0]) ||
-                         (vipt_refill_write &&
-                          vipt_preread_index == vipt_refill_index);
+        // Any simultaneous mutation conservatively poisons this preread. TLB
+        // mutations are rare, and a false collision only takes the normal
+        // authoritative lookup; avoiding the live index compares keeps D2 EA
+        // formation out of this register input.
+        vipt_hazard_r <= invalidate_all || invalidate_page || update_valid ||
+                         vipt_refill_write;
         vipt_tlb_q <= vipt_tlb[vipt_preread_index];
     end
 end

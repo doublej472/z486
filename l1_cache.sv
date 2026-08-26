@@ -25,6 +25,13 @@ module l1_cache #(
     output        cpu_resp_valid,
     output        stores_drained,
 
+    // Accepted CPU stores are registered before S_LOOKUP.  Export that
+    // registered payload for the instruction-cache coherence patch.
+    output [31:0] store_patch_addr,
+    output [31:0] store_patch_data,
+    output  [3:0] store_patch_be,
+    output        store_patch_valid,
+
     // Side-effect-free hardwired-load path. D2 selects the RAM word; EX
     // supplies the physical tag exactly one cycle later. The cache does not
     // retain request ownership and a miss retries through the CPU interface.
@@ -198,6 +205,11 @@ reg resp_valid_r;
 reg ready_r;
 
 assign cpu_ready = ready_r;
+assign store_patch_addr = req_addr_r;
+assign store_patch_data = req_din_r;
+assign store_patch_be = req_be_r;
+assign store_patch_valid = (state == S_LOOKUP) && req_valid_r &&
+                           req_write_r && !req_protect_write_r;
 
 function automatic [31:0] be_mask(input [3:0] be);
 begin
@@ -433,12 +445,23 @@ endtask
 // sees (it is only entered on accept_cpu).  This keeps the TLB-hit cone off
 // the wide rd_*_r register enables.
 wire idle_preread = (state == S_IDLE) && ready_r;
+// A posted store patches at most one data way during S_LOOKUP.  The inferred
+// cache RAMs have an independent read port, so an unrelated VIPT lookup can
+// preread the next load in that cycle.  A lookup in the store's set is
+// replayed: besides possible data read-during-write ambiguity, it must observe
+// the PLRU update made by the store hit before choosing a miss victim.
+wire store_lookup_preread = (state == S_LOOKUP) && req_valid_r &&
+                            req_write_r && !req_protect_write_r;
+wire store_lookup_alias = store_lookup_preread &&
+                          (vipt_probe_set == req_set_r);
 // Store hits patch the cache before it can accept another probe; store misses
 // have no matching line, and later fills are patched before the tag is valid.
 // Capacity is a registered-state fact. Demand arbitration must not feed back
 // through D2 issue; a denied speculative probe is replayed by the CPU.
-assign vipt_probe_ready = idle_preread;
-wire vipt_probe_fire = vipt_probe_valid && idle_preread &&
+assign vipt_probe_ready = idle_preread || store_lookup_preread;
+wire vipt_probe_fire = vipt_probe_valid &&
+                       (idle_preread || (store_lookup_preread &&
+                                        !store_lookup_alias)) &&
                        !cpu_preread_priority;
 assign vipt_probe_accepted = vipt_probe_fire;
 wire [SET_BITS-1:0] preread_set =
@@ -463,7 +486,7 @@ wire tag_fill_way2 = tag_fill_write && (fill_way == 2'd2);
 wire tag_fill_way3 = tag_fill_write && (fill_way == 2'd3);
 
 always_ff @(posedge clk) begin
-    if (idle_preread) begin
+    if (idle_preread || vipt_probe_fire) begin
         rd_tag_entry0_r <= tag_way0[preread_set];
         rd_tag_entry1_r <= tag_way1[preread_set];
         rd_tag_entry2_r <= tag_way2[preread_set];

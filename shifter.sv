@@ -40,6 +40,7 @@ module shifter
     output logic [1:0]  data_size,
     output logic [31:0] result,
     output logic [31:0] setup_result,       // SHIFT1 result consumed by data unit
+    output logic        bit_test_cf,        // Direct BITTST operand tap (bypasses barrel)
     output logic        count_nonzero,      // Captured count enables SHIFT2 commit
     output logic        flags_commit,       // SHIFT2 deferred flags are ready
     output logic        flags_we_zsp,
@@ -155,6 +156,10 @@ wire        shifted_next_sign = data_size == 2'd0 ? shifted[6] :
                                 data_size == 2'd1 ? shifted[14] : shifted[30];
 
 assign result = overflow ? (is_sar ? sar_overflow_result : 32'd0) : shifted[31:0];
+// Every BITTST site uses a right-count setup with swap clear.  Its carry is
+// therefore the selected low-word bit; do not route the full 64-bit barrel
+// result back into the architectural flag write path.
+assign bit_test_cf = alu_value[count[4:0]];
 wire result_pf = ~^result[7:0];
 wire result_zf = overflow ? (is_sar ? !low_sign : 1'b1) :
                  data_size == 2'd0 ? shifted[7:0] == 8'd0 :
@@ -328,6 +333,11 @@ always @(posedge clk)
         source_field != SRC_TMPC && source_field != SRC_TMPE &&
         source_field != SRC_SIGMA && source_field != SRC_SRCREG)
         $fatal(1, "SHIFT2 source outside ROM predecode inventory: %02x", source_field);
+always @(posedge clk)
+    if (reset_n && exec && (aluop == ALUJMP_BITTST) &&
+        (bit_test_cf !== result[0]))
+        $fatal(1, "BITTST DIRECT CARRY MISMATCH: direct=%b barrel=%b",
+               bit_test_cf, result[0]);
 // synthesis translate_on
 
 endmodule
