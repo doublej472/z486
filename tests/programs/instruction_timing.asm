@@ -941,10 +941,183 @@ incm_08: inc dword [edi]
 
     cmp dword [edi], ADDM_INIT + 8
     jne short phase_unary_mem_fail
-    jmp phase_done
+    jmp phase_word_load
 
 phase_unary_mem_fail:
     jmp fail_02
+
+    times (0x1F00 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 31: contained word load
+;------------------------------------------------------------------------------
+phase_word_load:
+    mov esi, LOAD_ADDR
+    mov dword [esi], LOAD_VALUE
+    xor eax, eax
+
+wload_01: mov ax, [esi]
+wload_02: mov ax, [esi]
+wload_03: mov ax, [esi]
+wload_04: mov ax, [esi]
+wload_05: mov ax, [esi]
+wload_06: mov ax, [esi]
+wload_07: mov ax, [esi]
+wload_08: mov ax, [esi]
+
+    cmp eax, LOAD_VALUE & 0xFFFF
+    jne fail_01
+    jmp phase_movzx_byte
+
+    times (0x2000 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 32: MOVZX byte load
+;------------------------------------------------------------------------------
+phase_movzx_byte:
+    mov esi, LOAD_ADDR
+    mov dword [esi], LOAD_VALUE
+
+movzxb_01: movzx eax, byte [esi]
+movzxb_02: movzx eax, byte [esi]
+movzxb_03: movzx eax, byte [esi]
+movzxb_04: movzx eax, byte [esi]
+movzxb_05: movzx eax, byte [esi]
+movzxb_06: movzx eax, byte [esi]
+movzxb_07: movzx eax, byte [esi]
+movzxb_08: movzx eax, byte [esi]
+
+    cmp eax, LOAD_VALUE & 0xFF
+    jne fail_01
+    jmp phase_movzx_word
+
+    times (0x2100 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 33: MOVZX word load
+;------------------------------------------------------------------------------
+phase_movzx_word:
+    mov esi, LOAD_ADDR
+    mov dword [esi], LOAD_VALUE
+
+movzxw_01: movzx eax, word [esi]
+movzxw_02: movzx eax, word [esi]
+movzxw_03: movzx eax, word [esi]
+movzxw_04: movzx eax, word [esi]
+movzxw_05: movzx eax, word [esi]
+movzxw_06: movzx eax, word [esi]
+movzxw_07: movzx eax, word [esi]
+movzxw_08: movzx eax, word [esi]
+
+    cmp eax, LOAD_VALUE & 0xFFFF
+    jne fail_01
+    jmp phase_movsx_byte
+
+    times (0x2200 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 34: MOVSX byte load
+;------------------------------------------------------------------------------
+phase_movsx_byte:
+    mov esi, LOAD_ADDR
+    mov byte [esi], 0x80
+
+movsxb_01: movsx eax, byte [esi]
+movsxb_02: movsx eax, byte [esi]
+movsxb_03: movsx eax, byte [esi]
+movsxb_04: movsx eax, byte [esi]
+movsxb_05: movsx eax, byte [esi]
+movsxb_06: movsx eax, byte [esi]
+movsxb_07: movsx eax, byte [esi]
+movsxb_08: movsx eax, byte [esi]
+
+    cmp eax, 0xFFFFFF80
+    jne fail_01
+    jmp phase_movsx_word
+
+    times (0x2300 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 35: MOVSX word load
+;------------------------------------------------------------------------------
+phase_movsx_word:
+    mov esi, LOAD_ADDR
+    mov word [esi], 0x8001
+
+movsxw_01: movsx eax, word [esi]
+movsxw_02: movsx eax, word [esi]
+movsxw_03: movsx eax, word [esi]
+movsxw_04: movsx eax, word [esi]
+movsxw_05: movsx eax, word [esi]
+movsxw_06: movsx eax, word [esi]
+movsxw_07: movsx eax, word [esi]
+movsxw_08: movsx eax, word [esi]
+
+    cmp eax, 0xFFFF8001
+    jne fail_01
+    jmp phase_load_use
+
+    times (0x2400 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 36: dword load to ordinary ALU consumer
+;------------------------------------------------------------------------------
+phase_load_use:
+    mov esi, LOAD_ADDR
+    mov dword [esi], LOAD_VALUE
+    xor ebx, ebx
+
+loaduse_p01: mov eax, [esi]
+loaduse_c01: add ebx, eax
+loaduse_p02: mov eax, [esi]
+loaduse_c02: add ebx, eax
+loaduse_p03: mov eax, [esi]
+loaduse_c03: add ebx, eax
+loaduse_p04: mov eax, [esi]
+loaduse_c04: add ebx, eax
+loaduse_p05: mov eax, [esi]
+loaduse_c05: add ebx, eax
+loaduse_p06: mov eax, [esi]
+loaduse_c06: add ebx, eax
+loaduse_p07: mov eax, [esi]
+loaduse_c07: add ebx, eax
+loaduse_p08: mov eax, [esi]
+loaduse_c08: add ebx, eax
+
+    cmp ebx, 0x89119A20
+    jne fail_01
+    jmp phase_pointer_load
+
+    times (0x2500 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 37: pointer load to address-dependent load
+;------------------------------------------------------------------------------
+phase_pointer_load:
+    mov edi, XCHG_ADDR
+    mov dword [edi], LOAD_ADDR
+    mov dword [LOAD_ADDR], LOAD_VALUE
+
+ptrload_p01: mov esi, [edi]
+ptrload_c01: mov eax, [esi]
+ptrload_p02: mov esi, [edi]
+ptrload_c02: mov eax, [esi]
+ptrload_p03: mov esi, [edi]
+ptrload_c03: mov eax, [esi]
+ptrload_p04: mov esi, [edi]
+ptrload_c04: mov eax, [esi]
+ptrload_p05: mov esi, [edi]
+ptrload_c05: mov eax, [esi]
+ptrload_p06: mov esi, [edi]
+ptrload_c06: mov eax, [esi]
+ptrload_p07: mov esi, [edi]
+ptrload_c07: mov eax, [esi]
+ptrload_p08: mov esi, [edi]
+ptrload_c08: mov eax, [esi]
+
+    cmp eax, LOAD_VALUE
+    jne fail_01
+    jmp phase_done
 
 phase_done:
     mov al, STATUS_PASS

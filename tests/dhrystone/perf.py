@@ -19,7 +19,7 @@ from pathlib import Path
 
 
 THIS_DIR = Path(__file__).resolve().parent
-DEFAULT_FST = THIS_DIR / "build" / "z386_current" / "dhrystone.fst"
+DEFAULT_FST = THIS_DIR / "build" / "z486_current" / "dhrystone.fst"
 DEFAULT_LST = THIS_DIR / "build" / "dhrystone.lst"
 DEFAULT_CODE_BASE = 0x00010000
 MARK_START_MASK = 0xFFFF0000
@@ -64,6 +64,22 @@ class CycleSample:
     uc_is_dly: int
     uc_addr: int
     q_flush: int
+    i_issue: int
+    recipe_rni: int
+    recipe_slot_has_work: int
+    uc_exec: int
+    d2_valid: int
+    d2_payload_ready: int
+    d2_ready_base: int
+    d2_ready: int
+    throttle_hold: int
+    d2_vipt_ea_hazard: int
+    vipt_replay_valid: int
+    vipt_slow_busy: int
+    d2_vipt_candidate: int
+    d2_vipt_load: int
+    vipt_ex_valid: int
+    d2_vipt_pipe_ready: int
     dcache_accept: int | None
     dcache_lookup_hit: int | None
     dcache_req_valid: int | None
@@ -193,16 +209,36 @@ def watched_signals(signals) -> tuple[dict[str, int], dict[str, str], set[str]]:
         "i_issue": [".dut.i_issue", ".z386_cpu.i_issue",
                     ".dut.i_pop", ".z386_cpu.i_pop"],
         "uc_addr": [".dut.uc_addr", ".z386_cpu.uc_addr"],
-        "uc_is_dly": [".dut.uc_is_dly", ".z386_cpu.uc_is_dly"],
+        "uc_is_dly": [".dut.uc_p_pure_dly", ".dut.uc_is_dly",
+                       ".z386_cpu.uc_is_dly"],
         "stall": [".dut.stall", ".z386_cpu.stall"],
         "stall_mem": [".dut.stall_mem", ".z386_cpu.stall_mem"],
         "mem_servicing": [".dut.mem_servicing", ".z386_cpu.mem_servicing"],
         "mem_complete_now": [".dut.mem_complete_now", ".z386_cpu.mem_complete_now"],
-        "pf_empty": [".dut.pf_empty", ".z386_cpu.pf_empty", ".decoder_inst.pf_empty"],
-        "pf_count": [".dut.pf_count", ".z386_cpu.pf_count", ".prefetch_inst.pf_count"],
+        "pf_empty": [".dut.prefetch_inst.q_empty", ".dut.pf_empty",
+                     ".z386_cpu.pf_empty", ".decoder_inst.pf_empty"],
+        "pf_count": [".dut.prefetch_inst.pf_byte_count", ".dut.pf_count",
+                     ".z386_cpu.pf_count", ".prefetch_inst.pf_count"],
         "decq_empty": [".dut.decq_empty", ".z386_cpu.decq_empty", ".decoder_inst.decq_empty"],
         "decq_count": [".dut.decoder_inst.decq_count", ".z386_cpu.decoder_inst.decq_count"],
+        "decq_has2": [".dut.decq_has2", ".z386_cpu.decq_has2",
+                      ".decoder_inst.decq_has2"],
         "q_flush": [".dut.q_flush", ".z386_cpu.q_flush", ".prefetch_inst.q_flush"],
+        "recipe_rni": [".dut.recipe_rni"],
+        "recipe_slot_has_work": [".dut.recipe_state.slot_has_work"],
+        "uc_exec": [".dut.uc_exec"],
+        "d2_valid": [".dut.d2_valid"],
+        "d2_payload_ready": [".dut.d2_payload_ready"],
+        "d2_ready_base": [".dut.d2_ready_base"],
+        "d2_ready": [".dut.d2_ready"],
+        "throttle_hold": [".dut.throttle_hold"],
+        "d2_vipt_ea_hazard": [".dut.d2_vipt_ea_hazard"],
+        "vipt_replay_valid": [".dut.vipt_load_replay_r.valid"],
+        "vipt_slow_busy": [".dut.vipt_load_slow_busy"],
+        "d2_vipt_candidate": [".dut.d2_vipt_candidate"],
+        "d2_vipt_load": [".dut.d2_vipt_load"],
+        "vipt_ex_valid": [".dut.vipt_load_ex_r.valid"],
+        "d2_vipt_pipe_ready": [".dut.d2_vipt_pipe_ready"],
         "test_data": [".tb_dhrystone.test_data"],
         "dcache_accept": [".dcache_inst.accept_cpu", ".l1_cache_inst.accept_cpu"],
         "dcache_lookup_hit": [".dcache_inst.lookup_hit", ".l1_cache_inst.lookup_hit"],
@@ -232,6 +268,8 @@ def watched_signals(signals) -> tuple[dict[str, int], dict[str, str], set[str]]:
     missing_required = sorted(required & missing)
     if missing_required:
         raise SystemExit(f"missing required signal(s): {', '.join(missing_required)}")
+    if "decq_count" in missing and {"decq_empty", "decq_has2"} <= handles.keys():
+        missing.remove("decq_count")
 
     return handles, names, missing
 
@@ -301,13 +339,16 @@ def read_trace(
             flush_times.append(current_time)
 
         if old.get("clk", 0) == 0 and val("clk") == 1:
+            decq_count = opt("decq_count")
+            if decq_count is None and "decq_empty" in handles:
+                decq_count = 0 if val("decq_empty") else (2 if val("decq_has2") else 1)
             samples.append(
                 CycleSample(
                     time=current_time,
                     pf_empty=val("pf_empty"),
                     pf_count=val("pf_count"),
                     decq_empty=val("decq_empty"),
-                    decq_count=opt("decq_count"),
+                    decq_count=decq_count,
                     stall=val("stall"),
                     stall_mem=val("stall_mem"),
                     mem_servicing=val("mem_servicing"),
@@ -315,6 +356,22 @@ def read_trace(
                     uc_is_dly=val("uc_is_dly"),
                     uc_addr=val("uc_addr"),
                     q_flush=val("q_flush"),
+                    i_issue=val("i_issue"),
+                    recipe_rni=val("recipe_rni"),
+                    recipe_slot_has_work=val("recipe_slot_has_work"),
+                    uc_exec=val("uc_exec"),
+                    d2_valid=val("d2_valid"),
+                    d2_payload_ready=val("d2_payload_ready"),
+                    d2_ready_base=val("d2_ready_base"),
+                    d2_ready=val("d2_ready"),
+                    throttle_hold=val("throttle_hold"),
+                    d2_vipt_ea_hazard=val("d2_vipt_ea_hazard"),
+                    vipt_replay_valid=val("vipt_replay_valid"),
+                    vipt_slow_busy=val("vipt_slow_busy"),
+                    d2_vipt_candidate=val("d2_vipt_candidate"),
+                    d2_vipt_load=val("d2_vipt_load"),
+                    vipt_ex_valid=val("vipt_ex_valid"),
+                    d2_vipt_pipe_ready=val("d2_vipt_pipe_ready"),
                     dcache_accept=opt("dcache_accept"),
                     dcache_lookup_hit=opt("dcache_lookup_hit"),
                     dcache_req_valid=opt("dcache_req_valid"),
@@ -517,6 +574,46 @@ def main() -> int:
         print(f"  stall cycles:                {stall_cycles:7d} {fmt_pct(stall_cycles, cycles)}")
         print(f"  memory stall cycles:         {stall_mem_cycles:7d} {fmt_pct(stall_mem_cycles, cycles)}")
         print(f"  memory servicing cycles:     {mem_servicing_cycles:7d} {fmt_pct(mem_servicing_cycles, cycles)}")
+
+        dead_rni_reasons = Counter()
+        for sample in win_samples:
+            if not (sample.recipe_rni and sample.uc_exec and
+                    not sample.i_issue and not sample.recipe_slot_has_work):
+                continue
+            if not sample.d2_valid and sample.decq_empty:
+                reason = "frontend_empty"
+            elif not sample.d2_valid:
+                reason = "decoder_head_not_launched"
+            elif not sample.d2_payload_ready:
+                reason = "d2_payload"
+            elif not sample.d2_ready_base:
+                if sample.throttle_hold:
+                    reason = "throttle"
+                elif sample.d2_vipt_ea_hazard:
+                    reason = "vipt_ea_hazard"
+                else:
+                    reason = "base_control"
+            elif sample.vipt_replay_valid:
+                reason = "vipt_replay"
+            elif sample.vipt_slow_busy:
+                reason = "vipt_slow"
+            elif sample.d2_vipt_candidate and not sample.d2_vipt_load:
+                reason = "vipt_probe"
+            elif sample.vipt_ex_valid and not sample.d2_vipt_pipe_ready:
+                reason = "vipt_capacity"
+            elif not sample.d2_ready:
+                reason = "other_ready"
+            else:
+                reason = "unclaimed_ready"
+            dead_rni_reasons[reason] += 1
+
+        print()
+        print("Dead Hardwired RNI Slots By Primary Blocker")
+        dead_rows = [
+            [reason, str(count), fmt_pct(count, sum(dead_rni_reasons.values()))]
+            for reason, count in dead_rni_reasons.most_common()
+        ]
+        print_table(["reason", "cycles", "share"], dead_rows or [["-", "0", "n/a"]])
 
         pf_hist = Counter(sample.pf_count for sample in win_samples)
         decq_hist = Counter(sample.decq_count for sample in win_samples if sample.decq_count is not None)

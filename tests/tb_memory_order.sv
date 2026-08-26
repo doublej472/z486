@@ -39,6 +39,8 @@ module tb_memory_order;
 
         .dcache_req_valid(dcache_req_valid),
         .dcache_req_phys_addr_raw(dcache_req_phys_addr_raw),
+        .dcache_req_preread_offset(12'h000),
+        .dcache_req_preread_priority(1'b0),
         .dcache_req_write(dcache_req_write),
         .dcache_req_be(dcache_req_be),
         .dcache_req_wdata(dcache_req_wdata),
@@ -50,6 +52,15 @@ module tb_memory_order;
         .dcache_req_complete(dcache_req_complete),
         .dcache_read_complete(dcache_read_complete),
         .dcache_rdata(dcache_rdata),
+
+        .dcache_vipt_probe_valid(1'b0),
+        .dcache_vipt_probe_offset(12'h000),
+        .dcache_vipt_probe_ready(),
+        .dcache_vipt_probe_accepted(),
+        .dcache_vipt_resolve_valid(1'b0),
+        .dcache_vipt_resolve_phys_addr_raw(32'h0),
+        .dcache_vipt_resolve_hit(),
+        .dcache_vipt_resolve_data(),
 
         .x87_req_selected(),
         .x87_req_accepted(1'b0),

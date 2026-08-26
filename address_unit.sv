@@ -9,6 +9,9 @@ module address_unit
     input  dec_entry_t  instr,
     input  logic        d2_start,            // Latch D2 base/index selection
     input  ea_dec_t     d2_ea,               // Predecoded D2 address recipe
+    input  logic        split_ea_prepare,     // Capture base + scaled index
+    input  logic        split_ea_use,         // Finish a three-term EA in D2b
+    input  logic [2:0]  split_ea_adjust,      // Post-POP ESP correction in D2a
     input  logic [31:0] displacement,
     output gpr_ref_t    ea_base,             // GPR read request to data unit
     output gpr_ref_t    ea_index,            // Second GPR read request to data unit
@@ -54,12 +57,26 @@ module address_unit
     output logic        ind_linear_valid,    // Relocation matches current IND
     output logic [31:0] ea,
     output logic [31:0] issue_ea,              // Combinational D2 effective address
-    output logic [31:0] issue_linear           // Combinational D2 relocated address
+    output logic [31:0] issue_linear,          // Combinational D2 relocated address
+    output logic [1:0]  issue_linear_low       // Low address bits without full relocation
 );
 
 logic [1:0] ea_scale_r;
 logic       ea_is_16bit_r;
 logic       ea_scale_to_base_r;
+logic [31:0] ea_partial_r;
+logic [31:0] issue_ind_r;
+logic [31:0] exec_ind_r;
+logic        ind_owner_issue_r;
+logic [31:0] issue_linear_r;
+logic [31:0] exec_linear_r;
+logic        linear_owner_issue_r;
+
+// Keep D2 and microcode address updates on independent register inputs. This
+// prevents D2 admission from selecting through the much wider execution IND
+// update mux while preserving issue priority on simultaneous boundaries.
+assign ind = ind_owner_issue_r ? issue_ind_r : exec_ind_r;
+assign ind_linear = linear_owner_issue_r ? issue_linear_r : exec_linear_r;
 
 //=============================================================================
 // D2 effective-address formation
@@ -74,21 +91,38 @@ endfunction
 
 wire [63:0] ea_terms = ea_scale_operands(
     ea_base_value, ea_index_value, ea_scale_r, ea_scale_to_base_r);
-wire [31:0] ea_term_a = ea_terms[63:32];
-wire [31:0] ea_term_b = ea_terms[31:0];
-wire [31:0] ea_offset_full = ea_term_a + ea_term_b + displacement;
+wire [31:0] ea_term_a_live = ea_terms[63:32];
+wire [31:0] ea_term_b_live = ea_terms[31:0];
+// A simple EA has at most two live terms. Select them before the adder so the
+// split does not leave a base+index+displacement cone in the normal D2 path.
+wire        ea_simple_two_regs = ea_base.valid && ea_index.valid &&
+                                 !ea_scale_to_base_r;
+wire [31:0] ea_simple_a = ea_base.valid ? ea_term_a_live : ea_term_b_live;
+wire [31:0] ea_simple_b = ea_simple_two_regs ? ea_term_b_live : displacement;
+wire [31:0] ea_add_a = split_ea_use ? ea_partial_r : ea_simple_a;
+wire [31:0] ea_add_b = split_ea_use ? displacement : ea_simple_b;
+wire [31:0] ea_offset_full = ea_add_a + ea_add_b;
 wire [31:0] effective_addr = ea_is_16bit_r
                            ? {16'd0, ea_offset_full[15:0]} : ea_offset_full;
-wire [31:0] ea_csa_sum = ea_term_a ^ ea_term_b ^ displacement;
-wire [31:0] ea_csa_carry = ((ea_term_a & ea_term_b) |
-                            (ea_term_a & displacement) |
-                            (ea_term_b & displacement)) << 1;
-wire [31:0] linear32 = ea_csa_sum + ea_csa_carry + issue_seg_base;
+wire [31:0] linear32 = ea_offset_full + issue_seg_base;
 wire [31:0] linear16 = {16'd0, ea_offset_full[15:0]} + issue_seg_base;
 wire [31:0] effective_linear = (ea_is_16bit_r || !issue_eff_mask)
                              ? linear16 : linear32;
+// Alignment participates in same-cycle VIPT admission. It depends only on the
+// low address bits, so keep both full-width EA and relocation adders out of it.
+wire [3:0] issue_linear_low_sum = {2'b0, ea_add_a[1:0]} +
+                                  {2'b0, ea_add_b[1:0]} +
+                                  {2'b0, issue_seg_base[1:0]};
 assign issue_ea = effective_addr;
 assign issue_linear = effective_linear;
+assign issue_linear_low = issue_linear_low_sum[1:0];
+
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        ea_partial_r <= 32'd0;
+    else if (split_ea_prepare)
+        ea_partial_r <= ea_term_a_live + ea_term_b_live + split_ea_adjust;
+end
 
 always_ff @(posedge clk) begin
     if (d2_start) begin
@@ -155,57 +189,94 @@ function automatic logic [31:0] relocate_add2(
                   : (a + b + seg_base_pending_exec);
 endfunction
 
+logic        exec_linear_write;
+logic        exec_linear_three_term;
+logic        exec_linear_mask16;
+logic [31:0] exec_linear_source;
+logic [31:0] exec_linear_a;
+logic [31:0] exec_linear_b;
+always_comb begin
+    exec_linear_write = (seg_cmd == SEG_CMD_DESCSW) ||
+                        (aluop == ALUJMP_STSSAF && seg_sel == SEG_SS);
+    exec_linear_three_term = 1'b0;
+    exec_linear_mask16 = !eff_mask_pending;
+    exec_linear_source = ind;
+    exec_linear_a = ind;
+    exec_linear_b = 32'd0;
+
+    case (busop)
+        BUSOP_IND_PLUS_ALU: begin
+            exec_linear_a = source == SRC_IRF2 ? ind : source_value;
+            exec_linear_b = instr_jcc ? alu_value_hold : alu_value;
+            if (destination == DEST_DESSTK)
+                exec_linear_mask16 = !pe || !ss_stack32;
+            else if (destination == DEST_DESCOD)
+                exec_linear_mask16 = !is_dword;
+            else if (destination == DEST_DES_ES ||
+                     destination == DEST_DES_OS ||
+                     destination == DEST_DES_SR)
+                exec_linear_mask16 = !exec_addr32;
+            exec_linear_write = 1'b1;
+            exec_linear_three_term = 1'b1;
+        end
+        BUSOP_IND_ALU2: begin
+            exec_linear_write = 1'b1;
+            exec_linear_source = alu_value;
+        end
+        BUSOP_IND_SRC: begin
+            exec_linear_write = 1'b1;
+            exec_linear_source = source_value;
+            if (destination == DEST_DESSTK && (!pe || !ss_stack32))
+                exec_linear_source = {16'd0, source_value[15:0]};
+            else if (destination == DEST_DESCOD && !is_dword)
+                exec_linear_source = {16'd0, source_value[15:0]};
+        end
+        BUSOP_IND_PLUS: begin
+            exec_linear_write = 1'b1;
+            exec_linear_three_term = 1'b1;
+            exec_linear_a = ind;
+            exec_linear_b = alu_value;
+        end
+        BUSOP_IN_PLUS_D: begin
+            exec_linear_write = 1'b1;
+            exec_linear_three_term = 1'b1;
+            exec_linear_a = ind;
+            exec_linear_b = ind_delta;
+        end
+        default: ;
+    endcase
+end
+
+// Execution owns a separate relocation register. Updating this shadow in a
+// simultaneous issue cycle is harmless because linear_owner_issue_r selects
+// the newly issued address; removing issue priority here breaks the D2-to-EX
+// control path without adding a pipeline stage.
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        exec_linear_r <= 32'd0;
+    else if (exec && exec_linear_write) begin
+        if (exec_linear_three_term)
+            exec_linear_r <= relocate_add2(exec_linear_a, exec_linear_b,
+                                            exec_linear_mask16);
+        else
+            exec_linear_r <= relocate_exec(exec_linear_source);
+    end
+end
+
 always_ff @(posedge clk) begin
     if (instr_issue)
         ea <= branch_relative ? branch_target_eip : effective_addr;
 end
 
+// The execution IND value is a shadow while a simultaneous D2 issue owns the
+// architectural output. Let it update independently so D2 admission and its
+// segment-fault qualification do not select through the execution update mux.
+// Ownership below still gives the newly issued instruction priority.
 always_ff @(posedge clk) begin
     if (!reset_n) begin
-        ind <= 32'd0;
-        ind_delta <= 32'd4;
-        ind_linear <= 32'd0;
-        ind_linear_valid <= 1'b0;
-    end else if (instr_issue) begin
-        ind_linear_valid <= 1'b0;
-        ind_delta <= !instr.stack_op ? 32'd2 :
-                     !instr.stack_dir ? (instr.data32 ? -32'd4 : -32'd2) :
-                                        (instr.data32 ? 32'd4 : 32'd2);
-        if (instr.stack_op && instr.stack_dir) begin
-            automatic logic [31:0] stack_offset =
-                ss_stack32 ? forwarded_esp : {16'd0, forwarded_esp[15:0]};
-            ind <= stack_offset;
-            ind_linear <= relocate_issue(stack_offset);
-            ind_linear_valid <= 1'b1;
-        end else if (instr.stack_op && !instr.stack_dir) begin
-            automatic logic [31:0] stack_offset = ss_stack32
-                ? forwarded_esp - (instr.data32 ? 32'd4 : 32'd2)
-                : {16'd0, forwarded_esp[15:0] -
-                          (instr.data32 ? 16'd4 : 16'd2)};
-            ind <= stack_offset;
-            ind_linear <= relocate_issue(stack_offset);
-            ind_linear_valid <= 1'b1;
-        end else if (instr.has_moffs) begin
-            ind <= instr.addr32 ? instr.immediate
-                                : {16'd0, instr.immediate[15:0]};
-            ind_linear <= relocate_issue(instr.immediate);
-            ind_linear_valid <= 1'b1;
-        end else if (instr.has_modrm) begin
-            ind <= effective_addr;
-            ind_linear <= effective_linear;
-            ind_linear_valid <= 1'b1;
-        end
+        exec_ind_r <= 32'd0;
     end else if (exec) begin
-        automatic logic [31:0] reloc_source = ind;
-        automatic logic        use_three_term = 1'b0;
-        automatic logic        write_linear = 1'b0;
-        automatic logic [31:0] linear_a = ind;
-        automatic logic [31:0] linear_b = 32'd0;
-        automatic logic        mask16 = !eff_mask_pending;
-
-        if (seg_cmd == SEG_CMD_DESCSW ||
-            (aluop == ALUJMP_STSSAF && seg_sel == SEG_SS))
-            write_linear = 1'b1;
+        automatic logic mask16 = !eff_mask_pending;
 
         case (busop)
             BUSOP_IND_PLUS_ALU: begin
@@ -214,8 +285,6 @@ always_ff @(posedge clk) begin
                 automatic logic [31:0] operand2;
                 operand1 = source == SRC_IRF2 ? ind : source_value;
                 operand2 = instr_jcc ? alu_value_hold : alu_value;
-                if (alu_source != ALUSRC_ZERO)
-                    ind_delta <= operand2;
                 if (destination == DEST_DESSTK)
                     mask16 = !pe || !ss_stack32;
                 else if (destination == DEST_DESCOD)
@@ -231,75 +300,139 @@ always_ff @(posedge clk) begin
                                destination == DEST_DES_OS ||
                                destination == DEST_DES_SR))
                     next_ind = {16'd0, next_ind[15:0]};
-                use_three_term = 1'b1;
-                linear_a = operand1;
-                linear_b = operand2;
-                write_linear = 1'b1;
-                ind <= next_ind;
-                reloc_source = next_ind;
-                ind_linear_valid <= 1'b1;
+                exec_ind_r <= next_ind;
             end
-            BUSOP_IND_ALU2: begin
-                write_linear = 1'b1;
-                ind <= alu_value;
-                reloc_source = alu_value;
-                ind_linear_valid <= 1'b1;
-            end
+            BUSOP_IND_ALU2: exec_ind_r <= alu_value;
             BUSOP_IND_SRC: begin
                 automatic logic [31:0] next_ind = source_value;
-                write_linear = 1'b1;
                 if (destination == DEST_DESSTK && (!pe || !ss_stack32))
                     next_ind = {16'd0, next_ind[15:0]};
                 else if (destination == DEST_DESCOD && !is_dword)
                     next_ind = {16'd0, next_ind[15:0]};
-                ind <= next_ind;
-                reloc_source = next_ind;
-                ind_linear_valid <= 1'b1;
+                exec_ind_r <= next_ind;
             end
             BUSOP_IND_PLUS: begin
                 automatic logic [31:0] next_ind = ind + alu_value;
-                write_linear = 1'b1;
                 if (!pe && !exec_addr32)
                     next_ind = {16'd0, next_ind[15:0]};
-                ind <= next_ind;
-                reloc_source = next_ind;
-                use_three_term = 1'b1;
-                linear_a = ind;
-                linear_b = alu_value;
+                exec_ind_r <= next_ind;
+            end
+            BUSOP_IN_PLUS_D: begin
+                automatic logic [31:0] next_ind = ind + ind_delta;
+                if (!pe ? !exec_addr32
+                        : !(descsw_mode ? cs_stack32 : ss_stack32))
+                    next_ind = {16'd0, next_ind[15:0]};
+                exec_ind_r <= next_ind;
+            end
+            BUSOP_LAR:  exec_ind_r <= lar_result;
+            BUSOP_LLIM: exec_ind_r <= llim_result;
+            BUSOP_LBAS: exec_ind_r <= lbas_result;
+            BUSOP_LPCR: begin
+                case (destination)
+                    DEST_PFERRC: exec_ind_r <= {29'd0, fault_code};
+                    DEST_LATTTF: exec_ind_r <= fault_addr;
+                    DEST_PDBR:   exec_ind_r <= cr3;
+                    default: ;
+                endcase
+            end
+            default: ;
+        endcase
+    end
+end
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        issue_ind_r <= 32'd0;
+        ind_owner_issue_r <= 1'b0;
+        ind_delta <= 32'd4;
+        issue_linear_r <= 32'd0;
+        linear_owner_issue_r <= 1'b0;
+        ind_linear_valid <= 1'b0;
+    end else if (instr_issue) begin
+        linear_owner_issue_r <= 1'b1;
+        ind_linear_valid <= 1'b0;
+        ind_delta <= !instr.stack_op ? 32'd2 :
+                     !instr.stack_dir ? (instr.data32 ? -32'd4 : -32'd2) :
+                                        (instr.data32 ? 32'd4 : 32'd2);
+        if (instr.stack_op && instr.stack_dir) begin
+            automatic logic [31:0] stack_offset =
+                ss_stack32 ? forwarded_esp : {16'd0, forwarded_esp[15:0]};
+            issue_ind_r <= stack_offset;
+            ind_owner_issue_r <= 1'b1;
+            issue_linear_r <= relocate_issue(stack_offset);
+            ind_linear_valid <= 1'b1;
+        end else if (instr.stack_op && !instr.stack_dir) begin
+            automatic logic [31:0] stack_offset = ss_stack32
+                ? forwarded_esp - (instr.data32 ? 32'd4 : 32'd2)
+                : {16'd0, forwarded_esp[15:0] -
+                          (instr.data32 ? 16'd4 : 16'd2)};
+            issue_ind_r <= stack_offset;
+            ind_owner_issue_r <= 1'b1;
+            issue_linear_r <= relocate_issue(stack_offset);
+            ind_linear_valid <= 1'b1;
+        end else if (instr.has_moffs) begin
+            issue_ind_r <= instr.addr32 ? instr.immediate
+                                        : {16'd0, instr.immediate[15:0]};
+            ind_owner_issue_r <= 1'b1;
+            issue_linear_r <= relocate_issue(instr.immediate);
+            ind_linear_valid <= 1'b1;
+        end else if (instr.has_modrm) begin
+            issue_ind_r <= effective_addr;
+            ind_owner_issue_r <= 1'b1;
+            issue_linear_r <= effective_linear;
+            ind_linear_valid <= 1'b1;
+        end
+    end else if (exec) begin
+        case (busop)
+            BUSOP_IND_PLUS_ALU: begin
+                automatic logic [31:0] operand2;
+                operand2 = instr_jcc ? alu_value_hold : alu_value;
+                if (alu_source != ALUSRC_ZERO)
+                    ind_delta <= operand2;
+                ind_owner_issue_r <= 1'b0;
+                ind_linear_valid <= 1'b1;
+            end
+            BUSOP_IND_ALU2: begin
+                ind_owner_issue_r <= 1'b0;
+                ind_linear_valid <= 1'b1;
+            end
+            BUSOP_IND_SRC: begin
+                ind_owner_issue_r <= 1'b0;
+                ind_linear_valid <= 1'b1;
+            end
+            BUSOP_IND_PLUS: begin
+                ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b1;
                 if (alu_source != ALUSRC_ZERO)
                     ind_delta <= alu_value;
             end
             BUSOP_IN_PLUS_D: begin
-                automatic logic [31:0] next_ind = ind + ind_delta;
-                write_linear = 1'b1;
-                if (!pe ? !exec_addr32
-                        : !(descsw_mode ? cs_stack32 : ss_stack32))
-                    next_ind = {16'd0, next_ind[15:0]};
-                ind <= next_ind;
-                reloc_source = next_ind;
-                use_three_term = 1'b1;
-                linear_a = ind;
-                linear_b = ind_delta;
+                ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b1;
             end
             BUSOP_LAR: begin
-                ind <= lar_result;
+                ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b0;
             end
             BUSOP_LLIM: begin
-                ind <= llim_result;
+                ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b0;
             end
             BUSOP_LBAS: begin
-                ind <= lbas_result;
+                ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b0;
             end
             BUSOP_LPCR: begin
                 case (destination)
-                    DEST_PFERRC: ind <= {29'd0, fault_code};
-                    DEST_LATTTF: ind <= fault_addr;
-                    DEST_PDBR:   ind <= cr3;
+                    DEST_PFERRC: begin
+                        ind_owner_issue_r <= 1'b0;
+                    end
+                    DEST_LATTTF: begin
+                        ind_owner_issue_r <= 1'b0;
+                    end
+                    DEST_PDBR: begin
+                        ind_owner_issue_r <= 1'b0;
+                    end
                     default: ;
                 endcase
                 ind_linear_valid <= 1'b0;
@@ -307,12 +440,8 @@ always_ff @(posedge clk) begin
             default: ;
         endcase
 
-        if (write_linear) begin
-            if (use_three_term)
-                ind_linear <= relocate_add2(linear_a, linear_b, mask16);
-            else
-                ind_linear <= relocate_exec(reloc_source);
-        end
+        if (exec_linear_write)
+            linear_owner_issue_r <= 1'b0;
     end
 end
 

@@ -89,6 +89,10 @@ decoder_work_t skid;        // one registered D1 successor ahead of D2
 reg            skid_v;
 reg [4:0]      skid_lit_off;
 reg            skid_one_d2;
+reg [31:0]     skid_raw_lo_r;
+reg [31:0]     skid_raw_hi_r;
+reg [1:0]      skid_raw_lit_off_r;
+reg            skid_raw_valid_r;
 
 // Byte aliases at the D1 cursor.  The cursor does not advance until the
 // skeleton handoff, so during the SIB sub-cycle the sib byte is byte 2.
@@ -133,8 +137,21 @@ always_comb begin
     handoff_d2 = handoff_work;
     handoff_d2.entry.entry_point = handoff_entry_point;
     handoff_d2.entry.ucode_action = recipe_action(handoff_entry_point);
+    // The recipe hazard mask is derived from this registered structural entry
+    // during D2. Keeping it out of D1 avoids serializing entry-PLA decode and
+    // mask generation on the raw-window-to-skeleton path.
+    handoff_d2.entry.recipe_gpr_read_mask = 8'h00;
     {handoff_d2.entry.ea_index_onehot, handoff_d2.entry.ea_base_onehot} =
         dec_ea_onehots(handoff_work.entry);
+    // Match the i486 complex-EA rule: a displacement on an address that also
+    // reads base and index requires a second D2 addition cycle. POP r/m may
+    // add a synthetic post-pop ESP displacement even when none was encoded.
+    handoff_d2.entry.ea_complex =
+        (|handoff_d2.entry.ea_base_onehot) &&
+        (|handoff_d2.entry.ea_index_onehot) &&
+        ((handoff_work.lit1_kind == LIT_DISP) ||
+         (handoff_work.lit2_kind == LIT_DISP) ||
+         handoff_work.entry.ea_uses_post_pop_esp);
     handoff_d2.entry.mem_seg = handoff_work.entry.stack_op ? SEG_SS :
         apply_seg_override_type(
             calc_default_seg_type(handoff_work.entry.modrm,
@@ -204,32 +221,13 @@ reg            skel_window_valid_r;
 reg            skel_window_raw_r; // skel_lit_r is the low half of the D1 window
 wire           head_v = skel_v;  // temporary trace compatibility alias
 
-// Register the raw literal window on the edge that installs an instruction in
-// D2. On replacement, the old pop cursor is still active, so add the retiring
-// instruction length to reach the successor. Literal interpretation remains a
-// D2 operation and therefore does not lengthen the D1 structural path.
+// Register the raw literal window on the D1 handoff edge. The skid keeps its
+// own copy so promotion never has to route i_issue through the live prefetch
+// aligner and back into the D2 literal register.
 wire promote_skid_capture = i_issue && skid_v;
 wire promote_handoff_capture = d1_handoff &&
                                 ((!skel_v && !i_issue) || (i_issue && !skid_v));
 wire incoming_capture = promote_skid_capture || promote_handoff_capture;
-// Only skid promotion reads a successor through the pop-relative literal
-// port. A direct D1 handoff freezes its opcode-relative win_d1 bytes instead;
-// do not feed live structural length decode back through the queue aligner.
-wire [5:0] skid_lit_abs = {1'b0, skel.entry.length} +
-                          {1'b0, skid_lit_off};
-wire [2:0] incoming_lit1_size = promote_skid_capture ? skid.lit1_size :
-                                                        handoff_d2.lit1_size;
-wire [2:0] incoming_lit2_size = promote_skid_capture ? skid.lit2_size :
-                                                        handoff_d2.lit2_size;
-wire [1:0] incoming_lit2_kind = promote_skid_capture ? skid.lit2_kind :
-                                                        handoff_d2.lit2_kind;
-wire [3:0] incoming_lit_total = {1'b0, incoming_lit1_size} +
-                                {1'b0, incoming_lit2_size};
-wire incoming_fields_fit = (incoming_lit2_kind == LIT_NONE) ||
-                           (incoming_lit_total <= 4'd4);
-wire [3:0] incoming_lit_size = incoming_fields_fit ? incoming_lit_total :
-                                                     {1'b0, incoming_lit1_size};
-wire incoming_bytes_ok = lit_avail >= {2'b00, incoming_lit_size};
 
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
@@ -244,6 +242,10 @@ always_ff @(posedge clk or negedge reset_n) begin
         prefix_count <= 4'd0;
         prefix_rep_lock <= PREFIX_NOREPLOCK;
         prefix_seg <= PREFIX_NOSEG;
+        skid_raw_lo_r <= 32'd0;
+        skid_raw_hi_r <= 32'd0;
+        skid_raw_lit_off_r <= 2'd0;
+        skid_raw_valid_r <= 1'b0;
     end else if (q_flush) begin
         code32_r <= D;
         skel_v <= 1'b0;
@@ -289,6 +291,10 @@ always_ff @(posedge clk or negedge reset_n) begin
 
         if (d1_handoff) begin
             d1_sib <= 1'b0;
+            skid_raw_lo_r <= win_d1[31:0];
+            skid_raw_hi_r <= win_d1[63:32];
+            skid_raw_lit_off_r <= handoff_raw_lit_off;
+            skid_raw_valid_r <= handoff_raw_valid;
             // The skeleton carries the prefix state; clear for the next one.
             prefix_66 <= 1'b0;
             prefix_67 <= 1'b0;
@@ -360,7 +366,7 @@ wire prefetch_fieldB = skel_v && d2_window_valid && !d2_phaseB &&
 wire [4:0] resident_lit_off = skel_lit_off +
                               ((d2_phaseB || prefetch_fieldB)
                                   ? {2'b00, sizeA} : 5'd0);
-assign lit_off = promote_skid_capture ? skid_lit_abs[4:0] : resident_lit_off;
+assign lit_off = resident_lit_off;
 
 // D1 carries raw bytes, not parsed literals. D2 selects the literal start from
 // the registered window; the second field uses the live literal port only when
@@ -413,6 +419,7 @@ decoder_work_t d2_final;
 always_comb begin
     d2_final = d2_phaseB ? capB :
                !has_litA ? skel :
+               !has_litB ? capA :
                skel.fields_fit ? capAB : capA;
 end
 
@@ -441,12 +448,11 @@ always_ff @(posedge clk or negedge reset_n) begin
     end else if (q_flush) begin
         skel_window_valid_r <= 1'b0;
     end else if (i_issue && skid_v) begin
-        // A skid promotion has a full registered D2 cycle before use. Capture
-        // its pop-relative literal view now instead of duplicating 64 raw bits
-        // in the D1 skid entry.
-        skel_lit_r <= win_lit;
-        skel_window_valid_r <= incoming_bytes_ok;
-        skel_window_raw_r <= 1'b0;
+        skel_lit_r <= skid_raw_lo_r;
+        skel_raw_hi_r <= skid_raw_hi_r;
+        skel_raw_lit_off_r <= skid_raw_lit_off_r;
+        skel_window_valid_r <= skid_raw_valid_r;
+        skel_window_raw_r <= 1'b1;
     end else if (promote_handoff_capture) begin
         skel_lit_r <= win_d1[31:0];
         skel_raw_hi_r <= win_d1[63:32];
@@ -469,13 +475,29 @@ end
 // Literal capture does not change structural EA fields; use the selectors and
 // segment index registered at the D1 handoff directly.
 dec_entry_t push_entry;
-assign push_entry = d2_final.entry;
+always_comb begin
+    // Literal capture changes only these two fields. Keep the full structural
+    // entry out of the phase-B mux so its EA and recipe controls remain direct
+    // registered skeleton outputs.
+    push_entry = skel.entry;
+    push_entry.immediate = d2_final.entry.immediate;
+    push_entry.displacement = d2_final.entry.displacement;
+    // Literals do not affect recipe register dependencies. Use the registered
+    // D1 skeleton so a second literal phase cannot enter this hazard path.
+    push_entry.recipe_gpr_read_mask = recipe_gpr_read_mask(skel.entry);
+end
+
+dec_entry_t skid_entry;
+always_comb begin
+    skid_entry = skid.entry;
+    skid_entry.recipe_gpr_read_mask = recipe_gpr_read_mask(skid.entry);
+end
 
 assign d2_entry = push_entry;
 assign d2_push  = d2_complete;
 assign i_bus = push_entry;
 assign decq_empty = !skel_v;
-assign i_bus2 = skid.entry;
+assign i_bus2 = skid_entry;
 assign decq_has2 = skel_v && skid_v && skid_one_d2;
 
 assign pop_now = d2_done;

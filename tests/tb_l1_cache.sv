@@ -15,6 +15,14 @@ module tb_l1_cache;
     wire        cpu_ready;
     wire        cpu_resp_valid;
     wire        stores_drained;
+    reg  [11:0] vipt_probe_offset = 12'd0;
+    reg         vipt_probe_valid = 1'b0;
+    wire        vipt_probe_ready;
+    wire        vipt_probe_accepted;
+    reg  [31:0] vipt_resolve_phys_addr = 32'd0;
+    reg         vipt_resolve_valid = 1'b0;
+    wire [31:0] vipt_resolve_data;
+    wire        vipt_resolve_hit;
 
     wire [31:0] mem_addr;
     wire [31:0] mem_din;
@@ -39,6 +47,8 @@ module tb_l1_cache;
         .reset(reset),
 
         .cpu_addr(cpu_addr),
+        .cpu_preread_offset(cpu_addr[11:0]),
+        .cpu_preread_priority(cpu_valid),
         .cpu_din(cpu_din),
         .cpu_dout(cpu_dout),
         .cpu_be(cpu_be),
@@ -47,6 +57,14 @@ module tb_l1_cache;
         .cpu_ready(cpu_ready),
         .cpu_resp_valid(cpu_resp_valid),
         .stores_drained(stores_drained),
+        .vipt_probe_offset(vipt_probe_offset),
+        .vipt_probe_valid(vipt_probe_valid),
+        .vipt_probe_ready(vipt_probe_ready),
+        .vipt_probe_accepted(vipt_probe_accepted),
+        .vipt_resolve_phys_addr(vipt_resolve_phys_addr),
+        .vipt_resolve_valid(vipt_resolve_valid),
+        .vipt_resolve_data(vipt_resolve_data),
+        .vipt_resolve_hit(vipt_resolve_hit),
 
         .mem_addr(mem_addr),
         .mem_din(mem_din),
@@ -74,6 +92,36 @@ module tb_l1_cache;
         mem[addr + 1] = data[15:8];
         mem[addr + 2] = data[23:16];
         mem[addr + 3] = data[31:24];
+    end
+    endtask
+
+    task automatic vipt_read(
+        input [31:0] linear_addr,
+        input [31:0] physical_addr,
+        input        expected_hit,
+        input [31:0] expected_data
+    );
+    begin
+        do @(negedge clk); while (!vipt_probe_ready);
+        vipt_probe_offset = linear_addr[11:0];
+        vipt_probe_valid = 1'b1;
+        @(negedge clk);
+        vipt_probe_valid = 1'b0;
+        vipt_resolve_phys_addr = physical_addr;
+        vipt_resolve_valid = 1'b1;
+        #1;
+        if (vipt_resolve_hit !== expected_hit) begin
+            $display("L1 VIPT HIT FAIL la=%08x pa=%08x got=%0b expected=%0b",
+                     linear_addr, physical_addr, vipt_resolve_hit, expected_hit);
+            $fatal(1);
+        end
+        if (expected_hit && vipt_resolve_data !== expected_data) begin
+            $display("L1 VIPT DATA FAIL pa=%08x got=%08x expected=%08x",
+                     physical_addr, vipt_resolve_data, expected_data);
+            $fatal(1);
+        end
+        @(negedge clk);
+        vipt_resolve_valid = 1'b0;
     end
     endtask
 
@@ -156,6 +204,34 @@ module tb_l1_cache;
     end
     endtask
 
+    task automatic demand_over_vipt(input [31:0] addr, input [31:0] expected);
+    begin
+        do @(negedge clk); while (!cpu_ready || !vipt_probe_ready);
+        cpu_addr = addr;
+        cpu_be = 4'hF;
+        cpu_write = 1'b0;
+        cpu_valid = 1'b1;
+        vipt_probe_offset = addr[11:0];
+        vipt_probe_valid = 1'b1;
+        #1;
+        if (vipt_probe_accepted) begin
+            $display("L1 VIPT ARB FAIL: speculative probe beat demand");
+            $fatal(1);
+        end
+        @(negedge clk);
+        cpu_valid = 1'b0;
+        vipt_probe_valid = 1'b0;
+        if (!cpu_resp_valid)
+            do @(negedge clk); while (!cpu_resp_valid);
+        if (cpu_dout !== expected) begin
+            $display("L1 VIPT ARB DATA FAIL got=%08x expected=%08x",
+                     cpu_dout, expected);
+            $fatal(1);
+        end
+        vipt_read(addr, addr, 1'b1, expected);
+    end
+    endtask
+
     initial begin
         fork
             begin
@@ -182,10 +258,20 @@ module tb_l1_cache;
 
         cache_read(32'h40, 4'hF, 32'h4433_2211);       // miss + fill
         cache_read(32'h40, 4'hF, 32'h4433_2211);       // hit
+        demand_over_vipt(32'h40, 32'h4433_2211);
+        vipt_read(32'h0000_0040, 32'h0000_0040, 1'b1, 32'h4433_2211);
+        vipt_read(32'h0000_0040, 32'h0100_0040, 1'b0, 32'd0);
         // Complete physical tags distinguish lines separated by 32MB.
         cache_read(32'h0200_0040, 4'hF, 32'h1357_9BDF);
         cache_read(32'h40, 4'hF, 32'h4433_2211);
+        mem_stall = 1'b1;
         cache_write(32'h40, 4'hC, 32'hAAAA_5555);      // write-hit patch
+        vipt_read(32'h0000_0040, 32'h0000_0040, 1'b1, 32'hAAAA_2211);
+        if (dut.storeq_count == 0) begin
+            $display("L1 VIPT QUEUE TEST FAIL: posted store drained before probe");
+            $fatal(1);
+        end
+        mem_stall = 1'b0;
         cache_read(32'h40, 4'hF, 32'hAAAA_2211);
 
         cache_write(32'h80, 4'hF, 32'hDEAD_BEEF);      // write miss, no allocate

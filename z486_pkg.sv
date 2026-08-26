@@ -26,9 +26,9 @@ typedef struct packed {
     logic uses_ea;     // consumes EA/moffs/IND at i_issue (LEA, loads, stores):
                        // never chain INTO — base/index GPRs may be written by
                        // the still-executing predecessor
-    logic reads_dst;   // EX-cycle GPR sources, for the load-use chain-out gate
-    logic reads_src;   //   (a MEM-commit load's value lands one cycle after
-    logic reads_ecx;   //    the chained successor reads its operands)
+    logic reads_dst;   // EX-cycle GPR sources; DSTREG/SRCREG readers can use
+    logic reads_src;   //   registered load-WB forwarding when chained
+    logic reads_ecx;   // implicit ECX reader (not covered by that bypass)
     logic writes_srcreg; // LEA: the entry word writes SRCREG (modrm reg field)
                        //   via uc_dest - the EA chain-into gate must see it
     logic op_byte;     // operand size is byte (precomputed: byte selectors
@@ -72,6 +72,43 @@ typedef struct packed {
     logic [1:0]  mode;
     logic [31:0] data;
 } gpr_forward_t;
+
+typedef enum logic [1:0] {
+    LOAD_RESULT_COPY,
+    LOAD_RESULT_ZERO_EXTEND,
+    LOAD_RESULT_SIGN_EXTEND
+} hardwired_load_result_t;
+
+// Complete ownership state for a hardwired load. The token is sufficient to
+// resolve, replay, format, or fault the instruction after D2 advances.
+typedef struct packed {
+    logic        valid;
+    logic [31:0] linear_addr;
+    logic [31:0] restart_eip;
+    logic [2:0]  dst;
+    logic [7:0]  dst_onehot;
+    logic [1:0]  mem_size;
+    logic [1:0]  lane;
+    logic [1:0]  write_size;
+    hardwired_load_result_t result_kind;
+    logic        is_alu;
+    logic [4:0]  alu_op;
+} hardwired_load_token_t;
+
+// A load that has left the direct pipeline no longer needs a token-valid bit;
+// the slow-path request/wait state owns its lifetime.
+typedef struct packed {
+    logic [31:0] linear_addr;
+    logic [31:0] restart_eip;
+    logic [2:0]  dst;
+    logic [7:0]  dst_onehot;
+    logic [1:0]  mem_size;
+    logic [1:0]  lane;
+    logic [1:0]  write_size;
+    hardwired_load_result_t result_kind;
+    logic        is_alu;
+    logic [4:0]  alu_op;
+} hardwired_load_payload_t;
 
 // A microsequencer redirect request and its destination.
 typedef struct packed {
@@ -262,8 +299,10 @@ typedef struct packed {
     // chain gates and the early-start latch do not re-derive them from ModR/M.
     logic [7:0]  ea_base_onehot;
     logic [7:0]  ea_index_onehot;
+    logic        ea_complex;          // Base + index + displacement needs two D2 cycles
     logic        ea_uses_post_pop_esp; // POP r/m SIB base observes incremented ESP
     logic [3:0]  mem_seg;             // resolved SS/DS/override segment for memory EA
+    logic [7:0]  recipe_gpr_read_mask; // D1 architectural GPR-use mask for chaining
 } dec_entry_t;
 
 // Normalized effective-address metadata shared by D2, chaining hazard

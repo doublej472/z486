@@ -13,6 +13,8 @@ module memory #(
     // Paging-unit demand request
     input              dcache_req_valid,
     input      [31:0]  dcache_req_phys_addr_raw,
+    input      [11:0]  dcache_req_preread_offset,
+    input              dcache_req_preread_priority,
     input              dcache_req_write,
     input       [3:0]  dcache_req_be,
     input      [31:0]  dcache_req_wdata,
@@ -24,6 +26,17 @@ module memory #(
     output             dcache_req_complete, // Read or write operation completed
     output             dcache_read_complete, // Read data is valid this cycle
     output     [31:0]  dcache_rdata,
+
+    // Non-owning hardwired-load preread. A miss is retried through the demand
+    // request interface above; this port never starts a fill by itself.
+    input              dcache_vipt_probe_valid,
+    input      [11:0]  dcache_vipt_probe_offset,
+    output             dcache_vipt_probe_ready,
+    output             dcache_vipt_probe_accepted,
+    input              dcache_vipt_resolve_valid,
+    input      [31:0]  dcache_vipt_resolve_phys_addr_raw,
+    output             dcache_vipt_resolve_hit,
+    output     [31:0]  dcache_vipt_resolve_data,
 
     // x87 data-port response
     output             x87_req_selected,    // Route demand request to x87 port space
@@ -60,6 +73,9 @@ module memory #(
 wire [31:0] dcache_req_phys_addr = (!a20_enable && !dcache_req_is_io)
                                       ? (dcache_req_phys_addr_raw & ~32'h0010_0000)
                                       : dcache_req_phys_addr_raw;
+wire [31:0] dcache_vipt_resolve_phys_addr = !a20_enable
+                                      ? (dcache_vipt_resolve_phys_addr_raw & ~32'h0010_0000)
+                                      : dcache_vipt_resolve_phys_addr_raw;
 wire [31:0] icache_req_phys_addr = !a20_enable
                                       ? (icache_req_phys_addr_raw & ~32'h0010_0000)
                                       : icache_req_phys_addr_raw;
@@ -282,6 +298,8 @@ l1_cache #(
     .clk(clk),
     .reset(!reset_n),
     .cpu_addr(dcache_req_phys_addr),
+    .cpu_preread_offset(dcache_req_preread_offset),
+    .cpu_preread_priority(dcache_req_preread_priority),
     .cpu_din(dcache_req_wdata),
     .cpu_dout(dcache_cpu_dout),
     .cpu_be(dcache_req_be),
@@ -290,6 +308,14 @@ l1_cache #(
     .cpu_ready(dcache_cpu_ready),
     .cpu_resp_valid(dcache_cpu_resp_valid),
     .stores_drained(dcache_stores_drained),
+    .vipt_probe_offset(dcache_vipt_probe_offset),
+    .vipt_probe_valid(dcache_vipt_probe_valid),
+    .vipt_probe_ready(dcache_vipt_probe_ready),
+    .vipt_probe_accepted(dcache_vipt_probe_accepted),
+    .vipt_resolve_phys_addr(dcache_vipt_resolve_phys_addr),
+    .vipt_resolve_valid(dcache_vipt_resolve_valid),
+    .vipt_resolve_data(dcache_vipt_resolve_data),
+    .vipt_resolve_hit(dcache_vipt_resolve_hit),
     .mem_addr(dcache_mem_addr),
     .mem_din(dcache_mem_din),
     .mem_dout(din),

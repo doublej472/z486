@@ -50,12 +50,20 @@ class BranchPhase:
 
 
 @dataclass(frozen=True)
+class DependencyPhase:
+    name: str
+    description: str
+    producer_eips: tuple[int, ...]
+    consumer_eips: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class PhaseResult:
     name: str
     description: str
-    target_cycles: float
+    target_cycles: float | None
     samples: tuple[float, ...]
-    branch: bool = False
+    measurement: str = "i_first -> next i_first"
 
 
 STEADY_PHASES = [
@@ -89,12 +97,32 @@ STEADY_PHASES = [
     SteadyPhase("alu_mem_rmw", "add [edi], eax", 7.0, (0x1C10, 0x1C12, 0x1C14, 0x1C16, 0x1C18, 0x1C1A, 0x1C1C, 0x1C1E)),
     SteadyPhase("shld_reg_imm", "shld r32, r32, 8", 3.0, (0x1D1E, 0x1D22, 0x1D26, 0x1D2A, 0x1D2E, 0x1D32, 0x1D36, 0x1D3A)),
     SteadyPhase("unary_mem_rmw", "inc dword [edi]", 6.0, (0x1E0B, 0x1E0D, 0x1E0F, 0x1E11, 0x1E13, 0x1E15, 0x1E17, 0x1E19)),
+    SteadyPhase("word_load", "mov ax, [esi]", 4.0, (0x1F10, 0x1F13, 0x1F16, 0x1F19, 0x1F1C, 0x1F1F, 0x1F22, 0x1F25)),
+    SteadyPhase("movzx_byte", "movzx eax, byte [esi]", 4.0, (0x200E, 0x2011, 0x2014, 0x2017, 0x201A, 0x201D, 0x2020, 0x2023)),
+    SteadyPhase("movzx_word", "movzx eax, word [esi]", 4.0, (0x210E, 0x2111, 0x2114, 0x2117, 0x211A, 0x211D, 0x2120, 0x2123)),
+    SteadyPhase("movsx_byte", "movsx eax, byte [esi]", 4.0, (0x220B, 0x220E, 0x2211, 0x2214, 0x2217, 0x221A, 0x221D, 0x2220)),
+    SteadyPhase("movsx_word", "movsx eax, word [esi]", 4.0, (0x230D, 0x2310, 0x2313, 0x2316, 0x2319, 0x231C, 0x231F, 0x2322)),
 ]
 
 BRANCH_PHASES = [
     BranchPhase("conditional_jump_taken", "jnz taken backward", 9.25, branch_eip=0x90D, target_eip=0x90A),
     BranchPhase("unconditional_jump", "jmp taken backward", 9.25, branch_eip=0xA0F, target_eip=0xA0A),
     BranchPhase("call_taken", "call taken", 9.25, branch_eip=0x1611, target_eip=0x1619),
+]
+
+DEPENDENCY_PHASES = [
+    DependencyPhase(
+        "load_use",
+        "mov eax,[esi] -> add ebx,eax",
+        (0x240F, 0x2413, 0x2417, 0x241B, 0x241F, 0x2423, 0x2427, 0x242B),
+        (0x2411, 0x2415, 0x2419, 0x241D, 0x2421, 0x2425, 0x2429, 0x242D),
+    ),
+    DependencyPhase(
+        "pointer_load",
+        "mov esi,[edi] -> mov eax,[esi]",
+        (0x2517, 0x251B, 0x251F, 0x2523, 0x2527, 0x252B, 0x252F, 0x2533),
+        (0x2519, 0x251D, 0x2521, 0x2525, 0x2529, 0x252D, 0x2531, 0x2535),
+    ),
 ]
 
 
@@ -164,6 +192,13 @@ TARGET_486_CYCLES = {
     "alu_mem_rmw": 3.0,          # i486 ADD m,r
     "shld_reg_imm": 2.0,
     "unary_mem_rmw": 3.0,
+    "word_load": 1.0,
+    "movzx_byte": 1.0,
+    "movzx_word": 1.0,
+    "movsx_byte": 1.0,
+    "movsx_word": 1.0,
+    "load_use": 1.0,
+    "pointer_load": 2.0,
     "conditional_jump_taken": 3.0,
     "unconditional_jump": 3.0,
     "call_taken": 3.0,
@@ -356,7 +391,8 @@ def print_comparison_table(results: list[PhaseResult], color_enabled: bool) -> N
         if current is not None:
             # color against the 486 goal when defined, else the 386 target
             ref = target486 if target486 is not None else result.target_cycles
-            current_text = colorize(current_text, classify_delta(current - ref), color_enabled)
+            delta = current - ref if ref is not None else None
+            current_text = colorize(current_text, classify_delta(delta), color_enabled)
         rows.append([
             result.description,
             fmt_cycles(result.target_cycles),
@@ -484,6 +520,45 @@ def measure_branch_phase(
     return samples
 
 
+def measure_dependency_phase(
+    phase: DependencyPhase,
+    i_first_events: list[tuple[int, int]],
+    cycle_period: float,
+) -> list[float]:
+    event_times = {eip: time for time, eip in i_first_events}
+    samples = []
+    for producer_eip, consumer_eip in zip(phase.producer_eips, phase.consumer_eips):
+        producer_time = event_times.get(producer_eip)
+        consumer_time = event_times.get(consumer_eip)
+        if producer_time is not None and consumer_time is not None and consumer_time > producer_time:
+            samples.append(cycles(consumer_time - producer_time, cycle_period))
+    if len(samples) >= 4:
+        samples = samples[1:-1]
+    return samples
+
+
+def check_486_parity(results: list[PhaseResult]) -> bool:
+    by_name = {result.name: result for result in results}
+    failures: list[str] = []
+    for name, target in TARGET_486_CYCLES.items():
+        result = by_name.get(name)
+        if result is None or not result.samples:
+            failures.append(f"{name}: no measurement (target {target:g})")
+            continue
+        current = min(result.samples)
+        if current > target + 1e-9:
+            failures.append(f"{name}: {current:g} cycles > {target:g}")
+
+    print("i486 parity gate (best-case cycles)")
+    if failures:
+        for failure in failures:
+            print(f"  FAIL {failure}")
+        print(f"Result: FAIL ({len(failures)} timing gaps)")
+        return False
+    print(f"Result: PASS ({len(TARGET_486_CYCLES)} classes)")
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Measure instruction timing microbenchmark")
     parser.add_argument(
@@ -515,6 +590,11 @@ def main() -> int:
         default="auto",
         help="Colorize good/bad timing results (default: auto)",
     )
+    parser.add_argument(
+        "--check-486",
+        action="store_true",
+        help="Exit nonzero if any measured class misses its best-case i486 target",
+    )
     args = parser.parse_args()
 
     trace_path = Path(args.trace_file)
@@ -540,22 +620,41 @@ def main() -> int:
 
     for phase in BRANCH_PHASES:
         samples = measure_branch_phase(phase, i_first_events, cycle_period, args.window_cycles)
-        results.append(PhaseResult(phase.name, phase.description, phase.target_cycles, tuple(samples), branch=True))
+        results.append(PhaseResult(
+            phase.name,
+            phase.description,
+            phase.target_cycles,
+            tuple(samples),
+            measurement="branch i_first -> target i_first",
+        ))
+
+    for phase in DEPENDENCY_PHASES:
+        samples = measure_dependency_phase(phase, i_first_events, cycle_period)
+        results.append(PhaseResult(
+            phase.name,
+            phase.description,
+            None,
+            tuple(samples),
+            measurement="producer i_first -> consumer i_first",
+        ))
 
     print_comparison_table(results, color_enabled)
 
     for result in results:
         samples = list(result.samples)
         avg = statistics.mean(samples) if samples else None
-        delta = (avg - result.target_cycles) if avg is not None else None
+        delta = (
+            avg - result.target_cycles
+            if avg is not None and result.target_cycles is not None
+            else None
+        )
         level = classify_delta(delta)
-        delta_text = f"{delta:+.2f}" if result.branch and delta is not None else f"{delta:+.1f}" if delta is not None else "n/a"
+        delta_text = f"{delta:+.1f}" if delta is not None else "n/a"
         print(f"{result.name}: {result.description}")
-        print(f"  target:  {result.target_cycles:.2f} cycles")
+        print(f"  386 target: {fmt_cycles(result.target_cycles)} cycles")
         print(f"  samples: {len(samples)}")
-        measurement = "branch i_first -> target i_first" if result.branch else "i_first -> next i_first"
         print(
-            f"  measured {measurement}: "
+            f"  measured {result.measurement}: "
             f"{colorize(f'{summarize(samples)} cycles', level, color_enabled)}"
         )
         print(
@@ -568,6 +667,8 @@ def main() -> int:
             print(f"  delta vs 486 target: {d486:+.1f} cycles (486 = {target486:g})")
         print()
 
+    if args.check_486:
+        return 0 if check_486_parity(results) else 1
     return 0
 
 

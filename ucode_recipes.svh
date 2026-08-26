@@ -56,6 +56,39 @@ function automatic logic [2:0] recipe_early_kind(input logic [11:0] entry);
     endcase
 endfunction
 
+// Architectural GPR inputs needed by a hardwired recipe. The full recipe
+// classifier separately qualifies legality; this compact D1 sidecar only
+// removes deferred-write hazard decoding from the issue critical path.
+function automatic logic [7:0] recipe_gpr_read_mask(input dec_entry_t e);
+    logic [7:0] mask;
+    logic op_byte;
+    logic [2:0] dst_idx, src_idx;
+    mask = e.stack_op ? 8'h10 : 8'h00;
+    if (e.opcode[7:4] == 4'h4 || e.opcode[7:4] == 4'h5)
+        op_byte = 1'b0;
+    else if (e.opcode[7:4] == 4'hB && !e.has_0f)
+        op_byte = !e.opcode[3];
+    else
+        op_byte = !e.opcode[0];
+    dst_idx = op_byte ? {1'b0, e.dst_reg_sel[1:0]} : e.dst_reg_sel;
+    src_idx = op_byte ? {1'b0, e.src_reg_sel[1:0]} : e.src_reg_sel;
+    unique case (e.entry_point)
+        12'h003, 12'h013: mask[src_idx] = 1'b1;
+        12'h01D, 12'h01F, 12'h0FC: begin
+            mask[dst_idx] = 1'b1; mask[src_idx] = 1'b1;
+        end
+        12'h021, 12'h023, 12'h025, 12'h0F9, 12'h105, 12'h1E8, 12'h1F0, 12'h086, 12'h027: mask[dst_idx] = 1'b1;
+        12'h0FF: begin
+            mask[dst_idx] = 1'b1; mask[3'd1] = 1'b1;
+        end
+        12'h102: begin
+            mask[dst_idx] = 1'b1; mask[src_idx] = 1'b1; mask[3'd1] = 1'b1;
+        end
+        default: ;
+    endcase
+    recipe_gpr_read_mask = mask;
+endfunction
+
 // Entry-point-derived hardwired control generated from the recipe inventory.
 function automatic recipe_meta_t recipe_metadata(input dec_entry_t e);
     recipe_meta_t r;
@@ -191,6 +224,8 @@ function automatic recipe_meta_t recipe_metadata(input dec_entry_t e);
                     (e.modrm[7:6] != 2'b11) && (grp != 3'b111)) begin
                     r.hardwired = 1'b1; r.multi_ustep = 1'b1;
                     r.commit_sel = RECIPE_COMMIT_ALU; r.uses_ea = 1'b1;
+                    r.reads_flags = (grp == 3'b010) || (grp == 3'b011);
+                    r.reads_dst = 1'b1;
                     r.writes_flags = 1'b1;
                 end
             end

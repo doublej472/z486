@@ -14,6 +14,8 @@ module l1_cache #(
                                // page-offset bits [11:2] (translation-invariant,
                                // so available without the TLB result) and tags off
                                // [31:12], exactly like l1_icache
+    input  [11:0] cpu_preread_offset, // untranslated low address for RAM preread
+    input         cpu_preread_priority,// demand intent owns preread over VIPT probe
     input  [31:0] cpu_din,
     output [31:0] cpu_dout,
     input   [3:0] cpu_be,
@@ -22,6 +24,18 @@ module l1_cache #(
     output        cpu_ready,
     output        cpu_resp_valid,
     output        stores_drained,
+
+    // Side-effect-free hardwired-load path. D2 selects the RAM word; EX
+    // supplies the physical tag exactly one cycle later. The cache does not
+    // retain request ownership and a miss retries through the CPU interface.
+    input  [11:0] vipt_probe_offset,
+    input         vipt_probe_valid,
+    output        vipt_probe_ready,
+    output        vipt_probe_accepted,
+    input  [31:0] vipt_resolve_phys_addr,
+    input         vipt_resolve_valid,
+    output [31:0] vipt_resolve_data,
+    output        vipt_resolve_hit,
 
     // Memory side.
     output [31:0] mem_addr,
@@ -54,7 +68,8 @@ localparam integer SET_LSB = LINE_OFFSET_BITS;
 localparam integer SET_MSB = SET_LSB + SET_BITS - 1;
 localparam integer TAG_LSB = SET_MSB + 1;
 localparam integer TAG_MSB = PHYS_ADDR_BITS - 1;
-localparam integer TAG_RAM_BITS = (TAG_BITS < 16) ? 16 : TAG_BITS;
+localparam integer TAG_RAM_BITS = (TAG_BITS < 16) ? 16 : (TAG_BITS + 1);
+localparam integer TAG_VALID_BIT = TAG_BITS;
 localparam integer STOREQ_DEPTH = 3;
 localparam integer STOREQ_IDX_BITS = 2;
 localparam integer STOREQ_CNT_BITS = 2;
@@ -70,19 +85,25 @@ wire [TAG_BITS-1:0] cpu_tag = cpu_addr[TAG_MSB:TAG_LSB];
 wire [SET_BITS-1:0] cpu_set = cpu_addr[SET_MSB:SET_LSB];
 wire [WORD_OFFSET_BITS-1:0] cpu_word = cpu_addr[LINE_OFFSET_BITS-1:BYTE_OFFSET_BITS];
 wire [BRAM_ADDR_BITS-1:0] cpu_bram_addr = {cpu_set, cpu_word};
+wire [SET_BITS-1:0] cpu_preread_set =
+    cpu_preread_offset[SET_MSB:SET_LSB];
+wire [WORD_OFFSET_BITS-1:0] cpu_preread_word =
+    cpu_preread_offset[LINE_OFFSET_BITS-1:BYTE_OFFSET_BITS];
+wire [SET_BITS-1:0] vipt_probe_set = vipt_probe_offset[SET_MSB:SET_LSB];
+wire [WORD_OFFSET_BITS-1:0] vipt_probe_word =
+    vipt_probe_offset[LINE_OFFSET_BITS-1:BYTE_OFFSET_BITS];
 wire [SET_BITS-1:0] snoop_set = snoop_addr[SET_MSB:SET_LSB];
 wire cpu_uncacheable = !cache_enable || (cpu_addr[31:17] == 15'h5);
 wire cpu_protect_write = PROTECT_UMA_ROM && cpu_write && (cpu_addr[24:18] == 7'b000_0011);
 
 // Tag/data storage.
-(* ram_style = "block" *) reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1] /* synthesis syn_ramstyle="block_ram" */;
-(* ram_style = "block" *) reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1] /* synthesis syn_ramstyle="block_ram" */;
-(* ram_style = "block" *) reg [TAG_RAM_BITS-1:0] tag_way2 [0:NUM_SETS-1] /* synthesis syn_ramstyle="block_ram" */;
-(* ram_style = "block" *) reg [TAG_RAM_BITS-1:0] tag_way3 [0:NUM_SETS-1] /* synthesis syn_ramstyle="block_ram" */;
-reg valid_way0 [0:NUM_SETS-1];
-reg valid_way1 [0:NUM_SETS-1];
-reg valid_way2 [0:NUM_SETS-1];
-reg valid_way3 [0:NUM_SETS-1];
+// Keep validity in the otherwise under-filled tag RAM word. This removes four
+// asynchronously indexed 256-bit register arrays from the preread address
+// path without changing the synchronous lookup boundary.
+(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1];
+(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1];
+(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way2 [0:NUM_SETS-1];
+(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way3 [0:NUM_SETS-1];
 reg [2:0] plru_set [0:NUM_SETS-1];
 
 reg [31:0] data_way0 [0:(NUM_SETS << WORD_OFFSET_BITS)-1];
@@ -91,8 +112,19 @@ reg [31:0] data_way2 [0:(NUM_SETS << WORD_OFFSET_BITS)-1];
 reg [31:0] data_way3 [0:(NUM_SETS << WORD_OFFSET_BITS)-1];
 
 // Synchronous cache read result for the request accepted in the previous cycle.
-reg [TAG_BITS-1:0] rd_tag0_r, rd_tag1_r, rd_tag2_r, rd_tag3_r;
-reg rd_valid0_r, rd_valid1_r, rd_valid2_r, rd_valid3_r;
+// Register each complete tag word as one RAM read; Quartus 17 otherwise treats
+// separate tag and valid slices as independent read ports and implements the
+// arrays in logic.
+reg [TAG_RAM_BITS-1:0] rd_tag_entry0_r, rd_tag_entry1_r;
+reg [TAG_RAM_BITS-1:0] rd_tag_entry2_r, rd_tag_entry3_r;
+wire [TAG_BITS-1:0] rd_tag0_r = rd_tag_entry0_r[TAG_BITS-1:0];
+wire [TAG_BITS-1:0] rd_tag1_r = rd_tag_entry1_r[TAG_BITS-1:0];
+wire [TAG_BITS-1:0] rd_tag2_r = rd_tag_entry2_r[TAG_BITS-1:0];
+wire [TAG_BITS-1:0] rd_tag3_r = rd_tag_entry3_r[TAG_BITS-1:0];
+wire rd_valid0_r = rd_tag_entry0_r[TAG_VALID_BIT];
+wire rd_valid1_r = rd_tag_entry1_r[TAG_VALID_BIT];
+wire rd_valid2_r = rd_tag_entry2_r[TAG_VALID_BIT];
+wire rd_valid3_r = rd_tag_entry3_r[TAG_VALID_BIT];
 reg [31:0] rd_data0_r, rd_data1_r, rd_data2_r, rd_data3_r;
 reg [2:0] rd_plru_r;
 
@@ -261,6 +293,20 @@ wire [3:0] lookup_hit_vec = {
 wire lookup_hit = |lookup_hit_vec;
 wire [1:0] lookup_way = way_encode(lookup_hit_vec);
 wire [31:0] lookup_way_data = way_data_mux(lookup_way, rd_data0_r, rd_data1_r, rd_data2_r, rd_data3_r);
+wire [TAG_BITS-1:0] vipt_resolve_tag =
+    vipt_resolve_phys_addr[TAG_MSB:TAG_LSB];
+wire [3:0] vipt_hit_vec = {
+    rd_valid3_r && (rd_tag3_r == vipt_resolve_tag),
+    rd_valid2_r && (rd_tag2_r == vipt_resolve_tag),
+    rd_valid1_r && (rd_tag1_r == vipt_resolve_tag),
+    rd_valid0_r && (rd_tag0_r == vipt_resolve_tag)
+};
+wire [1:0] vipt_hit_way = way_encode(vipt_hit_vec);
+assign vipt_resolve_data = way_data_mux(
+    vipt_hit_way, rd_data0_r, rd_data1_r, rd_data2_r, rd_data3_r);
+assign vipt_resolve_hit = vipt_resolve_valid && cache_enable &&
+                          (vipt_resolve_phys_addr[31:17] != 15'h5) &&
+                          (|vipt_hit_vec);
 wire [BRAM_ADDR_BITS-1:0] req_bram_addr = {req_set_r, req_word_r};
 wire can_accept_cpu = (state == S_IDLE) && !reset && (!cpu_write || cpu_protect_write || storeq_can_accept);
 wire ready_when_idle = !reset && storeq_can_accept;
@@ -382,39 +428,65 @@ begin
 end
 endtask
 
-task automatic write_cache_tag(input [1:0] way, input [SET_BITS-1:0] set, input [TAG_BITS-1:0] tag);
-begin
-    case (way)
-        2'd0: begin tag_way0[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way0[set] <= 1'b1; end
-        2'd1: begin tag_way1[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way1[set] <= 1'b1; end
-        2'd2: begin tag_way2[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way2[set] <= 1'b1; end
-        default: begin tag_way3[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way3[set] <= 1'b1; end
-    endcase
-end
-endtask
-
 // Preread runs on every ready idle cycle, with no cpu_valid/TLB gating: when
 // no request is accepted the preread results are garbage that S_LOOKUP never
 // sees (it is only entered on accept_cpu).  This keeps the TLB-hit cone off
 // the wide rd_*_r register enables.
 wire idle_preread = (state == S_IDLE) && ready_r;
+// Store hits patch the cache before it can accept another probe; store misses
+// have no matching line, and later fills are patched before the tag is valid.
+// Capacity is a registered-state fact. Demand arbitration must not feed back
+// through D2 issue; a denied speculative probe is replayed by the CPU.
+assign vipt_probe_ready = idle_preread;
+wire vipt_probe_fire = vipt_probe_valid && idle_preread &&
+                       !cpu_preread_priority;
+assign vipt_probe_accepted = vipt_probe_fire;
+wire [SET_BITS-1:0] preread_set =
+    vipt_probe_fire ? vipt_probe_set : cpu_preread_set;
+wire [WORD_OFFSET_BITS-1:0] preread_word =
+    vipt_probe_fire ? vipt_probe_word : cpu_preread_word;
+wire [BRAM_ADDR_BITS-1:0] preread_bram_addr = {preread_set, preread_word};
+
+// Keep each tag array in one conventional synchronous-read/synchronous-write
+// process. Quartus 17 will not infer a block RAM when the packed valid bit is
+// written from the snoop, reset-init, and fill branches of the cache FSM.
+wire tag_fill_write = (state == S_FILL) && mem_resp_valid &&
+                      (fill_count == {WORD_OFFSET_BITS{1'b1}});
+wire tag_clear_all = (state == S_RESET_INIT) || snoop_valid_r;
+wire [SET_BITS-1:0] tag_clear_set = (state == S_RESET_INIT) ?
+                                    init_set : snoop_set_r;
+wire [TAG_RAM_BITS-1:0] tag_fill_entry =
+    {{(TAG_RAM_BITS-TAG_BITS-1){1'b0}}, 1'b1, fill_tag};
+wire tag_fill_way0 = tag_fill_write && (fill_way == 2'd0);
+wire tag_fill_way1 = tag_fill_write && (fill_way == 2'd1);
+wire tag_fill_way2 = tag_fill_write && (fill_way == 2'd2);
+wire tag_fill_way3 = tag_fill_write && (fill_way == 2'd3);
 
 always_ff @(posedge clk) begin
     if (idle_preread) begin
-        rd_tag0_r <= tag_way0[cpu_set][TAG_BITS-1:0];
-        rd_tag1_r <= tag_way1[cpu_set][TAG_BITS-1:0];
-        rd_tag2_r <= tag_way2[cpu_set][TAG_BITS-1:0];
-        rd_tag3_r <= tag_way3[cpu_set][TAG_BITS-1:0];
-        rd_valid0_r <= valid_way0[cpu_set];
-        rd_valid1_r <= valid_way1[cpu_set];
-        rd_valid2_r <= valid_way2[cpu_set];
-        rd_valid3_r <= valid_way3[cpu_set];
-        rd_data0_r <= data_way0[cpu_bram_addr];
-        rd_data1_r <= data_way1[cpu_bram_addr];
-        rd_data2_r <= data_way2[cpu_bram_addr];
-        rd_data3_r <= data_way3[cpu_bram_addr];
-        rd_plru_r <= plru_set[cpu_set];
+        rd_tag_entry0_r <= tag_way0[preread_set];
+        rd_tag_entry1_r <= tag_way1[preread_set];
+        rd_tag_entry2_r <= tag_way2[preread_set];
+        rd_tag_entry3_r <= tag_way3[preread_set];
+        rd_data0_r <= data_way0[preread_bram_addr];
+        rd_data1_r <= data_way1[preread_bram_addr];
+        rd_data2_r <= data_way2[preread_bram_addr];
+        rd_data3_r <= data_way3[preread_bram_addr];
+        rd_plru_r <= plru_set[preread_set];
     end
+
+    if (tag_clear_all || tag_fill_way0)
+        tag_way0[tag_fill_way0 ? fill_set : tag_clear_set] <=
+            tag_fill_way0 ? tag_fill_entry : '0;
+    if (tag_clear_all || tag_fill_way1)
+        tag_way1[tag_fill_way1 ? fill_set : tag_clear_set] <=
+            tag_fill_way1 ? tag_fill_entry : '0;
+    if (tag_clear_all || tag_fill_way2)
+        tag_way2[tag_fill_way2 ? fill_set : tag_clear_set] <=
+            tag_fill_way2 ? tag_fill_entry : '0;
+    if (tag_clear_all || tag_fill_way3)
+        tag_way3[tag_fill_way3 ? fill_set : tag_clear_set] <=
+            tag_fill_way3 ? tag_fill_entry : '0;
 end
 
 always_ff @(posedge clk) begin
@@ -460,13 +532,6 @@ always_ff @(posedge clk) begin
             storeq_draining <= 1'b0;
         end
 
-        if (snoop_valid_r) begin
-            valid_way0[snoop_set_r] <= 1'b0;
-            valid_way1[snoop_set_r] <= 1'b0;
-            valid_way2[snoop_set_r] <= 1'b0;
-            valid_way3[snoop_set_r] <= 1'b0;
-        end
-
         // FSM-independent store-queue drain launch (see drain_issue_now).
         if (drain_issue_now) begin
             mem_valid_r <= 1'b1;
@@ -486,10 +551,6 @@ always_ff @(posedge clk) begin
 
         case (state)
             S_RESET_INIT: begin
-                valid_way0[init_set] <= 1'b0;
-                valid_way1[init_set] <= 1'b0;
-                valid_way2[init_set] <= 1'b0;
-                valid_way3[init_set] <= 1'b0;
                 plru_set[init_set] <= 3'b000;
                 if (init_set == LAST_SET) begin
                     state <= S_IDLE;
@@ -599,7 +660,6 @@ always_ff @(posedge clk) begin
                     end
 
                     if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
-                        write_cache_tag(fill_way, fill_set, fill_tag);
                         // Do NOT restore the other ways' valid bits from the
                         // fill-START snapshot -- a snoop invalidation landing
                         // DURING this fill must survive (same bug as l1_icache).
@@ -629,6 +689,8 @@ end
 always_ff @(posedge clk) begin
     if (!reset && state != S_RESET_INIT && cpu_valid && !cpu_ready && !(state == S_IDLE))
         ;
+    if (!reset && vipt_resolve_valid && state != S_IDLE)
+        $fatal(1, "VIPT resolve while cache is not idle");
 end
 // synthesis translate_on
 

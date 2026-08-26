@@ -60,7 +60,6 @@ logic        overflow;
 logic        eq_width;
 logic        eq_width_cf;
 logic        set_zsp;
-logic [5:0]  shift1_width;
 logic [1:0]  shift1_size;
 logic [2:0]  operation;
 logic [31:0] source_value;
@@ -68,7 +67,6 @@ logic [31:0] alu_value;
 
 wire [5:0] width = op_size == 2'd0 ? 6'd8 :
                    op_size == 2'd1 ? 6'd16 : 6'd32;
-wire [5:0] data_width = is_shift2 ? shift1_width : width;
 wire [31:0] width_mask = op_size == 2'd0 ? 32'h0000_00ff :
                          op_size == 2'd1 ? 32'h0000_ffff : 32'hffff_ffff;
 
@@ -143,11 +141,18 @@ wire [63:0] shift_input = data_size == 2'd0 ? {high_word, low_word[7:0]} :
                                                 {high_word, low_word};
 wire [63:0] shifted = shift_input >> count;
 wire        is_sar = (shift_operation == SAR) && !instr_is_shxd;
-wire [31:0] sar_overflow_result = low_word[data_width-1] ? 32'hffff_ffff : 32'd0;
 wire        low_sign = data_size == 2'd0 ? low_word[7] :
                        data_size == 2'd1 ? low_word[15] : low_word[31];
+wire [31:0] sar_overflow_result = low_sign ? 32'hffff_ffff : 32'd0;
 wire        last_out_lsb = shift_input[count-1];
-wire        last_out_msb = shifted[data_width];
+// SHIFT2 width has only three architectural values. Spell out these taps so
+// flag retirement does not infer full variable-index muxes after the barrel.
+wire        last_out_msb = data_size == 2'd0 ? shifted[8] :
+                           data_size == 2'd1 ? shifted[16] : shifted[32];
+wire        shifted_sign = data_size == 2'd0 ? shifted[7] :
+                           data_size == 2'd1 ? shifted[15] : shifted[31];
+wire        shifted_next_sign = data_size == 2'd0 ? shifted[6] :
+                                data_size == 2'd1 ? shifted[14] : shifted[30];
 
 assign result = overflow ? (is_sar ? sar_overflow_result : 32'd0) : shifted[31:0];
 wire result_pf = ~^result[7:0];
@@ -189,7 +194,6 @@ always_ff @(posedge clk) begin
                     default: reduced_count = raw_count;
                 endcase
                 count_raw_r <= raw_count;
-                shift1_width <= width;
                 shift1_size <= op_size;
 
                 if (instr_is_shxd) begin
@@ -239,7 +243,6 @@ always_ff @(posedge clk) begin
             ALUJMP_LDBSLU: begin
                 swap <= 1'b1;
                 count <= width - alu_src[4:0];
-                shift1_width <= width;
                 shift1_size <= op_size;
                 count_raw_r <= alu_src[4:0];
                 set_zsp <= 1'b0;
@@ -269,8 +272,8 @@ always_ff @(posedge clk) begin
                 if (count_raw_r == 5'd1) begin
                     flags_we_of <= 1'b1;
                     flags_of <= shift_right ?
-                        (result[shift1_width-1] ^ result[shift1_width-2]) :
-                        (result[shift1_width-1] ^ last_out_msb);
+                        (shifted_sign ^ shifted_next_sign) :
+                        (shifted_sign ^ last_out_msb);
                 end
             end else begin
                 case (operation)
@@ -278,21 +281,21 @@ always_ff @(posedge clk) begin
                     SAL: flags_cf <= overflow ? (eq_width ? eq_width_cf : 1'b0) : last_out_msb;
                     RCL: flags_cf <= last_out_msb;
                     SHR: flags_cf <= overflow ? (eq_width ? eq_width_cf : 1'b0) : last_out_lsb;
-                    SAR: flags_cf <= overflow ? result[shift1_width-1] : last_out_lsb;
+                    SAR: flags_cf <= overflow ? low_sign : last_out_lsb;
                     RCR: flags_cf <= last_out_lsb;
-                    ROL: flags_cf <= result[0];
-                    ROR: flags_cf <= result[shift1_width-1];
+                    ROL: flags_cf <= shifted[0];
+                    ROR: flags_cf <= shifted_sign;
                     default: flags_cf <= 1'b0;
                 endcase
                 if (count_raw_r == 5'd1) begin
                     case (operation)
                         SHL: begin
                             flags_we_of <= 1'b1;
-                            flags_of <= result[shift1_width-1] ^ last_out_msb;
+                            flags_of <= shifted_sign ^ last_out_msb;
                         end
                         SHR: begin
                             flags_we_of <= 1'b1;
-                            flags_of <= low_word[shift1_width-1];
+                            flags_of <= low_sign;
                         end
                         SAR: begin
                             flags_we_of <= 1'b1;
@@ -301,18 +304,18 @@ always_ff @(posedge clk) begin
                         ROR,
                         RCR: begin
                             flags_we_of <= 1'b1;
-                            flags_of <= result[shift1_width-1] ^ result[shift1_width-2];
+                            flags_of <= shifted_sign ^ shifted_next_sign;
                         end
                         default: ;
                     endcase
                 end
                 if (operation == ROL) begin
                     flags_we_of <= 1'b1;
-                    flags_of <= result[shift1_width-1] ^ result[0];
+                    flags_of <= shifted_sign ^ shifted[0];
                 end
                 if (operation == RCL) begin
                     flags_we_of <= 1'b1;
-                    flags_of <= result[shift1_width-1] ^ last_out_msb;
+                    flags_of <= shifted_sign ^ last_out_msb;
                 end
             end
         end

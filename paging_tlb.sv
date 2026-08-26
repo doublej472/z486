@@ -27,6 +27,24 @@ module paging_tlb
     output reg          live_dirty,
     output              live_is_vga_mem,
 
+    // Side-effect-free D2 preread for hardwired loads. The direct-mapped
+    // sidecar is a second TLB lookup port; an EX miss simply falls back to the
+    // authoritative four-way TLB and page walker.
+    input               vipt_preread,
+    input        [31:0] vipt_linear_addr,
+    output reg          vipt_hit,
+    output reg   [31:0] vipt_physical_addr,
+    output reg          vipt_user,
+    output              vipt_is_vga_mem,
+
+    // Refill the direct sidecar after a registered demand falls back to an
+    // authoritative four-way TLB hit.  This path is intentionally separate
+    // from the D2 preread: it cannot feed translation back into D2.
+    input               vipt_refill_valid,
+    input        [31:0] vipt_refill_linear,
+    input        [19:0] vipt_refill_pfn,
+    input               vipt_refill_user,
+
     // Update interface (from page walker)
     input               update_valid,
     input        [19:0] update_vpn,     // Virtual page number
@@ -104,6 +122,80 @@ wire [1:0] live_hit_way = live_hit0 ? 2'd0 :
                           live_hit1 ? 2'd1 :
                           live_hit2 ? 2'd2 :
                           live_hit3 ? 2'd3 : 2'd0;
+
+// The D2 port uses one synchronous RAM read followed by an EX tag compare.
+// It is maintained as an independent TLB: retaining a translation after the
+// four-way TLB replaces it is valid until software executes INVLPG or reloads
+// CR3, just as retaining it in any other TLB entry would be.
+localparam integer VIPT_TLB_INDEX_BITS = 5;
+localparam integer VIPT_TLB_ENTRIES = 1 << VIPT_TLB_INDEX_BITS;
+wire [VIPT_TLB_INDEX_BITS-1:0] vipt_preread_index =
+    vipt_linear_addr[16:12];
+wire [VIPT_TLB_INDEX_BITS-1:0] vipt_refill_index =
+    vipt_refill_linear[16:12];
+wire vipt_refill_write = vipt_refill_valid && !update_valid;
+reg [31:0] vipt_linear_r;
+reg        vipt_hazard_r;
+reg [VIPT_TLB_ENTRIES-1:0] vipt_valid;
+// {VPN tag[19:5], PFN[19:0], user, VGA}
+(* ramstyle = "M10K, no_rw_check" *) reg [36:0] vipt_tlb [0:VIPT_TLB_ENTRIES-1];
+reg [36:0] vipt_tlb_q;
+
+always_ff @(posedge clk) begin
+    if (vipt_preread) begin
+        vipt_linear_r <= vipt_linear_addr;
+        // Record only collisions with the synchronous RAM read here. Validity
+        // is selected in EX from the registered index, keeping its 32:1 mux
+        // out of the D2 preread register input.
+        vipt_hazard_r <= invalidate_all ||
+                         (invalidate_page &&
+                          vipt_preread_index == invalidate_vpn[4:0]) ||
+                         (update_valid &&
+                          vipt_preread_index == update_vpn[4:0]) ||
+                         (vipt_refill_write &&
+                          vipt_preread_index == vipt_refill_index);
+        vipt_tlb_q <= vipt_tlb[vipt_preread_index];
+    end
+end
+
+wire vipt_match = vipt_valid[vipt_linear_r[16:12]] && !vipt_hazard_r &&
+                  (vipt_tlb_q[36:22] == vipt_linear_r[31:17]);
+assign vipt_is_vga_mem = vipt_match && vipt_tlb_q[0];
+
+always_comb begin
+    vipt_hit = vipt_match;
+    vipt_physical_addr = {vipt_tlb_q[21:2], vipt_linear_r[11:0]};
+    vipt_user = vipt_tlb_q[1];
+    if (!vipt_match) begin
+        vipt_physical_addr = vipt_linear_r;
+        vipt_user = 1'b0;
+    end
+end
+
+always_ff @(posedge clk) begin
+    if (update_valid)
+        vipt_tlb[update_vpn[4:0]] <= {update_vpn[19:5], update_pfn,
+                                      update_user,
+                                      update_pfn[19:5] == 15'h5};
+    else if (vipt_refill_write)
+        vipt_tlb[vipt_refill_index] <= {vipt_refill_linear[31:17],
+                                        vipt_refill_pfn,
+                                        vipt_refill_user,
+                                        vipt_refill_pfn[19:5] == 15'h5};
+end
+
+always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n)
+        vipt_valid <= '0;
+    else if (invalidate_all)
+        vipt_valid <= '0;
+    else if (invalidate_page)
+        vipt_valid[invalidate_vpn[4:0]] <= 1'b0;
+    else if (update_valid)
+        vipt_valid[update_vpn[4:0]] <= 1'b1;
+    else if (vipt_refill_write)
+        vipt_valid[vipt_refill_index] <= 1'b1;
+end
 
 // Output signals - combinational
 always_comb begin

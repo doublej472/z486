@@ -12,6 +12,8 @@ module segmentation_unit
     input              ctssaf_pulse,        // CTSSAF aluop: 608 pairs CTSSAF with SDEL, 74B STSSAF with IN=+
     input      [3:0]   seg_cmd,            // SEG_CMD_* command (computed stall-independently)
     input      [3:0]   seg_target,         // Target segment (SEG_ES..SEG_GDT, SEG_NONE)
+    input      [3:0]   exec_seg_cmd,       // Microcode command, independent of issue INIT_SEG
+    input      [3:0]   exec_seg_target,    // Microcode target, independent of issue INIT_SEG
     input              init_addr32,        // D2 instruction address size for INIT_SEG
     input              init_stack_op,      // D2 stack operation for INIT_SEG
     input              clear_descsw,       // DESSTK mode bit for UPDATE_SEG
@@ -51,6 +53,8 @@ module segmentation_unit
     output     [31:0]  seg_base_pending,   // Next seg_base_r (this cycle's pending base),
                                            // so z486 can pre-register linear_address = base+IND
     output             eff_mask_pending,   // Next (addr_size || is_dtable): 0 => mask offset to 16b
+    output     [31:0]  seg_base_exec,      // Pending base excluding issue-only INIT_SEG
+    output             eff_mask_exec,      // Pending mask excluding issue-only INIT_SEG
     output             seg_fault,          // Segment limit/protection fault
     output             is_stack_fault      // Fault is on SS (→ #SS not #GP)
 );
@@ -169,6 +173,48 @@ always_comb begin
 end
 assign seg_base_pending = seg_base_pending_c;
 assign eff_mask_pending = addr_size_pending_c || is_dtable_pending_c;
+// Compute the older microcode instruction's relocation view independently of
+// a simultaneous issue-time INIT_SEG.  This prevents D2 admission and its EA
+// from selecting the execution address register's base/mask inputs.
+reg [31:0] seg_base_exec_c;
+reg        addr_size_exec_c;
+reg        is_dtable_exec_c;
+always_comb begin
+    seg_base_exec_c = seg_base_r;
+    addr_size_exec_c = addr_size;
+    is_dtable_exec_c = is_dtable;
+    if (stssaf_pulse && seg_sel == SEG_SS)
+        seg_base_exec_c = SS_base;
+    case (exec_seg_cmd)
+        SEG_CMD_UPDATE_SEG: begin
+            is_dtable_exec_c = (exec_seg_target == SEG_IDT ||
+                                exec_seg_target == SEG_GDT);
+            if (clear_descsw) begin
+                seg_base_exec_c = seg_base_for(exec_seg_target, 1'b0);
+                addr_size_exec_c = pe ? desc_cache[SEG_SS].D_B : i_addr32_r;
+            end else if (exec_seg_target == SEG_IO) begin
+                seg_base_exec_c = 32'h0;
+                addr_size_exec_c = 1'b1;
+            end else begin
+                seg_base_exec_c = seg_base_for(exec_seg_target, descsw_mode);
+                addr_size_exec_c =
+                    ((i_stack_op_r || stack_push_mode) && pe &&
+                     exec_seg_target == SEG_SS)
+                    ? (descsw_mode ? desc_cache[SEG_CS].D_B
+                                   : desc_cache[SEG_SS].D_B)
+                    : i_addr32_r;
+            end
+        end
+        SEG_CMD_DESCSW: begin
+            seg_base_exec_c = CS_base;
+            addr_size_exec_c = pe ? desc_cache[SEG_CS].D_B : i_addr32_r;
+            is_dtable_exec_c = 1'b0;
+        end
+        default: ;
+    endcase
+end
+assign seg_base_exec = seg_base_exec_c;
+assign eff_mask_exec = addr_size_exec_c || is_dtable_exec_c;
 
 assign is_stack_fault = (seg_sel == SEG_SS);
 

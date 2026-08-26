@@ -45,6 +45,9 @@ module hardwired_control
     input  logic        any_fault_issue,
     input  logic        throttle_hold,
     input  logic        stall,
+    input  logic        load_pipe_issue,     // Direct load bypasses its ROM recipe
+    input  logic        load_wb_retire,      // Registered VIPT hit retires in WB
+    input  logic        load_probe_wait,     // D2 direct load is waiting to issue
 
     output recipe_meta_t issue_recipe,
     output logic        issue_hardwired,
@@ -57,6 +60,7 @@ module hardwired_control
     output recipe_state_t recipe_state,  // Latched execution recipe
     output logic        slot_stale,       // Suppress the reclaimed RNI slot
     output logic        fold_active,      // Jcc folded into predecessor delay slot
+    output logic        branch_ustep_rni,  // Hardwired branch supplies synthetic RNI
     output logic        branch_ustep_exec, // Execute hardwired branch uStep
     output logic        branch_redirect   // Hardwired branch redirects frontend
 );
@@ -114,19 +118,11 @@ endfunction
 
 function automatic logic hazard_uses(input ea_dec_t ea,
                                      input dec_entry_t entry,
-                                     input recipe_meta_t fc,
                                      input logic hazard,
-                                     input logic [2:0] widx,
-                                     input logic [2:0] hreg,
-                                     input logic [1:0] hsize);
+                                     input logic [2:0] widx);
     hazard_uses = hazard &&
         (ea.base_sel[widx] || ea.index_sel[widx] ||
-         (fc.reads_dst && gpr_overlap(hreg, hsize == 2'd0,
-                                      entry.dst_reg_sel, fc.op_byte)) ||
-         (fc.reads_src && gpr_overlap(hreg, hsize == 2'd0,
-                                      entry.src_reg_sel, fc.op_byte)) ||
-         (fc.reads_ecx && gpr_overlap(hreg, hsize == 2'd0, 3'd1, 1'b0)) ||
-         (entry.stack_op && (widx == 3'd4)));
+         entry.recipe_gpr_read_mask[widx]);
 endfunction
 
 //=============================================================================
@@ -149,29 +145,66 @@ wire [2:0] pred2_widx = (recipe_state.commit_sel == RECIPE_COMMIT_SIGSRC)
     : wide_widx(exec_instr.dst_reg_sel, op_size == 2'd0);
 wire ea2_conflict = ea_conflict(pred2_we, pred2_widx, issue_ea, issue_instr, 1'b0);
 
-wire mem_set = recipe_rni && uc_exec && (recipe_state.commit_sel == RECIPE_COMMIT_MEM);
+wire mem_set = recipe_rni && uc_exec &&
+               (recipe_state.commit_sel == RECIPE_COMMIT_MEM);
 wire mem_hazard = mem_set || mem_commit.valid;
 wire [2:0] mem_hreg = mem_set ? exec_instr.dst_reg_sel : mem_commit.dst;
 wire [1:0] mem_hsize = mem_set ? op_size : mem_commit.size;
 wire [2:0] mem_widx = wide_widx(mem_hreg, mem_hsize == 2'd0);
-wire mem_conf1 = hazard_uses(next_ea, next_instr, next_recipe, mem_hazard,
-                             mem_widx, mem_hreg, mem_hsize);
-wire mem_confN = hazard_uses(issue_ea, issue_instr, issue_recipe, mem_hazard,
-                             mem_widx, mem_hreg, mem_hsize);
+wire mem_conf1 = hazard_uses(next_ea, next_instr, mem_hazard, mem_widx);
+wire mem_confN = hazard_uses(issue_ea, issue_instr, mem_hazard, mem_widx);
+
+// MOVZX/MOVSX use SRCREG as their architectural destination in the original
+// microcode, while ordinary MOV uses DSTREG.  Normalize byte aliases as well
+// so a direct AH load blocks a successor that consumes EAX as an EA input.
+wire issue_load_is_movx = issue_instr.has_0f &&
+    ((issue_instr.opcode == 8'hB6) || (issue_instr.opcode == 8'hB7) ||
+     (issue_instr.opcode == 8'hBE) || (issue_instr.opcode == 8'hBF));
+wire [2:0] issue_load_dst = issue_load_is_movx
+                          ? issue_instr.src_reg_sel
+                          : issue_instr.dst_reg_sel;
+wire [2:0] issue_load_widx = wide_widx(issue_load_dst,
+                                      !issue_load_is_movx &&
+                                      (issue_instr.operand_size == 2'd0));
+wire load_conf1 = hazard_uses(next_ea, next_instr, 1'b1,
+                              issue_load_widx);
+wire issue_load_byte = !issue_load_is_movx &&
+                       (issue_instr.operand_size == 2'd0);
+wire load_fwd_conf1 =
+    (next_recipe.reads_dst &&
+     gpr_overlap(issue_load_dst, issue_load_byte,
+                 next_instr.dst_reg_sel, next_recipe.op_byte)) ||
+    (next_recipe.reads_src &&
+     gpr_overlap(issue_load_dst, issue_load_byte,
+                 next_instr.src_reg_sel, next_recipe.op_byte));
+// DSTREG/SRCREG readers have a registered WB bypass.  ECX-special and other
+// implicit readers retain the interlock until they gain their own narrow path.
+wire load_ecx_conf1 = next_recipe.reads_ecx && (issue_load_widx == 3'd1);
+wire load_unforwarded_conf1 = load_conf1 &&
+                              (!load_fwd_conf1 || load_ecx_conf1);
+// A plain direct load forwards registered cache data.  A direct ALU result
+// would instead cross the private ALU and a successor ALU/EA in one cycle;
+// keep independent overlap, but interlock that dependent successor until M3
+// commits.  Direct ALU recipes are the load-pipe class that writes flags.
+wire load_alu_result_conf1 = issue_recipe.writes_flags && load_fwd_conf1;
 
 wire shift_set = recipe_rni && uc_exec && (recipe_state.commit_sel == RECIPE_COMMIT_SHIFT);
 wire shift_hazard = shift_set || shift_commit.valid;
 wire [2:0] shift_hreg = shift_set ? exec_instr.dst_reg_sel : shift_commit.dst;
 wire [1:0] shift_hsize = shift_set ? op_size : shift_commit.size;
 wire [2:0] shift_widx = wide_widx(shift_hreg, shift_hsize == 2'd0);
-wire shift_conf1 = hazard_uses(next_ea, next_instr, next_recipe, shift_hazard,
-                               shift_widx, shift_hreg, shift_hsize);
-wire shift_confN = hazard_uses(issue_ea, issue_instr, issue_recipe, shift_hazard,
-                               shift_widx, shift_hreg, shift_hsize);
+wire shift_conf1 = hazard_uses(next_ea, next_instr, shift_hazard, shift_widx);
+wire shift_confN = hazard_uses(issue_ea, issue_instr, shift_hazard, shift_widx);
 
 wire next_chain_safe = decq_has2 && next_recipe.hardwired &&
     (!next_recipe.reads_flags || !issue_recipe.writes_flags || next_recipe.jcc) &&
     (!next_recipe.uses_ea || !ea1_conflict) && !mem_conf1 && !shift_conf1;
+// A direct ALU predecessor has not produced its result or flags at the D2
+// chain point. Plain-load register consumers use WB forwarding; dependent M3
+// register and flag consumers wait for architectural commit.
+wire next_load_chain_safe = next_chain_safe && !load_unforwarded_conf1 &&
+    !load_alu_result_conf1 &&
+    !(issue_recipe.writes_flags && next_recipe.reads_flags);
 
 wire loaduse_conflict =
     (issue_recipe.reads_dst && gpr_overlap(exec_instr.dst_reg_sel,
@@ -200,21 +233,29 @@ assign fold_active = jcc_fold_r && i_first;
 
 wire chain_after_single = i_issue && issue_hardwired &&
     ((!issue_recipe.multi_ustep && !issue_recipe.jcc) || fold_now) && next_chain_safe;
+wire chain_after_load = load_pipe_issue && next_load_chain_safe;
 wire chain_after_multi = recipe_state.hardwired && recipe_state.multi_ustep && uc_exec && uc_next_rni &&
     !i_issue && !i_rni_delay && !q_flush && head_chain_safe;
 wire chain_after_jcc = recipe_active && recipe_state.jcc && uc_exec && jcc_issue_valid_r &&
     !jcc_issue_taken_r && !q_flush && head_chain_safe && !jcc_fold_r;
-assign chain_start = (chain_after_single || chain_after_multi || chain_after_jcc) &&
+assign chain_start = (chain_after_single || chain_after_load ||
+                      chain_after_multi || chain_after_jcc) &&
     (!d2_valid || i_issue) && !d2_waited && !throttle_hold &&
     !interrupt_pending && !trap_active && !single_step && !any_fault_issue;
-assign chain_from_next = chain_after_single;
-assign chain_entry = chain_after_single ? next_instr.entry_point : issue_instr.entry_point;
+assign chain_from_next = chain_after_single || chain_after_load;
+assign chain_entry = (chain_after_single || chain_after_load)
+                   ? next_instr.entry_point : issue_instr.entry_point;
 
 //=============================================================================
 // Bounded branch uStep and recipe state
 //=============================================================================
 
-assign branch_ustep_exec = i_first && branch_ustep_r && uc_exec;
+// RNI describes the resident uStep and, like a ROM RNI bit, remains visible
+// while execution is stalled.  Keeping uc_exec out of this qualifier breaks
+// the D2-stall -> uc_exec -> synthetic-RNI -> D2-stall feedback cone.  The
+// redirect itself remains execution-qualified below.
+assign branch_ustep_rni = i_first && branch_ustep_r;
+assign branch_ustep_exec = branch_ustep_rni && uc_exec;
 assign branch_redirect = branch_ustep_exec &&
                          (!branch_ustep_jcc_r || jcc_issue_taken_r);
 
@@ -254,6 +295,10 @@ always_ff @(posedge clk) begin
                 (!issue_recipe.jcc || !jcc_unsafe);
             branch_ustep_jcc_r <= issue_instr.rel_branch_kind == REL_BRANCH_JCC;
         end
+        if (load_wb_retire && !i_issue) begin
+            recipe_state.commit_sel <= RECIPE_COMMIT_NONE;
+            recipe_state.slot_has_work <= 1'b0;
+        end
         if (any_fault || any_fault_r || interrupt_entry) begin
             recipe_state.hardwired <= 1'b0;
             recipe_state.multi_ustep <= 1'b0;
@@ -269,8 +314,17 @@ end
 always_ff @(posedge clk) begin
     if (!reset_n)
         slot_stale <= 1'b0;
-    else if (!stall)
-        slot_stale <= recipe_rni && uc_exec && !i_issue && !recipe_state.slot_has_work;
+    else if (!stall) begin
+        // A VIPT probe wait can outlive the stale-slot pulse. Keep ownership
+        // only while the same hardwired recipe remains at its RNI word;
+        // otherwise a stale state from an older recipe could suppress useful
+        // work after the sequencer has moved on.
+        if (slot_stale && recipe_rni && load_probe_wait && !i_issue)
+            slot_stale <= 1'b1;
+        else
+            slot_stale <= recipe_rni && (uc_exec || load_wb_retire) && !i_issue &&
+                          (!recipe_state.slot_has_work || load_wb_retire);
+    end
 end
 
 //=============================================================================

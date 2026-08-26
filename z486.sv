@@ -126,6 +126,7 @@ wire [31:0] muldiv_result;
 
 // ALU source data for operand access
 wire [31:0] source_value_live;
+wire [31:0] memory_write_source_value;
 wire [31:0] alu_src_data;
 wire [31:0] protun_write_value;
 wire [15:0] cs_source_value;
@@ -238,6 +239,8 @@ wire        decoder_fetch_blocked;
 // Physical cache channels connect paging, memory arbitration, and x87.
 wire        dcache_req_valid;
 wire [31:0] dcache_req_phys_addr_raw;
+wire [11:0] dcache_req_preread_offset;
+wire        dcache_req_preread_priority;
 wire        dcache_req_write;
 wire [3:0]  dcache_req_be;
 wire [31:0] dcache_req_wdata;
@@ -250,6 +253,18 @@ wire        dcache_req_accepted;
 wire        dcache_req_complete;
 wire        dcache_read_complete;
 wire [31:0] dcache_rdata;
+wire        dcache_vipt_probe_valid;
+wire [11:0] dcache_vipt_probe_offset;
+wire        dcache_vipt_probe_ready;
+wire        dcache_vipt_probe_accepted;
+wire        dcache_vipt_resolve_valid;
+wire [31:0] dcache_vipt_resolve_phys_addr;
+wire        dcache_vipt_resolve_hit;
+wire [31:0] dcache_vipt_resolve_data;
+wire        vipt_tlb_hit;
+wire [31:0] vipt_tlb_phys_addr;
+wire        vipt_tlb_user;
+wire        vipt_tlb_is_vga_mem;
 wire        icache_req_valid;
 wire [31:0] icache_req_phys_addr_raw;
 wire        icache_req_accepted;
@@ -311,6 +326,7 @@ wire       i_issue;                 // D2 transfers one instruction into EX
 reg        i_first;                 // First ucode execution cycle after issue
 wire       i_rni;                   // RNI detected in this cycle (combinational from uc bits)
 wire       i_rni_delay;             // RNI delay slot - RNI has been executed. this is last instruction cycle
+wire       i_rni_delay_ea;          // Physically local copy for EA forwarding
 
 // Interrupt-controller outputs used by D2 admission and execution boundaries.
 wire       intr_pending;
@@ -333,6 +349,8 @@ wire       d2_push;                 // Decoder completed the resident D2 payload
 reg        d2_valid_r;
 reg        d2_waited_r;             // D2 held after predecessor delay slot
 reg        d2_stale_slot_r;         // D2 also waited during predecessor delay slot
+reg        d2_ea_split_done_r;      // D2a captured base + scaled index
+wire       d2_ea_split_wait;        // Three-term EA needs its D2a cycle
 reg        throttle_parked_r;       // predecessor retired; successor D2 waits for rate debt
 wire [11:0] d2_entry_r;             // Effective entry resident in D2
 wire        d2_rom_mem_resident;    // D2 entry tag aligned with ROM q_mem
@@ -355,6 +373,7 @@ wire       recipe_slot_stale;               // Reclaimed RNI slot is stale
 wire       hardwired_off;                    // Simulation-only disable
 wire       recipe_rni;                       // Current uStep contains RNI
 wire       branch_ustep_redirect;     // bounded branch uStep redirects frontend
+wire       branch_ustep_rni;          // synthetic RNI, independent of execution stall
 wire       branch_ustep_exec;         // execute bounded branch uStep this cycle
 recipe_meta_t d2_recipe;             // D2 instruction's generated recipe class
 wire       x87_direct_candidate;              // D2 entry is the direct x87 overlay
@@ -363,6 +382,66 @@ wire       chain_start;                // launch a chained hardwired successor
 wire       chain_from_next;               // successor comes from registered skid entry
 wire [11:0] chain_entry;          // chained successor's ROM entry
 wire       jcc_fold_active;            // not-taken Jcc occupies reclaimed slot
+wire       d2_vipt_candidate;          // Hardwired MOV/MOVX register load
+wire       d2_vipt_load;               // Candidate accepted by the VIPT probe
+wire       d2_vipt_alu;                // ALU register,memory via registered VIPT data
+wire       d2_vipt_ea_hazard;          // Pending direct load owns a D2 EA input
+wire       d2_vipt_older_store;         // Current EX uop must enter paging before a younger load
+wire [2:0] d2_vipt_dst;
+wire [7:0] d2_vipt_dst_onehot;
+wire [1:0] d2_vipt_mem_size;
+wire [1:0] d2_vipt_write_size;
+hardwired_load_result_t d2_vipt_result_kind;
+hardwired_load_token_t vipt_load_ex_r; // D2-owned preread resolves in EX
+hardwired_load_token_t vipt_load_replay_r; // Younger probe saved behind a miss
+hardwired_load_payload_t vipt_load_slow_r; // Miss owned by normal paging
+reg        vipt_load_slow_req_r;
+reg        vipt_load_slow_wait_r;
+reg        vipt_load_wb_valid_r;       // Registered load retires in WB
+reg        vipt_load_ex_probed_r;      // EX token owns valid cache/TLB prereads
+reg [31:0] vipt_load_wb_data_r;
+reg [2:0]  vipt_load_wb_dst_r;
+reg [1:0]  vipt_load_wb_size_r;
+reg        vipt_load_wb_is_alu_r;
+reg [4:0]  vipt_load_wb_alu_op_r;
+reg        vipt_load_rom_shadow_r;     // Held D2 load owns the resident 019 RD
+wire       vipt_load_slow_busy = vipt_load_slow_req_r || vipt_load_slow_wait_r;
+wire       vipt_load_busy = vipt_load_ex_r.valid || vipt_load_replay_r.valid ||
+                            vipt_load_slow_busy || vipt_load_wb_valid_r;
+wire       vipt_load_retire;
+
+function automatic [31:0] format_hardwired_load(
+    input [31:0] raw,
+    input [1:0] lane,
+    input [1:0] mem_size,
+    input hardwired_load_result_t result_kind
+);
+    logic [31:0] shifted;
+    begin
+        shifted = raw >> {lane, 3'b000};
+        case (mem_size)
+            2'd0: begin
+                case (result_kind)
+                    LOAD_RESULT_SIGN_EXTEND:
+                        format_hardwired_load = {{24{shifted[7]}}, shifted[7:0]};
+                    default:
+                        format_hardwired_load = {24'd0, shifted[7:0]};
+                endcase
+            end
+            2'd1: begin
+                case (result_kind)
+                    LOAD_RESULT_SIGN_EXTEND:
+                        format_hardwired_load = {{16{shifted[15]}}, shifted[15:0]};
+                    default:
+                        format_hardwired_load = {16'd0, shifted[15:0]};
+                endcase
+            end
+            default: format_hardwired_load = shifted;
+        endcase
+    end
+endfunction
+
+wire [31:0] vipt_load_wb_data = vipt_load_wb_data_r;
 
 // Empty D2 may launch directly from D1. Otherwise the resident D2 skeleton
 // supplies a registered entry address when the current instruction ends.
@@ -397,11 +476,24 @@ wire        throttle_atomic_chain = recipe_state.hardwired && uc_active && i_rni
 wire        throttle_release_cycle = throttle_parked_r && throttle_release_ready;
 
 assign     d2_valid = d2_valid_r;
-assign     d2_ready = d2_push && !stall &&
+wire       d2_payload_ready = d2_push && !d2_ea_split_wait;
+wire       d2_ready_base = d2_payload_ready && !stall &&
                       (!throttle_hold || throttle_atomic_chain ||
                        throttle_release_cycle) && !any_fault_issue &&
                       !(i_rni && tf_trap_pending && !single_step) &&
-                      !interrupt_at_boundary && !q_flush;
+                      !interrupt_at_boundary && !q_flush &&
+                      !d2_vipt_ea_hazard;
+// An occupied EX stage may accept only another direct load. If the older load
+// misses, the accepted younger token moves to the replay slot on this edge.
+wire       d2_vipt_pipe_ready = d2_vipt_candidate &&
+                                dcache_vipt_probe_ready &&
+                                vipt_load_ex_probed_r &&
+                                !vipt_load_replay_r.valid &&
+                                !vipt_load_slow_busy && !single_step;
+assign     d2_ready = d2_ready_base &&
+                      !vipt_load_replay_r.valid && !vipt_load_slow_busy &&
+                      (!d2_vipt_candidate || d2_vipt_load) &&
+                      (!vipt_load_ex_r.valid || d2_vipt_pipe_ready);
 assign     i_issue = d2_valid && d2_ready;
 
 wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
@@ -415,9 +507,10 @@ wire       stall_wio = (uc_is_wio && !interrupt_pending && !single_step);
 wire       stall_x87_direct;
 wire       stall_invlpg;
 // An entry may reach the ROM before its D2 literals arrive. Let the ending
-// instruction execute its architectural RNI delay slot, then hold the ROM word
-// until D2 can transfer it to EX.
-wire       stall_d2 = d2_valid && !d2_push && !i_rni_delay;
+// instruction execute its architectural RNI and delay slot, then hold the ROM
+// word until D2 can transfer it to EX. The RNI cycle can also prepare a split
+// EA; stalling it would suppress the current instruction's delay-slot writeback.
+wire       stall_d2 = d2_valid && !d2_payload_ready && !i_rni && !i_rni_delay;
 wire       stall = stall_mem || stall_wio || stall_d2 || stall_x87_direct ||
                    stall_invlpg;
 
@@ -428,9 +521,13 @@ wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight)
 
 // uc_exec: master enable for microcode execution
 wire       d2_release_hold = d2_valid && (d2_waited_r || d2_stale_slot_r);
+// A blocked direct load leaves the Jcc ROM delay word resident after the
+// synthetic branch uStep. Keep its stale PREF from redirecting the frontend.
 wire       uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) &&
                      !stall_wio && !stall_d2 && !stall_x87_direct && !stall_invlpg &&
-                     !d2_release_hold && !throttle_parked_r && !recipe_slot_stale;
+                     !d2_release_hold && !throttle_parked_r && !recipe_slot_stale &&
+                     !vipt_load_busy &&
+                     !(vipt_load_rom_shadow_r && recipe_state.jcc);
 wire       uc_exec_writeback = uc_exec;  // local copies for reducing fanout
 wire       uc_exec_shift = uc_exec;
 
@@ -442,6 +539,21 @@ wire       decq_empty;        // Legacy name: unified D2 has no skeleton
 dec_entry_t i_bus2;           // Registered D1 skid successor
 dec_entry_t i;                // Current instruction (latched at i_issue; written far below)
 wire       decq_has2;         // i_bus2 is valid
+
+// A direct load may remain in EX, replay, slow-path, or WB state after the
+// frontend has prepared its successor. Unlike ordinary source operands, an
+// effective address is captured on i_issue, so waiting until i_first is too
+// late to observe the load's architectural writeback. Hold only successors
+// whose base/index (or implicit stack pointer) consumes a pending destination;
+// independent direct loads retain one-per-cycle throughput.
+wire [7:0] d2_ea_read_mask = i_bus.ea_base_onehot |
+                             i_bus.ea_index_onehot |
+                             (i_bus.stack_op ? 8'h10 : 8'h00);
+wire [7:0] vipt_pending_dst_mask =
+    (vipt_load_ex_r.valid     ? vipt_load_ex_r.dst_onehot     : 8'h00) |
+    (vipt_load_replay_r.valid ? vipt_load_replay_r.dst_onehot : 8'h00) |
+    (vipt_load_slow_busy      ? vipt_load_slow_r.dst_onehot   : 8'h00);
+assign d2_vipt_ea_hazard = |(d2_ea_read_mask & vipt_pending_dst_mask);
 
 dec_entry_t d2_entry;         // entry completing D2 this cycle (AGU/i_entry source)
 ea_dec_t    d2_agu_dec;       // EA decode for d2_entry
@@ -492,6 +604,8 @@ memory #(
 
     .dcache_req_valid(dcache_req_valid),
     .dcache_req_phys_addr_raw(dcache_req_phys_addr_raw),
+    .dcache_req_preread_offset(dcache_req_preread_offset),
+    .dcache_req_preread_priority(dcache_req_preread_priority),
     .dcache_req_write(dcache_req_write),
     .dcache_req_be(dcache_req_be),
     .dcache_req_wdata(dcache_req_wdata),
@@ -503,6 +617,14 @@ memory #(
     .dcache_req_complete(dcache_req_complete),
     .dcache_read_complete(dcache_read_complete),
     .dcache_rdata(dcache_rdata),
+    .dcache_vipt_probe_valid(dcache_vipt_probe_valid),
+    .dcache_vipt_probe_offset(dcache_vipt_probe_offset),
+    .dcache_vipt_probe_ready(dcache_vipt_probe_ready),
+    .dcache_vipt_probe_accepted(dcache_vipt_probe_accepted),
+    .dcache_vipt_resolve_valid(dcache_vipt_resolve_valid),
+    .dcache_vipt_resolve_phys_addr_raw(dcache_vipt_resolve_phys_addr),
+    .dcache_vipt_resolve_hit(dcache_vipt_resolve_hit),
+    .dcache_vipt_resolve_data(dcache_vipt_resolve_data),
 
     .x87_req_selected(x87_req_selected),
     .x87_req_accepted(x87_req_accepted),
@@ -696,9 +818,6 @@ function automatic ea_dec_t ea_decode_of(input dec_entry_t e);
         // for addressing forms without a displacement.
         r.disp = e.displacement;
 
-        // Intel 386 POP r/m with an ESP base uses post-increment ESP.
-        if (e.ea_uses_post_pop_esp)
-            r.disp = e.displacement + (e.data32 ? 32'd4 : 32'd2);
     end
     ea_decode_of = r;
 endfunction
@@ -737,7 +856,7 @@ hardwired_control hardwired_control_inst (
     .next_ea(chain_next_ea),
     .decq_has2(decq_has2),
     .decq_empty(decq_empty),
-    .d2_push(d2_push),
+    .d2_push(d2_payload_ready),
     .d2_kind(d2_kind),
     .d2_valid(d2_valid),
     .d2_waited(d2_waited_r),
@@ -749,7 +868,9 @@ hardwired_control hardwired_control_inst (
     .i_rni_delay(i_rni_delay),
     .uc_next_rni(uc_next[10:8] == 3'b000),
     .uc_aluop(uc_aluop),
-    .alu_write_flags(uc_exec && alu_update_flags),
+    .alu_write_flags((uc_exec && alu_update_flags) ||
+                     (vipt_load_wb_valid_r && vipt_load_wb_is_alu_r &&
+                      !any_fault)),
     .flags_live(eflags_fwd),
     .flags_ahead(eflags_ahead),
     .op_size(op_size),
@@ -765,6 +886,9 @@ hardwired_control hardwired_control_inst (
     .any_fault_issue(any_fault_issue),
     .throttle_hold(throttle_hold),
     .stall(stall),
+    .load_pipe_issue(vipt_issue_load),
+    .load_wb_retire(vipt_load_retire),
+    .load_probe_wait(d2_valid && d2_vipt_candidate && !d2_vipt_load),
     .issue_recipe(d2_recipe),
     .issue_hardwired(d2_hardwired),
     .x87_direct_candidate(x87_direct_candidate),
@@ -776,6 +900,7 @@ hardwired_control hardwired_control_inst (
     .recipe_state(recipe_state),
     .slot_stale(recipe_slot_stale),
     .fold_active(jcc_fold_active),
+    .branch_ustep_rni(branch_ustep_rni),
     .branch_ustep_exec(branch_ustep_exec),
     .branch_redirect(branch_ustep_redirect)
 );
@@ -787,6 +912,7 @@ always_ff @(posedge clk) begin
         d2_valid_r <= 1'b0;
         d2_waited_r <= 1'b0;
         d2_stale_slot_r <= 1'b0;
+        d2_ea_split_done_r <= 1'b0;
         throttle_parked_r <= 1'b0;
         stack_init_pending <= 1'b0;
     end else begin
@@ -795,12 +921,19 @@ always_ff @(posedge clk) begin
             d2_stale_slot_r <= 1'b0;
         end else if (stall_d2) begin
             d2_waited_r <= 1'b1;
-        end else if (d2_valid && !d2_push && i_rni_delay &&
+        end else if (d2_valid && !d2_payload_ready && i_rni_delay &&
                      (uc_exec || recipe_slot_stale)) begin
             // q remains on the predecessor's slot while D2 waits. Suppress
             // that stale word when D2 becomes ready on the following cycle.
             d2_stale_slot_r <= 1'b1;
         end
+
+        if (q_flush || any_fault)
+            d2_ea_split_done_r <= 1'b0;
+        else if (d2_ea_split_wait)
+            d2_ea_split_done_r <= 1'b1;
+        else if (d2_start || i_issue)
+            d2_ea_split_done_r <= 1'b0;
 
         if (!d2_valid || i_issue || q_flush || any_fault ||
             interrupt_at_boundary || throttle_full)
@@ -843,6 +976,193 @@ always_ff @(posedge clk) begin
             d2_valid_r <= 1'b0;
     end
 end
+
+// The direct load pipeline admits a younger D2 probe while the older token
+// resolves in EX. A miss transfers the older token to normal paging and saves
+// the already-consumed younger token in one replay slot.
+wire vipt_page_enabled = CR0[31];
+wire vipt_user_ok = (pg_cpl != 2'd3) || vipt_tlb_user;
+wire vipt_translation_ok = !vipt_page_enabled ||
+                           (vipt_tlb_hit && vipt_user_ok);
+wire [31:0] vipt_resolve_phys = vipt_page_enabled
+                              ? vipt_tlb_phys_addr : vipt_load_ex_r.linear_addr;
+wire vipt_load_ex_contained =
+    (vipt_load_ex_r.mem_size == 2'd0) ||
+    ((vipt_load_ex_r.mem_size == 2'd1) &&
+     (vipt_load_ex_r.lane != 2'd3)) ||
+    ((vipt_load_ex_r.mem_size == 2'd2) &&
+     (vipt_load_ex_r.lane == 2'd0));
+wire vipt_load_ex_hit = vipt_load_ex_r.valid && vipt_load_ex_probed_r &&
+                        vipt_load_ex_contained &&
+                        vipt_translation_ok &&
+                        !vipt_tlb_is_vga_mem && !seg_gp_fault &&
+                        dcache_vipt_resolve_hit;
+wire vipt_load_alu_dst_capture_fast = vipt_load_ex_hit && !any_fault &&
+                                      vipt_load_ex_r.is_alu;
+wire vipt_load_alu_dst_capture_slow = vipt_load_slow_wait_r &&
+                                      !mem_servicing &&
+                                      vipt_load_slow_r.is_alu;
+wire vipt_load_alu_dst_capture = vipt_load_alu_dst_capture_fast ||
+                                 vipt_load_alu_dst_capture_slow;
+wire [2:0] vipt_load_alu_dst_capture_dst =
+    vipt_load_alu_dst_capture_fast ? vipt_load_ex_r.dst
+                                   : vipt_load_slow_r.dst;
+wire [1:0] vipt_load_alu_dst_capture_size =
+    vipt_load_alu_dst_capture_fast ? vipt_load_ex_r.write_size
+                                   : vipt_load_slow_r.write_size;
+wire vipt_replay_try = vipt_load_replay_r.valid &&
+                       !vipt_load_ex_r.valid && !vipt_load_slow_busy &&
+                       !mem_servicing &&
+                       dcache_vipt_probe_ready;
+wire vipt_issue_load = i_issue && d2_vipt_load;
+wire vipt_issue_store_wait = vipt_issue_load && d2_vipt_older_store;
+wire [31:0] vipt_probe_linear = vipt_replay_try
+                              ? vipt_load_replay_r.linear_addr
+                              : issue_ind_linear;
+
+assign dcache_vipt_probe_valid = vipt_issue_load || vipt_replay_try;
+assign dcache_vipt_probe_offset = vipt_probe_linear[11:0];
+assign dcache_vipt_resolve_valid = vipt_load_ex_r.valid &&
+                                   vipt_load_ex_probed_r &&
+                                   vipt_translation_ok &&
+                                   !vipt_tlb_is_vga_mem && !seg_gp_fault;
+assign dcache_vipt_resolve_phys_addr = vipt_resolve_phys;
+
+// A synthetic RNI is required only when the direct pipeline drains. Interior
+// load boundaries are represented by their D2 issue and WB commit tokens.
+assign vipt_load_retire = vipt_load_wb_valid_r &&
+                          !vipt_load_ex_r.valid &&
+                          !vipt_load_replay_r.valid &&
+                          !vipt_load_slow_busy;
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        vipt_load_ex_r <= '0;
+        vipt_load_replay_r <= '0;
+        vipt_load_slow_r <= '0;
+        vipt_load_slow_req_r <= 1'b0;
+        vipt_load_slow_wait_r <= 1'b0;
+        vipt_load_wb_valid_r <= 1'b0;
+        vipt_load_ex_probed_r <= 1'b0;
+        vipt_load_wb_data_r <= 32'd0;
+        vipt_load_wb_dst_r <= 3'd0;
+        vipt_load_wb_size_r <= 2'd2;
+        vipt_load_wb_is_alu_r <= 1'b0;
+        vipt_load_wb_alu_op_r <= 5'd0;
+        vipt_load_rom_shadow_r <= 1'b0;
+    end else begin
+        vipt_load_wb_valid_r <= 1'b0;
+
+        if (i_rni_delay && d2_vipt_candidate)
+            vipt_load_rom_shadow_r <= 1'b1;
+        if (i_issue || !d2_valid || !d2_vipt_candidate || q_flush || any_fault)
+            vipt_load_rom_shadow_r <= 1'b0;
+
+        // The EX slot normally advances or empties every cycle.
+        vipt_load_ex_r.valid <= 1'b0;
+        vipt_load_ex_probed_r <= 1'b0;
+
+        if (vipt_replay_try && dcache_vipt_probe_accepted) begin
+            vipt_load_ex_r <= vipt_load_replay_r;
+            vipt_load_ex_probed_r <= 1'b1;
+            vipt_load_replay_r.valid <= 1'b0;
+        end
+
+        if (vipt_load_ex_r.valid) begin
+            if (!vipt_load_ex_probed_r) begin
+                vipt_load_replay_r <= vipt_load_ex_r;
+            end else if (vipt_load_ex_hit && !any_fault) begin
+                vipt_load_wb_valid_r <= 1'b1;
+                vipt_load_wb_data_r <= format_hardwired_load(
+                    dcache_vipt_resolve_data, vipt_load_ex_r.lane,
+                    vipt_load_ex_r.mem_size, vipt_load_ex_r.result_kind);
+                vipt_load_wb_dst_r <= vipt_load_ex_r.dst;
+                vipt_load_wb_size_r <= vipt_load_ex_r.write_size;
+                vipt_load_wb_is_alu_r <= vipt_load_ex_r.is_alu;
+                vipt_load_wb_alu_op_r <= vipt_load_ex_r.alu_op;
+            end else if (!any_fault) begin
+                vipt_load_slow_r.linear_addr <= vipt_load_ex_r.linear_addr;
+                vipt_load_slow_r.restart_eip <= vipt_load_ex_r.restart_eip;
+                vipt_load_slow_r.dst <= vipt_load_ex_r.dst;
+                vipt_load_slow_r.dst_onehot <= vipt_load_ex_r.dst_onehot;
+                vipt_load_slow_r.mem_size <= vipt_load_ex_r.mem_size;
+                vipt_load_slow_r.lane <= vipt_load_ex_r.lane;
+                vipt_load_slow_r.write_size <= vipt_load_ex_r.write_size;
+                vipt_load_slow_r.result_kind <= vipt_load_ex_r.result_kind;
+                vipt_load_slow_r.is_alu <= vipt_load_ex_r.is_alu;
+                vipt_load_slow_r.alu_op <= vipt_load_ex_r.alu_op;
+                vipt_load_slow_req_r <= 1'b1;
+            end
+        end
+
+        if (vipt_issue_load) begin
+            if (vipt_load_ex_r.valid && !vipt_load_ex_hit) begin
+                vipt_load_replay_r.valid <= 1'b1;
+                vipt_load_replay_r.linear_addr <= issue_ind_linear;
+                vipt_load_replay_r.restart_eip <= EIP;
+                vipt_load_replay_r.dst <= d2_vipt_dst;
+                vipt_load_replay_r.dst_onehot <= d2_vipt_dst_onehot;
+                vipt_load_replay_r.mem_size <= d2_vipt_mem_size;
+                vipt_load_replay_r.lane <= issue_ind_linear_low;
+                vipt_load_replay_r.write_size <= d2_vipt_write_size;
+                vipt_load_replay_r.result_kind <= d2_vipt_result_kind;
+                vipt_load_replay_r.is_alu <= d2_vipt_alu;
+                vipt_load_replay_r.alu_op <= i_bus.decoded_alu_op;
+            end else begin
+                vipt_load_ex_r.valid <= 1'b1;
+                vipt_load_ex_probed_r <= dcache_vipt_probe_accepted &&
+                                          !vipt_issue_store_wait;
+                vipt_load_ex_r.linear_addr <= issue_ind_linear;
+                vipt_load_ex_r.restart_eip <= EIP;
+                vipt_load_ex_r.dst <= d2_vipt_dst;
+                vipt_load_ex_r.dst_onehot <= d2_vipt_dst_onehot;
+                vipt_load_ex_r.mem_size <= d2_vipt_mem_size;
+                vipt_load_ex_r.lane <= issue_ind_linear_low;
+                vipt_load_ex_r.write_size <= d2_vipt_write_size;
+                vipt_load_ex_r.result_kind <= d2_vipt_result_kind;
+                vipt_load_ex_r.is_alu <= d2_vipt_alu;
+                vipt_load_ex_r.alu_op <= i_bus.decoded_alu_op;
+            end
+        end
+
+        if (vipt_load_slow_req_r && mem_accepted) begin
+            vipt_load_slow_req_r <= 1'b0;
+            vipt_load_slow_wait_r <= 1'b1;
+        end
+        // Paging assembles crossing reads in OPR_R.  Wait until its ownership
+        // drops rather than treating the first fragment as a completed load.
+        if (vipt_load_slow_wait_r && !mem_servicing) begin
+            vipt_load_slow_wait_r <= 1'b0;
+            vipt_load_wb_valid_r <= 1'b1;
+            vipt_load_wb_data_r <= format_hardwired_load(
+                OPR_R, 2'd0, vipt_load_slow_r.mem_size,
+                vipt_load_slow_r.result_kind);
+            vipt_load_wb_dst_r <= vipt_load_slow_r.dst;
+            vipt_load_wb_size_r <= vipt_load_slow_r.write_size;
+            vipt_load_wb_is_alu_r <= vipt_load_slow_r.is_alu;
+            vipt_load_wb_alu_op_r <= vipt_load_slow_r.alu_op;
+        end
+
+        if (q_flush || any_fault || interrupt_entry) begin
+            vipt_load_ex_r.valid <= 1'b0;
+            vipt_load_replay_r.valid <= 1'b0;
+            vipt_load_slow_req_r <= 1'b0;
+            vipt_load_slow_wait_r <= 1'b0;
+            vipt_load_wb_valid_r <= 1'b0;
+            vipt_load_ex_probed_r <= 1'b0;
+        end
+    end
+end
+
+// synthesis translate_off
+always_ff @(posedge clk) begin
+    if (reset_n && i_issue && d2_vipt_load && !dcache_vipt_probe_ready)
+        $fatal(1, "VIPT load issued without an accepted D2 preread");
+    if (reset_n && vipt_issue_load && vipt_load_ex_r.valid &&
+        !vipt_load_ex_hit && vipt_load_replay_r.valid)
+        $fatal(1, "VIPT replay token overflow");
+end
+// synthesis translate_on
 
 always_ff @(posedge clk) begin
     if (i_issue)
@@ -931,30 +1251,28 @@ endfunction
 // Predecode from uc_next (the microword that becomes uc next cycle); register on
 // the same enable as uc so dly_gpr_*_pre_r tracks decode_dly_gpr(uc_dest).
 wire [5:0] dly_gpr_pre   = decode_dly_gpr(uc_next[30:24]);
-wire       dly_is_irf_pre = (uc_next[30:24] == DEST_IRF);
 reg        dly_gpr_we_pre_r;
 reg [2:0]  dly_gpr_sel_pre_r;
 reg [1:0]  dly_gpr_mode_pre_r;
-reg        dly_is_irf_pre_r;
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         dly_gpr_we_pre_r <= 1'b0; dly_gpr_sel_pre_r <= 3'd0;
-        dly_gpr_mode_pre_r <= FWD_D; dly_is_irf_pre_r <= 1'b0;
+        dly_gpr_mode_pre_r <= FWD_D;
     end else if (microcode_rom_ce) begin
         dly_gpr_we_pre_r   <= dly_gpr_pre[5];
         dly_gpr_sel_pre_r  <= dly_gpr_pre[4:2];
         dly_gpr_mode_pre_r <= dly_gpr_pre[1:0];
-        dly_is_irf_pre_r   <= dly_is_irf_pre;
     end
 end
 
-// Functional descriptor: registered predecode, IRF index taken live from COUNTR.
+// Functional descriptor: destination and width were resolved in the preceding
+// ROM cycle, including the uncommon COUNTR-selected IRF destination.
 // !recipe_slot_stale: a hardwired instruction's slot word is stale and writes nothing;
 // its result committed at the entry-word cycle, so the register file is current.
-wire       dly_gpr_we   = i_rni_delay && !recipe_slot_stale &&
-                          (dly_is_irf_pre_r ? (COUNTR[5:3] != 3'b100) : dly_gpr_we_pre_r);
-wire [2:0] dly_gpr_sel  = dly_is_irf_pre_r ? COUNTR[2:0]              : dly_gpr_sel_pre_r;
-wire [1:0] dly_gpr_mode = dly_is_irf_pre_r ? (is_dword ? FWD_D : FWD_W) : dly_gpr_mode_pre_r;
+wire       dly_gpr_we   = i_rni_delay_ea && !recipe_slot_stale &&
+                          dly_gpr_we_pre_r;
+wire [2:0] dly_gpr_sel  = dly_gpr_sel_pre_r;
+wire [1:0] dly_gpr_mode = dly_gpr_mode_pre_r;
 gpr_forward_t dly_gpr_forward;
 assign dly_gpr_forward.valid = dly_gpr_we;
 assign dly_gpr_forward.dst = dly_gpr_sel;
@@ -964,11 +1282,18 @@ assign dly_gpr_forward.data = dly_fwd_value;
 wire       dly_esp_fwd = dly_gpr_we && (dly_gpr_sel == 3'd4);
 wire       shc_esp_fwd = recipe_shift_write.valid && (recipe_shift_write.dst == 3'd4) &&
                          (recipe_shift_write.size != 2'd0);
+wire       vipt_esp_fwd = vipt_load_wb_valid_r &&
+                          (vipt_load_wb_size_r != 2'd0) &&
+                          (vipt_load_wb_dst_r == 3'd4);
+wire [31:0] vipt_esp_value = (vipt_load_wb_size_r == 2'd1)
+                           ? {ESP[31:16], vipt_load_wb_data[15:0]}
+                           : vipt_load_wb_data;
 wire [31:0] forwarded_esp = recipe_esp_fwd ? SIGMA :
                             dly_esp_fwd  ? dly_fwd_value :
                             shc_esp_fwd  ? (recipe_shift_write.size == 2'd1
                                             ? {ESP[31:16], recipe_shift_data[15:0]}
-                                            : recipe_shift_data) : ESP;
+                                            : recipe_shift_data) :
+                            vipt_esp_fwd ? vipt_esp_value : ESP;
 
 // D1 supplies registered selectors to the Address Unit. Literal displacement
 // remains a D2 value and is consumed when the instruction fires.
@@ -982,9 +1307,15 @@ wire [31:0] ea_base_value;
 wire [31:0] ea_index_value;
 wire [31:0] ea_early;
 wire [31:0] issue_ind_linear;
+wire [1:0]  issue_ind_linear_low;
 
 // D2-AGU observer
 assign d2_agu_dec = ea_decode_of(d2_entry);
+// Decoder completion may describe the incoming entry while the current D2
+// instruction issues.  Do not consume its split cycle until that entry is
+// actually resident, or the partial sum can retain the previous selectors.
+wire d2_ea_three_term = d2_valid && d2_push &&
+                        (d2_entry.ea_complex || d2_entry.ea_uses_post_pop_esp);
 wire [31:0] d2_agu_base  = onehot_gpr_mux(d2_agu_dec.base_sel);
 wire [31:0] d2_agu_index = onehot_gpr_mux(d2_agu_dec.index_sel);
 wire [63:0] d2_agu_prep  = ea_scale_operands(
@@ -1053,6 +1384,21 @@ wire [7:0] ea_inval_gpr =
         ? gpr_wr_expand(i.src_reg_sel) : 8'h0) |
     ((uc_exec && recipe_rni && !any_fault && recipe_state.commit_sel == RECIPE_COMMIT_ESP)
         ? 8'h10 : 8'h0);
+// A split EA is refreshed throughout its D2 residency. If a deferred producer
+// writes a base/index on the prospective issue edge, hold D2 for one more
+// cycle so the registered partial sum captures the forwarded value.
+wire [7:0] d2_split_commit_mask =
+    (dly_gpr_we ? (8'h01 << dly_gpr_sel) : 8'h00) |
+    (recipe_shift_write.valid ? gpr_wr_expand(recipe_shift_write.dst) : 8'h00) |
+    (vipt_load_wb_valid_r
+        ? (8'h01 << ((vipt_load_wb_size_r == 2'd0)
+                       ? {1'b0, vipt_load_wb_dst_r[1:0]}
+                       : vipt_load_wb_dst_r)) : 8'h00);
+wire d2_ea_split_refresh = d2_ea_split_done_r &&
+    (((d2_agu_dec.base_sel | d2_agu_dec.index_sel) &
+      d2_split_commit_mask) != 8'h00);
+assign d2_ea_split_wait = d2_ea_three_term &&
+                          (!d2_ea_split_done_r || d2_ea_split_refresh);
 // Clear-all events: segment state may change under any committed seg
 // command or descriptor load; the effective-mask mode must be stable.
 reg d2_agu_effmask_r;
@@ -1095,12 +1441,17 @@ wire        mem_is_dtable;
 wire        tss_access_flag;
 wire [31:0] seg_base_pending;  // next seg_base_r from seg unit; for unified linear_address relocate
 wire        eff_mask_pending;  // next (addr_size||is_dtable) from seg unit; 0 => mask offset to 16b
+wire [31:0] seg_base_exec;     // microcode relocation view, excluding issue INIT_SEG
+wire        eff_mask_exec;
 wire [31:0] seg_lar_result, seg_llim_result, seg_lbas_result;
 
 // Segmentation unit command encoder
 reg  [3:0]  seg_cmd;
 reg  [3:0]  seg_cmd_target;
 reg  [31:0] seg_cmd_data;
+reg  [3:0]  uc_seg_cmd;
+reg  [3:0]  uc_seg_target;
+reg  [31:0] uc_seg_data;
 // Decoded instruction register (all fields from decoder, latched at i_issue)
 // dec_entry_t i; -- declaration moved up beside i_bus2 (Quartus cannot
 // forward-reference struct members from the fast-chain gates)
@@ -1141,6 +1492,8 @@ segmentation_unit seg_unit (
     .ctssaf_pulse     (uc_exec && uc_aluop == ALUJMP_CTSSAF),
     .seg_cmd          (seg_cmd),
     .seg_target       (seg_cmd_target),
+    .exec_seg_cmd     (uc_seg_cmd),
+    .exec_seg_target  (uc_seg_target),
     .init_addr32      (i_bus.addr32),
     .init_stack_op    (i_bus.stack_op),
     .clear_descsw     (uc_dest == DEST_DESSTK),
@@ -1174,75 +1527,86 @@ segmentation_unit seg_unit (
     .is_write         (gp_fault_wr_op),
     .seg_base_pending (seg_base_pending),
     .eff_mask_pending (eff_mask_pending),
+    .seg_base_exec    (seg_base_exec),
+    .eff_mask_exec    (eff_mask_exec),
     .seg_fault        (seg_gp_fault),
     .is_stack_fault   (ss_segment_fault)
 );
 
+// Decode the older microcode command without issue-time priority.  The
+// segmentation unit uses this view only to form the execution relocation
+// base/mask; architectural command state retains the i_issue priority below.
 always_comb begin
-    seg_cmd = SEG_CMD_NONE;
-    seg_cmd_target = SEG_NONE;
-    seg_cmd_data = dest_value;
+    uc_seg_cmd = SEG_CMD_NONE;
+    uc_seg_data = dest_value;
+    if ((uc_buscode == BUSOP_IND_PLUS_ALU || uc_buscode == BUSOP_IND_ALU2 ||
+         uc_buscode == BUSOP_IND_SRC) &&
+        (uc_dest == DEST_DES_OS || uc_dest == DEST_DES_SR))
+        uc_seg_target = modrm_resolved_seg;
+    else
+        uc_seg_target = resolve_seg_target(uc_dest, i.seg_reg_sel, COUNTR[5:0]);
 
-    if (i_issue) begin
-        seg_cmd_target = init_final_seg;
-    end else if ((uc_buscode == BUSOP_IND_PLUS_ALU || uc_buscode == BUSOP_IND_ALU2 ||
-                  uc_buscode == BUSOP_IND_SRC)
-                 && (uc_dest == DEST_DES_OS || uc_dest == DEST_DES_SR)) begin
-        seg_cmd_target = modrm_resolved_seg;
-    end else begin
-        seg_cmd_target = resolve_seg_target(uc_dest, i.seg_reg_sel, COUNTR[5:0]);
-    end
-
-    if (i_issue) begin
-        seg_cmd = SEG_CMD_INIT_SEG;
-    end else if (uc_dest == DEST_DESCSW) begin
-        seg_cmd = SEG_CMD_DESCSW;
+    if (uc_dest == DEST_DESCSW) begin
+        uc_seg_cmd = SEG_CMD_DESCSW;
     end else begin
         case (uc_buscode)
             BUSOP_IND_PLUS_ALU,
             BUSOP_IND_ALU2,
             BUSOP_IND_SRC: begin
-                seg_cmd = SEG_CMD_UPDATE_SEG;
+                uc_seg_cmd = SEG_CMD_UPDATE_SEG;
             end
             BUSOP_SBRM: begin
                 if (!pe || vm)
-                    seg_cmd = SEG_CMD_SBRM;
+                    uc_seg_cmd = SEG_CMD_SBRM;
             end
             BUSOP_SAR: begin
-                seg_cmd = SEG_CMD_SAR;
+                uc_seg_cmd = SEG_CMD_SAR;
             end
             BUSOP_SLIM: begin
-                seg_cmd = (uc_dest == DEST_DESPTR) ? SEG_CMD_SLIM_TABLE : SEG_CMD_SLIM;
+                uc_seg_cmd = (uc_dest == DEST_DESPTR)
+                           ? SEG_CMD_SLIM_TABLE : SEG_CMD_SLIM;
             end
             BUSOP_SBAS: begin
                 if (uc_dest == DEST_DESPTR)
-                    seg_cmd = SEG_CMD_SBAS;
+                    uc_seg_cmd = SEG_CMD_SBAS;
             end
             BUSOP_SDEH: begin
                 if (pe && !gate_detect_cond)   // use cond, not _now (uc_exec already in valid)
-                    seg_cmd = SEG_CMD_SDEH;
+                    uc_seg_cmd = SEG_CMD_SDEH;
             end
             BUSOP_SDES: begin
                 if (pe && !gate_detect_cond) begin
-                    seg_cmd = SEG_CMD_SDES;
-                    seg_cmd_data = alu_src_data;
+                    uc_seg_cmd = SEG_CMD_SDES;
+                    uc_seg_data = alu_src_data;
                 end
             end
             BUSOP_SDEL: begin
                 if (pe && !gate_detect_cond) begin
-                    seg_cmd = SEG_CMD_SDEL;
+                    uc_seg_cmd = SEG_CMD_SDEL;
                     // SDEL's descriptor-low operand is encoded in the ALU source
                     // field. Most sites use TMPC, but cross-privilege CALL uses TMPD.
-                    seg_cmd_data = alu_src_data;
+                    uc_seg_data = alu_src_data;
                 end
             end
             BUSOP_SPCR: begin
-                seg_cmd = SEG_CMD_SPCR;
+                uc_seg_cmd = SEG_CMD_SPCR;
             end
             default: ;
         endcase
     end
-end  // always_comb
+end
+
+always_comb begin
+    if (i_issue) begin
+        seg_cmd = SEG_CMD_INIT_SEG;
+        seg_cmd_target = init_final_seg;
+        seg_cmd_data = dest_value;
+    end else begin
+        seg_cmd = uc_seg_cmd;
+        seg_cmd_target = uc_seg_target;
+        seg_cmd_data = uc_seg_data;
+    end
+end
 
 
 //=============================================================================
@@ -1258,9 +1622,17 @@ wire [1:0] mem_eff_size = uc_is_word_op ? (ind_delta_dword ? 2'd2 : 2'd1) :
 
 wire [31:0] mem_wdata = (uc_buscode == BUSOP_WR_OPR ||
                          uc_buscode == BUSOP_WR_OPR_WORD) ? OPR_R :
-    uc_is_word_op ? source_value_live :
+    uc_is_word_op ? memory_write_source_value :
     (uc_dest == DEST_OPR_W) ? (stack_init_pending ? source_value_live : dest_value) :
     OPR_W;
+
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && uc_exec && (uc_buscode == BUSOP_WR_WORD) &&
+        (memory_write_source_value !== source_value_live))
+        $fatal(1, "WR-W SOURCE MUX MISMATCH: uc_addr=%03x src=%02x narrow=%08x full=%08x",
+               uc_addr, uc_source, memory_write_source_value, source_value_live);
+// synthesis translate_on
 
 // INVLPG is a privileged address operation. The decoder registers the
 // optimizer-generated semantic action before execution, so neither an entry
@@ -1305,7 +1677,9 @@ wire iack_busop = uc_p_iack;        // IACK bus operation (interrupt acknowledge
 // waiting for literals. It is not an EX uop yet and must not issue its bus op.
 assign mem_op_eligible = core_live && !mem_servicing &&
                          !stall_d2 && !d2_release_hold &&
-                         !throttle_parked_r;
+                         !throttle_parked_r && !vipt_load_busy &&
+                         !vipt_load_rom_shadow_r &&
+                         !(i_rni_delay && d2_vipt_candidate);
 // A failed protection test redirects after its third architectural delay uop.
 // That uop may finish internal setup, but its protected bus operation must not
 // escape before the fault handler takes control (notably denied VM86 I/O).
@@ -1327,26 +1701,75 @@ wire [1:0] pg_cpl = implicit_supervisor ? 2'b00 : cpl;
 reg         gp_fault_r;
 reg         ss_fault_r;
 
-wire        mem_req_to_paging = mem_op_eligible &&
-                                (uc_data_busreq || x87_direct_mem_req) &&
-                                !gp_fault_trigger;
+wire        vipt_slow_submit = vipt_load_slow_req_r && !mem_servicing;
+wire        mem_req_to_paging = (mem_op_eligible &&
+                                 (uc_data_busreq || x87_direct_mem_req) &&
+                                 !gp_fault_trigger) || vipt_slow_submit;
 wire        iack_req_to_paging = mem_op_eligible && iack_busop && !gp_fault_trigger;
-wire        mem_write_now = x87_direct_mem_req ? 1'b0 :
+wire        mem_write_now = (x87_direct_mem_req || vipt_slow_submit) ? 1'b0 :
                             (uc_is_write || (io_busop_wr && mem_is_io));
-wire [1:0]  paging_mem_eff_size = x87_direct_mem_req ? 2'd2 :
-                                                               mem_eff_size;
+wire [1:0]  paging_mem_eff_size = vipt_slow_submit
+                                ? vipt_load_slow_r.mem_size
+                                : x87_direct_mem_req ? 2'd2 : mem_eff_size;
+wire [31:0] paging_linear_addr = vipt_slow_submit
+                               ? vipt_load_slow_r.linear_addr : ind_linear;
 wire [3:0]  mem_be_now = iack_busop ? 4'b1111 :
-                          calc_be(paging_mem_eff_size, ind_linear[1:0]);
-wire [31:0] paging_linear_addr = ind_linear;
+                          calc_be(paging_mem_eff_size,
+                                  paging_linear_addr[1:0]);
 assign pf_spec_store = mem_req_to_paging && mem_write_now && mem_accepted;
 assign pf_spec_store_linear = paging_linear_addr;
-wire        paging_live_valid  = ind_linear_valid;
-wire        paging_mem_rd_ind = !x87_direct_mem_req &&
+wire        paging_live_valid  = vipt_slow_submit ? 1'b1 : ind_linear_valid;
+wire        paging_mem_rd_ind = !x87_direct_mem_req && !vipt_slow_submit &&
                                 (uc_buscode == BUSOP_RD_IND);
-wire        paging_is_write_access = !x87_direct_mem_req &&
+wire        paging_is_write_access = !x87_direct_mem_req && !vipt_slow_submit &&
                                       (uc_is_write || uc_is_check_write);
-wire        mem_ea_read = x87_direct_mem_req ||
+wire        mem_ea_read = x87_direct_mem_req || vipt_slow_submit ||
                           (i_first && i.ind_is_ea);
+
+// Direct register loads share one token after D2.  MOVZX/MOVSX use SRCREG as
+// their architectural destination in the original microcode; plain MOV uses
+// DSTREG and may name AH/CH/DH/BH.  Crossing operands are admitted here so EX
+// can transfer their registered address and metadata to normal paging.
+// A write uop and its D2 successor can overlap on the edge where paging first
+// captures the write.  The store may still need a dirty-bit page walk, so it
+// is not yet visible to the cache's store queue.  Accept the younger load token
+// but discard that edge's speculative preread, then replay it only after paging
+// releases the older request.  The load retains VIPT while cache/store-queue
+// ordering sees the accepted store before the replayed lookup.
+assign d2_vipt_older_store = uc_active && uc_is_write;
+wire d2_vipt_plain_mov = !i_bus.has_0f &&
+                         ((i_bus.opcode == 8'h8A) ||
+                          (i_bus.opcode == 8'h8B));
+wire d2_vipt_movx = i_bus.has_0f && i_bus.data32 &&
+                    ((i_bus.opcode == 8'hB6) ||
+                     (i_bus.opcode == 8'hB7) ||
+                     (i_bus.opcode == 8'hBE) ||
+                     (i_bus.opcode == 8'hBF));
+assign d2_vipt_alu = !i_bus.has_0f &&
+                     (i_bus.opcode[7:6] == 2'b00) &&
+                     !i_bus.opcode[2] && i_bus.opcode[1] &&
+                     i_bus.has_modrm && (i_bus.modrm[7:6] != 2'b11) &&
+                     (i_bus.opcode[5:3] != 3'b111);
+assign d2_vipt_dst = d2_vipt_movx ? i_bus.src_reg_sel
+                                  : i_bus.dst_reg_sel;
+assign d2_vipt_mem_size = d2_vipt_movx ? i_bus.source_size
+                                       : i_bus.operand_size;
+assign d2_vipt_write_size = d2_vipt_movx ? 2'd2
+                                         : i_bus.operand_size;
+wire [2:0] d2_vipt_dst_wide = (d2_vipt_write_size == 2'd0)
+                            ? {1'b0, d2_vipt_dst[1:0]} : d2_vipt_dst;
+assign d2_vipt_dst_onehot = 8'h01 << d2_vipt_dst_wide;
+assign d2_vipt_result_kind = !d2_vipt_movx ? LOAD_RESULT_COPY :
+    (i_bus.opcode[3] ? LOAD_RESULT_SIGN_EXTEND : LOAD_RESULT_ZERO_EXTEND);
+assign d2_vipt_candidate = !hardwired_off &&
+                           (i_bus.rep_lock == PREFIX_NOREPLOCK) &&
+                           (d2_vipt_plain_mov || d2_vipt_movx || d2_vipt_alu) &&
+                           i_bus.addr32 && i_bus.has_modrm &&
+                           (i_bus.modrm[7:6] != 2'b11) &&
+                           !i_bus.has_moffs && !i_bus.stack_op &&
+                           !single_step;
+assign d2_vipt_load = d2_vipt_candidate && dcache_vipt_probe_ready &&
+                      !vipt_load_replay_r.valid && !vipt_load_slow_busy;
 
 // Paging unit instantiation
 paging_unit paging_inst (
@@ -1364,8 +1787,9 @@ paging_unit paging_inst (
     .mem_inta_req       (iack_req_to_paging),
     .mem_inta_addr      (IND),
     .mem_ea_read        (mem_ea_read),      // modrm/stack/moffs reads SET-read (linear relocated at i_issue); microcode IND reads excluded
-    .mem_req_precheck   (mem_op_eligible &&
-                         (uc_data_busreq || x87_direct_mem_req)),
+    .mem_req_precheck   ((mem_op_eligible &&
+                          (uc_data_busreq || x87_direct_mem_req)) ||
+                         vipt_slow_submit),
     .mem_req_upcoming   (mem_req_upcoming), // suppresses prefetch start to minimize contention
     .mem_accepted       (mem_accepted),     // ready: request accepted this cycle
     .mem_servicing      (mem_servicing),
@@ -1382,10 +1806,17 @@ paging_unit paging_inst (
     .mem_wdata          (mem_wdata),
     .mem_rd_ind         (paging_mem_rd_ind),
     .is_write_access    (paging_is_write_access),
-    .mem_check_only     (uc_is_check_write),
+    .mem_check_only     (vipt_slow_submit ? 1'b0 : uc_is_check_write),
     .cpl                (pg_cpl),
-    .mem_is_io          (mem_is_io),
+    .mem_is_io          (vipt_slow_submit ? 1'b0 : mem_is_io),
     .mem_be             (mem_be_now),
+    .vipt_preread       (dcache_vipt_probe_accepted),
+    .vipt_linear_addr   (vipt_probe_linear),
+    .vipt_fallback      (vipt_slow_submit),
+    .vipt_tlb_hit       (vipt_tlb_hit),
+    .vipt_tlb_phys_addr (vipt_tlb_phys_addr),
+    .vipt_tlb_user      (vipt_tlb_user),
+    .vipt_tlb_is_vga_mem(vipt_tlb_is_vga_mem),
 
     // Prefetch (toggle protocol)
     .pf_req_toggle      (pf_req_toggle),
@@ -1400,6 +1831,8 @@ paging_unit paging_inst (
     // Demand-side physical request interface
     .dcache_req_valid   (dcache_req_valid),
     .dcache_req_phys_addr(dcache_req_phys_addr_raw),
+    .dcache_req_preread_offset(dcache_req_preread_offset),
+    .dcache_req_preread_priority(dcache_req_preread_priority),
     .dcache_req_write   (dcache_req_write),
     .dcache_req_be      (dcache_req_be),
     .dcache_req_wdata   (dcache_req_wdata),
@@ -1713,7 +2146,8 @@ wire gate_detect_cond = pe && (uc_buscode == BUSOP_SDEL) &&
                         !gate_in_progress && !desc_raw_hi[12] && (desc_raw_hi[11:8] == 4'hC);
 wire gate_detect_now = uc_exec && gate_detect_cond;
 
-assign seq_advance = ((((i_issue && !d2_waited_r) | uc_exec) |
+assign seq_advance = ((((i_issue && !d2_waited_r) | uc_exec |
+                        vipt_load_retire) |
                        (fault_suppress_delay_slot & !stall)) &
                       !halted && !repeat_active);
 
@@ -1772,7 +2206,8 @@ microsequencer microsequencer_inst (
     .repeat_active(repeat_active),
     .prot_redirect_prev(prot_redirect_prev),
     .jcc_fold_active(jcc_fold_active),
-    .branch_ustep_exec(branch_ustep_exec),
+    .branch_ustep_rni(branch_ustep_rni),
+    .load_wb_retire(vipt_load_retire),
     .macro_active(uc_active),
     .instr_eip_written(instr_eip_written),
     .any_fault(any_fault),
@@ -1798,6 +2233,7 @@ microsequencer microsequencer_inst (
     .uc_addr(uc_addr),
     .uc_addr_mem(uc_addr_mem_r),
     .i_rni_delay(i_rni_delay),
+    .i_rni_delay_ea(i_rni_delay_ea),
     .jump_taken_prev(uc_jump_taken_prev),
     .pref_suppress_prev(uc_pref_suppress_prev),
     .i_rni(i_rni),
@@ -1934,6 +2370,9 @@ always_ff @(posedge clk) begin
             if (gate_detect_now)
                 gate_in_progress <= 1'b1;
         end
+
+        if (vipt_load_retire && uc_active && !instr_eip_written && !any_fault)
+            debug_ip <= EIP;
 
         fault_suppress_delay_slot <= any_fault || any_fault_r ||
                                      (fault_suppress_delay_slot && stall);
@@ -2257,6 +2696,8 @@ always_ff @(posedge clk) begin
         wr_restart_eip <= TMPeIP;
     if (page_fault && pg_fault_code[1])
         TMPeIP <= wr_restart_eip;
+    else if (data_page_fault && vipt_load_slow_wait_r)
+        TMPeIP <= vipt_load_slow_r.restart_eip;
     else if (ifetch_page_fault) begin
         // A cross-page instruction can fault before i_issue captures its restart
         // state. The architectural registers still describe that boundary.
@@ -2276,6 +2717,10 @@ address_unit address_unit_inst (
     .instr(i_bus),
     .d2_start(d2_start),
     .d2_ea(d2_start_ea_dec),
+    .split_ea_prepare(d2_ea_three_term && d2_valid && !i_issue),
+    .split_ea_use(d2_ea_three_term && d2_ea_split_done_r),
+    .split_ea_adjust(d2_entry.ea_uses_post_pop_esp ?
+                     (d2_entry.data32 ? 3'd4 : 3'd2) : 3'd0),
     .displacement(d2_agu_dec.disp),
     .ea_base(ea_base_ref),
     .ea_index(ea_index_ref),
@@ -2302,10 +2747,10 @@ address_unit address_unit_inst (
     .is_dword(is_dword),
     .descsw_mode(descsw_mode),
     .cs_stack32(desc_cache[SEG_CS].D_B),
-    .seg_cmd(seg_cmd),
+    .seg_cmd(uc_seg_cmd),
     .seg_sel(mem_seg_sel),
-    .seg_base_pending(seg_base_pending),
-    .eff_mask_pending(eff_mask_pending),
+    .seg_base_pending(seg_base_exec),
+    .eff_mask_pending(eff_mask_exec),
     .lar_result(seg_lar_result),
     .llim_result(seg_llim_result),
     .lbas_result(seg_lbas_result),
@@ -2318,7 +2763,8 @@ address_unit address_unit_inst (
     .ind_linear_valid(ind_linear_valid),
     .ea(ea_reg),
     .issue_ea(ea_early),
-    .issue_linear(issue_ind_linear)
+    .issue_linear(issue_ind_linear),
+    .issue_linear_low(issue_ind_linear_low)
 );
 
 // Derive control signals from ALU opcode
@@ -2387,6 +2833,15 @@ data_unit data_unit_inst (
     .recipe_state(recipe_state),
     .hardwired_off(hardwired_off),
     .recipe_commit_cancel(any_fault),
+    .load_wb_valid(vipt_load_wb_valid_r),
+    .load_wb_dst(vipt_load_wb_dst_r),
+    .load_wb_size(vipt_load_wb_size_r),
+    .load_wb_data(vipt_load_wb_data),
+    .load_wb_is_alu(vipt_load_wb_is_alu_r),
+    .load_wb_alu_op(vipt_load_wb_alu_op_r),
+    .load_alu_dst_capture(vipt_load_alu_dst_capture),
+    .load_alu_dst_capture_dst(vipt_load_alu_dst_capture_dst),
+    .load_alu_dst_capture_size(vipt_load_alu_dst_capture_size),
     .aluop(uc_aluop),
     .alu_operation(alu_op5),
     .shift_aluop(uc_aluop_shift),
@@ -2442,6 +2897,7 @@ data_unit data_unit_inst (
     .countr(COUNTR),
     .alu_src_hold(alu_src_r),
     .source_value_live(source_value_live),
+    .memory_write_source_value(memory_write_source_value),
     .alu_source_value_live(alu_src_data),
     .dest_value(dest_value),
     .alu_src(alu_src),

@@ -58,6 +58,16 @@ module paging_unit
     input               mem_is_io,         // This request is IO (skip translation)
     input        [3:0]  mem_be,            // Pre-computed byte enables (for IO and non-crossing mem)
 
+    // Read-only D2 TLB preread. EX consumes these outputs one cycle later;
+    // a miss continues through the ordinary demand interface above.
+    input               vipt_preread,
+    input        [31:0] vipt_linear_addr,
+    input               vipt_fallback,
+    output              vipt_tlb_hit,
+    output       [31:0] vipt_tlb_phys_addr,
+    output              vipt_tlb_user,
+    output              vipt_tlb_is_vga_mem,
+
     //=========================================================================
     // Prefetch request (toggle protocol)
     //=========================================================================
@@ -78,6 +88,8 @@ module paging_unit
     output logic [31:0] dcache_req_phys_addr, // Physical address (full 32-bit); the
                                               // cache indexes off [11:2] (page-offset,
                                               // TLB-free), tags off [31:12]
+    output logic [11:0] dcache_req_preread_offset, // TLB-free cache RAM address
+    output logic        dcache_req_preread_priority, // demand intent wins preread
     output logic        dcache_req_write,     // 1=write
     output logic [3:0]  dcache_req_be,        // Byte enables (pre-computed)
     output logic [31:0] dcache_req_wdata,     // Write data (pre-positioned on bus)
@@ -186,6 +198,11 @@ wire idle_inta_req = s_idle && mem_inta_req && !mem_servicing;
 wire idle_mem_req = idle_data_req || idle_inta_req;
 wire idle_mem_precheck = s_idle && mem_req_precheck && !mem_servicing;
 wire idle_mem_capture = idle_mem_precheck || idle_inta_req;
+// A direct VIPT miss reaches this registered demand path.  If the normal TLB
+// already owns the translation, populate the sidecar so subsequent accesses
+// do not repeat the slow fallback.  linear_addr is registered at this point.
+wire vipt_refill_valid = vipt_fallback && idle_mem_precheck && pg_enable &&
+                         live_valid && live_tlb_hit;
 // P0/P1 prefetch timing: P0 prefetch toggles pf_req_toggle and presents pf_linear_addr. P1 paging translates the registered prefetch...
 // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-189
 wire idle_pf_req = s_idle && pf_pending && !fast_path_pending && !pf_fast_pending;
@@ -207,6 +224,16 @@ paging_tlb tlb_inst (
     .live_user      (live_tlb_user),
     .live_dirty     (live_tlb_dirty),
     .live_is_vga_mem(live_tlb_is_vga_mem),
+    .vipt_preread   (vipt_preread),
+    .vipt_linear_addr(vipt_linear_addr),
+    .vipt_hit       (vipt_tlb_hit),
+    .vipt_physical_addr(vipt_tlb_phys_addr),
+    .vipt_user      (vipt_tlb_user),
+    .vipt_is_vga_mem(vipt_tlb_is_vga_mem),
+    .vipt_refill_valid(vipt_refill_valid),
+    .vipt_refill_linear(linear_addr),
+    .vipt_refill_pfn(live_tlb_physical[31:12]),
+    .vipt_refill_user(live_tlb_user),
     .update_valid   (tlb_update_valid),
     .update_vpn     (tlb_update_vpn),
     .update_pfn     (tlb_update_pfn),
@@ -443,6 +470,12 @@ wire [11:0] dcache_req_offset = early_idx_drive  ? linear_addr[11:0] :
                                 req_mem_present   ? req_linear[11:0] :
                                                     dcache_req_phys_addr_r[11:0];
 assign dcache_req_phys_addr = {dcache_req_frame, dcache_req_offset};
+assign dcache_req_preread_offset = dcache_req_offset;
+// Conservatively reserve the preread port for any registered demand request.
+// IO-like requests do not consume the cache, but retaining that distinction
+// here only lengthens the arbitration cone and cannot improve demand latency.
+assign dcache_req_preread_priority = early_idx_drive || req_mem_present ||
+                                     dcache_req_valid_r;
 assign dcache_req_write = early_wr_present ? 1'b1 :
                           early_rd_present ? 1'b0 :
                           req_mem_present  ? req_is_write : dcache_req_write_r;

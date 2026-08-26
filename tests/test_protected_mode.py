@@ -286,6 +286,10 @@ def run_simulation(test_name, test_config, hex_file, code_phys_base, verbose=Fal
     # Extra sim plusargs from the environment (e.g. SIM_PLUSARGS="+pf_evt")
     for extra in os.environ.get('SIM_PLUSARGS', '').split():
         cmd.append(extra)
+    # Per-test instrumentation requirements.  Keeping these in the test JSON
+    # makes a regression prove that its intended internal condition occurred.
+    for extra in test_config.get('sim_plusargs', []):
+        cmd.append(extra if extra.startswith('+') else f'+{extra}')
     cmd.append(f"+mem={hex_file}")
     cmd.append(f"+cycles={cycles}")
     cmd.append(f"+eip={test_config['eip']}")

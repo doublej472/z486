@@ -7,7 +7,8 @@
 
 module tb_protected_mode #(
     parameter ENABLE_X87 = 0,
-    parameter MEM_SIZE = 1 << 19
+    parameter MEM_SIZE = 1 << 19,
+    parameter DCACHE_SET_BITS = 7
 );
     // Segment cache array indices (from z486_pkg)
     localparam SEG_ES = 0, SEG_CS = 1, SEG_SS = 2, SEG_DS = 3;
@@ -39,7 +40,8 @@ module tb_protected_mode #(
 
     // Instantiate the z486 CPU
     z486 #(
-        .ENABLE_X87(ENABLE_X87)
+        .ENABLE_X87(ENABLE_X87),
+        .DCACHE_SET_BITS(DCACHE_SET_BITS)
     ) dut (
         .clk(clk),
         .reset_n(reset_n),
@@ -100,6 +102,12 @@ module tb_protected_mode #(
     longint cpu_stall_cycles [0:9];
     longint cpu_load_chain [0:11];
     longint cpu_load_intervals [0:16];
+    longint cpu_store_intervals [0:16];
+    longint cpu_store_states [0:9];
+    longint cpu_store_next_entry [0:4095];
+    longint cpu_store_next_opcode [0:255];
+    longint cpu_store_next_entry_gap [0:4095][0:3];
+    longint cpu_store_next_opcode_gap [0:255][0:3];
     longint cpu_current_start;
     logic [11:0] cpu_current_entry;
     logic [7:0] cpu_current_opcode;
@@ -112,6 +120,29 @@ module tb_protected_mode #(
     // instruction and separately count mutually exclusive pipeline states.
     always @(posedge clk) begin
         if (reset_n && $test$plusargs("profile_cpu")) begin
+            if (cpu_profile_active && (cpu_current_entry == 12'h013)) begin
+                if (dut.i_issue)
+                    cpu_store_states[0] += 1;
+                else if (dut.stall_mem)
+                    cpu_store_states[1] += 1;
+                else if (dut.stall_wio || dut.stall_x87_direct)
+                    cpu_store_states[2] += 1;
+                else if (dut.stall_d2)
+                    cpu_store_states[3] += 1;
+                else if (dut.throttle_parked_r)
+                    cpu_store_states[4] += 1;
+                else if (!dut.d2_valid)
+                    cpu_store_states[5] += 1;
+                else if (!dut.d2_ready)
+                    cpu_store_states[6] += 1;
+                else if (dut.hardwired_control_inst.recipe_state.slot_has_work)
+                    cpu_store_states[7] += 1;
+                else if (!dut.uc_active)
+                    cpu_store_states[8] += 1;
+                else
+                    cpu_store_states[9] += 1;
+            end
+
             if (dut.i_issue) begin
                 if (cpu_profile_active) begin
                     cpu_entry_cycles[cpu_current_entry] += cycle - cpu_current_start;
@@ -123,6 +154,19 @@ module tb_protected_mode #(
                             cpu_load_intervals[16] += 1;
                         else
                             cpu_load_intervals[cycle - cpu_current_start] += 1;
+                    end
+                    if (cpu_current_entry == 12'h013) begin
+                        automatic int store_gap;
+                        if ((cycle - cpu_current_start) >= 16)
+                            cpu_store_intervals[16] += 1;
+                        else
+                            cpu_store_intervals[cycle - cpu_current_start] += 1;
+                        store_gap = (cycle - cpu_current_start) >= 3
+                                  ? 3 : cycle - cpu_current_start;
+                        cpu_store_next_entry[dut.i_bus.entry_point] += 1;
+                        cpu_store_next_opcode[dut.i_bus.opcode] += 1;
+                        cpu_store_next_entry_gap[dut.i_bus.entry_point][store_gap] += 1;
+                        cpu_store_next_opcode_gap[dut.i_bus.opcode][store_gap] += 1;
                     end
                 end
                 cpu_current_start = cycle;
@@ -261,6 +305,29 @@ module tb_protected_mode #(
     reg [7:0] test_status = 8'h00;  // 0x00=running, 0x01=pass, 0xFF=fail
     reg [31:0] test_data = 32'h0;
     reg test_done = 0;
+    longint vipt_ea_interlock_cycles = 0;
+    longint vipt_store_wait_issues = 0;
+    longint vipt_store_replays = 0;
+    reg vipt_store_replay_pending = 0;
+
+    // A load-to-AGI regression must both exercise the dependency and prevent
+    // the dependent instruction from issuing while its EA input is pending.
+    always @(posedge clk) begin
+        if (reset_n && dut.d2_vipt_ea_hazard)
+            vipt_ea_interlock_cycles <= vipt_ea_interlock_cycles + 1;
+        if (reset_n && dut.i_issue && dut.d2_vipt_ea_hazard)
+            $fatal(1, "VIPT load-to-EA consumer issued before writeback");
+        if (!reset_n || dut.q_flush || dut.any_fault) begin
+            vipt_store_replay_pending <= 1'b0;
+        end else if (dut.vipt_issue_store_wait) begin
+            vipt_store_wait_issues <= vipt_store_wait_issues + 1;
+            vipt_store_replay_pending <= 1'b1;
+        end else if (vipt_store_replay_pending && dut.vipt_replay_try &&
+                     dut.dcache_vipt_probe_accepted) begin
+            vipt_store_replays <= vipt_store_replays + 1;
+            vipt_store_replay_pending <= 1'b0;
+        end
+    end
 
     // Hardware interrupt emulation
     reg [7:0] intr_vector = 8'h20;     // Vector to return on INTA
@@ -271,6 +338,7 @@ module tb_protected_mode #(
     int       signal_delay_instr = 0;  // Optional retired-instruction delay for trigger
     int       intr_instr_remaining = 0;
     int       nmi_instr_remaining = 0;
+    reg       intr_hardwired_load_arm = 0;
     int       nmi_pulse_cycles = 1;    // NMI high width in cycles (for deterministic edge delivery)
     int       nmi_hold_count = 0;
     reg       inta_first = 0;          // Track first vs second INTA pair
@@ -403,13 +471,37 @@ module tb_protected_mode #(
                 if (port == 16'h00E0) begin
                     test_status <= dout[7:0];
                     if (dout[7:0] == 8'h01) begin
-                        $display("");
-                        $display("========================================");
-                        $display("  TEST PASSED!");
-                        $display("  Total cycles: %0d", cycle);
-                        $display("  Total instructions: %0d", instruction_count);
-                        $display("========================================");
-                        test_done <= 1;
+                        if (($test$plusargs("expect_vipt_ea_interlock") &&
+                             (vipt_ea_interlock_cycles == 0)) ||
+                            ($test$plusargs("expect_vipt_store_replay") &&
+                             ((vipt_store_wait_issues == 0) ||
+                              (vipt_store_replays == 0)))) begin
+                            test_status <= 8'hFF;
+                            $display("");
+                            $display("========================================");
+                            $display("  TEST FAILED!");
+                            if (vipt_ea_interlock_cycles == 0)
+                                $display("  VIPT load-to-EA interlock was not exercised");
+                            else
+                                $display("  VIPT older-store replay was not exercised");
+                            $display("========================================");
+                            test_done <= 1;
+                        end else begin
+                            $display("");
+                            $display("========================================");
+                            $display("  TEST PASSED!");
+                            $display("  Total cycles: %0d", cycle);
+                            $display("  Total instructions: %0d", instruction_count);
+                            if ($test$plusargs("expect_vipt_ea_interlock"))
+                                $display("  VIPT EA interlock cycles: %0d",
+                                         vipt_ea_interlock_cycles);
+                            if ($test$plusargs("expect_vipt_store_replay"))
+                                $display("  VIPT store waits/replays: %0d/%0d",
+                                         vipt_store_wait_issues,
+                                         vipt_store_replays);
+                            $display("========================================");
+                            test_done <= 1;
+                        end
                     end else if (dout[7:0] == 8'hFF) begin
                         $display("");
                         $display("========================================");
@@ -433,6 +525,8 @@ module tb_protected_mode #(
                 // 1 = assert INTR after short delay
                 // 2 = pulse NMI after short delay
                 // 3 = assert INTR while IF=0 (masked test)
+                // 4 = assert INTR during the next hardwired absolute load,
+                //     so it becomes pending at the load's retirement boundary
                 if (port == 16'h00E8) begin
                     if (dout[7:0] == 8'h01 || dout[7:0] == 8'h03) begin
                         if (signal_delay_instr > 0) begin
@@ -457,6 +551,11 @@ module tb_protected_mode #(
                         if ($test$plusargs("trace_io"))
                             $display("SIGNAL: NMI requested (cyc=%0d, instr=%0d)",
                                      signal_delay_cycles, signal_delay_instr);
+                    end
+                    if (dout[7:0] == 8'h04) begin
+                        intr_hardwired_load_arm <= 1'b1;
+                        if ($test$plusargs("trace_io"))
+                            $display("SIGNAL: INTR armed for hardwired load boundary");
                     end
                 end
 
@@ -623,10 +722,16 @@ module tb_protected_mode #(
             cpu_entry_mem_stall[i] = 0;
             cpu_entry_x87_stall[i] = 0;
             cpu_entry_frontend_wait[i] = 0;
+            cpu_store_next_entry[i] = 0;
+            for (int j = 0; j < 4; j++)
+                cpu_store_next_entry_gap[i][j] = 0;
         end
         for (int i = 0; i < 256; i++) begin
             cpu_opcode_count[i] = 0;
             cpu_opcode_cycles[i] = 0;
+            cpu_store_next_opcode[i] = 0;
+            for (int j = 0; j < 4; j++)
+                cpu_store_next_opcode_gap[i][j] = 0;
         end
         for (int i = 0; i < 2; i++) begin
             cpu_hardwired_count[i] = 0;
@@ -642,6 +747,10 @@ module tb_protected_mode #(
             cpu_load_chain[i] = 0;
         for (int i = 0; i < 17; i++)
             cpu_load_intervals[i] = 0;
+        for (int i = 0; i < 17; i++)
+            cpu_store_intervals[i] = 0;
+        for (int i = 0; i < 10; i++)
+            cpu_store_states[i] = 0;
         cpu_current_start = 0;
         cpu_current_entry = 0;
         cpu_current_opcode = 0;
@@ -950,6 +1059,28 @@ module tb_protected_mode #(
                     for (int i = 0; i < 17; i++)
                         $display("CPU_LOAD_INTERVAL %0d %0d", i,
                                  cpu_load_intervals[i]);
+                    for (int i = 0; i < 17; i++)
+                        $display("CPU_STORE_INTERVAL %0d %0d", i,
+                                 cpu_store_intervals[i]);
+                    for (int i = 0; i < 10; i++)
+                        $display("CPU_STORE_STATE %0d %0d", i,
+                                 cpu_store_states[i]);
+                    for (int i = 0; i < 4096; i++) begin
+                        if (cpu_store_next_entry[i] != 0)
+                            $display("CPU_STORE_NEXT_ENTRY %03x %0d %0d %0d %0d",
+                                     i, cpu_store_next_entry[i],
+                                     cpu_store_next_entry_gap[i][1],
+                                     cpu_store_next_entry_gap[i][2],
+                                     cpu_store_next_entry_gap[i][3]);
+                    end
+                    for (int i = 0; i < 256; i++) begin
+                        if (cpu_store_next_opcode[i] != 0)
+                            $display("CPU_STORE_NEXT_OPCODE %02x %0d %0d %0d %0d",
+                                     i, cpu_store_next_opcode[i],
+                                     cpu_store_next_opcode_gap[i][1],
+                                     cpu_store_next_opcode_gap[i][2],
+                                     cpu_store_next_opcode_gap[i][3]);
+                    end
                 end
                 $display("  FNV64[%08x+%08x]: %016x",
                          checksum_start, checksum_bytes, checksum);
@@ -979,6 +1110,17 @@ module tb_protected_mode #(
             end
 
             // Hardware interrupt signal generation
+            if (intr_hardwired_load_arm && dut.uc_exec &&
+                (dut.uc_addr == 12'h019) && dut.recipe_state.hardwired &&
+                (dut.recipe_state.commit_sel == z486_pkg::RECIPE_COMMIT_MEM) &&
+                dut.d2_vipt_candidate) begin
+                intr_hardwired_load_arm <= 1'b0;
+                intr <= 1'b1;
+                if ($test$plusargs("trace_io"))
+                    $display("[TB] INTR asserted during hardwired load at cycle %0d",
+                             cycle);
+            end
+
             if (intr_delay > 0) begin
                 intr_delay <= intr_delay - 1;
                 if (intr_delay == 1) begin

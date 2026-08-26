@@ -21,7 +21,8 @@ module microsequencer
     input  logic        repeat_active,
     input  logic        prot_redirect_prev,   // Protection redirect delay-slot state
     input  logic        jcc_fold_active,      // Folded Jcc supplies synthetic RNI
-    input  logic        branch_ustep_exec,    // Hardwired branch supplies synthetic RNI
+    input  logic        branch_ustep_rni,     // Hardwired branch supplies synthetic RNI
+    input  logic        load_wb_retire,       // Registered VIPT hit supplies synthetic RNI
     input  logic        macro_active,
     input  logic        instr_eip_written,
     input  logic        any_fault,
@@ -47,6 +48,7 @@ module microsequencer
     output logic [11:0] uc_addr,              // Address of executing micro-op
     output logic [11:0] uc_addr_mem,          // Address in ROM memory stage
     output logic        i_rni_delay,           // RNI delay slot is executing
+    output logic        i_rni_delay_ea,        // Low-fanout copy for D2 EA bypass
     output logic        jump_taken_prev,      // Micro-jump delay-slot state
     output logic        pref_suppress_prev,   // Taken conditional PREF suppression
     output logic        i_rni,
@@ -79,6 +81,9 @@ logic        d2_rom_mem_id_r;
 logic        d2_rom_q_id_r;
 logic [2:0]  d2_rom_q_kind_r;
 logic        d2_slot_prefetched_r;
+(* preserve *) logic i_rni_delay_ea_r;
+
+assign i_rni_delay_ea = i_rni_delay_ea_r;
 logic [11:0] return_stack [0:3];
 logic [1:0]  return_sp;
 
@@ -91,7 +96,7 @@ wire [11:0] return_target = return_stack[return_sp - 2'd1];
 wire reljump_taken = uc_exec && !repeat_active &&
                      reljump_condition(uc_aluop, conditions) &&
                      !prot_redirect_prev &&
-                     !jcc_fold_active && !branch_ustep_exec;
+                     !jcc_fold_active && !branch_ustep_rni;
 wire pref_suppress_taken = reljump_taken &&
     (uc_aluop == ALUJMP_JNcond || uc_aluop == ALUJMP_JCNTNZ ||
      uc_aluop == ALUJMP_JCNT1 || uc_aluop == ALUJMP_LOOPnE);
@@ -107,7 +112,8 @@ wire flow_return = uc_exec && (uc_aluop == ALUJMP_RETURN);
 wire rni_base = (((uc_opcode == 3'b000) || (uc_opcode == 3'b010)) &&
                  !jump_taken_prev) ||
                 ((uc_opcode == 3'b001) && jump_taken_prev);
-assign i_rni = rni_base || jcc_fold_active || branch_ustep_exec;
+assign i_rni = rni_base || jcc_fold_active || branch_ustep_rni ||
+               load_wb_retire;
 
 seq_redirect_t exec_redirect;
 
@@ -274,6 +280,7 @@ always_ff @(posedge clk) begin
         uc_addr <= 12'h000;
         return_sp <= 2'd0;
         i_rni_delay <= 1'b0;
+        i_rni_delay_ea_r <= 1'b0;
         jump_taken_prev <= 1'b0;
         pref_suppress_prev <= 1'b0;
         uc_ctl_pref <= 1'b0;
@@ -289,11 +296,18 @@ always_ff @(posedge clk) begin
 
         if (i_rni_delay && !stall && !page_fault)
             i_rni_delay <= 1'b0;
-        if (uc_exec && i_rni && macro_active && !instr_eip_written &&
-            !any_fault && !i_issue)
+        if (i_rni_delay_ea_r && !stall && !page_fault)
+            i_rni_delay_ea_r <= 1'b0;
+        if ((uc_exec || load_wb_retire) && i_rni && macro_active &&
+            !instr_eip_written &&
+            !any_fault && !i_issue) begin
             i_rni_delay <= 1'b1;
-        if (page_fault)
+            i_rni_delay_ea_r <= 1'b1;
+        end
+        if (page_fault) begin
             i_rni_delay <= 1'b0;
+            i_rni_delay_ea_r <= 1'b0;
+        end
 
         if (uc_exec) begin
             jump_taken_prev <= normal_jump_taken;

@@ -26,6 +26,15 @@ module data_unit
     input  recipe_state_t recipe_state,           // Latched hardwired recipe
     input  logic        hardwired_off,
     input  logic        recipe_commit_cancel,     // Cancel deferred recipe commit
+    input  logic        load_wb_valid,             // Registered VIPT load WB
+    input  logic [2:0]  load_wb_dst,
+    input  logic [1:0]  load_wb_size,
+    input  logic [31:0] load_wb_data,
+    input  logic        load_wb_is_alu,          // Registered memory operand feeds shared ALU
+    input  logic [4:0]  load_wb_alu_op,
+    input  logic        load_alu_dst_capture,    // Capture M3 GPR operand at EX/WB boundary
+    input  logic [2:0]  load_alu_dst_capture_dst,
+    input  logic [1:0]  load_alu_dst_capture_size,
 
     input  logic [6:0]  aluop,
     input  logic [4:0]  alu_operation,
@@ -83,6 +92,7 @@ module data_unit
     output logic [31:0] countr,
     output logic [31:0] alu_src_hold,             // Registered ALU source operand
     output logic [31:0] source_value_live,        // Selected microcode source value
+    output logic [31:0] memory_write_source_value,// Narrow source mux for WR W
     output logic [31:0] alu_source_value_live,    // Selected ALU-source value
     output logic [31:0] dest_value,
     output logic [31:0] alu_src,
@@ -122,6 +132,13 @@ logic [31:0] alu_dst;
 logic [31:0] alu_flags;
 logic [2:0]  alu_zsp_ahead;
 logic        alu_zsp_update;
+logic [31:0] load_wb_commit_data;
+logic        load_wb_alu_exec;
+logic        load_wb_alu_commit;
+logic [31:0] load_wb_alu_result;
+logic [31:0] load_wb_alu_flags;
+logic [2:0]  load_wb_alu_zsp_ahead;
+logic [31:0] load_wb_alu_dst_r;
 
 logic [31:0] tmpb, tmpd, tmpe, tmpf, tmph;
 logic [31:0] csopcd, fsveip, oproff;
@@ -217,6 +234,48 @@ function automatic logic [31:0] read_gpr_value(
     endcase
 endfunction
 
+// WB-to-EX bypass for a hardwired load's immediate successor.  Cache data is
+// already registered in load_wb_data; this mux therefore starts at the WB
+// boundary and does not extend the cache finalize path into the ALU.
+function automatic logic [31:0] read_gpr_load_forwarded(
+    input logic [2:0] reg_sel,
+    input logic [1:0] size
+);
+    logic [2:0] read_widx, load_widx;
+    logic [31:0] merged;
+    begin
+        read_widx = (size == 2'd0) ? {1'b0, reg_sel[1:0]} : reg_sel;
+        load_widx = (load_wb_size == 2'd0)
+                  ? {1'b0, load_wb_dst[1:0]} : load_wb_dst;
+        merged = read_gpr_value(read_widx, 2'd2);
+
+        // Plain loads may feed a successor directly from registered cache
+        // data.  M3's value is the output of another combinational ALU, so it
+        // is interlocked until architectural commit instead of creating a
+        // private-ALU -> successor-ALU/EA path in one cycle.
+        if (load_wb_valid && !load_wb_is_alu &&
+            (load_widx == read_widx)) begin
+            if (load_wb_size == 2'd0)
+                merged = load_wb_dst[2]
+                       ? {merged[31:16], load_wb_data[7:0], merged[7:0]}
+                       : {merged[31:8], load_wb_data[7:0]};
+            else if (load_wb_size == 2'd1)
+                merged = {merged[31:16], load_wb_data[15:0]};
+            else
+                merged = load_wb_data;
+        end
+
+        if (size == 2'd0)
+            read_gpr_load_forwarded = reg_sel[2]
+                                    ? {24'd0, merged[15:8]}
+                                    : {24'd0, merged[7:0]};
+        else if (size == 2'd1)
+            read_gpr_load_forwarded = {16'd0, merged[15:0]};
+        else
+            read_gpr_load_forwarded = merged;
+    end
+endfunction
+
 localparam logic [1:0] EA_FWD_BLO = 2'd0;
 localparam logic [1:0] EA_FWD_BHI = 2'd1;
 localparam logic [1:0] EA_FWD_W   = 2'd2;
@@ -228,9 +287,9 @@ function automatic logic [31:0] read_ea_gpr(
     input logic       valid,
     input logic [2:0] idx
 );
-    logic [31:0] current_value, forward_value;
-    logic [1:0]  forward_mode;
-    logic        dly_hit, shift_hit;
+    logic [31:0] current_value, dly_value, shift_value, load_value;
+    logic [2:0]  load_widx;
+    logic        dly_hit, shift_hit, load_hit;
     begin
         current_value = valid ? read_gpr_value(idx, 2'd2) : 32'd0;
         dly_hit = dly_gpr_forward.valid && valid &&
@@ -240,27 +299,60 @@ function automatic logic [31:0] read_ea_gpr(
                       recipe_shift_write.dst == idx) ||
                      (recipe_shift_write.size == 2'd0 &&
                       {1'b0, recipe_shift_write.dst[1:0]} == idx));
-        forward_value = dly_hit ? dly_gpr_forward.data : recipe_shift_data;
-        forward_mode = dly_hit ? dly_gpr_forward.mode :
-                       (recipe_shift_write.size == 2'd0)
-                           ? (recipe_shift_write.dst[2] ? EA_FWD_BHI : EA_FWD_BLO) :
-                       (recipe_shift_write.size == 2'd1) ? EA_FWD_W : EA_FWD_D;
-        if (dly_hit || shift_hit) begin
-            case (forward_mode)
-                EA_FWD_BLO: read_ea_gpr =
-                    {current_value[31:8], forward_value[7:0]};
-                EA_FWD_BHI: read_ea_gpr =
-                    {current_value[31:16], forward_value[7:0],
-                     current_value[7:0]};
-                EA_FWD_W: read_ea_gpr =
-                    {current_value[31:16], forward_value[15:0]};
-                default: read_ea_gpr = forward_value;
-            endcase
-        end else begin
-            read_ea_gpr = current_value;
-        end
+        load_widx = (load_wb_size == 2'd0)
+                  ? {1'b0, load_wb_dst[1:0]} : load_wb_dst;
+        load_hit = load_wb_valid && !load_wb_is_alu && valid &&
+                   (load_widx == idx);
+
+        // Format each producer before the priority mux. This keeps delay-slot
+        // data out of the shift/load mode selection on the D2 EA path.
+        case (dly_gpr_forward.mode)
+            EA_FWD_BLO: dly_value =
+                {current_value[31:8], dly_gpr_forward.data[7:0]};
+            EA_FWD_BHI: dly_value =
+                {current_value[31:16], dly_gpr_forward.data[7:0],
+                 current_value[7:0]};
+            EA_FWD_W: dly_value =
+                {current_value[31:16], dly_gpr_forward.data[15:0]};
+            default: dly_value = dly_gpr_forward.data;
+        endcase
+        if (recipe_shift_write.size == 2'd0)
+            shift_value = recipe_shift_write.dst[2]
+                ? {current_value[31:16], recipe_shift_data[7:0],
+                   current_value[7:0]}
+                : {current_value[31:8], recipe_shift_data[7:0]};
+        else if (recipe_shift_write.size == 2'd1)
+            shift_value = {current_value[31:16], recipe_shift_data[15:0]};
+        else
+            shift_value = recipe_shift_data;
+
+        if (load_wb_size == 2'd0)
+            load_value = load_wb_dst[2]
+                ? {current_value[31:16], load_wb_data[7:0],
+                   current_value[7:0]}
+                : {current_value[31:8], load_wb_data[7:0]};
+        else if (load_wb_size == 2'd1)
+            load_value = {current_value[31:16], load_wb_data[15:0]};
+        else
+            load_value = load_wb_data;
+
+        read_ea_gpr = dly_hit   ? dly_value :
+                      shift_hit ? shift_value :
+                      load_hit  ? load_value : current_value;
     end
 endfunction
+
+// M3 reads its destination after older architectural writes have settled but
+// before cache data enters the private WB ALU.  Plain-load WB forwarding keeps
+// a chained older load visible at this capture edge without retaining the
+// private-ALU result on the successor combinational paths above.
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        load_wb_alu_dst_r <= 32'd0;
+    else if (load_alu_dst_capture)
+        load_wb_alu_dst_r <= read_gpr_load_forwarded(
+            load_alu_dst_capture_dst, load_alu_dst_capture_size);
+end
 
 function automatic logic [31:0] read_alu_source(input logic [5:0] field);
     case (field)
@@ -328,8 +420,8 @@ function automatic logic [31:0] read_alu_source(input logic [5:0] field);
             (op_size == 2'd0 ? 32'd1 : op_size == 2'd1 ? 32'd2 : 32'd4);
         ALUSRC_BITS_V: read_alu_source = op_size == 2'd0 ? 32'd7 :
                                           op_size == 2'd2 ? 32'd31 : 32'd15;
-        ALUSRC_DSTREG: read_alu_source = read_gpr_value(dst_reg_sel_r, op_size);
-        ALUSRC_SRCREG: read_alu_source = read_gpr_value(src_reg_sel_r, op_size);
+        ALUSRC_DSTREG: read_alu_source = read_gpr_load_forwarded(dst_reg_sel_r, op_size);
+        ALUSRC_SRCREG: read_alu_source = read_gpr_load_forwarded(src_reg_sel_r, op_size);
         ALUSRC_ZERO: read_alu_source = 32'd0;
         default: read_alu_source = 32'd0;
     endcase
@@ -400,8 +492,8 @@ function automatic logic [31:0] read_source(input logic [5:0] field);
                 default: read_source = 32'd0;
             endcase
         end
-        SRC_DSTREG: read_source = read_gpr_value(dst_reg_sel_r, srcreg_size_src);
-        SRC_SRCREG: read_source = read_gpr_value(src_reg_sel_r, op_size_src);
+        SRC_DSTREG: read_source = read_gpr_load_forwarded(dst_reg_sel_r, srcreg_size_src);
+        SRC_SRCREG: read_source = read_gpr_load_forwarded(src_reg_sel_r, op_size_src);
         SRC_NEG1: read_source = 32'hffff_ffff;
         default: read_source = 32'd0;
     endcase
@@ -447,8 +539,44 @@ function automatic logic [15:0] read_cs_source(
     endcase
 endfunction
 
+// WR W uses a small, fixed subset of the microcode source field. Keep the
+// generic source mux off the write-data path into paging and the cache.
+function automatic logic [31:0] read_memory_write_source(input logic [5:0] field);
+    case (field)
+        SRC_TMPB:   read_memory_write_source = tmpb;
+        SRC_CR0:    read_memory_write_source = cr0;
+        SRC_IMM:    read_memory_write_source = instr.immediate;
+        SRC_FOP:    read_memory_write_source = {21'd0, instr.fop};
+        SRC_PROTUN: read_memory_write_source = protun;
+        SRC_SIGMA:  read_memory_write_source = sigma;
+        SRC_ES:     read_memory_write_source = {16'd0, es};
+        SRC_CS:     read_memory_write_source = {16'd0, cs};
+        SRC_SS:     read_memory_write_source = {16'd0, ss};
+        SRC_DS:     read_memory_write_source = {16'd0, ds};
+        SRC_FS:     read_memory_write_source = {16'd0, fs};
+        SRC_GS:     read_memory_write_source = {16'd0, gs};
+        SRC_LDTR:   read_memory_write_source = {16'd0, ldtr};
+        SRC_TR:     read_memory_write_source = {16'd0, tr};
+        SRC_SEGREG: begin
+            case (seg_reg_sel)
+                3'd0: read_memory_write_source = {16'd0, es};
+                3'd1: read_memory_write_source = {16'd0, cs};
+                3'd2: read_memory_write_source = {16'd0, ss};
+                3'd3: read_memory_write_source = {16'd0, ds};
+                3'd4: read_memory_write_source = {16'd0, fs};
+                3'd5: read_memory_write_source = {16'd0, gs};
+                default: read_memory_write_source = 32'd0;
+            endcase
+        end
+        SRC_IRF: read_memory_write_source = read_gpr_value(
+            countr[2:0], op_size_src == 2'd2 ? 2'd2 : 2'd1);
+        default: read_memory_write_source = 32'd0;
+    endcase
+endfunction
+
 always_comb begin
     source_value_live = read_source(source_live);
+    memory_write_source_value = read_memory_write_source(source_live);
     alu_source_value_live = read_alu_source(alu_source_live);
     alu_dst = read_source(source_field);
     dest_value = alu_dst;
@@ -595,11 +723,24 @@ always_ff @(posedge clk) begin
             write_gpr(recipe_shift_write.dst, recipe_shift_data,
                       recipe_shift_write.size);
 
-        if (exec) begin
-            if (recipe_memory_write.valid)
-                write_gpr(recipe_memory_write.dst, opr_r,
-                          recipe_memory_write.size);
+        if (load_wb_valid && !recipe_commit_cancel)
+            write_gpr(load_wb_dst, load_wb_commit_data, load_wb_size);
 
+        // A chained successor may own EX while an older hardwired load's
+        // pending token retires. The token is already fully qualified.
+        if (recipe_memory_write.valid && !recipe_commit_cancel)
+            write_gpr(recipe_memory_write.dst, opr_r,
+                      recipe_memory_write.size);
+
+        // A younger VIPT candidate can shadow the ROM writeback slot of a
+        // hardwired load.  If an interrupt redirects that boundary, retire
+        // the completed OPR_R value before the handler starts using OPR_R.
+        if (interrupt_entry && recipe_rni && recipe_state.hardwired &&
+            (recipe_state.commit_sel == RECIPE_COMMIT_MEM) &&
+            !recipe_commit_cancel)
+            write_gpr(dst_reg_sel_r, opr_r, op_size);
+
+        if (exec) begin
             case (dest)
                 DEST_EAX: eax <= dest_value;
                 DEST_EDX: edx <= dest_value;
@@ -785,15 +926,19 @@ always_ff @(posedge clk) begin
         flag2_eflags_p  <= 1'b0;
         flag2_ucflags_p <= 1'b0;
     end else begin
-        flag2_eflags_p  <= exec && update_arch_flags;
-        flag2_ucflags_p <= exec && flag2_class_uc;
-        if (exec && flag2_class_uc) begin
-            flag2_result_r <= alu_result;
-            flag2_cf_r     <= alu_flags[0];
-            flag2_af_r     <= alu_flags[4];
-            flag2_of_r     <= alu_flags[11];
-            flag2_zsp_r    <= alu_zsp_update;
-            flag2_size_r   <= op_size;
+        flag2_eflags_p  <= (exec && update_arch_flags) || load_wb_alu_commit;
+        flag2_ucflags_p <= (exec && flag2_class_uc) || load_wb_alu_commit;
+        if ((exec && flag2_class_uc) || load_wb_alu_commit) begin
+            flag2_result_r <= load_wb_alu_commit ? load_wb_alu_result
+                                                 : alu_result;
+            flag2_cf_r     <= load_wb_alu_commit ? load_wb_alu_flags[0]
+                                                 : alu_flags[0];
+            flag2_af_r     <= load_wb_alu_commit ? load_wb_alu_flags[4]
+                                                 : alu_flags[4];
+            flag2_of_r     <= load_wb_alu_commit ? load_wb_alu_flags[11]
+                                                 : alu_flags[11];
+            flag2_zsp_r    <= load_wb_alu_commit ? 1'b1 : alu_zsp_update;
+            flag2_size_r   <= load_wb_alu_commit ? load_wb_size : op_size;
         end
     end
 end
@@ -819,8 +964,15 @@ always_comb begin
         eflags_fwd = eflags;
     end
 
-    if (!(exec && update_arch_flags)) begin
+    if (!((exec && update_arch_flags) || load_wb_alu_exec)) begin
         eflags_ahead = eflags_fwd;
+    end else if (load_wb_alu_exec) begin
+        eflags_ahead = {eflags_fwd[31:12], load_wb_alu_flags[11],
+                        eflags_fwd[10:8], load_wb_alu_zsp_ahead[2],
+                        load_wb_alu_zsp_ahead[1], eflags_fwd[5],
+                        load_wb_alu_flags[4], eflags_fwd[3],
+                        load_wb_alu_zsp_ahead[0], eflags_fwd[1],
+                        load_wb_alu_flags[0]};
     end else begin
         eflags_ahead = {eflags_fwd[31:12], alu_flags[11],
                         eflags_fwd[10:8],
@@ -1003,6 +1155,115 @@ end
 //=============================================================================
 // Arithmetic engines
 //=============================================================================
+
+// Direct register-memory ALU operations execute after the registered VIPT
+// result boundary.  Keep their seven-operation add/logic datapath separate
+// from the microcode ALU: sharing it creates a combinational loop through the
+// WB-to-successor GPR bypass, and qualifying computation with fault state drags
+// the divide-overflow cone onto every load result.  Faults gate commit below;
+// they need not gate this side-effect-free calculation.
+assign load_wb_alu_exec = load_wb_valid && load_wb_is_alu;
+assign load_wb_alu_commit = load_wb_alu_exec && !recipe_commit_cancel;
+
+wire [31:0] load_wb_alu_dst = load_wb_alu_dst_r;
+logic [31:0] load_wb_add_a;
+logic [31:0] load_wb_add_b;
+logic        load_wb_add_cin;
+logic        load_wb_arith;
+logic        load_wb_sub;
+logic [31:0] load_wb_logic_result;
+
+always_comb begin
+    load_wb_add_a = load_wb_alu_dst;
+    load_wb_add_b = load_wb_data;
+    load_wb_add_cin = 1'b0;
+    load_wb_arith = 1'b0;
+    load_wb_sub = 1'b0;
+    load_wb_logic_result = load_wb_alu_dst;
+
+    case (load_wb_alu_op)
+        ALU_ADD: load_wb_arith = 1'b1;
+        ALU_ADC: begin
+            load_wb_arith = 1'b1;
+            load_wb_add_cin = eflags_fwd[0];
+        end
+        ALU_SUBT: begin
+            load_wb_arith = 1'b1;
+            load_wb_sub = 1'b1;
+            load_wb_add_b = ~load_wb_data;
+            load_wb_add_cin = 1'b1;
+        end
+        ALU_SBB: begin
+            load_wb_arith = 1'b1;
+            load_wb_sub = 1'b1;
+            load_wb_add_b = ~load_wb_data;
+            load_wb_add_cin = ~eflags_fwd[0];
+        end
+        ALU_AND: load_wb_logic_result = load_wb_alu_dst & load_wb_data;
+        ALU_OR:  load_wb_logic_result = load_wb_alu_dst | load_wb_data;
+        ALU_XOR: load_wb_logic_result = load_wb_alu_dst ^ load_wb_data;
+        default: ;
+    endcase
+end
+
+wire [32:0] load_wb_sum33 = {1'b0, load_wb_add_a} +
+                            {1'b0, load_wb_add_b} +
+                            {32'd0, load_wb_add_cin};
+wire [8:0] load_wb_sum8 = {1'b0, load_wb_add_a[7:0]} +
+                          {1'b0, load_wb_add_b[7:0]} +
+                          {8'd0, load_wb_add_cin};
+wire [16:0] load_wb_sum16 = {1'b0, load_wb_add_a[15:0]} +
+                            {1'b0, load_wb_add_b[15:0]} +
+                            {16'd0, load_wb_add_cin};
+assign load_wb_alu_result = load_wb_arith ? load_wb_sum33[31:0]
+                                          : load_wb_logic_result;
+
+wire load_wb_result_sign = load_wb_size == 2'd0
+                         ? load_wb_alu_result[7]
+                         : load_wb_size == 2'd1
+                         ? load_wb_alu_result[15] : load_wb_alu_result[31];
+wire load_wb_dst_sign = load_wb_size == 2'd0
+                      ? load_wb_alu_dst[7]
+                      : load_wb_size == 2'd1
+                      ? load_wb_alu_dst[15] : load_wb_alu_dst[31];
+wire load_wb_src_sign = load_wb_size == 2'd0
+                      ? load_wb_data[7]
+                      : load_wb_size == 2'd1
+                      ? load_wb_data[15] : load_wb_data[31];
+wire load_wb_carry = load_wb_size == 2'd0 ? load_wb_sum8[8] :
+                     load_wb_size == 2'd1 ? load_wb_sum16[16] :
+                                            load_wb_sum33[32];
+wire load_wb_overflow = load_wb_arith &&
+    (load_wb_sub
+        ? ((load_wb_dst_sign ^ load_wb_src_sign) &
+           (load_wb_dst_sign ^ load_wb_result_sign))
+        : (~(load_wb_dst_sign ^ load_wb_src_sign) &
+           (load_wb_dst_sign ^ load_wb_result_sign)));
+wire load_wb_aux_carry = load_wb_arith &&
+    (load_wb_alu_dst[4] ^ load_wb_data[4] ^ load_wb_alu_result[4]);
+wire load_wb_zero = load_wb_size == 2'd0
+                  ? load_wb_alu_result[7:0] == 8'd0
+                  : load_wb_size == 2'd1
+                  ? load_wb_alu_result[15:0] == 16'd0
+                  : load_wb_alu_result == 32'd0;
+wire load_wb_parity = ~^load_wb_alu_result[7:0];
+
+always_comb begin
+    load_wb_alu_flags = eflags_fwd;
+    load_wb_alu_flags[11] = load_wb_overflow;
+    load_wb_alu_flags[7] = load_wb_result_sign;
+    load_wb_alu_flags[6] = load_wb_zero;
+    load_wb_alu_flags[4] = load_wb_aux_carry;
+    load_wb_alu_flags[2] = load_wb_parity;
+    load_wb_alu_flags[0] = load_wb_arith
+                         ? (load_wb_sub ? ~load_wb_carry : load_wb_carry)
+                         : 1'b0;
+    load_wb_alu_zsp_ahead = {load_wb_result_sign, load_wb_zero,
+                             load_wb_parity};
+end
+
+assign load_wb_commit_data = load_wb_is_alu ? load_wb_alu_result
+                                            : load_wb_data;
 
 `ifdef Z486_ALTERA_ALU
 alu_alt alu_inst (
