@@ -232,6 +232,8 @@ reg [31:0] dcache_req_phys_addr_r;
 reg        dcache_req_write_r;
 reg [3:0]  dcache_req_be_r;
 reg [31:0] dcache_req_wdata_r;
+reg [31:0] dcache_io_wdata_r;       // Isolate address-aligned IO data from the shared request mux.
+reg        dcache_io_wdata_valid_r;
 reg        dcache_req_is_io_r;
 reg        dcache_req_is_inta_r;
 reg        dcache_req_is_x87_r;
@@ -241,7 +243,12 @@ reg [31:0] icache_req_phys_addr_r;
 // Walker bus read/write tracking: prevents re-emission while op is in flight
 reg walk_biu_pending;
 wire walker_feed_ready = dcache_req_complete && walk_biu_pending;
-wire walker_issue_ready = (walker_mem_rd || walker_mem_wr) && !walk_biu_pending && !dcache_req_valid;
+// Walker states are mutually exclusive with the PG_IDLE/PG_MEM_TLB
+// combinational request paths. Only a retained registered request can block
+// walker issue; consulting dcache_req_valid needlessly feeds live TLB results
+// back into the walker request registers.
+wire walker_issue_ready = (walker_mem_rd || walker_mem_wr) &&
+                          !walk_biu_pending && !dcache_req_valid_r;
 
 // Forward declarations — Gowin synthesis requires these before first use
 reg        req_is_write;     // declared fully at line ~217
@@ -438,7 +445,8 @@ assign dcache_req_wdata = early_wr_data_drive ?
                           req_mem_present ?
                           (req_crossing ? split_write_first(req_wdata, req_offset, req_op_size) :
                                           shift_write_data(req_wdata, req_op_size, req_offset)) :
-                          dcache_req_wdata_r;
+                          dcache_io_wdata_valid_r ? dcache_io_wdata_r :
+                                                   dcache_req_wdata_r;
 assign dcache_req_is_io = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_io_r;
 assign dcache_req_is_inta = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_inta_r;
 assign dcache_req_is_x87 = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_x87_r;
@@ -605,6 +613,8 @@ always_ff @(posedge clk or negedge reset_n) begin
         dcache_req_write_r <= 1'b0;
         dcache_req_be_r <= 4'h0;
         dcache_req_wdata_r <= 32'h0;
+        dcache_io_wdata_r <= 32'h0;
+        dcache_io_wdata_valid_r <= 1'b0;
     end else begin
         // Default: clear one-shot signals
         mem_dly_grace <= 1'b0;
@@ -618,6 +628,7 @@ always_ff @(posedge clk or negedge reset_n) begin
             mem_opt_wait <= 1'b1;
         if (dcache_req_accepted) begin
             dcache_req_valid_r <= 1'b0;
+            dcache_io_wdata_valid_r <= 1'b0;
             dcache_req_is_io_r <= 1'b0;
             dcache_req_is_inta_r <= 1'b0;
             dcache_req_is_x87_r <= 1'b0;
@@ -682,7 +693,8 @@ always_ff @(posedge clk or negedge reset_n) begin
                             dcache_req_phys_addr_r <= idle_request_linear;
                             dcache_req_write_r <= mem_write;
                             dcache_req_be_r <= mem_be;
-                            dcache_req_wdata_r <= shift_write_data(mem_wdata, mem_op_size, idle_request_linear[1:0]);
+                            dcache_io_wdata_r <= shift_write_data(mem_wdata, mem_op_size, idle_request_linear[1:0]);
+                            dcache_io_wdata_valid_r <= 1'b1;
                             dcache_req_is_x87_r <= !idle_inta_req && idle_x87_io_req;
                             // First INTA cycle (addr=4) is dummy — suppress OPR_R update.
                             // Second INTA (addr=0) delivers the vector to OPR_R.
@@ -701,6 +713,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                             dcache_req_write_r <= mem_write;
                             dcache_req_be_r <= calc_be_first(mem_op_size, linear_addr[1:0]);
                             dcache_req_wdata_r <= split_write_first(mem_wdata, linear_addr[1:0], mem_op_size);
+                            dcache_io_wdata_valid_r <= 1'b0;
                             latch_biu_meta(2'd0, first_half_bytes(linear_addr[1:0]) - 2'd1,
                                            mem_write, linear_addr[1:0], 1'b0, 1'b0);
                         end
@@ -1045,6 +1058,7 @@ task automatic emit_walker_biu_req();
     dcache_req_write_r <= walker_mem_wr;
     dcache_req_be_r <= 4'b1111;
     dcache_req_wdata_r <= walker_mem_wdata;
+    dcache_io_wdata_valid_r <= 1'b0;
     dcache_req_is_io_r <= 1'b0;
     dcache_req_is_inta_r <= 1'b0;
     latch_biu_meta(2'd0, 2'd0, 1'b0, 2'b00, 1'b0, 1'b1);
@@ -1059,6 +1073,7 @@ task automatic emit_single(input [31:0] phys_addr);
     // req_offset == phys_addr[1:0] (paging preserves bits [11:0])
     dcache_req_be_r <= calc_be(req_op_size, req_offset);
     dcache_req_wdata_r <= shift_write_data(req_wdata, req_op_size, req_offset);
+    dcache_io_wdata_valid_r <= 1'b0;
     dcache_req_is_io_r <= 1'b0;
     dcache_req_is_inta_r <= 1'b0;
     latch_biu_meta(2'd0, op_size_bytes_m1(req_op_size), req_is_write,
@@ -1077,6 +1092,7 @@ task automatic emit_first_half(input [31:0] phys_addr);
     dcache_req_write_r <= req_is_write;
     dcache_req_be_r <= calc_be_first(req_op_size, req_offset);
     dcache_req_wdata_r <= split_write_first(req_wdata, req_offset, req_op_size);
+    dcache_io_wdata_valid_r <= 1'b0;
     dcache_req_is_io_r <= 1'b0;
     dcache_req_is_inta_r <= 1'b0;
     latch_biu_meta(2'd0, first_half_bytes(req_offset) - 2'd1,
@@ -1096,6 +1112,7 @@ task automatic emit_second_half(input [31:0] phys_addr);
     dcache_req_write_r <= req_is_write;
     dcache_req_be_r <= calc_be_second(req_op_size, req_offset);
     dcache_req_wdata_r <= split_write_second(req_wdata, req_offset, req_op_size);
+    dcache_io_wdata_valid_r <= 1'b0;
     dcache_req_is_io_r <= 1'b0;
     dcache_req_is_inta_r <= 1'b0;
     latch_biu_meta(fb, second_half_bytes(req_offset, req_op_size) - 2'd1,

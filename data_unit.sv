@@ -38,6 +38,8 @@ module data_unit
     input  logic        fpu_f8,
     input  logic [3:0]  shift_source_class,      // Predecoded shifter source class
     input  logic [1:0]  shift2_source,           // Predecoded SHIFT2 source
+    input  logic        shift_is_shift2,         // Registered ROM SHIFT2 decode
+    input  logic        shift_uc_carry,          // BSR loop needs carry immediately
     input  logic [1:0]  op_size,
     input  logic [1:0]  srcreg_size,
     input  logic [1:0]  op_size_src,             // Source-mux operand size
@@ -123,11 +125,22 @@ logic        alu_zsp_update;
 
 logic [31:0] tmpb, tmpd, tmpe, tmpf, tmph;
 logic [31:0] csopcd, fsveip, oproff;
+logic [2:0] src_reg_sel_r;           // EX-local copies of issued GPR selectors
+logic [2:0] dst_reg_sel_r;
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        src_reg_sel_r <= 3'd0;
+        dst_reg_sel_r <= 3'd0;
+    end else if (instr_start) begin
+        src_reg_sel_r <= next_instr.src_reg_sel;
+        dst_reg_sel_r <= next_instr.dst_reg_sel;
+    end
+end
 
 logic [31:0] shift_setup_result;
 logic [1:0]  shift_data_size;
 logic        shift_count_nonzero;
-logic        shift_cf;
 
 logic        muldiv_sigma_write;
 logic [31:0] muldiv_sigma_value;
@@ -319,8 +332,8 @@ function automatic logic [31:0] read_alu_source(input logic [5:0] field);
             (op_size == 2'd0 ? 32'd1 : op_size == 2'd1 ? 32'd2 : 32'd4);
         ALUSRC_BITS_V: read_alu_source = op_size == 2'd0 ? 32'd7 :
                                           op_size == 2'd2 ? 32'd31 : 32'd15;
-        ALUSRC_DSTREG: read_alu_source = read_gpr_value(instr.dst_reg_sel, op_size);
-        ALUSRC_SRCREG: read_alu_source = read_gpr_value(instr.src_reg_sel, op_size);
+        ALUSRC_DSTREG: read_alu_source = read_gpr_value(dst_reg_sel_r, op_size);
+        ALUSRC_SRCREG: read_alu_source = read_gpr_value(src_reg_sel_r, op_size);
         ALUSRC_ZERO: read_alu_source = 32'd0;
         default: read_alu_source = 32'd0;
     endcase
@@ -389,8 +402,8 @@ function automatic logic [31:0] read_source(input logic [5:0] field);
                 default: read_source = 32'd0;
             endcase
         end
-        SRC_DSTREG: read_source = read_gpr_value(instr.dst_reg_sel, srcreg_size_src);
-        SRC_SRCREG: read_source = read_gpr_value(instr.src_reg_sel, op_size_src);
+        SRC_DSTREG: read_source = read_gpr_value(dst_reg_sel_r, srcreg_size_src);
+        SRC_SRCREG: read_source = read_gpr_value(src_reg_sel_r, op_size_src);
         SRC_NEG1: read_source = 32'hffff_ffff;
         default: read_source = 32'd0;
     endcase
@@ -415,9 +428,9 @@ function automatic logic [31:0] read_protection_source(
         SRC_OPR_R:   read_protection_source = opr_r;
         SRC_IRF2:    read_protection_source = ind;
         SRC_TMPE:    read_protection_source = tmpe;
-        SRC_DSTREG:  read_protection_source = read_gpr_value(instr.dst_reg_sel,
+        SRC_DSTREG:  read_protection_source = read_gpr_value(dst_reg_sel_r,
                                                               srcreg_size);
-        SRC_SRCREG:  read_protection_source = read_gpr_value(instr.src_reg_sel,
+        SRC_SRCREG:  read_protection_source = read_gpr_value(src_reg_sel_r,
                                                               op_size);
         default:     read_protection_source = generic_value;
     endcase
@@ -552,7 +565,7 @@ always_ff @(posedge clk) begin
                                    (recipe_state.commit_sel == RECIPE_COMMIT_MEM);
         if (recipe_rni && exec && instr_start &&
             (recipe_state.commit_sel == RECIPE_COMMIT_MEM)) begin
-            recipe_memory_write.dst <= instr.dst_reg_sel;
+            recipe_memory_write.dst <= dst_reg_sel_r;
             recipe_memory_write.size <= op_size;
         end
 
@@ -560,7 +573,7 @@ always_ff @(posedge clk) begin
                                   (recipe_state.commit_sel == RECIPE_COMMIT_SHIFT);
         if (recipe_rni && exec &&
             (recipe_state.commit_sel == RECIPE_COMMIT_SHIFT)) begin
-            recipe_shift_write.dst <= instr.dst_reg_sel;
+            recipe_shift_write.dst <= dst_reg_sel_r;
             recipe_shift_write.size <= op_size;
             recipe_shift_data <= shift_result;
         end
@@ -600,8 +613,8 @@ always_ff @(posedge clk) begin
                         esp[15:0] <= dest_value[15:0];
                 DEST_EBP: ebp <= dest_value;
 
-                DEST_DSTREG: write_gpr(instr.dst_reg_sel, dest_value, op_size);
-                DEST_SRCREG: write_gpr(instr.src_reg_sel, dest_value, op_size);
+                DEST_DSTREG: write_gpr(dst_reg_sel_r, dest_value, op_size);
+                DEST_SRCREG: write_gpr(src_reg_sel_r, dest_value, op_size);
                 DEST_AX:     write_gpr(3'd0, dest_value, 2'd1);
                 DEST_BP:     write_gpr(3'd5, dest_value, 2'd1);
                 DEST_eAX_AL: write_gpr(3'd0, dest_value, op_size);
@@ -614,14 +627,14 @@ always_ff @(posedge clk) begin
                 DEST_AH:  write_gpr(3'd4, dest_value, 2'd0);
 
                 DEST_USTEP_BSWAP:
-                    write_gpr(instr.src_reg_sel,
+                    write_gpr(src_reg_sel_r,
                               {dest_value[7:0], dest_value[15:8],
                                dest_value[23:16], dest_value[31:24]}, 2'd2);
 
                 DEST_USTEP_ALU:
                     if (recipe_state.hardwired && !hardwired_off &&
                         !recipe_commit_cancel)
-                        write_gpr(instr.dst_reg_sel, alu_result, op_size);
+                        write_gpr(dst_reg_sel_r, alu_result, op_size);
 
                 DEST_IRF:
                     if (countr[5:3] != 3'b100)
@@ -632,7 +645,7 @@ always_ff @(posedge clk) begin
 
             if (recipe_rni && !recipe_commit_cancel &&
                 recipe_state.commit_sel == RECIPE_COMMIT_SIGSRC)
-                write_gpr(instr.src_reg_sel, sigma,
+                write_gpr(src_reg_sel_r, sigma,
                           aluop == ALUJMP_BITS32 ? 2'd2 : 2'd1);
 
             if (recipe_rni && !recipe_commit_cancel &&
@@ -640,7 +653,7 @@ always_ff @(posedge clk) begin
                 esp <= sigma;
 
             if (aluop == ALUJMP_CLZF && instr.has_0f && instr.opcode == 8'hBD)
-                write_gpr(instr.src_reg_sel, tmpc, op_size);
+                write_gpr(src_reg_sel_r, tmpc, op_size);
         end
     end
 end
@@ -859,12 +872,12 @@ always_ff @(posedge clk) begin
         if (!instr_start && exec) begin
             case (aluop)
                 ALUJMP_BITTST: uc_flags[0] <= shift_result[0];
-                ALUJMP_SHIFT2:
-                    if (shift_count_nonzero)
-                        uc_flags[0] <= shift_cf;
                 default: ;
             endcase
         end
+        if (!instr_start && exec && shift_uc_carry)
+            uc_flags[0] <= op_size == 2'd0 ? tmpb[7] :
+                           op_size == 2'd1 ? tmpb[15] : tmpb[31];
     end
 end
 
@@ -1030,6 +1043,7 @@ shifter shifter_inst (
     .source_field(source_field),
     .source_class(shift_source_class),
     .shift2_source(shift2_source),
+    .is_shift2(shift_is_shift2),
     .alu_source(alu_source),
     .instr_start(instr_start),
     .instr_is_shxd_next(next_instr.has_0f &&
@@ -1041,10 +1055,10 @@ shifter shifter_inst (
     .op_size(op_size),
     .alu_dst(alu_dst),
     .alu_src(alu_src),
-    .gpr_dst_src_size(read_gpr_value(instr.dst_reg_sel, srcreg_size)),
-    .gpr_src_op_size(read_gpr_value(instr.src_reg_sel, op_size)),
-    .gpr_dst_shift_size(read_gpr_value(instr.dst_reg_sel, shift_data_size)),
-    .gpr_src_shift_size(read_gpr_value(instr.src_reg_sel, shift_data_size)),
+    .gpr_dst_src_size(read_gpr_value(dst_reg_sel_r, srcreg_size)),
+    .gpr_src_op_size(read_gpr_value(src_reg_sel_r, op_size)),
+    .gpr_dst_shift_size(read_gpr_value(dst_reg_sel_r, shift_data_size)),
+    .gpr_src_shift_size(read_gpr_value(src_reg_sel_r, shift_data_size)),
     .immediate(instr.immediate),
     .ecx(ecx),
     .sigma(sigma),
@@ -1058,7 +1072,6 @@ shifter shifter_inst (
     .result(shift_result),
     .setup_result(shift_setup_result),
     .count_nonzero(shift_count_nonzero),
-    .current_cf(shift_cf),
     .flags_commit(sh_flags_commit),
     .flags_we_zsp(sh_flags_we_zsp),
     .flags_we_of(sh_flags_we_of),

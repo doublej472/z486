@@ -11,6 +11,7 @@ module shifter
     input  logic [5:0]  source_field,
     input  logic [3:0]  source_class,       // Predecoded SHIFT1 operand source
     input  logic [1:0]  shift2_source,      // Predecoded SHIFT2 operand source
+    input  logic        is_shift2,          // ROM-predecoded SHIFT2 control
     input  logic [5:0]  alu_source,
 
     input  logic        instr_start,        // Capture per-instruction shift state
@@ -40,8 +41,6 @@ module shifter
     output logic [31:0] result,
     output logic [31:0] setup_result,       // SHIFT1 result consumed by data unit
     output logic        count_nonzero,      // Captured count enables SHIFT2 commit
-    output logic        current_cf,         // Carry after current shift operation
-
     output logic        flags_commit,       // SHIFT2 deferred flags are ready
     output logic        flags_we_zsp,
     output logic        flags_we_of,
@@ -69,7 +68,6 @@ logic [31:0] alu_value;
 
 wire [5:0] width = op_size == 2'd0 ? 6'd8 :
                    op_size == 2'd1 ? 6'd16 : 6'd32;
-wire       is_shift2 = shift_aluop == ALUJMP_SHIFT2;
 wire [5:0] data_width = is_shift2 ? shift1_width : width;
 wire [31:0] width_mask = op_size == 2'd0 ? 32'h0000_00ff :
                          op_size == 2'd1 ? 32'h0000_ffff : 32'hffff_ffff;
@@ -152,8 +150,6 @@ wire        last_out_lsb = shift_input[count-1];
 wire        last_out_msb = shifted[data_width];
 
 assign result = overflow ? (is_sar ? sar_overflow_result : 32'd0) : shifted[31:0];
-assign current_cf = swap ? last_out_msb : last_out_lsb;
-
 wire result_pf = ~^result[7:0];
 wire result_zf = overflow ? (is_sar ? !low_sign : 1'b1) :
                  data_size == 2'd0 ? shifted[7:0] == 8'd0 :

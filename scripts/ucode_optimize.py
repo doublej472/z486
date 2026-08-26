@@ -497,7 +497,7 @@ def render_recipe_svh(words: list[int]) -> str:
 
     def overlay_qualifier_expr(recipe: OverlayRecipe) -> str:
         if recipe.qualifier == OverlayQualifier.X87_M32_FLOAT:
-            return "(e.opcode == 8'hD8) || ((e.opcode == 8'hD9) && (e.modrm[5:3] == 3'd0))"
+            return "(opcode == 8'hD8) || ((opcode == 8'hD9) && (modrm[5:3] == 3'd0))"
         raise ValueError(f"overlay {recipe.name}: unhandled qualifier {recipe.qualifier}")
 
     lines = [
@@ -521,9 +521,13 @@ def render_recipe_svh(words: list[int]) -> str:
     lines += [
         "",
         "// Resolve opcode-qualified overlays during D1 structural decode.",
-        "function automatic logic [11:0] recipe_effective_entry(input dec_entry_t e);",
-        "    recipe_effective_entry = e.entry_point;",
-        "    unique case (e.entry_point)",
+        "function automatic logic [11:0] recipe_effective_entry(",
+        "    input logic [11:0] entry,",
+        "    input logic [7:0] opcode,",
+        "    input logic [7:0] modrm",
+        ");",
+        "    recipe_effective_entry = entry;",
+        "    unique case (entry)",
     ]
     for recipe in OVERLAY_RECIPES:
         lines += [

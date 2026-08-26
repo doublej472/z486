@@ -156,6 +156,18 @@ wire [31:0] CS_base = desc_cache[SEG_CS].base;
 
 wire       pe = CR0[0];             // Protected mode enable
 wire       vm = EFLAGS[17];         // Virtual 8086 mode
+logic      decoder_default32_r;     // D1-local mode replicas
+logic      decoder_native_pe_r;
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        decoder_default32_r <= 1'b0;
+        decoder_native_pe_r <= 1'b0;
+    end else begin
+        decoder_default32_r <= D;
+        decoder_native_pe_r <= pe && !vm;
+    end
+end
 
 assign dbg_CS  = CS;
 assign dbg_EIP = EIP;
@@ -450,6 +462,7 @@ wire [5:0]  uc_source_shift;
 wire [3:0]  uc_shift_source_class;
 wire [1:0]  uc_shift2_source;
 wire        uc_is_shift2;
+wire        uc_shift_uc_carry;
 wire [5:0]  uc_alu_src_shift;
 wire [6:0]  uc_aluop_shift;
 wire [2:0]  uc_dly_source;
@@ -621,8 +634,8 @@ decoder decoder_inst (
     .pop_len    (dec_pop_len),
 
     // Mode signals
-    .D          (D),
-    .pe_enable  (pe & ~vm),  // Native protected mode: PE=1 and VM=0 (V86 uses real-mode entry points)
+    .D          (decoder_default32_r),
+    .pe_enable  (decoder_native_pe_r), // V86 uses real-mode entry points
 
     // Control signals
     .q_flush    (q_flush),
@@ -643,6 +656,15 @@ decoder decoder_inst (
     .d1_issue_entry(d1_issue_entry),
     .fetch_blocked(decoder_fetch_blocked)
 );
+
+// A mode transition flushes the frontend before another D1 handoff, giving
+// these local timing replicas time to match architectural state.
+// synthesis translate_off
+always_ff @(posedge clk)
+    if (reset_n && d1_issue_direct &&
+        ({decoder_default32_r, decoder_native_pe_r} !== {D, pe && !vm}))
+        $fatal(1, "D1 MODE REPLICA MISMATCH");
+// synthesis translate_on
 
 //=============================================================================
 // Unit 3: Decode2 - literals capture and early-address (EA decode, relocate,
@@ -1779,6 +1801,7 @@ microsequencer microsequencer_inst (
     .uc_shift_source_class(uc_shift_source_class),
     .uc_shift2_source(uc_shift2_source),
     .uc_is_shift2(uc_is_shift2),
+    .uc_shift_uc_carry(uc_shift_uc_carry),
     .uc_alu_src_shift(uc_alu_src_shift),
     .uc_aluop_shift(uc_aluop_shift),
     .uc_dly_source(uc_dly_source),
@@ -2457,6 +2480,8 @@ data_unit data_unit_inst (
     .fpu_f8(uc_fpu_f8),
     .shift_source_class(uc_shift_source_class),
     .shift2_source(uc_shift2_source),
+    .shift_is_shift2(uc_is_shift2),
+    .shift_uc_carry(uc_shift_uc_carry),
     .op_size(op_size),
     .srcreg_size(srcreg_size),
     .op_size_src(op_size_src),

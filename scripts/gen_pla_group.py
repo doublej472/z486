@@ -7,10 +7,10 @@ a second pass keyed by {row, modrm[5:3]}.  Chaining the two lookups puts ~6
 extra LUT levels on the prefetch->decq critical path.
 
 This script evaluates the first-level table offline and emits
-pla_group_lookup(), which produces the 6-bit group row directly from
-{data32, opcode, pe, has_0f}.  The decoder uses it to run the second-level
-lookup in parallel with the first; the result is only consumed when the first
-lookup confirms a group row, so non-group entries are don't-care (emitted 0).
+pla_group_lookup(), which produces a valid bit and the 6-bit group row directly
+from {data32, opcode, pe, has_0f}.  The decoder uses it to run the second-level
+lookup and select it in parallel with the first.  Row zero is valid, so the
+generated valid bit distinguishes it from non-group entries.
 
 The generated function is written into pla_entry.svh between the
 "begin/end generated: pla_group_lookup" markers (appended on first run),
@@ -82,7 +82,7 @@ def main():
                     assert len(rows) == 1, \
                         f"group row depends on rep: 0f={has_0f} op={opcode:02x}"
                     entry_first = rows.pop() & 0xFFF
-                    if (entry_first >> 6) == 0 and (entry_first & 0x3F) != 0:
+                    if (entry_first >> 6) == 0:
                         group_map.setdefault((has_0f, opcode), {})[
                             (data32, pe)] = entry_first & 0x3F
     # Emit: one casez line per (has_0f, opcode), split by data32/pe only when
@@ -118,13 +118,13 @@ def main():
     body = []
     body.append("// Generated second-level group PLA; do not edit by hand.")
     body.append("// Details: doc/z486/implementation_notes.md#src-24-z486-pla-entry-svh-561")
-    body.append("function automatic logic [5:0] pla_group_lookup(")
+    body.append("function automatic logic [6:0] pla_group_lookup(")
     body.append("    input [10:0] addr_in")
     body.append(");")
     body.append("    casez (addr_in)")
     for pat, val in lines:
-        body.append(f"        {pat}: pla_group_lookup = 6'b{val:06b};")
-    body.append("        default: pla_group_lookup = 6'b000000;")
+        body.append(f"        {pat}: pla_group_lookup = 7'b1{val:06b};")
+    body.append("        default: pla_group_lookup = 7'b0000000;")
     body.append("    endcase")
     body.append("endfunction")
     # Dedicated group-entry second-level lookup: the group rows (bit[1]==0) of
@@ -178,12 +178,14 @@ def main():
                         addr = ((data32 << 12) | (opcode << 4) | (rep << 3) |
                                 (pe << 2) | (1 << 1) | has_0f)
                         first = casez_eval(entry_pats, addr, 13) & 0xFFF
-                        if (first >> 6) != 0:
-                            continue
                         gaddr = (data32 << 10) | (opcode << 2) | (pe << 1) | has_0f
-                        grp = casez_eval(group_pats, gaddr, 11)
+                        grp_dec = casez_eval(group_pats, gaddr, 11)
+                        grp_valid = (grp_dec >> 6) & 1
+                        grp = grp_dec & 0x3F
                         checked += 1
-                        if grp != (first & 0x3F):
+                        is_group = (first >> 6) == 0
+                        if bool(grp_valid) != is_group or \
+                                (is_group and grp != (first & 0x3F)):
                             mismatches += 1
                             print(f"MISMATCH 0f={has_0f} op={opcode:02x} "
                                   f"d32={data32} pe={pe}: row {first & 0x3F:#x} "

@@ -12,11 +12,15 @@ localparam logic [1:0] RECIPE_ACTION_NONE = 2'd0;
 localparam logic [1:0] RECIPE_ACTION_X87_M32_LOAD = 2'd1;
 
 // Resolve opcode-qualified overlays during D1 structural decode.
-function automatic logic [11:0] recipe_effective_entry(input dec_entry_t e);
-    recipe_effective_entry = e.entry_point;
-    unique case (e.entry_point)
+function automatic logic [11:0] recipe_effective_entry(
+    input logic [11:0] entry,
+    input logic [7:0] opcode,
+    input logic [7:0] modrm
+);
+    recipe_effective_entry = entry;
+    unique case (entry)
         12'h4D7: begin
-            if ((e.opcode == 8'hD8) || ((e.opcode == 8'hD9) && (e.modrm[5:3] == 3'd0)))
+            if ((opcode == 8'hD8) || ((opcode == 8'hD9) && (modrm[5:3] == 3'd0)))
                 recipe_effective_entry = 12'h9C5;
         end
         default: ;

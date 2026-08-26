@@ -124,10 +124,14 @@ decoder_work_t handoff_work;
 always_comb begin
     handoff_work = d1_sib ? capture_sib(pend_work, sib_b) : struct_work;
 end
+wire [11:0] handoff_entry_point = recipe_effective_entry(
+    handoff_work.entry.entry_point,
+    handoff_work.entry.opcode,
+    handoff_work.entry.modrm);
 decoder_work_t handoff_d2;
 always_comb begin
     handoff_d2 = handoff_work;
-    handoff_d2.entry.entry_point = recipe_effective_entry(handoff_work.entry);
+    handoff_d2.entry.entry_point = handoff_entry_point;
     {handoff_d2.entry.ea_index_onehot, handoff_d2.entry.ea_base_onehot} =
         dec_ea_onehots(handoff_work.entry);
     handoff_d2.entry.mem_seg = handoff_work.entry.stack_op ? SEG_SS :
@@ -175,7 +179,7 @@ wire handoff_raw_valid = (d1_avail >= handoff_raw_end);
 // Launch the synchronous ROM as soon as structural decode owns an empty D2.
 // D2 holds the returned word while late or second literals are captured.
 assign d1_issue_direct = d1_handoff && !skel_v;
-assign d1_issue_entry_point = handoff_d2.entry.entry_point;
+assign d1_issue_entry_point = handoff_entry_point;
 always_comb begin
     d1_issue_entry = handoff_d2.entry;
 end
@@ -579,6 +583,7 @@ task automatic build_struct_work(
     logic [11:0] ctl_bits;
     logic [15:0] entry_first;
     logic [15:0] entry_final;
+    logic [6:0]  group_dec;
     logic        entry_group;
     logic [5:0]  group_code;
     logic        has_modrm;
@@ -618,10 +623,11 @@ task automatic build_struct_work(
         // across a mode switch.
         entry_first = pla_entry_lookup({data32, opcode, prefix_rep, pe_enable,
                                         1'b1, prefix_0f});
-        entry_group = ~(|entry_first[11:6]) && has_modrm;
-        // Parallel copy of entry_first[5:0] for group rows, so the
-        // second-level lookup does not chain behind the first.
-        group_code = pla_group_lookup({data32, opcode, pe_enable, prefix_0f});
+        // Decode group validity and row in parallel with entry_first. This
+        // keeps the group select off the first-level entry PLA result.
+        group_dec = pla_group_lookup({data32, opcode, pe_enable, prefix_0f});
+        group_code = group_dec[5:0];
+        entry_group = group_dec[6] && has_modrm;
         entry_final = entry_group ?
             pla_group_entry_lookup({data32, group_code[5:4], modrm[5:3],
                                     group_code[3:0], (modrm[7:6] != 2'b11),
