@@ -81,6 +81,7 @@ module paging_unit
     output logic        dcache_req_write,     // 1=write
     output logic [3:0]  dcache_req_be,        // Byte enables (pre-computed)
     output logic [31:0] dcache_req_wdata,     // Write data (pre-positioned on bus)
+    output logic [31:0] x87_req_wdata,        // Registered pseudo-I/O write data
     output logic        dcache_req_is_io,     // Request is IO space
     output logic        dcache_req_is_inta,   // Request is INTA cycle
     output logic        dcache_req_is_x87,    // Registered reserved x87 pseudo-I/O request
@@ -457,6 +458,7 @@ assign dcache_req_wdata = early_wr_data_drive ?
                                           shift_write_data(req_wdata, req_op_size, req_offset)) :
                           dcache_io_wdata_valid_r ? dcache_io_wdata_r :
                                                    dcache_req_wdata_r;
+assign x87_req_wdata = dcache_io_wdata_r;
 assign dcache_req_is_io = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_io_r;
 assign dcache_req_is_inta = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_inta_r;
 assign dcache_req_is_x87 = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_x87_r;

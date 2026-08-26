@@ -452,12 +452,16 @@ function automatic logic [22:0] x87_command_decode_word(
         11'h1ec: return 23'h080006;
         11'h1ed: return 23'h0a0006;
         11'h1ee: return 23'h0c0006;
+        11'h1f0: return 23'h00001b;
+        11'h1f1: return 23'h00001a;
         11'h1f2: return 23'h2001a8;
         11'h1f3: return 23'h2001a9;
         11'h1f6: return 23'h00000c;
         11'h1f7: return 23'h00000d;
+        11'h1f8: return 23'h00001d;
         11'h1fa: return 23'h200187;
         11'h1fc: return 23'h20000b;
+        11'h1fd: return 23'h00001c;
         11'h1fe: return 23'h2001aa;
         11'h1ff: return 23'h2201aa;
         11'h200: return 23'h2c00f7;

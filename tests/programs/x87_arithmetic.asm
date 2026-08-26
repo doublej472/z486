@@ -151,6 +151,58 @@ start:
     cmp dword [result32], 0x40400000          ; 3.0
     jne fail
 
+    ; Superfrog's mixer-table setup uses the classic pow()/exp2 sequence.
+    fld dword [real_3_0]
+    fld dword [real_2_0]
+    fyl2x                                      ; 3 * log2(2) = 3
+    fstp dword [result32]
+    cmp dword [result32], 0x40400000
+    jne fail
+
+    fld dword [real_0_5]
+    f2xm1                                      ; sqrt(2) - 1
+    fstp dword [result32]
+    cmp dword [result32], 0x3ed413cd
+    jne fail
+
+    fld dword [real_minus_0_5]
+    f2xm1                                      ; 2^-0.5 - 1
+    fstp dword [result32]
+    cmp dword [result32], 0xbe95f61a
+    jne fail
+
+    fld dword [real_1_0]
+    f2xm1
+    fstp dword [result32]
+    cmp dword [result32], 0x3f800000           ; 2^1 - 1 = 1
+    jne fail
+
+    fld dword [real_minus_1_0]
+    f2xm1
+    fstp dword [result32]
+    cmp dword [result32], 0xbf000000           ; 2^-1 - 1 = -0.5
+    jne fail
+
+    fld dword [real_3_0]
+    fld dword [real_1_5]
+    fscale                                     ; 1.5 * 2^3 = 12
+    fstp dword [result32]
+    fstp dword [scratch32]
+    cmp dword [result32], 0x41400000
+    jne fail
+
+    fld dword [real_5_0]
+    fld dword [real_17_0]
+    fprem                                      ; 17 % 5 = 2, quotient = 3
+    fnstsw ax
+    and ax, 0x4700
+    cmp ax, 0x4200                             ; C3:C1:C0 = Q1:Q0:Q2
+    jne fail
+    fstp dword [result32]
+    fstp dword [scratch32]
+    cmp dword [result32], 0x40000000
+    jne fail
+
     fninit
     fldz
     fld1
@@ -234,12 +286,17 @@ fpu_fault:
 
 align 8
 real_0_5:      dd 0x3f000000
+real_minus_0_5:dd 0xbf000000
 real_1_0:      dd 0x3f800000
 real_minus_1_0: dd 0xbf800000
 real_1_5:      dd 0x3fc00000
+real_2_0:      dd 0x40000000
 real_2_5:      dd 0x40200000
+real_3_0:      dd 0x40400000
+real_5_0:      dd 0x40a00000
 real_7_5:      dd 0x40f00000
 real_9:        dd 0x41100000
+real_17_0:     dd 0x41880000
 real_minus_1_5:dd 0xbfc00000
 real64_1_25:   dq 0x3ff4000000000000
 real64_2_5:    dq 0x4004000000000000

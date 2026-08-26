@@ -241,6 +241,7 @@ wire [31:0] dcache_req_phys_addr_raw;
 wire        dcache_req_write;
 wire [3:0]  dcache_req_be;
 wire [31:0] dcache_req_wdata;
+wire [31:0] x87_req_wdata;
 wire        dcache_req_is_io;
 wire        dcache_req_is_inta;
 wire        dcache_req_is_x87;
@@ -1402,6 +1403,7 @@ paging_unit paging_inst (
     .dcache_req_write   (dcache_req_write),
     .dcache_req_be      (dcache_req_be),
     .dcache_req_wdata   (dcache_req_wdata),
+    .x87_req_wdata      (x87_req_wdata),
     .dcache_req_is_io   (dcache_req_is_io),
     .dcache_req_is_inta (dcache_req_is_inta),
     .dcache_req_is_x87  (dcache_req_is_x87),
@@ -2490,7 +2492,7 @@ x87_unit #(.ENABLE_X87(ENABLE_X87)) x87 (
     .req_data_port(dcache_req_phys_addr_raw[2]),
     .req_write(dcache_req_write),
     .req_be(dcache_req_be),
-    .req_wdata(dcache_req_wdata),
+    .req_wdata(x87_req_wdata),
     .req_accepted(x87_req_accepted),
     .req_complete(x87_req_complete),
     .req_read_complete(x87_read_complete),

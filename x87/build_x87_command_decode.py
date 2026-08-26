@@ -12,7 +12,8 @@ ACTIONS = {
             "PUSH_CONST", "FSQRT", "FPTAN", "FPATAN", "TRIG",
             "FRNDINT", "FDECSTP", "FINCSTP", "TX_ENV", "TX_STATE",
             "RX_ENV", "RX_STATE", "ARITH", "FLD_ST", "FXCH", "FFREE",
-            "FSTP_ST", "MEMORY_MATH", "LOAD", "STORE",
+            "FSTP_ST", "MEMORY_MATH", "LOAD", "STORE", "FYL2X",
+            "F2XM1", "FSCALE", "FPREM",
         )
     )
 }
@@ -101,6 +102,8 @@ def fields(fop: int) -> dict[str, int]:
         0x1F2: "FPTAN", 0x1F3: "FPATAN", 0x1FC: "FRNDINT",
         0x1F6: "FDECSTP", 0x1F7: "FINCSTP", 0x130: "TX_ENV",
         0x530: "TX_STATE", 0x120: "RX_ENV", 0x520: "RX_STATE",
+        0x1F1: "FYL2X", 0x1F0: "F2XM1", 0x1FD: "FSCALE",
+        0x1F8: "FPREM",
     }
     if key in exact:
         result["action"] = ACTIONS[exact[key]]

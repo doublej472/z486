@@ -3,6 +3,8 @@
 // The Intel 80387 block diagram places the stack inside the FPU; keeping its
 // RAM here lets stack and transfer control share one owner. Arithmetic is
 // delegated to x87_executor.
+`include "x87_logexp_rom.sv"
+
 module x87_control
     import x87_pkg::*, x87_ucode_pkg::*;
 (
@@ -176,6 +178,60 @@ logic         trans_atan2;
 logic         fptan_trans_pending;       // CORDIC tangent pair has not returned.
 logic         fptan_div_pending;         // Shared divide is producing tan = sin/cos.
 logic         fptan_push_after_result;   // Tangent write precedes architectural push 1.0.
+typedef enum logic [2:0] {
+    FPREM_IDLE,
+    FPREM_DIVIDE,
+    FPREM_ROUND,
+    FPREM_MULTIPLY,
+    FPREM_SUBTRACT
+} fprem_phase_t;
+fprem_phase_t fprem_phase;
+x87_reg_t     fprem_dividend;
+x87_reg_t     fprem_divisor;
+logic [2:0]   fprem_quotient_bits;
+typedef enum logic [1:0] {
+    FSCALE_IDLE,
+    FSCALE_SHIFT,
+    FSCALE_APPLY
+} fscale_phase_t;
+fscale_phase_t fscale_phase;
+x87_reg_t      fscale_value;
+logic   [52:0] fscale_shift;
+logic    [5:0] fscale_shift_count;
+logic          fscale_sign;
+logic signed [31:0] fscale_delta;
+typedef enum logic [3:0] {
+    LOGEXP_IDLE,
+    LOGEXP_ARGUMENT_SHIFT,
+    LOGEXP_LOOKUP,
+    LOGEXP_PREPARE,
+    LOGEXP_INTERPOLATE,
+    LOGEXP_OFFSET,
+    LOGEXP_NORMALIZE,
+    LOGEXP_NORMALIZE_STEP,
+    LOGEXP_COMMIT
+} logexp_phase_t;
+logexp_phase_t logexp_phase;
+logic          logexp_fyl2x;
+x87_reg_t      logexp_input;
+x87_reg_t      logexp_multiplier;
+logic   [52:0] logexp_argument_shift;
+logic    [5:0] logexp_argument_shift_count;
+logic    [9:0] logexp_address;
+logic   [99:0] logexp_data;
+logic signed [54:0] logexp_base_q52;
+logic signed [45:0] logexp_delta_q52;
+logic          [7:0] logexp_fraction;
+logic signed [69:0] logexp_offset_q52;
+logic signed [54:0] logexp_interpolated_q52;
+logic signed [69:0] logexp_fixed_q52;
+logic         [69:0] logexp_normal_magnitude;
+logic signed  [16:0] logexp_normal_exp;
+logic                logexp_normal_sign;
+logic                logexp_normal_guard;
+logic                logexp_normal_round;
+logic                logexp_normal_sticky;
+x87_reg_t             logexp_result;
 logic   [7:0] v2_exec_uaddr;
 
 wire [15:0] status_word = {status_flags[15:14], top, status_flags[10:0]};
@@ -194,7 +250,7 @@ wire v2_exec_math_done = v2_exec_done &&
                             (v2_exec_owner == EXEC_MATH);
 wire trans_done = v2_exec_math_done &&
                   (v2_exec_op == X87_ARITH_TRANS);
-wire math_done = v2_exec_math_done &&
+wire math_done = v2_exec_math_done && (fprem_phase == FPREM_IDLE) &&
                  !(trans_done && fptan_trans_pending);
 wire math_invalid = v2_exec_invalid;
 wire math_inexact = v2_exec_inexact;
@@ -276,6 +332,35 @@ function automatic logic [10:0] fop_decode_key(input logic [10:0] fop);
     if (fop[7:6] == 2'b11)
         return fop;
     return {fop[10:8], 2'b00, fop[5:3], 3'b000};
+endfunction
+
+function automatic logic signed [69:0] x87_log2_integer_q52(
+    input x87_reg_t value
+);
+    logic signed [16:0] unbiased;
+    logic signed [69:0] extended;
+    begin
+        unbiased = $signed({2'b00, value.exp}) - 17'sd16383;
+        extended = {{53{unbiased[16]}}, unbiased};
+        return extended <<< 52;
+    end
+endfunction
+
+function automatic logic [2:0] x87_integer_low3(input x87_reg_t value);
+    logic signed [16:0] unbiased;
+    logic [63:0] magnitude;
+    begin
+        unbiased = $signed({2'b00, value.exp}) - 17'sd16383;
+        if ((value.class_id == X87_ZERO) || (unbiased < 0))
+            return 3'b000;
+        if (unbiased > 54)
+            return 3'b000;
+        if (unbiased >= 52)
+            magnitude = {11'b0, value.sig} << (unbiased - 52);
+        else
+            magnitude = {11'b0, value.sig} >> (52 - unbiased);
+        return magnitude[2:0];
+    end
 endfunction
 
 function automatic logic m32_is_normal(input logic [31:0] raw);
@@ -529,7 +614,9 @@ wire core_cmd_ready = ((rx_kind == RX_NONE) || restartable_rx_command) &&
                    !v2_exec_pending &&
                    !v2_exec_busy && !v2_exec_done &&
                    !fptan_trans_pending && !fptan_div_pending &&
-                   !fptan_push_after_result && !read_resp_valid;
+                   !fptan_push_after_result &&
+                   (fscale_phase == FSCALE_IDLE) &&
+                   (logexp_phase == LOGEXP_IDLE) && !read_resp_valid;
 // Direct memory commands remain ordered ahead of later bridge commands. Only
 // masked-exception mode permits capture while a predecessor is still active.
 assign direct_m32_ready = !direct_m32_pending && !cmd_valid && queue_safe;
@@ -547,8 +634,11 @@ wire [2:0] tx_entry_bytes = transfer_byte_count(transfer_pop_data[35:32]);
 wire [2:0] tx_request_bytes = transfer_byte_count(read_req_be);
 wire tx_entry_consumed = tx_byte_offset + tx_request_bytes >= tx_entry_bytes;
 wire v2_exec_start = v2_exec_pending && !v2_exec_busy;
+wire signed [32:0] fscale_scaled_exp =
+    $signed({18'b0, fscale_value.exp}) + fscale_delta;
 assign busy_n = !(((v2_exec_owner == EXEC_MATH) &&
                    (v2_exec_pending || v2_exec_busy)) ||
+                  (fscale_phase != FSCALE_IDLE) ||
                   (command_pending && command_is_arithmetic));
 // PEREQ releases the 80386 coprocessor-wait microcode as well as requesting
 // operand transfers. Keep it asserted throughout an accepted command because
@@ -562,6 +652,8 @@ assign pereq = (rx_kind != RX_NONE) ||
                v2_exec_pending || v2_exec_busy || v2_exec_done ||
                fptan_trans_pending || fptan_div_pending ||
                fptan_push_after_result ||
+               (fscale_phase != FSCALE_IDLE) ||
+               (logexp_phase != LOGEXP_IDLE) ||
                status_read_pending || command_complete_pulse ||
                (pereq_release_hold != 2'b00);
 assign error_n = !status_flags[7];
@@ -647,7 +739,10 @@ always_comb begin
     if (core_cmd_valid && core_cmd_ready) begin
         stack_port_addr_a = top;
         stack_port_addr_b = ((fop_decode_key(core_cmd_fop) == 11'h530) ||
-                             (core_cmd_fop == 11'h1f3))
+                             (core_cmd_fop == 11'h1f1) ||
+                             (core_cmd_fop == 11'h1f3) ||
+                             (core_cmd_fop == 11'h1f8) ||
+                             (core_cmd_fop == 11'h1fd))
                           ? top + 3'd1 : top + core_cmd_fop[2:0];
     end
 end
@@ -664,6 +759,15 @@ x87_stack_mem stack_mem (
     .read_data_b(stack_read_raw_b)
 );
 
+x87_logexp_rom logexp_rom (
+    .clk(clk),
+    .address(logexp_address),
+    .q(logexp_data)
+);
+
+wire [1:0] executor_rounding_mode =
+    (fprem_phase == FPREM_ROUND) ? 2'b11 : control_word[11:10];
+
 x87_executor executor (
     .clk(clk),
     .reset(reset),
@@ -671,7 +775,7 @@ x87_executor executor (
     .exec_op(v2_exec_op),
     .integer_size(v2_exec_size),
     .precision_control(control_word[9:8]),
-    .rounding_mode(control_word[11:10]),
+    .rounding_mode(executor_rounding_mode),
     .quiet_compare(arith_quiet_compare),
     .trans_cosine(trans_cosine),
     .trans_tangent_pair(trans_tangent_pair),
@@ -770,6 +874,36 @@ always_ff @(posedge clk) begin
         fptan_trans_pending <= 1'b0;
         fptan_div_pending <= 1'b0;
         fptan_push_after_result <= 1'b0;
+        fprem_phase <= FPREM_IDLE;
+        fprem_dividend <= x87_empty();
+        fprem_divisor <= x87_empty();
+        fprem_quotient_bits <= 3'b000;
+        fscale_phase <= FSCALE_IDLE;
+        fscale_value <= x87_empty();
+        fscale_shift <= '0;
+        fscale_shift_count <= '0;
+        fscale_sign <= 1'b0;
+        fscale_delta <= '0;
+        logexp_phase <= LOGEXP_IDLE;
+        logexp_fyl2x <= 1'b0;
+        logexp_input <= x87_empty();
+        logexp_multiplier <= x87_empty();
+        logexp_argument_shift <= '0;
+        logexp_argument_shift_count <= '0;
+        logexp_address <= 10'd0;
+        logexp_base_q52 <= '0;
+        logexp_delta_q52 <= '0;
+        logexp_fraction <= '0;
+        logexp_offset_q52 <= '0;
+        logexp_interpolated_q52 <= '0;
+        logexp_fixed_q52 <= '0;
+        logexp_normal_magnitude <= '0;
+        logexp_normal_exp <= '0;
+        logexp_normal_sign <= 1'b0;
+        logexp_normal_guard <= 1'b0;
+        logexp_normal_round <= 1'b0;
+        logexp_normal_sticky <= 1'b0;
+        logexp_result <= x87_empty();
         read_resp_valid <= 1'b0;
         read_resp_data <= 32'h0;
         clear_stack();
@@ -981,6 +1115,182 @@ always_ff @(posedge clk) begin
                 fptan_push_after_result <= 1'b1;
         end
 
+        // FSCALE needs only the truncated integer part of ST(1). Shift its
+        // significand one bit per cycle instead of building a 53-bit barrel
+        // shifter on the stack-RAM output.
+        if (fscale_phase == FSCALE_SHIFT) begin
+            fscale_shift <= fscale_shift >> 1;
+            fscale_shift_count <= fscale_shift_count - 6'd1;
+            if (fscale_shift_count == 6'd1) begin
+                fscale_delta <= fscale_sign
+                              ? -$signed({1'b0, fscale_shift[31:1]})
+                              :  $signed({1'b0, fscale_shift[31:1]});
+                fscale_phase <= FSCALE_APPLY;
+            end
+        end else if (fscale_phase == FSCALE_APPLY) begin
+            result_write_index <= st0_index;
+            if ((fscale_value.class_id != X87_NORMAL) &&
+                (fscale_value.class_id != X87_DENORMAL))
+                result_write_raw <= x87_to_m80(fscale_value);
+            else if (fscale_scaled_exp >= 33'sh7fff)
+                result_write_raw <= {fscale_value.sign, 15'h7fff,
+                                     64'h8000_0000_0000_0000};
+            else if (fscale_scaled_exp <= 0)
+                result_write_raw <= {fscale_value.sign, 79'h0};
+            else
+                result_write_raw <= {fscale_value.sign,
+                                     fscale_scaled_exp[14:0],
+                                     fscale_value.sig, 11'h0};
+            result_write_pending <= 1'b1;
+            fscale_phase <= FSCALE_IDLE;
+        end
+
+        // Keep ROM lookup, interpolation, offset, and normalization registered.
+        // Normalize one bit per cycle to avoid a wide priority encoder and
+        // variable shifter in these low-rate transcendental operations.
+        if (logexp_phase == LOGEXP_ARGUMENT_SHIFT) begin
+            logexp_argument_shift <= logexp_argument_shift >> 1;
+            logexp_argument_shift_count <= logexp_argument_shift_count - 6'd1;
+            if (logexp_argument_shift_count == 6'd1) begin
+                logexp_address <= logexp_input.sign
+                                ? {2'b10, logexp_argument_shift[52:45]}
+                                : {2'b01, logexp_argument_shift[52:45]};
+                logexp_fraction <= logexp_argument_shift[44:37];
+                logexp_phase <= LOGEXP_LOOKUP;
+            end
+        end else if (logexp_phase == LOGEXP_LOOKUP) begin
+            logexp_phase <= LOGEXP_PREPARE;
+        end else if (logexp_phase == LOGEXP_PREPARE) begin
+            logexp_base_q52 <= $signed({1'b0, logexp_data[99:46]});
+            logexp_delta_q52 <= $signed(logexp_data[45:0]);
+            if (logexp_fyl2x) begin
+                logexp_fraction <= logexp_input.sig[43:36];
+                logexp_offset_q52 <= x87_log2_integer_q52(logexp_input);
+            end else begin
+                logexp_offset_q52 <= -70'sd4503599627370496;
+            end
+            logexp_phase <= LOGEXP_INTERPOLATE;
+        end else if (logexp_phase == LOGEXP_INTERPOLATE) begin
+            logexp_interpolated_q52 <= logexp_base_q52 + 55'(
+                (logexp_delta_q52 * $signed({1'b0, logexp_fraction})) >>> 8);
+            logexp_phase <= LOGEXP_OFFSET;
+        end else if (logexp_phase == LOGEXP_OFFSET) begin
+            logexp_fixed_q52 <= logexp_offset_q52 +
+                {{15{logexp_interpolated_q52[54]}},
+                 logexp_interpolated_q52};
+            logexp_phase <= LOGEXP_NORMALIZE;
+        end else if (logexp_phase == LOGEXP_NORMALIZE) begin
+            if (logexp_fixed_q52 == 0) begin
+                logexp_result <= x87_zero(1'b0);
+                logexp_phase <= LOGEXP_COMMIT;
+            end else begin
+                logexp_normal_magnitude <= logexp_fixed_q52[69]
+                                         ? -logexp_fixed_q52
+                                         : logexp_fixed_q52;
+                logexp_normal_exp <= 17'sd16383;
+                logexp_normal_sign <= logexp_fixed_q52[69];
+                logexp_normal_guard <= 1'b0;
+                logexp_normal_round <= 1'b0;
+                logexp_normal_sticky <= 1'b0;
+                logexp_phase <= LOGEXP_NORMALIZE_STEP;
+            end
+        end else if (logexp_phase == LOGEXP_NORMALIZE_STEP) begin
+            if (|logexp_normal_magnitude[69:53]) begin
+                logexp_normal_magnitude <= logexp_normal_magnitude >> 1;
+                logexp_normal_exp <= logexp_normal_exp + 17'sd1;
+                logexp_normal_guard <= logexp_normal_magnitude[0];
+                logexp_normal_round <= logexp_normal_guard;
+                logexp_normal_sticky <= logexp_normal_sticky |
+                                        logexp_normal_round;
+            end else if (!logexp_normal_magnitude[52]) begin
+                logexp_normal_magnitude <= logexp_normal_magnitude << 1;
+                logexp_normal_exp <= logexp_normal_exp - 17'sd1;
+            end else begin
+                logexp_result.sign <= logexp_normal_sign;
+                logexp_result.exp <= logexp_normal_exp[14:0];
+                logexp_result.sig <= logexp_normal_magnitude[52:0];
+                logexp_result.class_id <= X87_NORMAL;
+                logexp_result.guard_bit <= logexp_normal_guard;
+                logexp_result.round_bit <= logexp_normal_round;
+                logexp_result.sticky_bit <= logexp_normal_sticky;
+                logexp_phase <= LOGEXP_COMMIT;
+            end
+        end else if (logexp_phase == LOGEXP_COMMIT) begin
+            logexp_phase <= LOGEXP_IDLE;
+            if (logexp_fyl2x) begin
+                arith_compare <= 1'b0;
+                arith_write_result <= 1'b1;
+                arith_pop_count <= 2'd1;
+                arith_dest_index <= top + 3'd1;
+                arith_operand_a <= logexp_multiplier;
+                arith_operand_b <= logexp_result;
+                v2_exec_op <= X87_ARITH_MUL;
+                v2_exec_owner <= EXEC_MATH;
+                v2_exec_size <= 2'd0;
+                v2_exec_transfer <= 64'h0;
+                v2_exec_pending <= 1'b1;
+            end else begin
+                result_write_index <= st0_index;
+                result_write_raw <= x87_to_m80(logexp_result);
+                result_write_pending <= 1'b1;
+                if ((logexp_input.class_id != X87_ZERO) &&
+                    !((logexp_input.exp == 15'h3fff) &&
+                      (logexp_input.sig == {1'b1, 52'h0})))
+                    status_flags[5] <= 1'b1;
+            end
+        end
+
+        // FPREM reuses the existing divide, round-to-integer, multiply, and
+        // subtract microprograms. The quotient is rounded toward zero, and
+        // its low three bits become C0/C3/C1 after the remainder commits.
+        if (v2_exec_math_done && (fprem_phase != FPREM_IDLE)) begin
+            case (fprem_phase)
+                FPREM_DIVIDE: begin
+                    arith_operand_a <= v2_exec_result;
+                    arith_operand_b <= x87_empty();
+                    v2_exec_op <= X87_CONVERT_FRNDINT;
+                    v2_exec_owner <= EXEC_MATH;
+                    v2_exec_size <= 2'd0;
+                    v2_exec_transfer <= 64'h0;
+                    v2_exec_pending <= 1'b1;
+                    fprem_phase <= FPREM_ROUND;
+                end
+                FPREM_ROUND: begin
+                    fprem_quotient_bits <= x87_integer_low3(v2_exec_result);
+                    arith_operand_a <= v2_exec_result;
+                    arith_operand_b <= fprem_divisor;
+                    v2_exec_op <= X87_ARITH_MUL;
+                    v2_exec_owner <= EXEC_MATH;
+                    v2_exec_size <= 2'd0;
+                    v2_exec_transfer <= 64'h0;
+                    v2_exec_pending <= 1'b1;
+                    fprem_phase <= FPREM_MULTIPLY;
+                end
+                FPREM_MULTIPLY: begin
+                    arith_operand_a <= fprem_dividend;
+                    arith_operand_b <= v2_exec_result;
+                    v2_exec_op <= X87_ARITH_SUB;
+                    v2_exec_owner <= EXEC_MATH;
+                    v2_exec_size <= 2'd0;
+                    v2_exec_transfer <= 64'h0;
+                    v2_exec_pending <= 1'b1;
+                    fprem_phase <= FPREM_SUBTRACT;
+                end
+                FPREM_SUBTRACT: begin
+                    fprem_phase <= FPREM_IDLE;
+                    status_flags[14] <= fprem_quotient_bits[1]; // C3 = Q1
+                    status_flags[10] <= 1'b0;                   // Complete
+                    status_flags[9] <= fprem_quotient_bits[0]; // C1 = Q0
+                    status_flags[8] <= fprem_quotient_bits[2]; // C0 = Q2
+                    result_write_index <= st0_index;
+                    result_write_raw <= x87_to_m80(v2_exec_result);
+                    result_write_pending <= 1'b1;
+                    command_complete_pulse <= 1'b0;
+                end
+                default: ;
+            endcase
+        end
+
         if (math_done) begin
             command_complete_pulse <= 1'b1;
             status_flags[9] <= v2_exec_math_done &&
@@ -1067,7 +1377,10 @@ always_ff @(posedge clk) begin
             command_pending <= 1'b1;
             stack_addr_a <= top;
             stack_addr_b <= ((fop_decode_key(core_cmd_fop) == 11'h530) ||
-                             (core_cmd_fop == 11'h1f3))
+                             (core_cmd_fop == 11'h1f1) ||
+                             (core_cmd_fop == 11'h1f3) ||
+                             (core_cmd_fop == 11'h1f8) ||
+                             (core_cmd_fop == 11'h1fd))
                           ? top + 3'd1 : top + core_cmd_fop[2:0];
             if (core_cmd_direct)
                 direct_m32_pending <= 1'b0;
@@ -1298,6 +1611,118 @@ always_ff @(posedge clk) begin
                         v2_exec_size <= 2'd0;
                         v2_exec_transfer <= 64'h0;
                         v2_exec_pending <= 1'b1;
+                    end
+                end
+                X87_CMD_FYL2X: begin
+                    if (stack_empty(st0_index) ||
+                        stack_empty(top + 3'd1)) begin
+                        raise_stack_fault(1'b0);
+                        if (control_word[0]) begin
+                            write_stack(top + 3'd1, x87_indefinite());
+                            pop_value();
+                        end
+                    end else if (stack_read_data_a.sign ||
+                                 (stack_read_data_a.class_id == X87_ZERO)) begin
+                        raise_invalid();
+                        if (control_word[0]) begin
+                            write_stack(top + 3'd1, x87_indefinite());
+                            pop_value();
+                        end
+                    end else begin
+                        command_complete_pulse <= 1'b0;
+                        logexp_fyl2x <= 1'b1;
+                        logexp_input <= stack_read_data_a;
+                        logexp_multiplier <= stack_read_data_b;
+                        logexp_address <= {2'b00,
+                                           stack_read_data_a.sig[51:44]};
+                        logexp_phase <= LOGEXP_LOOKUP;
+                    end
+                end
+                X87_CMD_F2XM1: begin
+                    if (stack_empty(st0_index)) begin
+                        raise_stack_fault(1'b0);
+                        if (control_word[0])
+                            write_stack(st0_index, x87_indefinite());
+                    end else if ((stack_read_data_a.exp > 15'h3fff) ||
+                                 ((stack_read_data_a.exp == 15'h3fff) &&
+                                  (stack_read_data_a.sig !=
+                                   {1'b1, 52'h0}))) begin
+                        status_flags[10] <= 1'b1; // C2: range incomplete
+                    end else begin
+                        status_flags[10] <= 1'b0;
+                        command_complete_pulse <= 1'b0;
+                        logexp_fyl2x <= 1'b0;
+                        logexp_input <= stack_read_data_a;
+                        if (stack_read_data_a.exp < 15'd16331) begin
+                            logexp_address <= stack_read_data_a.sign
+                                            ? 10'd512 : 10'd256;
+                            logexp_fraction <= 8'h00;
+                            logexp_phase <= LOGEXP_LOOKUP;
+                        end else if (stack_read_data_a.exp == 15'd16383) begin
+                            logexp_address <= stack_read_data_a.sign
+                                            ? 10'd769 : 10'd768;
+                            logexp_fraction <= 8'h00;
+                            logexp_phase <= LOGEXP_LOOKUP;
+                        end else begin
+                            logexp_argument_shift <= stack_read_data_a.sig;
+                            logexp_argument_shift_count <= 6'(
+                                15'd16383 - stack_read_data_a.exp);
+                            logexp_phase <= LOGEXP_ARGUMENT_SHIFT;
+                        end
+                    end
+                end
+                X87_CMD_FSCALE: begin
+                    if (stack_empty(st0_index) ||
+                        stack_empty(top + 3'd1)) begin
+                        raise_stack_fault(1'b0);
+                        if (control_word[0])
+                            write_stack(st0_index, x87_indefinite());
+                    end else begin
+                        fscale_value <= stack_read_data_a;
+                        fscale_sign <= stack_read_data_b.sign;
+                        if ((stack_read_data_a.class_id != X87_NORMAL) &&
+                            (stack_read_data_a.class_id != X87_DENORMAL)) begin
+                            fscale_delta <= 32'sd0;
+                            fscale_phase <= FSCALE_APPLY;
+                        end else if ((stack_read_data_b.class_id == X87_ZERO) ||
+                                     (stack_read_data_b.exp < 15'd16383)) begin
+                            fscale_delta <= 32'sd0;
+                            fscale_phase <= FSCALE_APPLY;
+                        end else if (stack_read_data_b.exp > 15'd16413) begin
+                            fscale_delta <= stack_read_data_b.sign
+                                          ? -32'sh7fff_ffff
+                                          :  32'sh7fff_ffff;
+                            fscale_phase <= FSCALE_APPLY;
+                        end else begin
+                            fscale_shift <= stack_read_data_b.sig;
+                            fscale_shift_count <= 6'(
+                                15'd16435 - stack_read_data_b.exp);
+                            fscale_phase <= FSCALE_SHIFT;
+                        end
+                        command_complete_pulse <= 1'b0;
+                    end
+                end
+                X87_CMD_FPREM: begin
+                    if (stack_empty(st0_index) ||
+                        stack_empty(top + 3'd1)) begin
+                        raise_stack_fault(1'b0);
+                        if (control_word[0])
+                            write_stack(st0_index, x87_indefinite());
+                    end else begin
+                        command_complete_pulse <= 1'b0;
+                        arith_compare <= 1'b0;
+                        arith_write_result <= 1'b0;
+                        arith_pop_count <= 2'd0;
+                        fprem_dividend <= stack_read_data_a;
+                        fprem_divisor <= stack_read_data_b;
+                        arith_operand_a <= stack_read_data_a;
+                        arith_operand_b <= stack_read_data_b;
+                        v2_exec_op <= X87_ARITH_DIV;
+                        v2_exec_owner <= EXEC_MATH;
+                        v2_exec_size <= 2'd0;
+                        v2_exec_transfer <= 64'h0;
+                        v2_exec_pending <= 1'b1;
+                        fprem_phase <= FPREM_DIVIDE;
                     end
                 end
                 X87_CMD_TRIG: begin                    // FSIN / FCOS
