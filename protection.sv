@@ -25,7 +25,7 @@ module protection_unit
 
     // Processor State
     input        [1:0]  cpl,              // Current Privilege Level
-    input        [1:0]  transition_rpl,   // SLCTR RPL during an outer-level transition
+    input        [1:0]  transition_rpl,   // Selector RPL when an outer-level transition begins
     input               pe_mode,          // Protected mode enabled (CR0.PE)
 
     // CR0 flags for FPU tests (multiplexed into state vector)
@@ -90,6 +90,7 @@ logic [1:0]  conform_dpl_value_s1, conform_dpl_value_s2;
 logic        write_rpl_s1, write_rpl_s2;
 logic        arpl_update_s1, arpl_update_s2;
 logic        cpl_transition_r;
+logic  [1:0] pending_cpl_r;
 
 wire is_6x = (uc_aluop[6:4] == 3'b110);
 wire is_ptsav = is_6x && !uc_aluop[3];
@@ -126,7 +127,9 @@ assign test_inflight = test_inflight_r;
 assign result_now = result_valid && test_inflight_r;
 assign redirect_taken = uc_exec && result_now && jump_valid;
 assign redirect_prev = redirect_prev_r;
-wire [1:0] cpl_live = cpl_transition_r ? transition_rpl : cpl;
+// SLCTR is a microcode scratch register and may be overwritten by later
+// descriptor operations.  Preserve the transition CPL until it is committed.
+wire [1:0] cpl_live = cpl_transition_r ? pending_cpl_r : cpl;
 
 assign effective_cpl = cpl_live;
 assign transition.set_rpl_redirect = set_rpl_s2;
@@ -1316,6 +1319,7 @@ always_ff @(posedge clk) begin
         arpl_update_s1 <= 1'b0;
         arpl_update_s2 <= 1'b0;
         cpl_transition_r <= 1'b0;
+        pending_cpl_r <= 2'b00;
     end else if (pipe_en) begin
         set_rpl_s1 <= uc_exec && pe_mode &&
             (uc_aluop == ALUJMP_PTGEN) && (uc_alu_src == 6'h2D) &&
@@ -1347,10 +1351,14 @@ always_ff @(posedge clk) begin
             (uc_aluop == ALUJMP_PTSELA) && (uc_alu_src == 6'h05);
         arpl_update_s2 <= arpl_update_s1;
 
-        if (result_now && jump_valid && (jump_addr == 12'h686))
+        if (result_now && jump_valid && (jump_addr == 12'h686)) begin
             cpl_transition_r <= 1'b1;
-        if (write_rpl_s2)
+            pending_cpl_r <= transition_rpl;
+        end
+        if (write_rpl_s2) begin
             cpl_transition_r <= 1'b1;
+            pending_cpl_r <= desc_raw_hi_r[14:13];
+        end
         if (copy_stack_dpl_s2)
             cpl_transition_r <= 1'b0;
     end

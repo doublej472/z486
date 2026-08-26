@@ -1172,6 +1172,7 @@ localparam [11:0] UADDR_HARDWARE_IRQ   = 12'h82D;  // INTR handler entry point
 localparam [11:0] UADDR_NMI            = 12'h836;  // NMI handler entry point
 localparam [11:0] UADDR_SINGLE_STEP    = 12'h93F;  // #DB(1) - TF single-step trap
 localparam [11:0] UADDR_PRIV_INT_DONE  = 12'h639;  // Cross-privilege handler CS/SS committed
+localparam [11:0] UADDR_TASK_INT_DONE  = 12'h7E0;  // Task-gate handler task state committed
 localparam [11:0] UADDR_TRAP_INT_DONE  = 12'h8E3;  // Handler CS committed; delivery complete
 localparam [11:0] UADDR_TSS_PROBLEM    = 12'h85D;  // #TS path used by protected-mode descriptor checks
 

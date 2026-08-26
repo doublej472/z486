@@ -1823,7 +1823,9 @@ always_ff @(posedge clk) begin
         end
 
         if (uc_exec &&
-            (uc_addr == UADDR_TRAP_INT_DONE || uc_addr == UADDR_PRIV_INT_DONE) &&
+            (uc_addr == UADDR_TRAP_INT_DONE ||
+             uc_addr == UADDR_PRIV_INT_DONE ||
+             uc_addr == UADDR_TASK_INT_DONE) &&
             !any_fault) begin
             fault_delivery_state <= FAULT_IDLE;
             fault_combine_active <= 1'b0;
@@ -1846,7 +1848,9 @@ always @(posedge clk) begin
             $display("%0t FAULT-COMBINE state=%0d uaddr=%03x", $time,
                      fault_delivery_state, uc_addr);
         if (uc_exec &&
-            (uc_addr == UADDR_TRAP_INT_DONE || uc_addr == UADDR_PRIV_INT_DONE))
+            (uc_addr == UADDR_TRAP_INT_DONE ||
+             uc_addr == UADDR_PRIV_INT_DONE ||
+             uc_addr == UADDR_TASK_INT_DONE))
             $display("%0t FAULT-DONE state=%0d", $time, fault_delivery_state);
         if (triple_fault_reset)
             $display("%0t TRIPLE-FAULT RESET", $time);

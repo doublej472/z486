@@ -33,7 +33,9 @@ SEL_CODE0   equ 0x08       ; ring 0 code, DPL=0
 SEL_DATA0   equ 0x10       ; ring 0 data, DPL=0
 SEL_CODE3   equ 0x18       ; ring 3 code, DPL=3
 SEL_DATA3   equ 0x20       ; ring 3 data, DPL=3
-SEL_TSS     equ 0x28       ; 32-bit TSS
+; LTR ignores the selector RPL.  Keep it nonzero to ensure later call-gate
+; stack switching does not mistake the TR scratch selector for the pending CPL.
+SEL_TSS     equ 0x2B       ; 32-bit TSS, deliberately encoded with RPL=3
 SEL_GATE    equ 0x30       ; call gate, DPL=3, 0 params
 SEL_GATE2   equ 0x38       ; call gate, DPL=3, 2 params
 
