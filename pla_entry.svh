@@ -711,6 +711,7 @@ function automatic logic [15:0] pla_group_entry_lookup(
     input [12:0] addr_in
 );
     casez (addr_in)
+        13'b?101110001101: pla_group_entry_lookup = 16'b0000100111000111;
         13'b?000000001?01: pla_group_entry_lookup = 16'b0000000000000000;
         13'b?0001?0001?01: pla_group_entry_lookup = 16'b0000000000000000;
         13'b?001?00001?01: pla_group_entry_lookup = 16'b0000000000000000;
@@ -1009,7 +1010,8 @@ function automatic logic [15:0] pla_group_entry_lookup(
         13'b?101100000?01: pla_group_entry_lookup = 16'b0000100000101011;
         13'b?100??0001001: pla_group_entry_lookup = 16'b0000100000101011;
         13'b?101010001?01: pla_group_entry_lookup = 16'b0000100000101011;
-        13'b?10111000??01: pla_group_entry_lookup = 16'b0000100000101011;
+        13'b?101110000?01: pla_group_entry_lookup = 16'b0000100000101011;
+        13'b?101110001001: pla_group_entry_lookup = 16'b0000100000101011;
         13'b?1000?010??01: pla_group_entry_lookup = 16'b0000100000101011;
         13'b?1010?010??01: pla_group_entry_lookup = 16'b0000100000101011;
         13'b?10?1?010??01: pla_group_entry_lookup = 16'b0000100000101011;

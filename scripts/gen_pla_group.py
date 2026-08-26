@@ -140,10 +140,21 @@ def main():
     body.append("    input [12:0] addr_in")
     body.append(");")
     body.append("    casez (addr_in)")
+    # 486 extension: the original 386 group row rejects 0F 01 /7. Resolve
+    # INVLPG inside the existing group PLA so it does not add a post-PLA mux
+    # to every decoded microcode entry bit. Address fields are
+    # {data32, group[5:4], modrm.reg, group[3:0], memory, 0, has_0f}.
+    body.append("        13'b?101110001101: pla_group_entry_lookup = 16'b0000100111000111;")
     ge_count = 0
     for pat, val in entry_pats:
         if pat[11] in ("0", "?"):          # bit[1]: group rows (0) or shared (?)
-            body.append(f"        13'b{pat}: pla_group_entry_lookup = 16'b{val:016b};")
+            # Split the original illegal 0F 01 /7 row around the exact
+            # INVLPG memory form above, keeping the generated case disjoint.
+            if pat == "?10111000??01":
+                body.append(f"        13'b?101110000?01: pla_group_entry_lookup = 16'b{val:016b};")
+                body.append(f"        13'b?101110001001: pla_group_entry_lookup = 16'b{val:016b};")
+            else:
+                body.append(f"        13'b{pat}: pla_group_entry_lookup = 16'b{val:016b};")
             ge_count += 1
     body.append("        default: pla_group_entry_lookup = 16'h0000;")
     body.append("    endcase")
@@ -165,6 +176,15 @@ def main():
 
     # Self-check: parallel lookup == chained lookup for every input combo.
     group_pats = parse_casez(out, "pla_group_lookup", 11)
+    group_entry_pats = parse_casez(out, "pla_group_entry_lookup", 13)
+    invlpg_group = 0x21
+    for data32 in (0, 1):
+        invlpg_addr = ((data32 << 12) |
+                       ((invlpg_group >> 4) << 10) | (7 << 7) |
+                       ((invlpg_group & 0xF) << 3) | (1 << 2) | 1)
+        register_addr = invlpg_addr & ~(1 << 2)
+        assert casez_eval(group_entry_pats, invlpg_addr, 13) == 0x09C7
+        assert casez_eval(group_entry_pats, register_addr, 13) == 0x082B
     checked = mismatches = 0
     for has_0f in (0, 1):
         for opcode in range(256):

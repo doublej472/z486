@@ -12,6 +12,12 @@ module paging_unit
     input        [31:0] cr3,
     input               cr3_write,         // TLB flush on CR3 write
 
+    // 486 INVLPG. The request is acknowledged only after any older page walk
+    // has finished, preventing a stale translation from being reinserted.
+    input               invlpg_req,
+    input        [31:0] invlpg_linear,
+    output              invlpg_ack,
+
     //=========================================================================
     // Memory/IO request from z486.sv
     //=========================================================================
@@ -206,7 +212,9 @@ paging_tlb tlb_inst (
     .update_writable(tlb_update_writable),
     .update_user    (tlb_update_user),
     .update_dirty   (tlb_update_dirty),
-    .invalidate_all (cr3_write)
+    .invalidate_all (cr3_write),
+    .invalidate_page(invlpg_fire),
+    .invalidate_vpn (invlpg_linear[31:12])
 );
 
 //=============================================================================
@@ -242,6 +250,8 @@ reg [31:0] icache_req_phys_addr_r;
 
 // Walker bus read/write tracking: prevents re-emission while op is in flight
 reg walk_biu_pending;
+assign invlpg_ack = s_idle && !walk_biu_pending;
+wire invlpg_fire = invlpg_req && invlpg_ack;
 wire walker_feed_ready = dcache_req_complete && walk_biu_pending;
 // Walker states are mutually exclusive with the PG_IDLE/PG_MEM_TLB
 // combinational request paths. Only a retained registered request can block

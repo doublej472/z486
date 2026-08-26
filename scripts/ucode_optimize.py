@@ -112,6 +112,15 @@ PATCHES = [
     Patch(0x9C4, "BSWAP r32 extension: SRCREG -> byte-swapped SRCREG + RNI",
           copy_from=0x003, fields=dict(dst=DEST_USTEP_BSWAP)),
 
+    # 0F 01 /7 uses an address operand but performs no data transfer. The CPU
+    # sidecar serializes this RNI word with the paging unit and invalidates the
+    # addressed TLB entry; the following blank word is its architectural delay
+    # slot.
+    Patch(0x9C7, "INVLPG m extension: paging-owned single-page invalidate + RNI",
+          fields=dict(op=0)),
+    Patch(0x9C8, "INVLPG m extension: blank RNI delay slot",
+          copy_from=0x030),
+
     # D8 m32 arithmetic and D9 /0 FLD use a paging-owned demand read and post
     # the completed operand directly to the integrated x87. Dynamic CR0/x87
     # eligibility falls back to the original 4D7 routine.

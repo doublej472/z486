@@ -412,11 +412,13 @@ wire       mem_block_idle = (uc_busreq && !mem_accepted);  // uop wants the bus,
 wire       stall_mem = mem_servicing ? mem_block_busy : (mem_req_current && !mem_accepted);
 wire       stall_wio = (uc_is_wio && !interrupt_pending && !single_step);
 wire       stall_x87_direct;
+wire       stall_invlpg;
 // An entry may reach the ROM before its D2 literals arrive. Let the ending
 // instruction execute its architectural RNI delay slot, then hold the ROM word
 // until D2 can transfer it to EX.
 wire       stall_d2 = d2_valid && !d2_push && !i_rni_delay;
-wire       stall = stall_mem || stall_wio || stall_d2 || stall_x87_direct;
+wire       stall = stall_mem || stall_wio || stall_d2 || stall_x87_direct ||
+                   stall_invlpg;
 
 // Repeat
 wire       prot_result_now;
@@ -426,7 +428,7 @@ wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight)
 // uc_exec: master enable for microcode execution
 wire       d2_release_hold = d2_valid && (d2_waited_r || d2_stale_slot_r);
 wire       uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) &&
-                     !stall_wio && !stall_d2 && !stall_x87_direct &&
+                     !stall_wio && !stall_d2 && !stall_x87_direct && !stall_invlpg &&
                      !d2_release_hold && !throttle_parked_r && !recipe_slot_stale;
 wire       uc_exec_writeback = uc_exec;  // local copies for reducing fanout
 wire       uc_exec_shift = uc_exec;
@@ -1121,6 +1123,7 @@ wire [1:0] gp_access_adj = uc_is_word_op ? 2'd1 :
                            (srcreg_size == 2'd0) ? 2'd0 : (srcreg_size == 2'd2) ? 2'd3 : 2'd1;
 
 wire        mem_op_eligible, gp_fault_mem_op, gp_fault_wr_op, ss_segment_fault;
+wire        seg_gp_fault;
 prot_transition_t prot_transition;
 
 segmentation_unit seg_unit (
@@ -1165,7 +1168,7 @@ segmentation_unit seg_unit (
     .is_write         (gp_fault_wr_op),
     .seg_base_pending (seg_base_pending),
     .eff_mask_pending (eff_mask_pending),
-    .seg_fault        (gp_fault_trigger),
+    .seg_fault        (seg_gp_fault),
     .is_stack_fault   (ss_segment_fault)
 );
 
@@ -1253,6 +1256,18 @@ wire [31:0] mem_wdata = (uc_buscode == BUSOP_WR_OPR ||
     (uc_dest == DEST_OPR_W) ? (stack_init_pending ? source_value_live : dest_value) :
     OPR_W;
 
+// INVLPG is a privileged address operation. Its effective address is already
+// latched in IND/ind_linear at i_issue, like an ordinary ModR/M memory operand.
+wire invlpg_active = uc_active && i_first && (i.entry_point == 12'h9C7);
+wire invlpg_priv_fault = invlpg_active && pe && (cpl != 2'b00);
+wire invlpg_request = invlpg_active && !invlpg_priv_fault && !seg_gp_fault;
+wire invlpg_ack;
+// Waiting for an older page walk is independent of the live segmentation
+// result. This keeps seg_fault out of the stall/uc_exec feedback cone; a
+// faulting INVLPG may wait for the walker but can never issue invalidation.
+assign stall_invlpg = invlpg_active && !invlpg_priv_fault && !invlpg_ack;
+assign gp_fault_trigger = seg_gp_fault || invlpg_priv_fault;
+
 // div_overflow fires only at the first DIV7/PREDIV word
 assign any_fault_issue = gp_fault_trigger || page_fault;
 assign any_fault = any_fault_issue || div_overflow;
@@ -1331,6 +1346,9 @@ paging_unit paging_inst (
     .cr0                (CR0),
     .cr3                (CR3),
     .cr3_write          (cr3_write),
+    .invlpg_req         (invlpg_request),
+    .invlpg_linear      (ind_linear),
+    .invlpg_ack         (invlpg_ack),
 
     // Memory/IO request: current RD/WR/IACK uop is held by stall until accepted.
     .mem_req            (mem_req_to_paging),
@@ -1614,7 +1632,7 @@ wire loopne_condition = instr_is_loop ? (countr_will_be_nonzero && zf_check)
                                       : (!countr_will_be_nonzero || zf_check);
 
 // GP Fault Detection — handled by segmentation_unit
-assign gp_fault_mem_op = x87_direct_mem_req ||
+assign gp_fault_mem_op = invlpg_active || x87_direct_mem_req ||
                          (uc_is_mem_busop && (uc_buscode != BUSOP_RD_D));
 assign gp_fault_wr_op = uc_is_write || uc_is_check_write;
 

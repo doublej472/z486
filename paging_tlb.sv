@@ -36,7 +36,11 @@ module paging_tlb
     input               update_dirty,
 
     // Invalidate all entries (on CR3 write)
-    input               invalidate_all
+    input               invalidate_all,
+
+    // Invalidate every cached translation for one linear page (INVLPG).
+    input               invalidate_page,
+    input        [19:0] invalidate_vpn
 );
 
 // 8 sets × 4 ways
@@ -192,6 +196,9 @@ wire match1 = tlb[update_set][1].valid && (tlb[update_set][1].tag == update_tag)
 wire match2 = tlb[update_set][2].valid && (tlb[update_set][2].tag == update_tag);
 wire match3 = tlb[update_set][3].valid && (tlb[update_set][3].tag == update_tag);
 
+wire [2:0] invalidate_set = invalidate_vpn[2:0];
+wire [16:0] invalidate_tag = invalidate_vpn[19:3];
+
 // PLRU victim selection for the update set (existing entry wins)
 wire [1:0] victim_way = match0 ? 2'd0 :
                         match1 ? 2'd1 :
@@ -221,6 +228,21 @@ always_ff @(posedge clk or negedge reset_n) begin
             tlb[s][3].valid <= 1'b0;
             plru[s] <= 3'b000;
         end
+    end else if (invalidate_page) begin
+        // Multiple matching ways are not expected, but clear every match so
+        // INVLPG also repairs any duplicate left by an earlier implementation.
+        if (tlb[invalidate_set][0].valid &&
+            tlb[invalidate_set][0].tag == invalidate_tag)
+            tlb[invalidate_set][0].valid <= 1'b0;
+        if (tlb[invalidate_set][1].valid &&
+            tlb[invalidate_set][1].tag == invalidate_tag)
+            tlb[invalidate_set][1].valid <= 1'b0;
+        if (tlb[invalidate_set][2].valid &&
+            tlb[invalidate_set][2].tag == invalidate_tag)
+            tlb[invalidate_set][2].valid <= 1'b0;
+        if (tlb[invalidate_set][3].valid &&
+            tlb[invalidate_set][3].tag == invalidate_tag)
+            tlb[invalidate_set][3].valid <= 1'b0;
     end else begin
         // Update PLRU on hit (point away from accessed way in the hit set)
         if (hit) begin
