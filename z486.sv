@@ -1572,11 +1572,13 @@ wire br_jcc_taken = br_is_jcc && condition_true(i.opcode[3:0], eflags_fwd);
 wire early_redirect = branch_ustep_redirect ||
                       (i_first && is_dword && br_is_call_rel);
 reg  early_redirected;
-// Cleared at the NEXT instruction's arrival
+// A fault or interrupt abandons the instruction that owned an early redirect.
+// Clear that ownership before its handler's microcode PREF reaches q_flush.
 always_ff @(posedge clk or negedge reset_n) begin
-    if (!reset_n)                            early_redirected <= 1'b0;
-    else if (early_redirect)                 early_redirected <= 1'b1;
-    else if (i_entry || i_issue || interrupt_entry) early_redirected <= 1'b0;
+    if (!reset_n)                                  early_redirected <= 1'b0;
+    else if (any_fault || interrupt_entry)         early_redirected <= 1'b0;
+    else if (early_redirect)                       early_redirected <= 1'b1;
+    else if (i_entry || i_issue)                   early_redirected <= 1'b0;
 end
 
 wire uc_is_wio = uc_p_wio;  // WIO: wait for interrupt/IO (HLT, only with RPT)
