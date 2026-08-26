@@ -66,6 +66,21 @@ module tb_l1_icache;
     end
     endtask
 
+    task automatic mem_put_line(
+        input [31:0] addr,
+        input [31:0] word0,
+        input [31:0] word1,
+        input [31:0] word2,
+        input [31:0] word3
+    );
+    begin
+        mem_put32(addr + 32'd0, word0);
+        mem_put32(addr + 32'd4, word1);
+        mem_put32(addr + 32'd8, word2);
+        mem_put32(addr + 32'd12, word3);
+    end
+    endtask
+
     function automatic [31:0] mem_get32(input [31:0] addr);
         if (addr[31:25] == 7'b0000001) begin
             case (addr[3:2])
@@ -252,6 +267,93 @@ module tb_l1_icache;
         cache_read(32'h140, 128'hFEDC_BA98_7654_3210_89AB_CDEF_0123_4567);
         if (mem_request_count != mem_request_before) begin
             $display("L1 ICACHE UNRELATED SNOOP suppressed fill");
+            $fatal(1);
+        end
+
+        // Recreate the packed-tag collision from FastDoom.  Four lines in set
+        // zero occupy all four ways; with the initial PLRU state, 0x300 is in
+        // way 1.  A fresh set-one fill chooses way 0.  A matching invalidate
+        // for way 1 on the final beat must clear that way while the fill tag
+        // is installed in way 0.  The old global tag-write arbitration wrote
+        // the fill data but suppressed its tag, leaving a stale valid tag
+        // paired with the wrong line.
+        reset = 1'b1;
+        repeat (5) @(posedge clk);
+        reset = 1'b0;
+        repeat (20) @(posedge clk);
+        mem_put_line(32'h200, 32'h2000_0000, 32'h2000_0001,
+                     32'h2000_0002, 32'h2000_0003);
+        mem_put_line(32'h280, 32'h2800_0000, 32'h2800_0001,
+                     32'h2800_0002, 32'h2800_0003);
+        mem_put_line(32'h300, 32'h3000_0000, 32'h3000_0001,
+                     32'h3000_0002, 32'h3000_0003);
+        mem_put_line(32'h380, 32'h3800_0000, 32'h3800_0001,
+                     32'h3800_0002, 32'h3800_0003);
+        mem_put_line(32'h210, 32'h2100_0000, 32'h2100_0001,
+                     32'h2100_0002, 32'h2100_0003);
+        mem_put_line(32'h220, 32'h2200_0000, 32'h2200_0001,
+                     32'h2200_0002, 32'h2200_0003);
+        cache_read(32'h200, 128'h2000_0003_2000_0002_2000_0001_2000_0000);
+        cache_read(32'h280, 128'h2800_0003_2800_0002_2800_0001_2800_0000);
+        cache_read(32'h300, 128'h3000_0003_3000_0002_3000_0001_3000_0000);
+        cache_read(32'h380, 128'h3800_0003_3800_0002_3800_0001_3800_0000);
+        if (!dut.tag_way1[0][20] || dut.tag_way1[0][19:0] != 20'h00006) begin
+            $display("L1 ICACHE COLLISION SETUP expected 0x300 in way 1");
+            $fatal(1);
+        end
+
+        do @(negedge clk); while (!cpu_ready);
+        cpu_addr = 32'h210;
+        cpu_valid = 1'b1;
+        @(negedge clk);
+        cpu_valid = 1'b0;
+        do @(negedge clk); while (!(dut.state == 3'd3 &&
+                                    dut.fill_count == 2'd2 &&
+                                    mem_resp_valid));
+        invalidate_addr = 32'h300;
+        invalidate_valid = 1'b1;
+        @(negedge clk);
+        invalidate_valid = 1'b0;
+        if (!cpu_resp_valid)
+            do @(negedge clk); while (!cpu_resp_valid);
+        if (cpu_line !== 128'h2100_0003_2100_0002_2100_0001_2100_0000) begin
+            $display("L1 ICACHE DIFFERENT-WAY COLLISION RESPONSE FAIL got=%032x", cpu_line);
+            $fatal(1);
+        end
+        repeat (2) @(negedge clk);
+        mem_request_before = mem_request_count;
+        cache_read(32'h210, 128'h2100_0003_2100_0002_2100_0001_2100_0000);
+        if (mem_request_count != mem_request_before) begin
+            $display("L1 ICACHE DIFFERENT-WAY COLLISION lost fill tag");
+            $fatal(1);
+        end
+
+        // If the snoop and fill need the same way RAM, neither the fill tag
+        // nor its data may be installed.  The response is still returned, and
+        // a later access refills instead of hitting mismatched tag/data state.
+        do @(negedge clk); while (!cpu_ready);
+        cpu_addr = 32'h220;
+        cpu_valid = 1'b1;
+        @(negedge clk);
+        cpu_valid = 1'b0;
+        do @(negedge clk); while (!(dut.state == 3'd3 &&
+                                    dut.fill_count == 2'd2 &&
+                                    mem_resp_valid));
+        invalidate_addr = 32'h200;
+        invalidate_valid = 1'b1;
+        @(negedge clk);
+        invalidate_valid = 1'b0;
+        if (!cpu_resp_valid)
+            do @(negedge clk); while (!cpu_resp_valid);
+        if (cpu_line !== 128'h2200_0003_2200_0002_2200_0001_2200_0000) begin
+            $display("L1 ICACHE SAME-WAY COLLISION RESPONSE FAIL got=%032x", cpu_line);
+            $fatal(1);
+        end
+        repeat (2) @(negedge clk);
+        mem_request_before = mem_request_count;
+        cache_read(32'h220, 128'h2200_0003_2200_0002_2200_0001_2200_0000);
+        if (mem_request_count != mem_request_before + 1) begin
+            $display("L1 ICACHE SAME-WAY COLLISION incorrectly cached fill");
             $fatal(1);
         end
 

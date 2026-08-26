@@ -346,10 +346,22 @@ wire tag_snoop_match2 = snoop_tag_entry2_r[TAG_VALID_BIT] &&
                         (snoop_tag_entry2_r[TAG_BITS-1:0] == snoop_tag_r);
 wire tag_snoop_match3 = snoop_tag_entry3_r[TAG_VALID_BIT] &&
                         (snoop_tag_entry3_r[TAG_BITS-1:0] == snoop_tag_r);
-wire tag_snoop_write = snoop_valid_r && (tag_snoop_match0 ||
-                                         tag_snoop_match1 ||
-                                         tag_snoop_match2 ||
-                                         tag_snoop_match3);
+wire fill_way_snoop_conflict =
+    ((fill_way == 2'd0) && tag_snoop_match0) ||
+    ((fill_way == 2'd1) && tag_snoop_match1) ||
+    ((fill_way == 2'd2) && tag_snoop_match2) ||
+    ((fill_way == 2'd3) && tag_snoop_match3);
+wire registered_snoop_fill_conflict = snoop_valid_r &&
+                                      (snoop_set_r == fill_set) &&
+                                      (snoop_tag_r == fill_tag);
+// Each way is a separate RAM and can accept its own write.  A snoop matching
+// another way must not suppress the fill tag: doing so while still writing the
+// fill data leaves the victim's old valid tag paired with the new line.  If
+// both writes need the same way RAM, or the snoop targets the line being
+// filled, return the requested line but leave the cache arrays untouched.
+wire fill_install_allowed = !live_snoop_fill_conflict &&
+                            !registered_snoop_fill_conflict &&
+                            !fill_way_snoop_conflict;
 
 always_ff @(posedge clk) begin
     if (accept_cpu) begin
@@ -376,31 +388,30 @@ always_ff @(posedge clk) begin
     end
 
     // Keep each tag array in one write process so Quartus can retain the tag
-    // memories as M10Ks.  A matching snoop wins over a simultaneous final
-    // fill beat: the requested line is still returned, but is conservatively
-    // left uncached instead of allowing an invalidation to be lost.  A snoop
-    // miss consumes no tag write port and must not suppress an unrelated fill.
+    // memories as M10Ks.  An unrelated snoop and fill can update different
+    // way RAMs together.  A same-way collision leaves the fill uncached.
     if (tag_reset_write) begin
         tag_way0[init_set] <= '0;
         tag_way1[init_set] <= '0;
         tag_way2[init_set] <= '0;
         tag_way3[init_set] <= '0;
-    end else if (tag_snoop_write) begin
+    end else begin
         if (tag_snoop_match0)
             tag_way0[snoop_set_r] <= '0;
+        else if (tag_fill_write && fill_install_allowed && (fill_way == 2'd0))
+            tag_way0[fill_set] <= tag_fill_entry;
         if (tag_snoop_match1)
             tag_way1[snoop_set_r] <= '0;
+        else if (tag_fill_write && fill_install_allowed && (fill_way == 2'd1))
+            tag_way1[fill_set] <= tag_fill_entry;
         if (tag_snoop_match2)
             tag_way2[snoop_set_r] <= '0;
+        else if (tag_fill_write && fill_install_allowed && (fill_way == 2'd2))
+            tag_way2[fill_set] <= tag_fill_entry;
         if (tag_snoop_match3)
             tag_way3[snoop_set_r] <= '0;
-    end else if (tag_fill_write && !live_snoop_fill_conflict) begin
-        case (fill_way)
-            2'd0: tag_way0[fill_set] <= tag_fill_entry;
-            2'd1: tag_way1[fill_set] <= tag_fill_entry;
-            2'd2: tag_way2[fill_set] <= tag_fill_entry;
-            default: tag_way3[fill_set] <= tag_fill_entry;
-        endcase
+        else if (tag_fill_write && fill_install_allowed && (fill_way == 2'd3))
+            tag_way3[fill_set] <= tag_fill_entry;
     end
 end
 
@@ -541,7 +552,8 @@ always_ff @(posedge clk) begin
                     fill_line <= fill_line_next;
 
                     if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
-                        write_cache_line(fill_way, fill_set, fill_line_next);
+                        if (fill_install_allowed)
+                            write_cache_line(fill_way, fill_set, fill_line_next);
                         line_r <= fill_line_next;
                         resp_valid_r <= 1'b1;
                         // Only the tag-RAM fill write sets valid for fill_way.
