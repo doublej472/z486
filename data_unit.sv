@@ -315,11 +315,7 @@ function automatic logic [31:0] read_alu_source(input logic [5:0] field);
         ALUSRC_CONST_NEG1: read_alu_source = 32'hffff_ffff;
         ALUSRC_CONST_NEG2: read_alu_source = 32'hffff_fffe;
         ALUSRC_CONST_NEG4: read_alu_source = 32'hffff_fffc;
-        // Native 386 PUSHFD first masks EFLAGS to 16 bits. Preserve the full
-        // value for z486; the following FLAGS_MASK step filters reserved bits.
-        ALUSRC_MASK16: read_alu_source =
-            (instr.opcode == 8'h9c && instr.data32) ? 32'hffff_ffff :
-                                                      32'h0000_ffff;
+        ALUSRC_MASK16: read_alu_source = 32'h0000_ffff;
         ALUSRC_CONST_0: read_alu_source = 32'd0;
         ALUSRC_WORDSZ: read_alu_source = is_dword ? 32'd4 :
                                          op_size == 2'd0 ? 32'd1 : 32'd2;

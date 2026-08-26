@@ -107,6 +107,14 @@ class OverlayRecipe:
 
 PATCHES = [
     # ---- 80486 instruction extensions -----------------------------------
+    # The extracted 80386 PUSHFD routine first truncates EFLAGS to 16 bits at
+    # 7F3, before 7F4 applies the architectural 0x37fd7 mask. A 486 must retain
+    # the high EFLAGS bits, including AC, so replace only that first mask with
+    # all ones. Keeping this in the generated z486 ROM avoids changing the
+    # shared MASK16 literal used by interrupt and fault delivery.
+    Patch(0x7F3, "486 PUSHFD: preserve full EFLAGS width before architectural mask",
+          fields=dict(alusrc=0x10)),
+
     # 0F C8-CF has no 80386 PLA entry. The decoder redirects it to this
     # otherwise unused word and selects the register through opcode[2:0].
     Patch(0x9C4, "BSWAP r32 extension: SRCREG -> byte-swapped SRCREG + RNI",
