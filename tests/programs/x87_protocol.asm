@@ -25,6 +25,7 @@ start:
     fnstsw ax
     fnstsw word [status_word]
     fnstcw word [control_word_out]
+    fnop                                ; Must not open a memory-output stream.
     fldcw word [control_word]
 
     ; Register-only stack and arithmetic commands.

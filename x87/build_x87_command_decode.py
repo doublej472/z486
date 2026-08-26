@@ -163,32 +163,34 @@ def fields(fop: int) -> dict[str, int]:
             parameter={0: RX["M32"], 2: RX["I32"], 4: RX["M64"],
                        6: RX["I16"]}[group(fop)],
         )
-    elif group(fop) == 1 and operation(fop) == 0:
+    elif not register_form(fop) and group(fop) == 1 and operation(fop) == 0:
         result.update(action=ACTIONS["LOAD"], parameter=RX["M32"])
-    elif group(fop) == 5 and operation(fop) == 0:
+    elif not register_form(fop) and group(fop) == 5 and operation(fop) == 0:
         result.update(action=ACTIONS["LOAD"], parameter=RX["M64"])
-    elif group(fop) == 3 and operation(fop) == 5:
+    elif not register_form(fop) and group(fop) == 3 and operation(fop) == 5:
         result.update(action=ACTIONS["LOAD"], parameter=RX["M80"])
-    elif group(fop) == 7 and operation(fop) == 0:
+    elif not register_form(fop) and group(fop) == 7 and operation(fop) == 0:
         result.update(action=ACTIONS["LOAD"], parameter=RX["I16"])
-    elif group(fop) == 3 and operation(fop) == 0:
+    elif not register_form(fop) and group(fop) == 3 and operation(fop) == 0:
         result.update(action=ACTIONS["LOAD"], parameter=RX["I32"])
-    elif group(fop) == 7 and operation(fop) == 5:
+    elif not register_form(fop) and group(fop) == 7 and operation(fop) == 5:
         result.update(action=ACTIONS["LOAD"], parameter=RX["I64"])
-    elif group(fop) == 1 and operation(fop) == 5:
+    elif not register_form(fop) and group(fop) == 1 and operation(fop) == 5:
         result.update(action=ACTIONS["LOAD"], parameter=RX["CONTROL"])
-    elif group(fop) in (1, 5) and operation(fop) in (2, 3):
+    elif (not register_form(fop) and group(fop) in (1, 5) and
+          operation(fop) in (2, 3)):
         width = 0 if group(fop) == 1 else 1
         result.update(action=ACTIONS["STORE"],
                       parameter=(int(bool(fop & 8)) << 3) | (width << 1))
-    elif group(fop) == 3 and operation(fop) == 7:
+    elif not register_form(fop) and group(fop) == 3 and operation(fop) == 7:
         result.update(action=ACTIONS["STORE"], parameter=(1 << 3) | (2 << 1))
-    elif group(fop) in (7, 3) and operation(fop) in (2, 3):
+    elif (not register_form(fop) and group(fop) in (7, 3) and
+          operation(fop) in (2, 3)):
         width = 0 if group(fop) == 7 else 1
         result.update(action=ACTIONS["STORE"],
                       parameter=(1 << 0) | (int(bool(fop & 8)) << 3) |
                                 (width << 1))
-    elif group(fop) == 7 and operation(fop) == 7:
+    elif not register_form(fop) and group(fop) == 7 and operation(fop) == 7:
         result.update(action=ACTIONS["STORE"],
                       parameter=(1 << 0) | (1 << 3) | (2 << 1))
     return result
@@ -208,6 +210,14 @@ def main() -> None:
     root = Path(__file__).resolve().parent
     words = [pack(fop) for fop in range(2048)]
     assert all(word < (1 << 23) for word in words)
+    # Register-form ESC instructions must never open a memory-transfer stream.
+    # In particular, FNOP (D9 D0) precedes FLDCW in Creative DIAGNOSE.
+    for fop in range(2048):
+        if register_form(fop):
+            assert fields(fop)["action"] not in (ACTIONS["LOAD"],
+                                                  ACTIONS["STORE"],
+                                                  ACTIONS["MEMORY_MATH"])
+    assert fields(0x1D0)["action"] == ACTIONS["NONE"]
     svh = [
         "function automatic logic [22:0] x87_command_decode_word(",
         "    input logic [10:0] decode_address);",
