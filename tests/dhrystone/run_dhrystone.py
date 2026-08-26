@@ -241,7 +241,8 @@ def rtl_sources(core: str, core_dir: Path) -> list[Path]:
 def copy_ucode_files(core_dir: Path, build_dir: Path) -> None:
     # Copy whichever ROM images the core revision provides (older cores use
     # the expanded ucode45.hex; current cores predecode in hardware).
-    for name in ("ucode.hex", "ucode45.hex", "pla_entry_rom.hex"):
+    for name in ("ucode.hex", "ucode45.hex", "pla_entry_rom.hex",
+                 "pla_group_entry.hex"):
         src = core_dir / name
         if src.exists():
             shutil.copy2(src, build_dir / name)

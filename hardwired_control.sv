@@ -31,7 +31,6 @@ module hardwired_control
     input  logic [6:0]  uc_aluop,
     input  logic        alu_write_flags,
     input  logic [31:0] flags_live,      // Current-cycle condition flags
-    input  logic [31:0] flags_ahead,     // Flags after pending ALU commit
     input  logic [1:0]  op_size,
     input  recipe_pending_write_t mem_commit,   // Deferred load GPR write
     input  recipe_pending_write_t shift_commit, // Deferred shift GPR write
@@ -69,7 +68,6 @@ recipe_meta_t next_recipe;
 logic branch_ustep_r;
 logic branch_ustep_jcc_r;
 logic jcc_fold_r;
-logic jcc_issue_taken_r;
 logic jcc_issue_valid_r;
 logic hardwired_off = 1'b0;
 
@@ -225,6 +223,10 @@ wire fold_now = i_issue && issue_hardwired && issue_recipe.jcc &&
                 !(alu_write_flags || jcc_unsafe) &&
                 !condition_true(issue_instr.branch_condition, flags_live);
 assign fold_active = jcc_fold_r && i_first;
+// A non-folded Jcc already owns a branch uStep. Evaluate it there, after the
+// predecessor's flags have reached the registered flag-forwarding boundary,
+// rather than carrying the predecessor's live ALU result into an issue FF.
+wire jcc_exec_taken = condition_true(exec_instr.branch_condition, flags_live);
 
 wire chain_after_single = i_issue && issue_hardwired &&
     ((!issue_recipe.multi_ustep && !issue_recipe.jcc) || fold_now) && next_chain_safe;
@@ -232,14 +234,25 @@ wire chain_after_load = load_pipe_issue && next_load_chain_safe;
 wire chain_after_multi = recipe_state.hardwired && recipe_state.multi_ustep && uc_exec && uc_next_rni &&
     !i_issue && !i_rni_delay && !q_flush && head_chain_safe;
 wire chain_after_jcc = recipe_active && recipe_state.jcc && uc_exec && jcc_issue_valid_r &&
-    !jcc_issue_taken_r && !q_flush && head_chain_safe && !jcc_fold_r;
-assign chain_start = (chain_after_single || chain_after_load ||
-                      chain_after_multi || chain_after_jcc) &&
+    !jcc_exec_taken && !q_flush && head_chain_safe && !jcc_fold_r;
+wire chain_start_unstalled = (chain_after_single || chain_after_load ||
+                              chain_after_multi || chain_after_jcc) &&
     (!d2_valid || i_issue) && !d2_waited && !throttle_hold &&
     !interrupt_pending && !trap_active && !single_step && !any_fault_issue;
+// Every chain source already implies an accepted issue or uc_exec. State the
+// common stall boundary explicitly so stalled memory/x87 fault cones cannot
+// reach the microcode-ROM address through speculative chain arbitration.
+assign chain_start = chain_start_unstalled && !stall;
 assign chain_from_next = chain_after_single || chain_after_load;
 assign chain_entry = (chain_after_single || chain_after_load)
                    ? next_instr.entry_point : issue_instr.entry_point;
+
+// synthesis translate_off
+always_ff @(posedge clk) begin
+    if (reset_n && chain_start_unstalled && stall)
+        $fatal(1, "Chain source active while execution is stalled");
+end
+// synthesis translate_on
 
 //=============================================================================
 // Bounded branch uStep and recipe state
@@ -252,7 +265,7 @@ assign chain_entry = (chain_after_single || chain_after_load)
 assign branch_ustep_rni = i_first && branch_ustep_r;
 assign branch_ustep_exec = branch_ustep_rni && uc_exec;
 assign branch_redirect = branch_ustep_exec &&
-                         (!branch_ustep_jcc_r || jcc_issue_taken_r);
+                         (!branch_ustep_jcc_r || jcc_exec_taken);
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
@@ -260,7 +273,6 @@ always_ff @(posedge clk) begin
         branch_ustep_r <= 1'b0;
         branch_ustep_jcc_r <= 1'b0;
         jcc_fold_r <= 1'b0;
-        jcc_issue_taken_r <= 1'b0;
         jcc_issue_valid_r <= 1'b0;
     end else begin
         if (q_flush || interrupt_entry || any_fault) begin
@@ -269,7 +281,6 @@ always_ff @(posedge clk) begin
         end else if (i_issue) begin
             jcc_fold_r <= fold_now;
             jcc_issue_valid_r <= issue_recipe.jcc && !jcc_unsafe;
-            jcc_issue_taken_r <= condition_true(issue_instr.branch_condition, flags_ahead);
         end else if (!stall) begin
             jcc_fold_r <= 1'b0;
         end

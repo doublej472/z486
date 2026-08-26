@@ -86,7 +86,6 @@ reg [31:0] EIP = 32'h0000FFF0;      // Architectural IP (next instruction) - res
 wire [31:0] EFLAGS;
 wire [31:0] uc_flags;               // Internal ALU flags for microcode conditionals
 wire [31:0] eflags_fwd;             // Includes pending ALU/shifter retirement
-wire [31:0] eflags_ahead;           // Includes current-cycle ALU flags
 
 // Shared internal registers. Their owning units drive these interconnects.
 wire [31:0] TMPC, TMPG;
@@ -182,9 +181,11 @@ reg [31:0] latched_pf_addr;         // Latched faulting linear address (for LPCR
 
 // Frontend interconnect.
 wire [63:0] win_d1;                 // registered raw window at the prefetcher's D1 cursor
+wire [63:0] win_d1_early;           // speculative next D1 window for entry ROM
 wire [5:0]  d1_avail;               // bytes fetched beyond the D1 cursor
 wire [3:0]  d1_adv;                 // D1 cursor advance this cycle (a prefix, or
                                     //   the instruction rest at handoff, 0-11)
+wire [3:0]  d1_preread_adv;         // structural advance without D2 backpressure
 wire [31:0] win_lit;                // D2 literal window at pop_cursor + lit_off
 wire [5:0]  lit_avail;              // bytes fetched beyond that point
 wire [4:0]  dec_lit_off;            // literal offset from the pop cursor
@@ -509,7 +510,25 @@ assign     d2_ready = d2_ready_base &&
                       (!d2_vipt_candidate || d2_vipt_load) &&
                       (!vipt_load_ex_r.valid || d2_vipt_pipe_ready ||
                        d2_plain_load_overlap_ready);
-assign     i_issue = d2_valid && d2_ready;
+// For a new VIPT load, d2_vipt_load already proves candidate/probe readiness,
+// no replay/slow token, and !single_step. The plain-load overlap arm is then
+// false and the generic equation reduces exactly to the registered older-token
+// occupancy check below. Express that branch directly so an older load's live
+// TLB/cache hit result cannot feed decoder handoff and prefetch advancement.
+wire       d2_vipt_issue_ready = d2_ready_base &&
+                                  (!vipt_load_ex_r.valid ||
+                                   vipt_load_ex_probed_r);
+wire       i_issue_reference = d2_valid && d2_ready;
+assign     i_issue = d2_valid &&
+                     (d2_vipt_load ? d2_vipt_issue_ready : d2_ready);
+
+// synthesis translate_off
+always_ff @(posedge clk) begin
+    if (reset_n && (i_issue !== i_issue_reference))
+        $fatal(1, "VIPT ISSUE READY MISMATCH: direct=%b generic=%b",
+               i_issue, i_issue_reference);
+end
+// synthesis translate_on
 
 wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
 wire       dly_grace_now = mem_dly_grace && uc_p_pure_dly;
@@ -640,6 +659,36 @@ wire        uc_fpu_f8;
 wire        microcode_rom_ce;
 wire [2:0]  d2_kind;
 
+// q_mem is one cycle ahead of the executing micro-op. Decode the compact
+// shifter source here so the data unit can capture it on the same edge that
+// promotes the word into q, before the barrel operation executes.
+function automatic [1:0] shift2_source_next_decode(input [5:0] source);
+    case (source)
+        SRC_TMPC:   shift2_source_next_decode = 2'd0;
+        SRC_TMPE:   shift2_source_next_decode = 2'd1;
+        SRC_SIGMA:  shift2_source_next_decode = 2'd2;
+        SRC_SRCREG: shift2_source_next_decode = 2'd3;
+        default:    shift2_source_next_decode = 2'd0;
+    endcase
+endfunction
+wire       uc_next_is_shift2 = uc_next[17:11] == ALUJMP_SHIFT2;
+wire       uc_next_is_src_shift =
+    (uc_next[17:11] == ALUJMP_SHIFT) &&
+    (uc_next[23:18] == SRC_SRCREG);
+wire       uc_next_captures_shift_source = uc_next_is_shift2 ||
+                                           uc_next_is_src_shift;
+wire [1:0] uc_next_shift2_source = shift2_source_next_decode(uc_next[23:18]);
+
+// synthesis translate_off
+// The immutable Intel ROM has only two plain SHIFT words whose source is
+// SRCREG. They are the signed bit-index scaling steps for BT and BTS/BTR/BTC.
+always @(posedge clk)
+    if (reset_n && uc_exec && (uc_aluop == ALUJMP_SHIFT) &&
+        (uc_source == SRC_SRCREG) &&
+        (uc_addr != 12'h136) && (uc_addr != 12'h14F))
+        $fatal(1, "UNCAPTURED SRCREG SHIFT: uc_addr=%03x", uc_addr);
+// synthesis translate_on
+
 
 //=============================================================================
 // Unit 1: Prefetch queue and Bus Interface
@@ -714,8 +763,10 @@ prefetch prefetch_inst (
     .reset_n(reset_n),
     // Queue output to decoder
     .win_d1(win_d1),
+    .win_d1_early(win_d1_early),
     .d1_avail(d1_avail),
     .d1_adv(d1_adv),
+    .d1_preread_adv(d1_preread_adv),
     .win_lit(win_lit),
     .lit_avail(lit_avail),
     .lit_off(dec_lit_off),
@@ -804,8 +855,10 @@ decoder decoder_inst (
 
     // Prefetch queue interface (two-cursor protocol)
     .win_d1     (win_d1),
+    .win_d1_early(win_d1_early),
     .d1_avail   (d1_avail),
     .d1_adv     (d1_adv),
+    .d1_preread_adv(d1_preread_adv),
     .win_lit    (win_lit),
     .lit_avail  (lit_avail),
     .lit_off    (dec_lit_off),
@@ -926,7 +979,6 @@ hardwired_control hardwired_control_inst (
                      (vipt_load_wb_valid_r && vipt_load_wb_is_alu_r &&
                       !any_fault)),
     .flags_live(eflags_fwd),
-    .flags_ahead(eflags_ahead),
     .op_size(op_size),
     .mem_commit(recipe_mem_write),
     .shift_commit(recipe_shift_write),
@@ -1051,7 +1103,14 @@ wire vipt_load_ex_hit = vipt_load_ex_r.valid && vipt_load_ex_probed_r &&
                         vipt_translation_ok &&
                         !vipt_tlb_is_vga_mem && !seg_gp_fault &&
                         dcache_vipt_resolve_hit;
-wire vipt_load_alu_dst_capture_fast = vipt_load_ex_hit && !any_fault &&
+// Capture the destination operand from the registered EX token, independently
+// of translation, segmentation, and cache outcome.  This state is speculative
+// WB metadata and has no architectural side effect; fault/miss handling gates
+// the later valid/commit token.  Keeping outcome qualification off this edge
+// prevents the EA -> segmentation/fault -> GPR-forwarding cone from crossing
+// the EX/WB boundary.
+wire vipt_load_alu_dst_capture_fast = vipt_load_ex_r.valid &&
+                                      vipt_load_ex_probed_r &&
                                       vipt_load_ex_r.is_alu;
 wire vipt_load_alu_dst_capture_slow = vipt_load_slow_wait_r &&
                                       !mem_servicing &&
@@ -1451,13 +1510,13 @@ wire [7:0] ea_inval_gpr =
 // A split EA is refreshed throughout its D2 residency. If a deferred producer
 // writes a base/index on the prospective issue edge, hold D2 for one more
 // cycle so the registered partial sum captures the forwarded value.
+// The VIPT token normalized byte-register destinations when it entered the
+// pipe. Reuse that registered one-hot here instead of putting WB size/dst
+// decode on the split-EA wait and macro-entry launch cone.
 wire [7:0] d2_split_commit_mask =
     (dly_gpr_we ? (8'h01 << dly_gpr_sel) : 8'h00) |
     (recipe_shift_write.valid ? gpr_wr_expand(recipe_shift_write.dst) : 8'h00) |
-    (vipt_load_wb_valid_r
-        ? (8'h01 << ((vipt_load_wb_size_r == 2'd0)
-                       ? {1'b0, vipt_load_wb_dst_r[1:0]}
-                       : vipt_load_wb_dst_r)) : 8'h00);
+    (vipt_load_wb_valid_r ? vipt_load_wb_dst_onehot_r : 8'h00);
 wire d2_ea_split_refresh = d2_ea_split_done_r &&
     (((d2_agu_dec.base_sel | d2_agu_dec.index_sel) &
       d2_split_commit_mask) != 8'h00);
@@ -1766,6 +1825,11 @@ reg         gp_fault_r;
 reg         ss_fault_r;
 
 wire        vipt_slow_submit = vipt_load_slow_req_r && !mem_servicing;
+// A fallback token owns stable registered address metadata as soon as it is
+// pending.  Present that address to the live TLB while an older request drains;
+// submission remains idle-gated above.  This keeps mem_servicing out of the
+// live-TLB/cache-address cone without changing request ordering.
+wire        vipt_slow_addr_owned = vipt_load_slow_req_r;
 wire        mem_req_to_paging = (mem_op_eligible &&
                                  (uc_data_busreq || x87_direct_mem_req) &&
                                  !gp_fault_trigger) || vipt_slow_submit;
@@ -1775,7 +1839,7 @@ wire        mem_write_now = (x87_direct_mem_req || vipt_slow_submit) ? 1'b0 :
 wire [1:0]  paging_mem_eff_size = vipt_slow_submit
                                 ? vipt_load_slow_r.mem_size
                                 : x87_direct_mem_req ? 2'd2 : mem_eff_size;
-wire [31:0] paging_linear_addr = vipt_slow_submit
+wire [31:0] paging_linear_addr = vipt_slow_addr_owned
                                ? vipt_load_slow_r.linear_addr : ind_linear;
 wire [3:0]  mem_be_now = iack_busop ? 4'b1111 :
                           calc_be(paging_mem_eff_size,
@@ -2918,6 +2982,9 @@ data_unit data_unit_inst (
     .shift_source_class(uc_shift_source_class),
     .shift2_source(uc_shift2_source),
     .shift_is_shift2(uc_is_shift2),
+    .shift2_capture_ce(microcode_rom_ce),
+    .shift2_next_valid(uc_next_captures_shift_source),
+    .shift2_next_source(uc_next_shift2_source),
     .shift_uc_carry(uc_shift_uc_carry),
     .op_size(op_size),
     .srcreg_size(srcreg_size),
@@ -2985,7 +3052,6 @@ data_unit data_unit_inst (
     .flags_backup(FLAGSB),
     .flags_backup_active(flags_backup_active),
     .eflags_fwd(eflags_fwd),
-    .eflags_ahead(eflags_ahead),
     .recipe_shift_write(recipe_shift_write),
     .recipe_shift_data(recipe_shift_data),
     .recipe_memory_write(recipe_mem_write),

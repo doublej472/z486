@@ -40,6 +40,7 @@ typedef enum logic [2:0] {
 bridge_state_t state;       // One registered CPU request from capture to completion.
 logic          write_r;     // Captured request direction.
 logic          data_port_r; // Captured f8/fc port selector.
+logic          cmd_dispatch_r; // Captured command-write dispatch predicate.
 logic [3:0]    be_r;        // Captured byte lanes for partial transfers.
 logic [31:0]   wdata_r;     // Captured CPU write payload.
 logic [31:0]   rdata_r;     // Registered CPU read response.
@@ -53,7 +54,11 @@ always_comb begin
     req_read_complete = req_complete && !write_r;
     req_rdata = rdata_r;
 
-    cmd_valid = (state == BR_DISPATCH) && write_r && !data_port_r;
+    // Keep the command-stream exclusion seen by the direct m32 path behind
+    // the bridge register boundary. This is exactly the request class that
+    // enters BR_DISPATCH; retaining it while dispatch stalls avoids a live
+    // write/data-port/state decode on direct_release and global issue stall.
+    cmd_valid = cmd_dispatch_r;
     cmd_fop = wdata_r[10:0];
 
     word_in_valid = (state == BR_DISPATCH) && write_r && data_port_r;
@@ -70,6 +75,7 @@ always_ff @(posedge clk) begin
         state <= BR_IDLE;
         write_r <= 1'b0;
         data_port_r <= 1'b0;
+        cmd_dispatch_r <= 1'b0;
         be_r <= 4'h0;
         wdata_r <= 32'h0;
         rdata_r <= 32'h0;
@@ -79,6 +85,7 @@ always_ff @(posedge clk) begin
                 if (req_valid) begin
                     write_r <= req_write;
                     data_port_r <= req_data_port;
+                    cmd_dispatch_r <= req_write && !req_data_port;
                     be_r <= req_be;
                     wdata_r <= req_wdata;
                     state <= BR_DISPATCH;
@@ -86,8 +93,10 @@ always_ff @(posedge clk) begin
             end
 
             BR_DISPATCH: begin
-                if (dispatch_ready)
+                if (dispatch_ready) begin
+                    cmd_dispatch_r <= 1'b0;
                     state <= write_r ? BR_COMPLETE : BR_READ_WAIT;
+                end
             end
 
             BR_READ_WAIT: begin
@@ -97,10 +106,24 @@ always_ff @(posedge clk) begin
                 end
             end
 
-            BR_COMPLETE: state <= BR_IDLE;
-            default: state <= BR_IDLE;
+            BR_COMPLETE: begin
+                cmd_dispatch_r <= 1'b0;
+                state <= BR_IDLE;
+            end
+            default: begin
+                cmd_dispatch_r <= 1'b0;
+                state <= BR_IDLE;
+            end
         endcase
     end
 end
+
+// synthesis translate_off
+always_ff @(posedge clk) begin
+    if (!reset && (cmd_dispatch_r !==
+                   ((state == BR_DISPATCH) && write_r && !data_port_r)))
+        $fatal(1, "x87 bridge command predicate mismatch");
+end
+// synthesis translate_on
 
 endmodule

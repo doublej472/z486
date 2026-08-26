@@ -12,6 +12,9 @@ module shifter
     input  logic [3:0]  source_class,       // Predecoded SHIFT1 operand source
     input  logic [1:0]  shift2_source,      // Predecoded SHIFT2 operand source
     input  logic        is_shift2,          // ROM-predecoded SHIFT2 control
+    input  logic        capture_ce,         // q_mem -> q advance
+    input  logic        capture_valid,      // Upcoming q word prereads its operand
+    input  logic [31:0] capture_value,      // Forwarded upcoming shift operand
     input  logic [5:0]  alu_source,
 
     input  logic        instr_start,        // Capture per-instruction shift state
@@ -65,13 +68,16 @@ logic [1:0]  shift1_size;
 logic [2:0]  operation;
 logic [31:0] source_value;
 logic [31:0] alu_value;
+logic [31:0] shift2_operand_r;
 
+wire use_captured_source = is_shift2 ||
+    ((aluop == ALUJMP_SHIFT) && (source_class == 4'd3));
 wire [5:0] width = op_size == 2'd0 ? 6'd8 :
                    op_size == 2'd1 ? 6'd16 : 6'd32;
 wire [31:0] width_mask = op_size == 2'd0 ? 32'h0000_00ff :
                          op_size == 2'd1 ? 32'h0000_ffff : 32'hffff_ffff;
 
-assign data_size = is_shift2 ? shift1_size : op_size;
+assign data_size = use_captured_source ? shift1_size : op_size;
 assign count_nonzero = count_raw_r != 5'd0;
 
 always_ff @(posedge clk) begin
@@ -84,20 +90,20 @@ always_ff @(posedge clk) begin
     end
 end
 
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        shift2_operand_r <= 32'd0;
+    else if (capture_ce && capture_valid)
+        shift2_operand_r <= capture_value;
+end
+
 always_comb begin
-    if (is_shift2) begin
-        case (shift2_source)
-            2'd0:    source_value = tmpc;
-            2'd1:    source_value = tmpe;
-            2'd2:    source_value = sigma;
-            2'd3:    source_value = gpr_src_shift_size;
-            default: source_value = 32'd0;
-        endcase
+    if (use_captured_source) begin
+        source_value = shift2_operand_r;
     end else begin
         case (source_class)
             4'd1:    source_value = sigma;
             4'd2:    source_value = gpr_dst_src_size;
-            4'd3:    source_value = gpr_src_op_size;
             4'd4:    source_value = immediate;
             4'd5:    source_value = tmpb;
             4'd6:    source_value = tmpc;
@@ -110,6 +116,21 @@ always_comb begin
         endcase
     end
 end
+
+// synthesis translate_off
+// Prove that moving the only plain SRCREG SHIFT operands and widths to the
+// existing preread registers preserves the former live values.
+always @(posedge clk)
+    if (reset_n && exec && (aluop == ALUJMP_SHIFT) &&
+        (source_class == 4'd3)) begin
+        if (shift2_operand_r !== gpr_src_op_size)
+            $fatal(1, "SRCREG SHIFT PREREAD MISMATCH: captured=%08x live=%08x",
+                   shift2_operand_r, gpr_src_op_size);
+        if (shift1_size !== op_size)
+            $fatal(1, "SRCREG SHIFT SIZE MISMATCH: captured=%x live=%x",
+                   shift1_size, op_size);
+    end
+// synthesis translate_on
 
 always_comb begin
     case (alu_source)
@@ -238,6 +259,7 @@ always_ff @(posedge clk) begin
             ALUJMP_LDBSRU: begin
                 swap <= 1'b0;
                 count <= alu_src[4:0];
+                shift1_size <= op_size;
                 overflow <= 1'b0;
             end
             ALUJMP_LDBSLM: begin
@@ -328,6 +350,21 @@ always_ff @(posedge clk) begin
 end
 
 // synthesis translate_off
+logic [31:0] shift2_live_reference;
+always_comb begin
+    case (shift2_source)
+        2'd0:    shift2_live_reference = tmpc;
+        2'd1:    shift2_live_reference = tmpe;
+        2'd2:    shift2_live_reference = sigma;
+        2'd3:    shift2_live_reference = gpr_src_shift_size;
+        default: shift2_live_reference = 32'd0;
+    endcase
+end
+always @(posedge clk)
+    if (reset_n && exec && is_shift2 &&
+        (shift2_operand_r !== shift2_live_reference))
+        $fatal(1, "SHIFT2 OPERAND CAPTURE MISMATCH: captured=%08x live=%08x source=%0d",
+               shift2_operand_r, shift2_live_reference, shift2_source);
 always @(posedge clk)
     if (reset_n && exec && (shift_aluop == ALUJMP_SHIFT2) &&
         source_field != SRC_TMPC && source_field != SRC_TMPE &&

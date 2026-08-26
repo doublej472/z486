@@ -45,7 +45,8 @@ localparam integer SET_LSB = LINE_OFFSET_BITS;
 localparam integer SET_MSB = SET_LSB + SET_BITS - 1;
 localparam integer TAG_LSB = SET_MSB + 1;
 localparam integer TAG_MSB = PHYS_ADDR_BITS - 1;
-localparam integer TAG_RAM_BITS = (TAG_BITS < 16) ? 16 : TAG_BITS;
+localparam integer TAG_RAM_BITS = (TAG_BITS < 16) ? 16 : (TAG_BITS + 1);
+localparam integer TAG_VALID_BIT = TAG_BITS;
 localparam [SET_BITS-1:0] LAST_SET = SET_BITS'(NUM_SETS - 1);
 localparam integer PATCHQ_DEPTH = 3;
 localparam integer PATCHQ_IDX_BITS = 2;
@@ -69,10 +70,6 @@ wire cpu_uncacheable = !cache_enable;
 (* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1];
 (* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way2 [0:NUM_SETS-1];
 (* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way3 [0:NUM_SETS-1];
-reg valid_way0 [0:NUM_SETS-1];
-reg valid_way1 [0:NUM_SETS-1];
-reg valid_way2 [0:NUM_SETS-1];
-reg valid_way3 [0:NUM_SETS-1];
 reg [2:0] plru_set [0:NUM_SETS-1];
 
 (* ramstyle = "M10K" *) reg [127:0] data_way0 [0:NUM_SETS-1];
@@ -80,8 +77,21 @@ reg [2:0] plru_set [0:NUM_SETS-1];
 (* ramstyle = "M10K" *) reg [127:0] data_way2 [0:NUM_SETS-1];
 (* ramstyle = "M10K" *) reg [127:0] data_way3 [0:NUM_SETS-1];
 
-reg [TAG_BITS-1:0] rd_tag0_r, rd_tag1_r, rd_tag2_r, rd_tag3_r;
-reg rd_valid0_r, rd_valid1_r, rd_valid2_r, rd_valid3_r;
+// Register each complete tag word as one RAM read.  Keeping the valid bit in
+// the otherwise unused tag-RAM bit removes four 256-bit register arrays while
+// preserving the existing synchronous CPU lookup boundary.
+reg [TAG_RAM_BITS-1:0] rd_tag_entry0_r, rd_tag_entry1_r;
+reg [TAG_RAM_BITS-1:0] rd_tag_entry2_r, rd_tag_entry3_r;
+reg [TAG_RAM_BITS-1:0] snoop_tag_entry0_r, snoop_tag_entry1_r;
+reg [TAG_RAM_BITS-1:0] snoop_tag_entry2_r, snoop_tag_entry3_r;
+wire [TAG_BITS-1:0] rd_tag0_r = rd_tag_entry0_r[TAG_BITS-1:0];
+wire [TAG_BITS-1:0] rd_tag1_r = rd_tag_entry1_r[TAG_BITS-1:0];
+wire [TAG_BITS-1:0] rd_tag2_r = rd_tag_entry2_r[TAG_BITS-1:0];
+wire [TAG_BITS-1:0] rd_tag3_r = rd_tag_entry3_r[TAG_BITS-1:0];
+wire rd_valid0_r = rd_tag_entry0_r[TAG_VALID_BIT];
+wire rd_valid1_r = rd_tag_entry1_r[TAG_VALID_BIT];
+wire rd_valid2_r = rd_tag_entry2_r[TAG_VALID_BIT];
+wire rd_valid3_r = rd_tag_entry3_r[TAG_VALID_BIT];
 reg [127:0] rd_line0_r, rd_line1_r, rd_line2_r, rd_line3_r;
 reg [2:0] rd_plru_r;
 
@@ -313,32 +323,84 @@ begin
 end
 endtask
 
-task automatic write_cache_tag(input [1:0] way, input [SET_BITS-1:0] set, input [TAG_BITS-1:0] tag);
-begin
-    case (way)
-        2'd0: begin tag_way0[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way0[set] <= 1'b1; end
-        2'd1: begin tag_way1[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way1[set] <= 1'b1; end
-        2'd2: begin tag_way2[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way2[set] <= 1'b1; end
-        default: begin tag_way3[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way3[set] <= 1'b1; end
-    endcase
-end
-endtask
+wire tag_reset_write = (state == S_RESET_INIT);
+wire tag_fill_write = (state == S_FILL) && mem_resp_valid &&
+                      (fill_count == {WORD_OFFSET_BITS{1'b1}});
+wire [TAG_RAM_BITS-1:0] tag_fill_entry =
+    {{(TAG_RAM_BITS-TAG_BITS-1){1'b0}}, 1'b1, fill_tag};
+wire snoop_capture = invalidate_valid || patch_valid;
+wire [SET_BITS-1:0] snoop_capture_set = invalidate_valid ?
+                                              invalidate_addr[SET_MSB:SET_LSB] :
+                                              patch_set;
+wire [TAG_BITS-1:0] snoop_capture_tag = invalidate_valid ?
+                                              invalidate_addr[TAG_MSB:TAG_LSB] :
+                                              patch_tag;
+wire live_snoop_fill_conflict = snoop_capture &&
+                                (snoop_capture_set == fill_set) &&
+                                (snoop_capture_tag == fill_tag);
+wire tag_snoop_match0 = snoop_tag_entry0_r[TAG_VALID_BIT] &&
+                        (snoop_tag_entry0_r[TAG_BITS-1:0] == snoop_tag_r);
+wire tag_snoop_match1 = snoop_tag_entry1_r[TAG_VALID_BIT] &&
+                        (snoop_tag_entry1_r[TAG_BITS-1:0] == snoop_tag_r);
+wire tag_snoop_match2 = snoop_tag_entry2_r[TAG_VALID_BIT] &&
+                        (snoop_tag_entry2_r[TAG_BITS-1:0] == snoop_tag_r);
+wire tag_snoop_match3 = snoop_tag_entry3_r[TAG_VALID_BIT] &&
+                        (snoop_tag_entry3_r[TAG_BITS-1:0] == snoop_tag_r);
+wire tag_snoop_write = snoop_valid_r && (tag_snoop_match0 ||
+                                         tag_snoop_match1 ||
+                                         tag_snoop_match2 ||
+                                         tag_snoop_match3);
 
 always_ff @(posedge clk) begin
     if (accept_cpu) begin
-        rd_tag0_r <= tag_way0[cpu_set][TAG_BITS-1:0];
-        rd_tag1_r <= tag_way1[cpu_set][TAG_BITS-1:0];
-        rd_tag2_r <= tag_way2[cpu_set][TAG_BITS-1:0];
-        rd_tag3_r <= tag_way3[cpu_set][TAG_BITS-1:0];
-        rd_valid0_r <= valid_way0[cpu_set];
-        rd_valid1_r <= valid_way1[cpu_set];
-        rd_valid2_r <= valid_way2[cpu_set];
-        rd_valid3_r <= valid_way3[cpu_set];
+        rd_tag_entry0_r <= tag_way0[cpu_set];
+        rd_tag_entry1_r <= tag_way1[cpu_set];
+        rd_tag_entry2_r <= tag_way2[cpu_set];
+        rd_tag_entry3_r <= tag_way3[cpu_set];
         rd_line0_r <= data_way0[cpu_set];
         rd_line1_r <= data_way1[cpu_set];
         rd_line2_r <= data_way2[cpu_set];
         rd_line3_r <= data_way3[cpu_set];
         rd_plru_r <= plru_set[cpu_set];
+    end
+
+    // The second synchronous tag read is launched from the live snoop input
+    // while its address and payload are registered.  Its result is therefore
+    // aligned with snoop_valid_r on the following lookup cycle, when the
+    // existing conflict mask already prevents a stale CPU hit.
+    if (snoop_capture) begin
+        snoop_tag_entry0_r <= tag_way0[snoop_capture_set];
+        snoop_tag_entry1_r <= tag_way1[snoop_capture_set];
+        snoop_tag_entry2_r <= tag_way2[snoop_capture_set];
+        snoop_tag_entry3_r <= tag_way3[snoop_capture_set];
+    end
+
+    // Keep each tag array in one write process so Quartus can retain the tag
+    // memories as M10Ks.  A matching snoop wins over a simultaneous final
+    // fill beat: the requested line is still returned, but is conservatively
+    // left uncached instead of allowing an invalidation to be lost.  A snoop
+    // miss consumes no tag write port and must not suppress an unrelated fill.
+    if (tag_reset_write) begin
+        tag_way0[init_set] <= '0;
+        tag_way1[init_set] <= '0;
+        tag_way2[init_set] <= '0;
+        tag_way3[init_set] <= '0;
+    end else if (tag_snoop_write) begin
+        if (tag_snoop_match0)
+            tag_way0[snoop_set_r] <= '0;
+        if (tag_snoop_match1)
+            tag_way1[snoop_set_r] <= '0;
+        if (tag_snoop_match2)
+            tag_way2[snoop_set_r] <= '0;
+        if (tag_snoop_match3)
+            tag_way3[snoop_set_r] <= '0;
+    end else if (tag_fill_write && !live_snoop_fill_conflict) begin
+        case (fill_way)
+            2'd0: tag_way0[fill_set] <= tag_fill_entry;
+            2'd1: tag_way1[fill_set] <= tag_fill_entry;
+            2'd2: tag_way2[fill_set] <= tag_fill_entry;
+            default: tag_way3[fill_set] <= tag_fill_entry;
+        endcase
     end
 end
 
@@ -416,26 +478,10 @@ always_ff @(posedge clk) begin
                 end
             end
 
-            if (valid_way0[snoop_set_r] && tag_way0[snoop_set_r][TAG_BITS-1:0] == snoop_tag_r) begin
-                valid_way0[snoop_set_r] <= 1'b0;
-            end
-            if (valid_way1[snoop_set_r] && tag_way1[snoop_set_r][TAG_BITS-1:0] == snoop_tag_r) begin
-                valid_way1[snoop_set_r] <= 1'b0;
-            end
-            if (valid_way2[snoop_set_r] && tag_way2[snoop_set_r][TAG_BITS-1:0] == snoop_tag_r) begin
-                valid_way2[snoop_set_r] <= 1'b0;
-            end
-            if (valid_way3[snoop_set_r] && tag_way3[snoop_set_r][TAG_BITS-1:0] == snoop_tag_r) begin
-                valid_way3[snoop_set_r] <= 1'b0;
-            end
         end
 
         case (state)
             S_RESET_INIT: begin
-                valid_way0[init_set] <= 1'b0;
-                valid_way1[init_set] <= 1'b0;
-                valid_way2[init_set] <= 1'b0;
-                valid_way3[init_set] <= 1'b0;
                 plru_set[init_set] <= 3'b000;
                 if (init_set == LAST_SET) begin
                     state <= S_IDLE;
@@ -496,10 +542,11 @@ always_ff @(posedge clk) begin
 
                     if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
                         write_cache_line(fill_way, fill_set, fill_line_next);
-                        write_cache_tag(fill_way, fill_set, fill_tag);
                         line_r <= fill_line_next;
                         resp_valid_r <= 1'b1;
-                        // Only write_cache_tag (above) sets valid for fill_way. Do NOT restore the other ways' valid bits from the fill-START snapshot: a snoop...
+                        // Only the tag-RAM fill write sets valid for fill_way.
+                        // Do not restore any other way from the fill-start
+                        // snapshot: a snoop during this fill must survive.
                         // Details: doc/z486/implementation_notes.md#src-24-z486-l1-icache-sv-491
                         plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
                         state <= S_IDLE;

@@ -118,11 +118,6 @@ assign live_is_vga_mem =
     (live_hit2 && vga_mem[live_set2][2]) ||
     (live_hit3 && vga_mem[live_set3][3]);
 
-wire [1:0] live_hit_way = live_hit0 ? 2'd0 :
-                          live_hit1 ? 2'd1 :
-                          live_hit2 ? 2'd2 :
-                          live_hit3 ? 2'd3 : 2'd0;
-
 // The D2 port uses one synchronous RAM read followed by an EX tag compare.
 // It is maintained as an independent TLB: retaining a translation after the
 // four-way TLB replaces it is valid until software executes INVLPG or reloads
@@ -236,40 +231,30 @@ end
 
 always_comb begin
     live_hit = live_hit0 | live_hit1 | live_hit2 | live_hit3;
-
-    case (live_hit_way)
-        2'd0: begin
-            live_physical_addr = {tlb[live_set0][0].pfn, lal_w0[11:0]};
-            live_writable = tlb[live_set0][0].writable;
-            live_user = tlb[live_set0][0].user;
-            live_dirty = tlb[live_set0][0].dirty;
-        end
-        2'd1: begin
-            live_physical_addr = {tlb[live_set1][1].pfn, lal_w1[11:0]};
-            live_writable = tlb[live_set1][1].writable;
-            live_user = tlb[live_set1][1].user;
-            live_dirty = tlb[live_set1][1].dirty;
-        end
-        2'd2: begin
-            live_physical_addr = {tlb[live_set2][2].pfn, lal_w2[11:0]};
-            live_writable = tlb[live_set2][2].writable;
-            live_user = tlb[live_set2][2].user;
-            live_dirty = tlb[live_set2][2].dirty;
-        end
-        2'd3: begin
-            live_physical_addr = {tlb[live_set3][3].pfn, lal_w3[11:0]};
-            live_writable = tlb[live_set3][3].writable;
-            live_user = tlb[live_set3][3].user;
-            live_dirty = tlb[live_set3][3].dirty;
-        end
-    endcase
-
-    if (!live_hit) begin
-        live_physical_addr = linear_addr_live;
-        live_writable = 1'b1;
-        live_user = 1'b0;
-        live_dirty = 1'b0;
-    end
+    // Matching translations are unique.  Select each field directly from the
+    // one-hot hit vector instead of priority-encoding a way and then muxing;
+    // this shortens the live address -> paging/cache finalize cone.
+    live_physical_addr = {
+        ({20{live_hit0}} & tlb[live_set0][0].pfn) |
+        ({20{live_hit1}} & tlb[live_set1][1].pfn) |
+        ({20{live_hit2}} & tlb[live_set2][2].pfn) |
+        ({20{live_hit3}} & tlb[live_set3][3].pfn) |
+        ({20{!live_hit}} & linear_addr_live[31:12]),
+        linear_addr_live[11:0]
+    };
+    live_writable = !live_hit |
+                    (live_hit0 & tlb[live_set0][0].writable) |
+                    (live_hit1 & tlb[live_set1][1].writable) |
+                    (live_hit2 & tlb[live_set2][2].writable) |
+                    (live_hit3 & tlb[live_set3][3].writable);
+    live_user = (live_hit0 & tlb[live_set0][0].user) |
+                (live_hit1 & tlb[live_set1][1].user) |
+                (live_hit2 & tlb[live_set2][2].user) |
+                (live_hit3 & tlb[live_set3][3].user);
+    live_dirty = (live_hit0 & tlb[live_set0][0].dirty) |
+                 (live_hit1 & tlb[live_set1][1].dirty) |
+                 (live_hit2 & tlb[live_set2][2].dirty) |
+                 (live_hit3 & tlb[live_set3][3].dirty);
 end
 
 // Update address decomposition

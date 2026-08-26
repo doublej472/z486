@@ -48,6 +48,9 @@ module data_unit
     input  logic [3:0]  shift_source_class,      // Predecoded shifter source class
     input  logic [1:0]  shift2_source,           // Predecoded SHIFT2 source
     input  logic        shift_is_shift2,         // Registered ROM SHIFT2 decode
+    input  logic        shift2_capture_ce,       // Advance q_mem -> q operand capture
+    input  logic        shift2_next_valid,       // q_mem word is SHIFT2
+    input  logic [1:0]  shift2_next_source,      // q_mem SHIFT2 source class
     input  logic        shift_uc_carry,          // BSR loop needs carry immediately
     input  logic [1:0]  op_size,
     input  logic [1:0]  srcreg_size,
@@ -116,7 +119,6 @@ module data_unit
     output logic [31:0] flags_backup,
     output logic        flags_backup_active,
     output logic [31:0] eflags_fwd,               // Current-cycle flag forwarding
-    output logic [31:0] eflags_ahead,             // Next-cycle condition flags
 
     output recipe_pending_write_t recipe_shift_write, // Deferred shift GPR commit
     output logic [31:0] recipe_shift_data,          // Deferred shift result
@@ -130,20 +132,19 @@ module data_unit
 
 logic [31:0] alu_dst;
 logic [31:0] alu_flags;
-logic [2:0]  alu_zsp_ahead;
 logic        alu_zsp_update;
 logic [31:0] load_wb_commit_data;
 logic        load_wb_alu_exec;
 logic        load_wb_alu_commit;
 logic [31:0] load_wb_alu_result;
 logic [31:0] load_wb_alu_flags;
-logic [2:0]  load_wb_alu_zsp_ahead;
 logic [31:0] load_wb_alu_dst_r;
 
 logic [31:0] tmpb, tmpd, tmpe, tmpf, tmph;
 logic [31:0] csopcd, fsveip, oproff;
 logic [2:0] src_reg_sel_r;           // EX-local copies of issued GPR selectors
 logic [2:0] dst_reg_sel_r;
+logic [2:0] recipe_shift_widx;       // Byte-normalized deferred-shift GPR
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
@@ -176,6 +177,8 @@ logic sh_flags_of;
 logic sh_flags_zf;
 logic sh_flags_sf;
 logic sh_flags_pf;
+
+logic [31:0] shift2_capture_value;
 
 logic        flag2_eflags_p;
 logic        flag2_ucflags_p;
@@ -296,10 +299,7 @@ function automatic logic [31:0] read_ea_gpr(
         dly_hit = dly_gpr_forward.valid && valid &&
                   (dly_gpr_forward.dst == idx);
         shift_hit = recipe_shift_write.valid && valid &&
-                    ((recipe_shift_write.size != 2'd0 &&
-                      recipe_shift_write.dst == idx) ||
-                     (recipe_shift_write.size == 2'd0 &&
-                      {1'b0, recipe_shift_write.dst[1:0]} == idx));
+                    (recipe_shift_widx == idx);
         load_widx = (load_wb_size == 2'd0)
                   ? {1'b0, load_wb_dst[1:0]} : load_wb_dst;
         load_hit = load_wb_valid && !load_wb_is_alu && valid &&
@@ -459,7 +459,10 @@ function automatic logic [31:0] read_source(input logic [5:0] field);
         SRC_DR7: read_source = dr7;
         SRC_CSOPCD: read_source = csopcd;
         SRC_OPROFF: read_source = oproff;
-        SRC_MDTMP: read_source = muldiv_result;
+        // MDTMP is factored beside this generic mux below. Keeping its
+        // registered mul/div result out of this large source tree shortens
+        // the common quotient/product-to-GPR writeback path.
+        SRC_MDTMP: read_source = 32'd0;
         SRC_SIGMA: read_source = sigma;
         SRC_IMM: read_source = instr.immediate;
         SRC_ES: read_source = {16'd0, es};
@@ -471,15 +474,14 @@ function automatic logic [31:0] read_source(input logic [5:0] field);
         SRC_LDTR: read_source = {16'd0, ldtr};
         SRC_TR: read_source = {16'd0, tr};
         SRC_SLCTR: read_source = {16'd0, slctr[15:3], 3'b000};
-        SRC_eAX_AL: read_source = read_gpr_load_forwarded(3'd0, op_size_src);
-        SRC_eDX_AH: read_source = read_gpr_load_forwarded(
-            op_size_src == 2'd0 ? 3'd4 : 3'd2, op_size_src);
+        // Width-sensitive GPR sources are factored beside this generic mux.
+        SRC_eAX_AL: read_source = 32'd0;
+        SRC_eDX_AH: read_source = 32'd0;
         SRC_OPR_R: read_source = opr_r;
         SRC_IRF2: read_source = ind;
         SRC_EA: read_source = ea;
         SRC_eCX: read_source = read_gpr_load_forwarded(3'd1, 2'd2);
-        SRC_IRF: read_source = read_gpr_load_forwarded(
-            countr[2:0], op_size_src == 2'd2 ? 2'd2 : 2'd1);
+        SRC_IRF: read_source = 32'd0;
         SRC_USTEP_SEG_INDEX: read_source = {24'd0, 5'b10100, seg_reg_sel};
         SRC_FOP: read_source = {21'd0, instr.fop};
         SRC_SEGREG: begin
@@ -493,10 +495,39 @@ function automatic logic [31:0] read_source(input logic [5:0] field);
                 default: read_source = 32'd0;
             endcase
         end
-        SRC_DSTREG: read_source = read_gpr_load_forwarded(dst_reg_sel_r, srcreg_size_src);
-        SRC_SRCREG: read_source = read_gpr_load_forwarded(src_reg_sel_r, op_size_src);
+        SRC_DSTREG: read_source = 32'd0;
+        SRC_SRCREG: read_source = 32'd0;
         SRC_NEG1: read_source = 32'hffff_ffff;
         default: read_source = 32'd0;
+    endcase
+endfunction
+
+function automatic logic source_is_factored_gpr(input logic [5:0] field);
+    case (field)
+        SRC_eAX_AL, SRC_eDX_AH, SRC_IRF, SRC_DSTREG, SRC_SRCREG:
+            source_is_factored_gpr = 1'b1;
+        default: source_is_factored_gpr = 1'b0;
+    endcase
+endfunction
+
+// These five sources share the byte/word/dword register formatter. Keeping
+// them beside the generic microcode source mux prevents op_size from crossing
+// the full source tree before descriptor and architectural writeback.
+function automatic logic [31:0] read_factored_gpr_source(
+    input logic [5:0] field
+);
+    case (field)
+        SRC_eAX_AL: read_factored_gpr_source = read_gpr_load_forwarded(
+            3'd0, op_size_src);
+        SRC_eDX_AH: read_factored_gpr_source = read_gpr_load_forwarded(
+            op_size_src == 2'd0 ? 3'd4 : 3'd2, op_size_src);
+        SRC_IRF: read_factored_gpr_source = read_gpr_load_forwarded(
+            countr[2:0], op_size_src == 2'd2 ? 2'd2 : 2'd1);
+        SRC_DSTREG: read_factored_gpr_source = read_gpr_load_forwarded(
+            dst_reg_sel_r, srcreg_size_src);
+        SRC_SRCREG: read_factored_gpr_source = read_gpr_load_forwarded(
+            src_reg_sel_r, op_size_src);
+        default: read_factored_gpr_source = 32'd0;
     endcase
 endfunction
 
@@ -576,10 +607,16 @@ function automatic logic [31:0] read_memory_write_source(input logic [5:0] field
 endfunction
 
 always_comb begin
-    source_value_live = read_source(source_live);
+    source_value_live = source_live == SRC_MDTMP ? muldiv_result :
+                        source_is_factored_gpr(source_live)
+                      ? read_factored_gpr_source(source_live)
+                      : read_source(source_live);
     memory_write_source_value = read_memory_write_source(source_live);
     alu_source_value_live = read_alu_source(alu_source_live);
-    alu_dst = read_source(source_field);
+    alu_dst = source_field == SRC_MDTMP ? muldiv_result :
+              source_is_factored_gpr(source_field)
+            ? read_factored_gpr_source(source_field)
+            : read_source(source_field);
     dest_value = alu_dst;
     alu_src = fpu_f8 ? 32'h8000_00f8 : read_alu_source(alu_source);
     protection_source_value = read_protection_source(source_live,
@@ -685,6 +722,7 @@ endtask
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         recipe_shift_write <= '0;
+        recipe_shift_widx <= 3'd0;
         recipe_memory_write <= '0;
     end else if (pipeline_advance) begin
         recipe_memory_write.valid <= recipe_rni && exec && instr_start &&
@@ -702,10 +740,23 @@ always_ff @(posedge clk) begin
             (recipe_state.commit_sel == RECIPE_COMMIT_SHIFT)) begin
             recipe_shift_write.dst <= dst_reg_sel_r;
             recipe_shift_write.size <= op_size;
+            recipe_shift_widx <= (op_size == 2'd0)
+                               ? {1'b0, dst_reg_sel_r[1:0]}
+                               : dst_reg_sel_r;
             recipe_shift_data <= shift_result;
         end
     end
 end
+
+// synthesis translate_off
+always_ff @(posedge clk) begin
+    if (reset_n && recipe_shift_write.valid &&
+        (recipe_shift_widx !== ((recipe_shift_write.size == 2'd0)
+                              ? {1'b0, recipe_shift_write.dst[1:0]}
+                              : recipe_shift_write.dst)))
+        $fatal(1, "Deferred shift normalized destination mismatch");
+end
+// synthesis translate_on
 
 // All GPR producers retain their original ordering. Later assignments are
 // younger and therefore win when two producers target the same register.
@@ -965,24 +1016,6 @@ always_comb begin
         eflags_fwd = eflags;
     end
 
-    if (!((exec && update_arch_flags) || load_wb_alu_exec)) begin
-        eflags_ahead = eflags_fwd;
-    end else if (load_wb_alu_exec) begin
-        eflags_ahead = {eflags_fwd[31:12], load_wb_alu_flags[11],
-                        eflags_fwd[10:8], load_wb_alu_zsp_ahead[2],
-                        load_wb_alu_zsp_ahead[1], eflags_fwd[5],
-                        load_wb_alu_flags[4], eflags_fwd[3],
-                        load_wb_alu_zsp_ahead[0], eflags_fwd[1],
-                        load_wb_alu_flags[0]};
-    end else begin
-        eflags_ahead = {eflags_fwd[31:12], alu_flags[11],
-                        eflags_fwd[10:8],
-                        alu_zsp_update ? alu_zsp_ahead[2] : eflags_fwd[7],
-                        alu_zsp_update ? alu_zsp_ahead[1] : eflags_fwd[6],
-                        eflags_fwd[5], alu_flags[4], eflags_fwd[3],
-                        alu_zsp_update ? alu_zsp_ahead[0] : eflags_fwd[2],
-                        eflags_fwd[1], alu_flags[0]};
-    end
 end
 
 always_ff @(posedge clk) begin
@@ -1259,12 +1292,28 @@ always_comb begin
     load_wb_alu_flags[0] = load_wb_arith
                          ? (load_wb_sub ? ~load_wb_carry : load_wb_carry)
                          : 1'b0;
-    load_wb_alu_zsp_ahead = {load_wb_result_sign, load_wb_zero,
-                             load_wb_parity};
 end
 
 assign load_wb_commit_data = load_wb_is_alu ? load_wb_alu_result
                                             : load_wb_data;
+
+// Capture the operand for a q_mem SHIFT2 word or the two SRCREG SHIFT words.
+// A predecessor may update the selected temporary or SIGMA on this same edge,
+// so forward that exact value. SRCREG uses the existing load-WB bypass and the
+// architectural operand width; its preceding LDBSRU records that width.
+always_comb begin
+    case (shift2_next_source)
+        2'd0: shift2_capture_value = (exec && dest == DEST_TMPC)
+                                    ? dest_value : tmpc;
+        2'd1: shift2_capture_value = (exec && dest == DEST_TMPE)
+                                    ? dest_value : tmpe;
+        2'd2: shift2_capture_value = (exec && aluop == ALUJMP_SHIFT1)
+                                    ? shift_setup_result : sigma;
+        2'd3: shift2_capture_value = read_gpr_load_forwarded(src_reg_sel_r,
+                                                              op_size);
+        default: shift2_capture_value = 32'd0;
+    endcase
+end
 
 `ifdef Z486_ALTERA_ALU
 alu_alt alu_inst (
@@ -1279,7 +1328,6 @@ alu alu_inst (
     .update_carry(update_carry),
     .result(alu_result),
     .flags_out(alu_flags),
-    .zsp_ahead(alu_zsp_ahead),
     .zsp_update(alu_zsp_update)
 );
 
@@ -1293,6 +1341,9 @@ shifter shifter_inst (
     .source_class(shift_source_class),
     .shift2_source(shift2_source),
     .is_shift2(shift_is_shift2),
+    .capture_ce(shift2_capture_ce),
+    .capture_valid(shift2_next_valid),
+    .capture_value(shift2_capture_value),
     .alu_source(alu_source),
     .instr_start(instr_start),
     .instr_is_shxd_next(next_instr.shift_is_double),

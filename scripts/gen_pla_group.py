@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate pla_group_lookup() inside pla_entry.svh.
+"""Regenerate pla_group_lookup() and the compact group-entry ROM.
 
 The entry-point lookup is two serial PLA passes: a first pass keyed by the
 opcode byte, and (when the first pass returns a group row, entry[11:6]==0)
@@ -18,7 +18,7 @@ since it is derived data of the entry PLA.  Inputs are parsed from
 pla_entry.svh and pla_control.svh in the directory above this script.
 Run from anywhere:
 
-    ./gen_pla_group.py            # refreshes pla_group_lookup in ../pla_entry.svh
+    ./gen_pla_group.py            # also writes ../pla_group_entry.hex
 """
 
 from __future__ import annotations
@@ -57,6 +57,34 @@ def casez_eval(pats, addr: int, width: int) -> int:
         if all(pc in ("?", sc) for pc, sc in zip(p, s)):
             return v
     return 0  # both tables end with `default: = 0`
+
+
+def build_group_entry_rom(group_map, group_entry_pats):
+    """Return the reachable {group, ModR/M.reg, memory} entry-point ROM.
+
+    The six-bit first-level group code already captures the data-size and 0F
+    opcode-family distinctions.  Prove that by evaluating every way each group
+    can be reached before using the narrower address in hardware.
+    """
+    entries = [0] * 1024
+    valid = [False] * 1024
+    for (has_0f, _opcode), rows in group_map.items():
+        for (data32, _pe), group in rows.items():
+            for reg in range(8):
+                for memory in (0, 1):
+                    old_addr = ((data32 << 12) | ((group >> 4) << 10) |
+                                (reg << 7) | ((group & 0xF) << 3) |
+                                (memory << 2) | has_0f)
+                    value = casez_eval(group_entry_pats, old_addr, 13)
+                    key = (group << 4) | (reg << 1) | memory
+                    if valid[key] and entries[key] != value:
+                        sys.exit(
+                            "group entry depends on removed mode inputs: "
+                            f"group={group:02x} reg={reg} mem={memory} "
+                            f"{entries[key]:04x}!={value:04x}")
+                    entries[key] = value
+                    valid[key] = True
+    return entries, valid
 
 
 def main():
@@ -185,6 +213,11 @@ def main():
         register_addr = invlpg_addr & ~(1 << 2)
         assert casez_eval(group_entry_pats, invlpg_addr, 13) == 0x09C7
         assert casez_eval(group_entry_pats, register_addr, 13) == 0x082B
+    group_entry_rom, group_entry_valid = build_group_entry_rom(
+        group_map, group_entry_pats)
+    rom_out = CORE / "pla_group_entry.hex"
+    rom_out.write_text("".join(f"{entry:04x}\n" for entry in group_entry_rom))
+    assert sum(group_entry_valid) == 944
     checked = mismatches = 0
     for has_0f in (0, 1):
         for opcode in range(256):
@@ -210,7 +243,8 @@ def main():
                             print(f"MISMATCH 0f={has_0f} op={opcode:02x} "
                                   f"d32={data32} pe={pe}: row {first & 0x3F:#x} "
                                   f"!= group {grp:#x}")
-    print(f"wrote {out} ({len(lines)} patterns); "
+    print(f"wrote {out} ({len(lines)} patterns) and {rom_out} "
+          f"({sum(group_entry_valid)} reachable entries); "
           f"self-check: {checked} group cases, {mismatches} mismatches")
     if mismatches:
         sys.exit(1)

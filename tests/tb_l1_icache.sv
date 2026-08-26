@@ -54,6 +54,8 @@ module tb_l1_icache;
     reg [7:0] mem [0:4095];
     reg [31:0] rd_addr = 32'h0;
     reg [7:0] rd_left = 8'd0;
+    integer mem_request_count = 0;
+    integer mem_request_before;
 
     task automatic mem_put32(input [31:0] addr, input [31:0] data);
     begin
@@ -92,6 +94,7 @@ module tb_l1_icache;
             mem_ready <= 1'b1;
             rd_addr <= mem_addr;
             rd_left <= mem_burstcount == 8'd0 ? 8'd1 : mem_burstcount;
+            mem_request_count <= mem_request_count + 1;
         end
     end
 
@@ -191,6 +194,64 @@ module tb_l1_icache;
         do @(negedge clk); while (!cpu_resp_valid);
         if (cpu_line !== 128'h00FF_EEDD_1234_5678_CAFE_BABE_DEAD_BEEF) begin
             $display("L1 ICACHE INVALIDATE RACE FAIL got=%032x", cpu_line);
+            $fatal(1);
+        end
+
+        // A live invalidation on the final fill beat is captured one cycle
+        // before its tag match can complete.  The just-filled line must stay
+        // invalid rather than briefly becoming a stale hit.
+        mem_put32(32'h100, 32'h1111_0000);
+        mem_put32(32'h104, 32'h3333_2222);
+        mem_put32(32'h108, 32'h5555_4444);
+        mem_put32(32'h10C, 32'h7777_6666);
+        do @(negedge clk); while (!cpu_ready);
+        cpu_addr = 32'h100;
+        cpu_valid = 1'b1;
+        @(negedge clk);
+        cpu_valid = 1'b0;
+        do @(negedge clk); while (!(dut.state == 3'd3 &&
+                                    dut.fill_count == 2'd3 &&
+                                    mem_resp_valid));
+        mem_put32(32'h100, 32'hDEAD_C0DE);
+        invalidate_addr = 32'h100;
+        invalidate_valid = 1'b1;
+        @(negedge clk);
+        invalidate_valid = 1'b0;
+        if (!cpu_resp_valid)
+            do @(negedge clk); while (!cpu_resp_valid);
+        if (cpu_line !== 128'h7777_6666_5555_4444_3333_2222_1111_0000) begin
+            $display("L1 ICACHE FINAL FILL RESPONSE FAIL got=%032x", cpu_line);
+            $fatal(1);
+        end
+        repeat (2) @(negedge clk);
+        cache_read(32'h100, 128'h7777_6666_5555_4444_3333_2222_DEAD_C0DE);
+
+        // A registered snoop miss does not consume a tag write port.  When it
+        // overlaps the last beat of an unrelated fill, that fill must remain
+        // cached instead of causing a later avoidable miss.
+        mem_put32(32'h140, 32'h0123_4567);
+        mem_put32(32'h144, 32'h89AB_CDEF);
+        mem_put32(32'h148, 32'h7654_3210);
+        mem_put32(32'h14C, 32'hFEDC_BA98);
+        do @(negedge clk); while (!cpu_ready);
+        cpu_addr = 32'h140;
+        cpu_valid = 1'b1;
+        @(negedge clk);
+        cpu_valid = 1'b0;
+        do @(negedge clk); while (!(dut.state == 3'd3 &&
+                                    dut.fill_count == 2'd2 &&
+                                    mem_resp_valid));
+        invalidate_addr = 32'h300;
+        invalidate_valid = 1'b1;
+        @(negedge clk);
+        invalidate_valid = 1'b0;
+        if (!cpu_resp_valid)
+            do @(negedge clk); while (!cpu_resp_valid);
+        repeat (2) @(negedge clk);
+        mem_request_before = mem_request_count;
+        cache_read(32'h140, 128'hFEDC_BA98_7654_3210_89AB_CDEF_0123_4567);
+        if (mem_request_count != mem_request_before) begin
+            $display("L1 ICACHE UNRELATED SNOOP suppressed fill");
             $fatal(1);
         end
 

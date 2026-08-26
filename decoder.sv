@@ -8,10 +8,12 @@ module decoder
 
     // Prefetch queue interface (two-cursor protocol)
     input        [63:0] win_d1,         // registered raw window at the D1 cursor
+    input        [63:0] win_d1_early,   // speculative next window for entry-ROM preread
     input        [5:0]  d1_avail,       // bytes fetched beyond the D1 cursor
     output       [3:0]  d1_adv,         // D1 cursor advance (0-11 bytes: a prefix,
                                         //   or the whole rest of the instruction
                                         //   at handoff - struct AND literal bytes)
+    output       [3:0]  d1_preread_adv, // structural advance without D2 backpressure
     input        [31:0] win_lit,        // 4 bytes at pop_cursor + lit_off
     input        [5:0]  lit_avail,      // bytes fetched beyond that point
     output       [4:0]  lit_off,        // literal offset from the pop cursor
@@ -121,8 +123,66 @@ wire d1_slot_ready = !skid_v || i_issue;
 
 wire d1_to_sib  = !consume_prefix && !consume_0f &&
                   struct_bytes_ok && struct_work.need_sib;
+wire d1_preread_handoff = !consume_prefix && !consume_0f &&
+    ((struct_bytes_ok && !struct_work.need_sib) || sib_bytes_ok);
 wire d1_handoff = !consume_prefix && !consume_0f && d1_slot_ready &&
                   ((struct_bytes_ok && !struct_work.need_sib) || sib_bytes_ok);
+
+// Preread the macro-entry PLA from M10K one cycle before D1 handoff. The
+// speculative cursor deliberately ignores D2 backpressure; when D1 cannot
+// advance, retain the entry corresponding to its current window. This removes
+// both the combinational PLA and D2/VIPT readiness from the ucode-ROM address.
+logic prefix_0f_early, prefix_rep_early;
+always_comb begin
+    prefix_0f_early = prefix_0f;
+    prefix_rep_early = prefix_rep;
+    if (q_flush) begin
+        prefix_0f_early = 1'b0;
+        prefix_rep_early = 1'b0;
+    end else begin
+        if (consume_0f)
+            prefix_0f_early = 1'b1;
+        else if (consume_prefix && ((opcode == 8'hf2) || (opcode == 8'hf3)))
+            prefix_rep_early = 1'b1;
+        if (d1_preread_handoff) begin
+            prefix_0f_early = 1'b0;
+            prefix_rep_early = 1'b0;
+        end
+    end
+end
+
+wire [9:0] entry_rom_addr = {win_d1_early[7:0],
+                             prefix_rep_early, prefix_0f_early};
+(* ramstyle = "M10K" *) reg [63:0] entry_rom [0:1023];
+initial $readmemh("pla_entry_rom.hex", entry_rom);
+reg [63:0] entry_rom_q;
+always_ff @(posedge clk)
+    entry_rom_q <= entry_rom[entry_rom_addr];
+
+reg [63:0] entry_rom_hold_r;
+reg        entry_rom_use_q_r;
+always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        entry_rom_hold_r <= 64'd0;
+        entry_rom_use_q_r <= 1'b0;
+    end else begin
+        if (entry_rom_use_q_r)
+            entry_rom_hold_r <= entry_rom_q;
+        entry_rom_use_q_r <= q_flush || (d1_adv == d1_preread_adv);
+    end
+end
+wire [63:0] entry_rom_current = entry_rom_use_q_r
+                              ? entry_rom_q : entry_rom_hold_r;
+wire [15:0] entry_rom_sel =
+    entry_rom_current[{data32, pe_enable}*16 +: 16];
+
+// The first-level group code already encodes data-size and opcode-map mode.
+// Keep the ModR/M-dependent second-level entry table in an asynchronous ROM so
+// Quartus can constant-fold it as one compact lookup rather than retaining the
+// original deep priority PLA on the D1 -> microcode-address cone.
+/* synthesis syn_ramstyle = "MLAB, no_rw_check" */
+reg [15:0] group_entry_rom [0:1023];
+initial $readmemh("pla_group_entry.hex", group_entry_rom);
 
 decoder_work_t handoff_work;
 always_comb begin
@@ -206,6 +266,9 @@ end
 assign d1_adv = (consume_prefix || consume_0f) ? 4'd1 :
                 d1_handoff ? handoff_adv[3:0] :
                 4'd0;
+assign d1_preread_adv = (consume_prefix || consume_0f) ? 4'd1 :
+                        d1_preread_handoff ? handoff_adv[3:0] :
+                        4'd0;
 
 //=============================================================================
 // The skeleton register (D1 -> D2 pipeline boundary; Step 2's lookahead)
@@ -638,17 +701,15 @@ task automatic build_struct_work(
 
         // A PE/D change flushes the frontend, so a skeleton is never consumed
         // across a mode switch.
-        entry_first = pla_entry_lookup({data32, opcode, prefix_rep, pe_enable,
-                                        1'b1, prefix_0f});
+        entry_first = entry_rom_sel;
         // Decode group validity and row in parallel with entry_first. This
         // keeps the group select off the first-level entry PLA result.
         group_dec = pla_group_lookup({data32, opcode, pe_enable, prefix_0f});
         group_code = group_dec[5:0];
         entry_group = group_dec[6] && has_modrm;
         entry_final = entry_group ?
-            pla_group_entry_lookup({data32, group_code[5:4], modrm[5:3],
-                                    group_code[3:0], (modrm[7:6] != 2'b11),
-                                    1'b0, prefix_0f}) :
+            group_entry_rom[{group_code, modrm[5:3],
+                             (modrm[7:6] != 2'b11)}] :
             entry_first;
         invalid_lock = check_lock_invalid(prefix_rep_lock, prefix_0f, opcode,
                                           has_modrm, modrm);
@@ -840,6 +901,20 @@ task automatic build_struct_work(
                             w.entry.has_moffs;
     end
 endtask
+
+// synthesis translate_off
+// Check the generated contents and speculative-cursor alignment anywhere D1
+// is live. The X guard excludes only the startup preread.
+wire [15:0] pla_entry_now =
+    pla_entry_lookup({data32, opcode, prefix_rep, pe_enable, 1'b1, prefix_0f});
+always_ff @(posedge clk) begin
+    if (reset_n && !q_flush &&
+        (^{entry_rom_sel, pla_entry_now} !== 1'bx) &&
+        (entry_rom_sel !== pla_entry_now))
+        $fatal(1, "entry ROM mismatch: op=%02x rom=%04x pla=%04x",
+               opcode, entry_rom_sel, pla_entry_now);
+end
+// synthesis translate_on
 
 function automatic decoder_work_t capture_sib(input decoder_work_t in,
                                               input logic [7:0]   sib_byte);

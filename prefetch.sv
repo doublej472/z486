@@ -9,9 +9,11 @@ module prefetch
 
     // Queue read interface to the decoder (two cursors, one pop point)
     output     [63:0] win_d1,        // registered raw window at the D1 cursor
+    output     [63:0] win_d1_early,  // speculative window for synchronous entry ROM
     output     [5:0]  d1_avail,      // bytes fetched beyond the D1 cursor
     input      [3:0]  d1_adv,        // D1 cursor advance this cycle (0-11: a
                                      //   prefix, or the instruction rest at handoff)
+    input      [3:0]  d1_preread_adv,// structural advance independent of D2 availability
     output     [31:0] win_lit,       // 4 bytes at pop_cursor + lit_off
     output     [5:0]  lit_avail,     // bytes fetched beyond that point
     input      [4:0]  lit_off,       // literal offset from the pop cursor
@@ -195,6 +197,7 @@ wire seed_now = pf_can_fetch && !good_ack && q_empty &&
 wire [5:0] byte_advance = {4'b0000, pf_byte_offset} + {1'b0, pop_len};
 // D1 cursor advance: a prefix byte or the instruction rest at handoff.
 wire [3:0] d1_sum = {2'b00, d1_boff} + d1_adv;
+wire [3:0] d1_preread_sum = {2'b00, d1_boff} + d1_preread_adv;
 
 logic [3:0]  rptr_next;
 logic [3:0]  wptr_next;
@@ -325,18 +328,85 @@ end
 
 // D1 window: registered from the queue's NEXT state at the NEXT cursor, so the decoder always sees the byte rotate of the new cursor...
 // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-342
-wire [31:0] d1_word_cur_next = queue_next[ptr_idx(d1_word_next)];
-wire [31:0] d1_word_nxt_next = queue_next[ptr_idx(d1_word_next + 4'd1)];
-wire [31:0] d1_word_2nd_next = queue_next[ptr_idx(d1_word_next + 4'd2)];
+// If D2 backpressure blocks a structural handoff, the D1 cursor holds. Build
+// that hold window without the late d1_adv/i_issue cursor adder; the already
+// required preread window below supplies the advancing case. The late control
+// path therefore ends at one 64-bit select instead of traversing an add and
+// byte aligner.
+wire [31:0] d1_hold_word_cur = queue_next[ptr_idx(d1_word)];
+wire [31:0] d1_hold_word_nxt = queue_next[ptr_idx(d1_word + 4'd1)];
+wire [31:0] d1_hold_word_2nd = queue_next[ptr_idx(d1_word + 4'd2)];
+wire [63:0] win_d1_hold_next =
+    d1_boff == 2'd0 ? {d1_hold_word_nxt,       d1_hold_word_cur} :
+    d1_boff == 2'd1 ? {d1_hold_word_2nd[7:0],  d1_hold_word_nxt,
+                                                d1_hold_word_cur[31:8]} :
+    d1_boff == 2'd2 ? {d1_hold_word_2nd[15:0], d1_hold_word_nxt,
+                                                d1_hold_word_cur[31:16]} :
+                      {d1_hold_word_2nd[23:0], d1_hold_word_nxt,
+                                                d1_hold_word_cur[31:24]};
 
-wire [63:0] win_d1_next =
-    d1_boff_next == 2'd0 ? {d1_word_nxt_next,       d1_word_cur_next} :
-    d1_boff_next == 2'd1 ? {d1_word_2nd_next[7:0],  d1_word_nxt_next,
-                                                     d1_word_cur_next[31:8]} :
-    d1_boff_next == 2'd2 ? {d1_word_2nd_next[15:0], d1_word_nxt_next,
-                                                     d1_word_cur_next[31:16]} :
-                           {d1_word_2nd_next[23:0], d1_word_nxt_next,
-                                                     d1_word_cur_next[31:24]};
+// Run the entry-table cursor from structural decode alone. If the real D1
+// cursor is held by D2, the decoder keeps the prior table output; therefore
+// this address never needs issue, VIPT, paging, or execution readiness.
+logic [3:0] d1_preread_word;
+logic [1:0] d1_preread_boff;
+always_comb begin
+    d1_preread_word = d1_word + {2'b00, d1_preread_sum[3:2]};
+    d1_preread_boff = d1_preread_sum[1:0];
+    if (q_flush) begin
+        d1_preread_word = 4'h0;
+        d1_preread_boff = spec_flush_hit ? spec_off[1:0] : pf_flush_addr[1:0];
+    end else if (seed_now) begin
+        d1_preread_boff = pf_fetch_addr[1:0];
+    end
+end
+
+wire [31:0] d1_preread_word_cur = queue_next[ptr_idx(d1_preread_word)];
+wire [31:0] d1_preread_word_nxt = queue_next[ptr_idx(d1_preread_word + 4'd1)];
+wire [31:0] d1_preread_word_2nd = queue_next[ptr_idx(d1_preread_word + 4'd2)];
+wire [63:0] win_d1_preread_next =
+    d1_preread_boff == 2'd0 ? {d1_preread_word_nxt,
+                                d1_preread_word_cur} :
+    d1_preread_boff == 2'd1 ? {d1_preread_word_2nd[7:0],
+                                d1_preread_word_nxt,
+                                d1_preread_word_cur[31:8]} :
+    d1_preread_boff == 2'd2 ? {d1_preread_word_2nd[15:0],
+                                d1_preread_word_nxt,
+                                d1_preread_word_cur[31:16]} :
+                               {d1_preread_word_2nd[23:0],
+                                d1_preread_word_nxt,
+                                d1_preread_word_cur[31:24]};
+assign win_d1_early = win_d1_preread_next;
+
+// q_flush gives both cursor views the same redirected origin. Otherwise the
+// real cursor advances exactly when structural preread and committed advance
+// agree; disagreement means D2 held the handoff.
+wire d1_commit_preread = q_flush || (d1_adv == d1_preread_adv);
+wire [63:0] win_d1_next = d1_commit_preread
+                        ? win_d1_preread_next : win_d1_hold_next;
+
+// synthesis translate_off
+wire [31:0] d1_reference_word_cur = queue_next[ptr_idx(d1_word_next)];
+wire [31:0] d1_reference_word_nxt = queue_next[ptr_idx(d1_word_next + 4'd1)];
+wire [31:0] d1_reference_word_2nd = queue_next[ptr_idx(d1_word_next + 4'd2)];
+wire [63:0] win_d1_reference =
+    d1_boff_next == 2'd0 ? {d1_reference_word_nxt,
+                             d1_reference_word_cur} :
+    d1_boff_next == 2'd1 ? {d1_reference_word_2nd[7:0],
+                             d1_reference_word_nxt,
+                             d1_reference_word_cur[31:8]} :
+    d1_boff_next == 2'd2 ? {d1_reference_word_2nd[15:0],
+                             d1_reference_word_nxt,
+                             d1_reference_word_cur[31:16]} :
+                           {d1_reference_word_2nd[23:0],
+                             d1_reference_word_nxt,
+                             d1_reference_word_cur[31:24]};
+always_ff @(posedge clk) begin
+    if (reset_n && (win_d1_next !== win_d1_reference))
+        $fatal(1, "PF D1 WINDOW MISMATCH: selected=%h reference=%h",
+               win_d1_next, win_d1_reference);
+end
+// synthesis translate_on
 
 // Keep the queue/decoder boundary physical. Quartus retiming this register
 // turns an icache response into a same-cycle cache -> aligner -> D1 PLA path.

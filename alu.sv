@@ -16,10 +16,7 @@ module alu
     // 1 when this op updates ZF/SF/PF.  The two-cycle flag retirement
     // derives them from the registered result; NOT/MOVZX/MOVSX preserve
     // all flags and AAA/AAS preserve ZF/SF/PF.
-    output        zsp_update,
-    // v50 timing-first: dedicated pre-assembled Z/S/P for the z486-level eflags_ahead overlay (the jcc pop-time condition capture). These are...
-    // Details: doc/z486/implementation_notes.md#src-24-z486-alu-sv-20
-    output [2:0]  zsp_ahead    // {sf, zf, pf}
+    output        zsp_update
 );
 
 // -----------------------------------------------------------------------------
@@ -316,11 +313,6 @@ wire cf_byte  = slice_carry[7];
 wire cf_word  = slice_carry[15];
 wire cf_dword = slice_carry[31];
 wire cout_msb = flag_byte_mode ? cf_byte : (is_word ? cf_word : cf_dword);
-
-wire zfa_sized = is_dword ? zfa_dword : is_word ? zfa_word : zfa_byte;
-wire zf_ahead  = use_adder_zf ? zfa_sized :
-                 is_dword ? (|R == 0) : is_word ? (|R[15:0] == 0) : (|R[7:0] == 0);
-assign zsp_ahead = {r_msb, zf_ahead, ~^R[7:0]};
 
 reg [31:0] f2;
 always @* begin
