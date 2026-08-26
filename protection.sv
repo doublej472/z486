@@ -192,6 +192,7 @@ logic [11:0] s2_jump_addr;
 logic        s2_jump_valid;
 logic [3:0]  s2_flags;
 logic        s2_valid;
+logic        s2_cpl_transition;
 logic        s2_is_checking_test;
 logic [5:0]  s2_test_const;     // For debug display
 
@@ -375,6 +376,7 @@ always_comb begin
     // Default: test passes (continue execution)
     pla_test_addr  = 12'h000;
     pla_test_flags = 4'b0000;
+    pla_test_cpl_transition = 1'b0;
 
     case (s1_test_const)
         //----------------------------------------------------------------------
@@ -411,8 +413,10 @@ always_comb begin
         //----------------------------------------------------------------------
         TST_SEL_RET: begin
             // Term 75: !p1 !p2 !p → 0x686 (cross-privilege return)
-            if (!p1 && !p2 && !p)
+            if (!p1 && !p2 && !p) begin
                 pla_test_addr = pla_test_addr | 12'h686;
+                pla_test_cpl_transition = 1'b1;
+            end
             // Term 118: p1 !p2 → 0x85D
             // Terms 144-146: p → 0x85D
             if (p1 && !p2 || p)
@@ -442,7 +446,7 @@ always_comb begin
         //----------------------------------------------------------------------
         TST_PORTIO_BIT: begin
             // this is a hack
-            pla_test_addr = s1_desc_low16_nonzero ? 12'h85B : 12'h000;
+            pla_test_addr = s1_desc_low16_nonzero ? UADDR_GENERAL_FAULT1 : 12'h000;
             // // Term 136: !p2 → 0x85B if (!p2) pla_test_addr = pla_test_addr | 12'h85B; // Term 137: !p → 0x85B if (!p) pla_test_addr =...
             // Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-408
         end
@@ -669,7 +673,7 @@ always_comb begin
                     pla_test_addr = 12'h743;
                 end else if (p && x && ce && !a) begin
                     // Term 33: !p1 p !u x ce !rw !a → CALLGATE386
-                    pla_test_addr = 12'h5BE;
+                    pla_test_addr = UADDR_CALL_GATE_386;
                 end else if (p && !x && ce && !a) begin
                     // Term 36: !p1 p !u !x ce !rw !a → CALLGATE286
                     pla_test_addr = 12'h5BD;
@@ -1050,13 +1054,13 @@ always_comb begin
                 pla_test_addr = pla_test_addr | 12'h85A;
             // Term 78: !u !x !ce a → |0x85B
             if (!u && !x && !ce && a)
-                pla_test_addr = pla_test_addr | 12'h85B;
+                pla_test_addr = pla_test_addr | UADDR_GENERAL_FAULT1;
             // Term 84: !u !x ce rw → |0x85E
             if (!u && !x && ce && rw)
                 pla_test_addr = pla_test_addr | 12'h85E;
             // Term 100: !u !x !rw → |0x85B
             if (!u && !x && !rw)
-                pla_test_addr = pla_test_addr | 12'h85B;
+                pla_test_addr = pla_test_addr | UADDR_GENERAL_FAULT1;
         end
 
         //----------------------------------------------------------------------
@@ -1271,6 +1275,7 @@ assign pla_test_output = {pla_test_flags, pla_test_addr, 2'b00};
 
 logic [11:0] pla_test_addr;      // Computed by always_comb block
 logic [3:0]  pla_test_flags;     // Computed by always_comb block
+logic        pla_test_cpl_transition;
 
 //==============================================================================
 // Stage 2: Register PLA4 outputs (posedge clk when pipe_en)
@@ -1281,6 +1286,7 @@ always_ff @(posedge clk) begin
         s2_jump_valid <= 1'b0;
         s2_flags <= 4'b0000;
         s2_valid <= 1'b0;
+        s2_cpl_transition <= 1'b0;
         s2_is_checking_test <= 1'b0;
         s2_test_const <= 6'h0;
     end else if (pipe_en) begin
@@ -1288,6 +1294,7 @@ always_ff @(posedge clk) begin
         s2_jump_valid <= (pla_test_addr != 12'h000);
         s2_flags <= pla_test_flags;
         s2_valid <= s1_valid;
+        s2_cpl_transition <= pla_test_cpl_transition;
         s2_is_checking_test <= s1_is_checking_test;
         s2_test_const <= s1_test_const;
     end
@@ -1351,7 +1358,7 @@ always_ff @(posedge clk) begin
             (uc_aluop == ALUJMP_PTSELA) && (uc_alu_src == 6'h05);
         arpl_update_s2 <= arpl_update_s1;
 
-        if (result_now && jump_valid && (jump_addr == 12'h686)) begin
+        if (result_now && s2_cpl_transition) begin
             cpl_transition_r <= 1'b1;
             pending_cpl_r <= transition_rpl;
         end

@@ -132,6 +132,7 @@ decoder_work_t handoff_d2;
 always_comb begin
     handoff_d2 = handoff_work;
     handoff_d2.entry.entry_point = handoff_entry_point;
+    handoff_d2.entry.ucode_action = recipe_action(handoff_entry_point);
     {handoff_d2.entry.ea_index_onehot, handoff_d2.entry.ea_base_onehot} =
         dec_ea_onehots(handoff_work.entry);
     handoff_d2.entry.mem_seg = handoff_work.entry.stack_op ? SEG_SS :
@@ -481,44 +482,33 @@ assign pop_now = d2_done;
 assign pop_len = skel.entry.length;
 
 // synthesis translate_off
-// Equivalence oracle. Recipe metadata and live hardwired control come from the
-// optimized microcode inventory; the legacy opcode classifier remains in
-// simulation to prove every decoded instruction produces identical control.
+// Focused recipe legality checks. The generated inventory is authoritative;
+// these assertions verify that its early role agrees with its hazard metadata.
 wire [2:0] push_recipe_early = recipe_early_kind(push_entry.entry_point);
-recipe_meta_t push_legacy_fc, push_recipe_fc;
-assign push_legacy_fc = dec_recipe_metadata(push_entry);
+recipe_meta_t push_recipe_fc;
 assign push_recipe_fc = recipe_metadata(push_entry);
 reg recipe_cov_en = 1'b0;
 initial recipe_cov_en = $test$plusargs("recipe_cov");
 always @(posedge clk) begin
-    if (reset_n && d2_done) begin
-        // Extension overlays add recipes that have no legacy opcode
-        // classifier counterpart; their generated recipe is authoritative.
-        if ((recipe_action(push_entry.entry_point) == RECIPE_ACTION_NONE) &&
-            (push_recipe_fc !== push_legacy_fc))
-            $fatal(1, "hardwired recipe classifier mismatch: entry=%03x opcode=%02x modrm=%02x old=%04x new=%04x",
-                   push_entry.entry_point, push_entry.opcode, push_entry.modrm,
-                   push_legacy_fc, push_recipe_fc);
-    end
-    if (reset_n && d2_done && push_legacy_fc.hardwired) begin
+    if (reset_n && d2_done && push_recipe_fc.hardwired) begin
         if (push_recipe_early == RECIPE_EARLY_SEQ)
             $fatal(1, "hardwired recipe missing: entry=%03x opcode=%02x modrm=%02x 0f=%b",
                    push_entry.entry_point, push_entry.opcode, push_entry.modrm,
                    push_entry.has_0f);
         unique case (push_recipe_early)
             RECIPE_EARLY_NONE:
-                if (push_legacy_fc.uses_ea || push_legacy_fc.br_rel)
+                if (push_recipe_fc.uses_ea || push_recipe_fc.br_rel)
                     $fatal(1, "hardwired recipe NONE role mismatch: entry=%03x fc=%04x",
-                           push_entry.entry_point, push_legacy_fc);
+                           push_entry.entry_point, push_recipe_fc);
             RECIPE_EARLY_EA, RECIPE_EARLY_LOAD, RECIPE_EARLY_STORE,
             RECIPE_EARLY_RMW, RECIPE_EARLY_STACK:
-                if (!push_legacy_fc.uses_ea)
+                if (!push_recipe_fc.uses_ea)
                     $fatal(1, "hardwired recipe address role mismatch: entry=%03x kind=%0d fc=%04x",
-                           push_entry.entry_point, push_recipe_early, push_legacy_fc);
+                           push_entry.entry_point, push_recipe_early, push_recipe_fc);
             RECIPE_EARLY_BRANCH:
-                if (!push_legacy_fc.br_rel)
+                if (!push_recipe_fc.br_rel)
                     $fatal(1, "hardwired recipe branch role mismatch: entry=%03x fc=%04x",
-                           push_entry.entry_point, push_legacy_fc);
+                           push_entry.entry_point, push_recipe_fc);
             default:
                 $fatal(1, "hardwired recipe invalid early kind: entry=%03x kind=%0d",
                        push_entry.entry_point, push_recipe_early);
@@ -526,7 +516,7 @@ always @(posedge clk) begin
         if (recipe_cov_en)
             $display("RECIPE_COV entry=%03x kind=%0d opcode=%02x modrm=%02x fc=%04x",
                      push_entry.entry_point, push_recipe_early,
-                     push_entry.opcode, push_entry.modrm, push_legacy_fc);
+                     push_entry.opcode, push_entry.modrm, push_recipe_fc);
     end
 end
 
@@ -563,8 +553,8 @@ end
 
 // JMP/CALL rel is unconditionally taken, so its speculative fall-through prefetch is always wasted.
 function automatic logic entry_jmp_call(input dec_entry_t e);
-    entry_jmp_call = !e.has_0f && (e.opcode == 8'hEB || e.opcode == 8'hE9 ||
-                                   e.opcode == 8'hE8);
+    entry_jmp_call = (e.rel_branch_kind == REL_BRANCH_JMP) ||
+                     (e.rel_branch_kind == REL_BRANCH_CALL);
 endfunction
 
 assign decq_has_jmp_call =
@@ -594,6 +584,11 @@ task automatic build_struct_work(
     logic        imm_sign_extend;
     logic        invalid_lock;
     logic        instr_bswap;
+    logic        is_setcc;
+    logic        is_movzx_movsx;
+    logic        is_movzx_word;
+    logic        is_xlat;
+    logic        is_byte_operand;
     begin
         w = '0;
         s_len = 3'd1;
@@ -636,13 +631,75 @@ task automatic build_struct_work(
         invalid_lock = check_lock_invalid(prefix_rep_lock, prefix_0f, opcode,
                                           has_modrm, modrm);
         instr_bswap = prefix_0f && (opcode[7:3] == 5'b11001);
-        w.entry.entry_point = invalid_lock ? 12'h82B :
-                              instr_bswap ? 12'h9C4 : entry_final[11:0];
+        w.entry.boundary_action = invalid_lock ? BOUNDARY_ACTION_NONE :
+            decode_boundary_action(prefix_0f, opcode, has_modrm, modrm);
+        w.entry.seg_reg_sel = decode_segment_register(prefix_0f, opcode,
+                                                       has_modrm, modrm);
+        w.entry.cmptest_is_cmp = (opcode[7:2] == 6'b100000) ||
+                                 (opcode[7:3] == 5'b00111);
+        w.entry.decoded_alu_op = decode_instruction_alu_op(prefix_0f, opcode,
+                                                           has_modrm, modrm);
+        w.entry.mul_signed = (!prefix_0f &&
+                              (opcode == 8'h69 || opcode == 8'h6B)) ||
+                             (prefix_0f && opcode == 8'hAF) ||
+                             (!prefix_0f && has_modrm &&
+                              (opcode == 8'hF6 || opcode == 8'hF7) &&
+                              modrm[5:3] == 3'd5);
+        w.entry.div_quotient_zf = !prefix_0f && has_modrm &&
+                                  (opcode == 8'hF6 || opcode == 8'hF7) &&
+                                  modrm[5:3] == 3'd6;
+        w.entry.flag_op = decode_flag_op(prefix_0f, opcode);
+        if (!prefix_0f && opcode[7:3] == 5'b11011)
+            w.entry.fop = {opcode[2:0], modrm};
+        w.entry.shift_is_double = prefix_0f &&
+            ((opcode == 8'hA4) || (opcode == 8'hA5) ||
+             (opcode == 8'hAC) || (opcode == 8'hAD));
+        w.entry.shift_right = opcode[3];
+        w.entry.shift_operation = modrm[5:3];
+        w.entry.port_io = !prefix_0f &&
+            ((opcode[7:2] == 6'b011011) ||  // 6C-6F: INS/OUTS
+             (opcode[7:2] == 6'b111001) ||  // E4-E7: IN/OUT imm8
+             (opcode[7:2] == 6'b111011));   // EC-EF: IN/OUT DX
+        if ((!prefix_0f && (opcode[7:4] == 4'h7)) ||
+            ( prefix_0f && (opcode[7:4] == 4'h8)))
+            w.entry.rel_branch_kind = REL_BRANCH_JCC;
+        else if (!prefix_0f && ((opcode == 8'hEB) || (opcode == 8'hE9)))
+            w.entry.rel_branch_kind = REL_BRANCH_JMP;
+        else if (!prefix_0f && (opcode == 8'hE8))
+            w.entry.rel_branch_kind = REL_BRANCH_CALL;
+        w.entry.branch_rel8 = !prefix_0f &&
+                              ((opcode[7:4] == 4'h7) || (opcode == 8'hEB));
+        w.entry.branch_condition = opcode[3:0];
+        if (!prefix_0f && (opcode[7:1] == 7'b1110000))
+            w.entry.repeat_kind = opcode[0] ? REPEAT_KIND_LOOPE
+                                             : REPEAT_KIND_LOOPNE;
+        w.entry.entry_point = invalid_lock ? UADDR_INVALID_LOCK :
+                              instr_bswap ? UADDR_BSWAP : entry_final[11:0];
         w.entry.stack_op = (invalid_lock || instr_bswap) ? 1'b0 : entry_final[13];
         w.entry.stack_dir = (invalid_lock || instr_bswap) ? 1'b0 : entry_final[12];
         // BSWAP has a fixed r32 operand even in a 16-bit code segment.
         if (instr_bswap)
             w.entry.data32 = 1'b1;
+
+        // Resolve architectural widths once in D1. These exceptions are the
+        // same ones that cannot be represented by the generic W-bit rule.
+        is_setcc = prefix_0f && (opcode[7:4] == 4'b1001);
+        is_movzx_movsx = prefix_0f && (opcode[7:4] == 4'b1011) &&
+                          (opcode[2:1] == 2'b11);
+        is_movzx_word = is_movzx_movsx && opcode[0];
+        is_xlat = !prefix_0f && (opcode == 8'hD7);
+        is_byte_operand = is_setcc ? 1'b1 :
+                          is_movzx_movsx ? 1'b0 :
+                          is_xlat ? 1'b1 :
+                          (w.entry.has_embedded_register && w.entry.has_w_bit)
+                              ? ~opcode[3] :
+                          w.entry.has_w_bit ? ~opcode[0] : 1'b0;
+        w.entry.operand_size = is_byte_operand ? 2'd0 :
+                               is_movzx_word ? 2'd2 :
+                               w.entry.data32 ? 2'd2 : 2'd1;
+        w.entry.source_size = is_movzx_movsx
+                            ? (opcode[0] ? 2'd1 : 2'd0)
+                            : w.entry.operand_size;
 
         if (has_modrm) begin
             has_sib = addr32 && (modrm[7:6] != 2'b11) && (modrm[2:0] == 3'b100);
@@ -757,6 +814,8 @@ task automatic build_struct_work(
         w.entry.length = {1'b0, prefix_count} + (prefix_0f ? 5'd1 : 5'd0) +
                          {2'b00, s_len} + {2'b00, disp_size} +
                          {2'b00, imm_total_size};
+        w.entry.ind_is_ea = w.entry.has_modrm || w.entry.stack_op ||
+                            w.entry.has_moffs;
     end
 endtask
 
@@ -771,6 +830,8 @@ function automatic decoder_work_t capture_sib(input decoder_work_t in,
 
         out.need_sib = 1'b0;
         out.entry.sib = sib_byte;
+        out.entry.ea_uses_post_pop_esp = !in.entry.has_0f &&
+            (in.entry.opcode == 8'h8F) && (sib_byte[2:0] == 3'b100);
         out.entry.length = in.entry.length + 5'd1 + {2'b00, disp_size};
 
         if (disp_size != 3'd0) begin
@@ -845,6 +906,135 @@ endfunction
 //=============================================================================
 // Helpers
 //=============================================================================
+
+function automatic logic [4:0] decode_instruction_alu_op(
+    input logic       has_0f_in,
+    input logic [7:0] opcode_in,
+    input logic       has_modrm_in,
+    input logic [7:0] modrm_in
+);
+    logic [1:0] bit_sel;
+    begin
+        // Ordinary ALU opcodes encode the operation in opcode[5:3]; group
+        // forms encode the same three-bit value in ModR/M.reg.
+        decode_instruction_alu_op = opcode_in[7] && has_modrm_in
+                                  ? {2'b00, modrm_in[5:3]}
+                                  : {2'b00, opcode_in[5:3]};
+
+        if (!has_0f_in && (opcode_in[7:4] == 4'h4))
+            decode_instruction_alu_op = {4'b1100, opcode_in[3]};
+        else if (!has_0f_in && has_modrm_in &&
+                 (((opcode_in == 8'hF6 || opcode_in == 8'hF7) &&
+                   (modrm_in[5:3] == 3'd2 || modrm_in[5:3] == 3'd3)) ||
+                  ((opcode_in == 8'hFE || opcode_in == 8'hFF) &&
+                   (modrm_in[5:3] == 3'd0 || modrm_in[5:3] == 3'd1))))
+            decode_instruction_alu_op = {3'b110, modrm_in[4:3]};
+        else if ((!has_0f_in && opcode_in == 8'h98) ||
+                 (has_0f_in && opcode_in[7:4] == 4'hB &&
+                  opcode_in[2:1] == 2'b11)) begin
+            if (opcode_in[0] || !opcode_in[5])
+                decode_instruction_alu_op = opcode_in[3] ? ALU_SEXT : ALU_ZEXT;
+            else
+                decode_instruction_alu_op = opcode_in[3] ? ALU_SEXT_B : ALU_ZEXT_B;
+        end else if (has_0f_in &&
+                     ((opcode_in == 8'hA3) || (opcode_in == 8'hAB) ||
+                      (opcode_in == 8'hB3) || (opcode_in == 8'hBB) ||
+                      (opcode_in == 8'hBA))) begin
+            bit_sel = (opcode_in == 8'hBA) ? modrm_in[4:3] : opcode_in[4:3];
+            unique case (bit_sel)
+                2'b00: decode_instruction_alu_op = ALU_PASS;
+                2'b01: decode_instruction_alu_op = ALU_OR;
+                2'b10: decode_instruction_alu_op = ALU_ANDN;
+                2'b11: decode_instruction_alu_op = ALU_XOR;
+            endcase
+        end else if (!has_0f_in &&
+                     (opcode_in == 8'h37 || opcode_in == 8'h3F))
+            decode_instruction_alu_op = opcode_in[3] ? ALU_AAS : ALU_AAA;
+        else if (!has_0f_in &&
+                     (opcode_in == 8'h27 || opcode_in == 8'h2F))
+            decode_instruction_alu_op = opcode_in[3] ? ALU_DAS : ALU_DAA;
+    end
+endfunction
+
+function automatic flag_op_t decode_flag_op(
+    input logic       has_0f_in,
+    input logic [7:0] opcode_in
+);
+    begin
+        decode_flag_op = FLAG_OP_NONE;
+        if (!has_0f_in) begin
+            unique case (opcode_in)
+                8'hF5: decode_flag_op = FLAG_OP_CMC;
+                8'hF8: decode_flag_op = FLAG_OP_CLC;
+                8'hF9: decode_flag_op = FLAG_OP_STC;
+                8'hFA: decode_flag_op = FLAG_OP_CLI;
+                8'hFB: decode_flag_op = FLAG_OP_STI;
+                8'hFC: decode_flag_op = FLAG_OP_CLD;
+                8'hFD: decode_flag_op = FLAG_OP_STD;
+                default: ;
+            endcase
+        end
+    end
+endfunction
+
+function automatic boundary_action_t decode_boundary_action(
+    input logic       has_0f_in,
+    input logic [7:0] opcode_in,
+    input logic       has_modrm_in,
+    input logic [7:0] modrm_in
+);
+    begin
+        decode_boundary_action = BOUNDARY_ACTION_NONE;
+        if (!has_0f_in) begin
+            unique case (opcode_in)
+                8'h9d, 8'hcf: decode_boundary_action = BOUNDARY_ACTION_PRESERVE_RF;
+                8'h17:        decode_boundary_action = BOUNDARY_ACTION_LOAD_SS;
+                8'h8e: begin
+                    if (has_modrm_in && modrm_in[5:3] == 3'd2)
+                        decode_boundary_action = BOUNDARY_ACTION_LOAD_SS;
+                end
+                8'hcc, 8'hcd: decode_boundary_action = BOUNDARY_ACTION_SOFT_INT;
+                8'hce:        decode_boundary_action = BOUNDARY_ACTION_INTO;
+                8'hfb:        decode_boundary_action = BOUNDARY_ACTION_STI;
+                default: ;
+            endcase
+        end
+    end
+endfunction
+
+function automatic logic [2:0] decode_segment_register(
+    input logic       has_0f_in,
+    input logic [7:0] opcode_in,
+    input logic       has_modrm_in,
+    input logic [7:0] modrm_in
+);
+    begin
+        decode_segment_register = 3'd0;
+        if (!has_0f_in) begin
+            if (opcode_in[7:5] == 3'b000 && opcode_in[2:1] == 2'b11)
+                decode_segment_register = {1'b0, opcode_in[4:3]};
+            else begin
+                unique case (opcode_in)
+                    8'h8c, 8'h8e:
+                        if (has_modrm_in)
+                            decode_segment_register = modrm_in[5:3];
+                    8'hc4: decode_segment_register = 3'd0;
+                    8'hc5: decode_segment_register = 3'd3;
+                    default: ;
+                endcase
+            end
+        end else begin
+            unique case (opcode_in)
+                8'ha0, 8'ha1: decode_segment_register = 3'd4;
+                8'ha8, 8'ha9: decode_segment_register = 3'd5;
+                8'hb2:        decode_segment_register = 3'd2;
+                8'hb4:        decode_segment_register = 3'd4;
+                8'hb5:        decode_segment_register = 3'd5;
+                default: ;
+            endcase
+        end
+    end
+endfunction
 
 function automatic logic is_prefix(input logic [7:0] b);
     unique case (b)

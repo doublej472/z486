@@ -18,6 +18,8 @@ module address_unit
     input  logic [31:0] branch_target_eip,   // D2-computed relative target
     input  logic [31:0] forwarded_esp,       // ESP including prior delay-slot write
     input  logic        ss_stack32,
+    input  logic [31:0] issue_seg_base,      // D2 segment base, independent of seg command feedback
+    input  logic        issue_eff_mask,      // D2 address mask, independent of seg command feedback
 
     input  logic        exec,                // Execute a microcode IND operation
     input  logic        exec_addr32,
@@ -29,7 +31,7 @@ module address_unit
     input  logic [31:0] source_value,
     input  logic [31:0] alu_value,
     input  logic [31:0] alu_value_hold,
-    input  logic        jcc_active,
+    input  logic        instr_jcc,
     input  logic        pe,
     input  logic        is_dword,
     input  logic        descsw_mode,
@@ -81,9 +83,9 @@ wire [31:0] ea_csa_sum = ea_term_a ^ ea_term_b ^ displacement;
 wire [31:0] ea_csa_carry = ((ea_term_a & ea_term_b) |
                             (ea_term_a & displacement) |
                             (ea_term_b & displacement)) << 1;
-wire [31:0] linear32 = ea_csa_sum + ea_csa_carry + seg_base_pending;
-wire [31:0] linear16 = {16'd0, ea_offset_full[15:0]} + seg_base_pending;
-wire [31:0] effective_linear = (ea_is_16bit_r || !eff_mask_pending)
+wire [31:0] linear32 = ea_csa_sum + ea_csa_carry + issue_seg_base;
+wire [31:0] linear16 = {16'd0, ea_offset_full[15:0]} + issue_seg_base;
+wire [31:0] effective_linear = (ea_is_16bit_r || !issue_eff_mask)
                              ? linear16 : linear32;
 assign issue_ea = effective_addr;
 assign issue_linear = effective_linear;
@@ -106,16 +108,16 @@ always @(posedge clk)
     if (reset_n && instr_issue && instr.has_modrm && !instr.stack_op &&
         !instr.has_moffs &&
         (effective_linear !==
-         ((eff_mask_pending ? effective_addr :
+         ((issue_eff_mask ? effective_addr :
                                {16'd0, effective_addr[15:0]}) +
-          seg_base_pending)))
+          issue_seg_base)))
         $fatal(1,
                "POP-LIN FUSE MISMATCH: fused=%08x ref=%08x ea=%08x seg=%08x",
                effective_linear,
-               (eff_mask_pending ? effective_addr :
+               (issue_eff_mask ? effective_addr :
                                     {16'd0, effective_addr[15:0]}) +
-                   seg_base_pending,
-               effective_addr, seg_base_pending);
+                   issue_seg_base,
+               effective_addr, issue_seg_base);
 // synthesis translate_on
 
 //=============================================================================
@@ -125,6 +127,13 @@ always @(posedge clk)
 function automatic logic [31:0] relocate(input logic [31:0] offset);
     relocate = (eff_mask_pending ? offset : {16'd0, offset[15:0]}) +
                seg_base_pending;
+endfunction
+
+// Issue-time relocation bypasses the generic SEG_CMD next-state cone. The
+// segmentation unit still receives INIT_SEG and commits identical state.
+function automatic logic [31:0] relocate_issue(input logic [31:0] offset);
+    relocate_issue = (issue_eff_mask ? offset : {16'd0, offset[15:0]}) +
+                     issue_seg_base;
 endfunction
 
 // Preserve the dedicated microcode relocation cone used before extraction.
@@ -166,7 +175,7 @@ always_ff @(posedge clk) begin
             automatic logic [31:0] stack_offset =
                 ss_stack32 ? forwarded_esp : {16'd0, forwarded_esp[15:0]};
             ind <= stack_offset;
-            ind_linear <= relocate(stack_offset);
+            ind_linear <= relocate_issue(stack_offset);
             ind_linear_valid <= 1'b1;
         end else if (instr.stack_op && !instr.stack_dir) begin
             automatic logic [31:0] stack_offset = ss_stack32
@@ -174,12 +183,12 @@ always_ff @(posedge clk) begin
                 : {16'd0, forwarded_esp[15:0] -
                           (instr.data32 ? 16'd4 : 16'd2)};
             ind <= stack_offset;
-            ind_linear <= relocate(stack_offset);
+            ind_linear <= relocate_issue(stack_offset);
             ind_linear_valid <= 1'b1;
         end else if (instr.has_moffs) begin
             ind <= instr.addr32 ? instr.immediate
                                 : {16'd0, instr.immediate[15:0]};
-            ind_linear <= relocate(instr.immediate);
+            ind_linear <= relocate_issue(instr.immediate);
             ind_linear_valid <= 1'b1;
         end else if (instr.has_modrm) begin
             ind <= effective_addr;
@@ -204,7 +213,7 @@ always_ff @(posedge clk) begin
                 automatic logic [31:0] operand1;
                 automatic logic [31:0] operand2;
                 operand1 = source == SRC_IRF2 ? ind : source_value;
-                operand2 = jcc_active ? alu_value_hold : alu_value;
+                operand2 = instr_jcc ? alu_value_hold : alu_value;
                 if (alu_source != ALUSRC_ZERO)
                     ind_delta <= operand2;
                 if (destination == DEST_DESSTK)

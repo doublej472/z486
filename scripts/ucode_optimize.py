@@ -23,8 +23,20 @@ from pathlib import Path
 ROM_DEPTH = 2560
 UCODE_BITS = 37
 ROM_BITS = 40
+SRC_TMPC = 0x0C            # Canonical CROM source encoding.
+DEST_SRCREG = 0x3E         # Canonical CROM destination encoding.
+DEST_USTEP_RPTI_EIP = 0x6D # Optimizer-owned: restart EIP write.
+DEST_USTEP_TASK_CS = 0x6E  # Optimizer-owned: task load establishes CS RPL.
+DEST_USTEP_FAULT_DONE = 0x6F # Optimizer-owned: fault delivery completion.
+DEST_USTEP_INVLPG = 0x70   # Optimizer-owned: invalidate one TLB page.
 DEST_USTEP_ALU = 0x7E       # Optimizer-owned: commit this word's ALU result to DSTREG.
 DEST_USTEP_BSWAP = 0x7C     # Optimizer-owned: byte-swap SRCREG into itself.
+ALUJMP_JDESCA = 0x20        # Optimizer-owned: jump if descriptor A bit is set.
+ALUJMP_USTEP_AAD_SHIFT = 0x21 # Optimizer-owned: AAD barrel result and CF clear.
+ALUJMP_USTEP_FAULT_DONE = 0x22 # Optimizer-owned: fault delivery completion.
+ALUJMP_PASS = 0x14
+SRC_USTEP_SEG_INDEX = 0x3A  # Optimizer-owned: decoded segment as legacy IRF selector.
+SRC_FOP = 0x3B              # Architectural x87 ESC/ModR/M command.
 
 # field name -> (shift, width)
 FIELDS = {
@@ -75,6 +87,7 @@ class RecipeAction(IntEnum):
 
     NONE = 0
     X87_M32_LOAD = 1
+    INVLPG = 2
 
 
 @dataclass(frozen=True)
@@ -125,7 +138,7 @@ PATCHES = [
     # addressed TLB entry; the following blank word is its architectural delay
     # slot.
     Patch(0x9C7, "INVLPG m extension: paging-owned single-page invalidate + RNI",
-          fields=dict(op=0)),
+          fields=dict(dst=DEST_USTEP_INVLPG, op=0)),
     Patch(0x9C8, "INVLPG m extension: blank RNI delay slot",
           copy_from=0x030),
 
@@ -136,6 +149,89 @@ PATCHES = [
           copy_from=0x20E),
     Patch(0x9C6, "x87 m32 direct-load overlay: retire after x87 queue accepts operand",
           copy_from=0x20F),
+
+    # ---- Original 386 microcode repairs ---------------------------------
+    # BSR's loop leaves the final bit index in TMPC. The extracted routine's
+    # 182 CLZF/RNI word does not encode the architectural destination write,
+    # which previously required an opcode-specific RTL writeback. Make the
+    # write part of the microcode word so normal destination handling owns it.
+    Patch(0x182, "BSR completion: TMPC -> SRCREG with CLZF/RNI",
+          fields=dict(src=SRC_TMPC, dst=DEST_SRCREG)),
+
+    # RPTI's EIP restore restarts an interrupted repeat instruction. Give the
+    # write its own semantic destination instead of recognizing routine
+    # addresses in the CPU control path.
+    Patch(0x20D, "RPTI restart: TMPeIP -> restart EIP and prefetch",
+          fields=dict(dst=DEST_USTEP_RPTI_EIP)),
+
+    # A task switch establishes CPL from the incoming CS selector. Ordinary
+    # protected-mode CS writes retain the current RPL, so distinguish this
+    # architectural task-load write in the generated microcode.
+    Patch(0x76F, "LOAD_TASK: incoming selector establishes full CS including RPL",
+          fields=dict(dst=DEST_USTEP_TASK_CS)),
+
+    # Descriptor loading writes the Accessed bit back only when it was clear.
+    # Express the branch condition in the micro-op rather than recognizing the
+    # original routine address in the sequencer path.
+    Patch(0x5D3, "LD_DESCRIPTOR: jump when descriptor Accessed bit is already set",
+          fields=dict(aluop=ALUJMP_JDESCA)),
+
+    # Fault delivery has three completion paths with different useful fields.
+    # Mark the two NOPMOVE words through ALU/JMP and the task-gate OR word
+    # through its otherwise-empty destination, producing one semantic event.
+    Patch(0x639, "cross-privilege interrupt delivery completion",
+          fields=dict(aluop=ALUJMP_USTEP_FAULT_DONE)),
+    Patch(0x7E0, "task-gate interrupt delivery completion",
+          fields=dict(dst=DEST_USTEP_FAULT_DONE)),
+    Patch(0x8E3, "ordinary interrupt/fault delivery completion",
+          fields=dict(aluop=ALUJMP_USTEP_FAULT_DONE)),
+
+    # LSS/LFS/LGS originally borrow IMM to carry the second opcode byte, then
+    # XOR it with 0x10 to form the segment IRF selector. Use the decoder's
+    # segment selection directly, leaving the architectural immediate field
+    # exclusively for instruction operands.
+    Patch(0x0C9, "LSS: decoded segment target replaces opcode-in-IMM XOR",
+          fields=dict(src=SRC_USTEP_SEG_INDEX, alusrc=0, aluop=ALUJMP_PASS)),
+    Patch(0x0D0, "LFS/LGS: decoded segment target replaces opcode-in-IMM XOR",
+          fields=dict(src=SRC_USTEP_SEG_INDEX, alusrc=0, aluop=ALUJMP_PASS)),
+    Patch(0x5C5, "LSS/LFS/LGS descriptor load: retain decoded segment target",
+          fields=dict(src=SRC_USTEP_SEG_INDEX, alusrc=0, aluop=ALUJMP_PASS)),
+
+    # x87 command transport uses the architectural OPCODE/FOP source rather
+    # than borrowing the instruction immediate field. Every IMM read in the
+    # original x87 region observed that borrowed FOP value.
+    Patch(0x3D0, "x87 flag command: decoded FOP -> OPR_W",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x3E2, "x87 misc command setup: decoded FOP source",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x3E3, "x87 misc command: decoded FOP -> OPR_W",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x404, "x87 save command: decoded FOP -> OPR_W",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x478, "x87 restore command: decoded FOP -> OPR_W",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x4CC, "x87 register command setup: decoded FOP source",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x4CD, "x87 register command: decoded FOP -> OPR_W",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x500, "x87 load command: decoded FOP -> OPR_W",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x507, "x87 load loop: retain decoded FOP",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x51E, "x87 load command: decoded FOP -> OPR_W",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x531, "x87 short load: decoded FOP -> TMPF",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x566, "x87 store command: decoded FOP -> OPR_W",
+          fields=dict(src=SRC_FOP)),
+    Patch(0x56A, "x87 store abort: decoded FOP -> TMPF",
+          fields=dict(src=SRC_FOP)),
+
+    # AAD's final ADC must behave as ADD regardless of the incoming carry.
+    # Mark its preceding barrel step explicitly instead of recognizing opcode
+    # D5 inside the data unit's shared SHIFT implementation.
+    Patch(0x1A0, "AAD shift: barrel result plus explicit carry clear",
+          fields=dict(aluop=ALUJMP_USTEP_AAD_SHIFT)),
 
     # ---- v52 direct ALU usteps -------------------------------------------
     # Every hardwired ALU retire word owns its architectural write through one
@@ -326,6 +422,13 @@ OVERLAY_RECIPES = [
                   ("ea", "paging", "x87-order")),
 ]
 
+# Semantic execution actions for ordinary generated microcode entries.  Keep
+# literal entry addresses in this generated decode table; execution registers
+# and consumes only the action.
+ENTRY_ACTIONS = {
+    0x9C7: RecipeAction.INVLPG,
+}
+
 
 def read_words(path: Path) -> list[int]:
     words: list[int] = []
@@ -459,6 +562,18 @@ def validate_recipes(words: list[int]) -> None:
         overlay_entries.add(recipe.entry)
         overlay_actions.add(recipe.action)
 
+    for entry, action in ENTRY_ACTIONS.items():
+        if not 0 <= entry < ROM_DEPTH or words[entry] == default_word:
+            raise ValueError(f"entry action {action.name}: invalid word 0x{entry:03X}")
+        if action == RecipeAction.NONE or action in overlay_actions:
+            raise ValueError(f"entry action 0x{entry:03X}: invalid or duplicate action {action}")
+        if (action == RecipeAction.INVLPG and
+                get_field(words[entry], "dst") != DEST_USTEP_INVLPG):
+            raise ValueError(
+                f"entry action 0x{entry:03X}: INVLPG marker is missing from microcode"
+            )
+        overlay_actions.add(action)
+
 
 def render_recipe_manifest(words: list[int]) -> str:
     validate_recipes(words)
@@ -577,6 +692,10 @@ def render_recipe_svh(words: list[int]) -> str:
         lines.append(
             f"        12'h{recipe.entry:03X}: recipe_action = RECIPE_ACTION_{recipe.action.name};"
         )
+    for entry, action in sorted(ENTRY_ACTIONS.items()):
+        lines.append(
+            f"        12'h{entry:03X}: recipe_action = RECIPE_ACTION_{action.name};"
+        )
     lines += [
         "        default: recipe_action = RECIPE_ACTION_NONE;",
         "    endcase",
@@ -600,8 +719,7 @@ def render_recipe_svh(words: list[int]) -> str:
         "    endcase",
         "endfunction",
         "",
-        "// Entry-point-derived hardwired control. The legacy dec_recipe_metadata()",
-        "// remains a simulation-only equivalence oracle.",
+        "// Entry-point-derived hardwired control generated from the recipe inventory.",
         "function automatic recipe_meta_t recipe_metadata(input dec_entry_t e);",
         "    recipe_meta_t r;",
         "    logic [2:0] grp;",

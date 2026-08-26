@@ -7,6 +7,7 @@ STATUS_PORT equ 0xE0
 DATA_PORT   equ 0xE4
 STATUS_PASS equ 0x01
 STATUS_FAIL equ 0xFF
+SW_INT_VECTOR equ 0x40
 
 start:
     cli
@@ -20,6 +21,10 @@ start:
     mov word [es:1*4+2], 0x1000
     mov word [es:3*4], isr_bp
     mov word [es:3*4+2], 0x1000
+    mov word [es:4*4], isr_bp
+    mov word [es:4*4+2], 0x1000
+    mov word [es:SW_INT_VECTOR*4], isr_bp
+    mov word [es:SW_INT_VECTOR*4+2], 0x1000
 
     mov byte [marker], 0
     mov byte [seen_marker], 0
@@ -62,6 +67,61 @@ start:
     cmp word [trap_count], 0
     jne .fail_int_db
 
+    ; INT imm8 has the same TF suppression rule as INT3.
+    mov word [trap_count], 0
+    mov word [bp_count], 0
+    pushf
+    pop ax
+    or ax, 0x0100
+    push ax
+    push cs
+    push word .int_imm
+    iret
+
+.int_imm:
+    int SW_INT_VECTOR
+    cmp word [bp_count], 1
+    jne .fail_int_imm
+    cmp word [trap_count], 0
+    jne .fail_int_imm_db
+
+    ; Taken INTO suppresses the pending TF trap and enters vector 4.
+    mov word [trap_count], 0
+    mov word [bp_count], 0
+    pushf
+    pop ax
+    or ax, 0x0900          ; TF | OF
+    push ax
+    push cs
+    push word .into_taken
+    iret
+
+.into_taken:
+    into
+    cmp word [bp_count], 1
+    jne .fail_into_taken
+    cmp word [trap_count], 0
+    jne .fail_into_taken_db
+
+    ; Untaken INTO remains an ordinary retired instruction and must trap.
+    mov word [trap_count], 0
+    mov word [bp_count], 0
+    pushf
+    pop ax
+    and ax, 0xF7FF         ; clear OF
+    or ax, 0x0100          ; set TF
+    push ax
+    push cs
+    push word .into_not_taken
+    iret
+
+.into_not_taken:
+    into
+    cmp word [bp_count], 0
+    jne .fail_into_not_taken
+    cmp word [trap_count], 1
+    jne .fail_into_not_taken_db
+
     mov al, STATUS_PASS
     mov dx, STATUS_PORT
     out dx, al
@@ -79,6 +139,24 @@ start:
     jmp fail
 .fail_int_db:
     mov eax, 4
+    jmp fail
+.fail_int_imm:
+    mov eax, 5
+    jmp fail
+.fail_int_imm_db:
+    mov eax, 6
+    jmp fail
+.fail_into_taken:
+    mov eax, 7
+    jmp fail
+.fail_into_taken_db:
+    mov eax, 8
+    jmp fail
+.fail_into_not_taken:
+    mov eax, 9
+    jmp fail
+.fail_into_not_taken_db:
+    mov eax, 10
     jmp fail
 
 isr_db:

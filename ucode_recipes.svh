@@ -10,6 +10,7 @@ localparam logic [2:0] RECIPE_EARLY_STACK  = 3'd7;
 
 localparam logic [1:0] RECIPE_ACTION_NONE = 2'd0;
 localparam logic [1:0] RECIPE_ACTION_X87_M32_LOAD = 2'd1;
+localparam logic [1:0] RECIPE_ACTION_INVLPG = 2'd2;
 
 // Resolve opcode-qualified overlays during D1 structural decode.
 function automatic logic [11:0] recipe_effective_entry(
@@ -37,6 +38,7 @@ endfunction
 function automatic logic [1:0] recipe_action(input logic [11:0] entry);
     unique case (entry)
         12'h9C5: recipe_action = RECIPE_ACTION_X87_M32_LOAD;
+        12'h9C7: recipe_action = RECIPE_ACTION_INVLPG;
         default: recipe_action = RECIPE_ACTION_NONE;
     endcase
 endfunction
@@ -54,8 +56,7 @@ function automatic logic [2:0] recipe_early_kind(input logic [11:0] entry);
     endcase
 endfunction
 
-// Entry-point-derived hardwired control. The legacy dec_recipe_metadata()
-// remains a simulation-only equivalence oracle.
+// Entry-point-derived hardwired control generated from the recipe inventory.
 function automatic recipe_meta_t recipe_metadata(input dec_entry_t e);
     recipe_meta_t r;
     logic [2:0] grp;

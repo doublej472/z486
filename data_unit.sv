@@ -387,6 +387,8 @@ function automatic logic [31:0] read_source(input logic [5:0] field);
         SRC_eCX: read_source = ecx;
         SRC_IRF: read_source = read_gpr_value(countr[2:0],
                                               op_size_src == 2'd2 ? 2'd2 : 2'd1);
+        SRC_USTEP_SEG_INDEX: read_source = {24'd0, 5'b10100, seg_reg_sel};
+        SRC_FOP: read_source = {21'd0, instr.fop};
         SRC_SEGREG: begin
             case (seg_reg_sel)
                 3'd0: read_source = {16'd0, es};
@@ -648,8 +650,6 @@ always_ff @(posedge clk) begin
                 recipe_state.commit_sel == RECIPE_COMMIT_ESP)
                 esp <= sigma;
 
-            if (aluop == ALUJMP_CLZF && instr.has_0f && instr.opcode == 8'hBD)
-                write_gpr(src_reg_sel_r, tmpc, op_size);
         end
     end
 end
@@ -717,6 +717,7 @@ always_ff @(posedge clk) begin
                 ALUJMP_SHIFT1: sigma <= shift_setup_result;
 
                 ALUJMP_SHIFT,
+                ALUJMP_USTEP_AAD_SHIFT,
                 ALUJMP_SHIFT2,
                 ALUJMP_BITTST: sigma <= shift_result;
 
@@ -767,22 +768,14 @@ always_ff @(posedge clk) begin
 end
 
 always_ff @(posedge clk) begin
-    logic next_jcc_short;
-    logic next_jcc_near;
-    logic current_jcc;
-
-    next_jcc_short = next_instr.opcode[7:4] == 4'h7;
-    next_jcc_near = next_instr.has_0f && next_instr.opcode[7:4] == 4'h8;
-    current_jcc = instr.opcode[7:4] == 4'h7 ||
-                  (instr.has_0f && instr.opcode[7:4] == 4'h8);
-
-    if (instr_start && !halted && (next_jcc_short || next_jcc_near)) begin
-        if (next_jcc_short)
+    if (instr_start && !halted &&
+        (next_instr.rel_branch_kind == REL_BRANCH_JCC)) begin
+        if (next_instr.branch_rel8)
             alu_src_hold <= {{24{next_instr.displacement[7]}},
                              next_instr.displacement[7:0]};
         else
             alu_src_hold <= next_instr.displacement;
-    end else if (!(current_jcc && uc_active)) begin
+    end else if (!((instr.rel_branch_kind == REL_BRANCH_JCC) && uc_active)) begin
         alu_src_hold <= alu_src;
     end
 end
@@ -911,22 +904,21 @@ always_ff @(posedge clk) begin
         if (exec) begin
             case (aluop)
                 ALUJMP_FLGOPS: begin
-                    case (instr.opcode[3:0])
-                        4'h5: eflags[0]  <= ~eflags[0];
-                        4'h8: eflags[0]  <= 1'b0;
-                        4'h9: eflags[0]  <= 1'b1;
-                        4'hA: eflags[9]  <= 1'b0;
-                        4'hB: eflags[9]  <= 1'b1;
-                        4'hC: eflags[10] <= 1'b0;
-                        4'hD: eflags[10] <= 1'b1;
+                    case (instr.flag_op)
+                        FLAG_OP_CMC: eflags[0]  <= ~eflags[0];
+                        FLAG_OP_CLC: eflags[0]  <= 1'b0;
+                        FLAG_OP_STC: eflags[0]  <= 1'b1;
+                        FLAG_OP_CLI: eflags[9]  <= 1'b0;
+                        FLAG_OP_STI: eflags[9]  <= 1'b1;
+                        FLAG_OP_CLD: eflags[10] <= 1'b0;
+                        FLAG_OP_STD: eflags[10] <= 1'b1;
                         default: ;
                     endcase
                 end
                 ALUJMP_BITTST: eflags[0] <= shift_result[0];
                 ALUJMP_DIV5: begin
                     eflags[0] <= 1'b0;
-                    if ((instr.opcode == 8'hF6 || instr.opcode == 8'hF7) &&
-                        instr.modrm[5:3] == 3'd6)
+                    if (instr.div_quotient_zf)
                         eflags[6] <= muldiv_quotient_zero;
                 end
                 ALUJMP_CLZF: eflags[6] <= 1'b0;
@@ -939,9 +931,8 @@ always_ff @(posedge clk) begin
                     clear_if_pending <= 1'b0;
                 end
                 ALUJMP_SHIFT2: ;
-                ALUJMP_SHIFT:
-                    if (instr.opcode == 8'hD5)
-                        eflags[0] <= 1'b0;
+                ALUJMP_SHIFT: ;
+                ALUJMP_USTEP_AAD_SHIFT: eflags[0] <= 1'b0;
                 ALUJMP_SZ_EX2,
                 ALUJMP_IMCS: begin
                     eflags[0]  <= muldiv_flag_overflow;
@@ -1042,12 +1033,10 @@ shifter shifter_inst (
     .is_shift2(shift_is_shift2),
     .alu_source(alu_source),
     .instr_start(instr_start),
-    .instr_is_shxd_next(next_instr.has_0f &&
-        (next_instr.opcode == 8'hA4 || next_instr.opcode == 8'hA5 ||
-         next_instr.opcode == 8'hAC || next_instr.opcode == 8'hAD)),
+    .instr_is_shxd_next(next_instr.shift_is_double),
     .carry_in(eflags_fwd[0]),
-    .opcode_bit3(instr.opcode[3]),
-    .modrm_op(instr.modrm[5:3]),
+    .shift_right(instr.shift_right),
+    .shift_operation(instr.shift_operation),
     .op_size(op_size),
     .alu_dst(alu_dst),
     .alu_src(alu_src),

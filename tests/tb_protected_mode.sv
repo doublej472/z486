@@ -206,8 +206,8 @@ module tb_protected_mode #(
                 end
                 if (dut.x87.direct_valid && dut.x87.direct_ready) begin
                     x87_direct_load_count <= x87_direct_load_count + 1;
-                    x87_direct_load_fop_count[dut.i.immediate[10:0]] <=
-                        x87_direct_load_fop_count[dut.i.immediate[10:0]] + 1;
+                    x87_direct_load_fop_count[dut.i.fop] <=
+                        x87_direct_load_fop_count[dut.i.fop] + 1;
                 end
                 if (!dut.x87_busy_n)
                     x87_control_busy_cycles <= x87_control_busy_cycles + 1;

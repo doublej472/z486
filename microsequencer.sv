@@ -30,7 +30,6 @@ module microsequencer
     input  logic        pe,
     input  logic        vm,
     input  logic        cpl_nonzero,
-    input  logic        desc_accessed_writeback,
     input  seq_condition_t conditions,       // Precomputed micro-branch conditions
     input  logic        prot_redirect_valid,
     input  logic [11:0] prot_redirect_target,
@@ -91,7 +90,7 @@ wire [11:0] uc_ljump_target = {uc_source, uc_alu_src};
 wire [11:0] return_target = return_stack[return_sp - 2'd1];
 wire reljump_taken = uc_exec && !repeat_active &&
                      reljump_condition(uc_aluop, conditions) &&
-                     !desc_accessed_writeback && !prot_redirect_prev &&
+                     !prot_redirect_prev &&
                      !jcc_fold_active && !branch_ustep_exec;
 wire pref_suppress_taken = reljump_taken &&
     (uc_aluop == ALUJMP_JNcond || uc_aluop == ALUJMP_JCNTNZ ||
@@ -166,7 +165,7 @@ always_comb begin
         end
         if (set_rpl_redirect) begin
             exec_redirect.valid = 1'b1;
-            exec_redirect.target = 12'h5fb;
+            exec_redirect.target = UADDR_MORE_PRIVILEGE;
         end
         if (div_redirect_valid) begin
             exec_redirect.valid = 1'b1;
@@ -174,7 +173,7 @@ always_comb begin
         end
         if (gate_redirect) begin
             exec_redirect.valid = 1'b1;
-            exec_redirect.target = 12'h5be;
+            exec_redirect.target = UADDR_CALL_GATE_386;
         end
     end
 end
@@ -349,6 +348,7 @@ function automatic logic reljump_condition(
         ALUJMP_JBUSY: reljump_condition = c.x87_error;
         ALUJMP_JICEWT: reljump_condition = 1'b0;
         ALUJMP_J16BIT: reljump_condition = c.task_16bit;
+        ALUJMP_JDESCA: reljump_condition = c.desc_accessed;
         default: reljump_condition = 1'b0;
     endcase
 endfunction

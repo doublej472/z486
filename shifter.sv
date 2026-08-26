@@ -17,8 +17,8 @@ module shifter
     input  logic        instr_start,        // Capture per-instruction shift state
     input  logic        instr_is_shxd_next, // D2 lookahead for SHLD/SHRD
     input  logic        carry_in,           // Carry captured at instruction start
-    input  logic        opcode_bit3,
-    input  logic [2:0]  modrm_op,
+    input  logic        shift_right,
+    input  logic [2:0]  shift_operation,
     input  logic [1:0]  op_size,
 
     input  logic [31:0] alu_dst,
@@ -142,7 +142,7 @@ wire [63:0] shift_input = data_size == 2'd0 ? {high_word, low_word[7:0]} :
                           data_size == 2'd1 ? {high_word, low_word[15:0]} :
                                                 {high_word, low_word};
 wire [63:0] shifted = shift_input >> count;
-wire        is_sar = (modrm_op == SAR) && !instr_is_shxd;
+wire        is_sar = (shift_operation == SAR) && !instr_is_shxd;
 wire [31:0] sar_overflow_result = low_word[data_width-1] ? 32'hffff_ffff : 32'd0;
 wire        low_sign = data_size == 2'd0 ? low_word[7] :
                        data_size == 2'd1 ? low_word[15] : low_word[31];
@@ -161,7 +161,7 @@ wire result_sf = overflow ? (is_sar ? low_sign : 1'b0) :
 always_comb begin
     setup_result = alu_dst;
     if (!instr_is_shxd) begin
-        case (modrm_op)
+        case (shift_operation)
             RCL:     setup_result = (instr_cf << (width-1)) |
                                     ((alu_dst & width_mask) >> 1);
             RCR:     setup_result = {alu_dst, instr_cf};
@@ -193,20 +193,20 @@ always_ff @(posedge clk) begin
                 shift1_size <= op_size;
 
                 if (instr_is_shxd) begin
-                    swap <= !opcode_bit3;
-                    count <= opcode_bit3 ? raw_count : width - raw_count;
-                    operation <= opcode_bit3 ? ROR : ROL;
+                    swap <= !shift_right;
+                    count <= shift_right ? raw_count : width - raw_count;
+                    operation <= shift_right ? ROR : ROL;
                     set_zsp <= 1'b1;
                 end else begin
-                    swap <= !modrm_op[0];
+                    swap <= !shift_operation[0];
                     overflow <= raw_count >= width &&
-                                (modrm_op == SHL || modrm_op == SAL ||
-                                 modrm_op == SHR || modrm_op == SAR);
+                                (shift_operation == SHL || shift_operation == SAL ||
+                                 shift_operation == SHR || shift_operation == SAR);
                     eq_width <= raw_count == width &&
-                                (modrm_op == SHL || modrm_op == SAL ||
-                                 modrm_op == SHR || modrm_op == SAR);
-                    eq_width_cf <= modrm_op[0] ? alu_dst[width-1] : alu_dst[0];
-                    case (modrm_op)
+                                (shift_operation == SHL || shift_operation == SAL ||
+                                 shift_operation == SHR || shift_operation == SAR);
+                    eq_width_cf <= shift_operation[0] ? alu_dst[width-1] : alu_dst[0];
+                    case (shift_operation)
                         ROL:     count <= width - reduced_count;
                         ROR:     count <= reduced_count[4:0];
                         RCL:     count <= width - raw_count[4:0];
@@ -216,9 +216,9 @@ always_ff @(posedge clk) begin
                         SHR:     count <= raw_count >= width ? 5'd31 : raw_count;
                         default: count <= raw_count >= width ? 5'd31 : raw_count;
                     endcase
-                    operation <= modrm_op;
-                    set_zsp <= modrm_op == SHL || modrm_op == SHR ||
-                               modrm_op == SAR || modrm_op == SAL;
+                    operation <= shift_operation;
+                    set_zsp <= shift_operation == SHL || shift_operation == SHR ||
+                               shift_operation == SAR || shift_operation == SAL;
                 end
             end
 
@@ -265,10 +265,10 @@ always_ff @(posedge clk) begin
             flags_sf <= result_sf;
             flags_we_of <= 1'b0;
             if (instr_is_shxd) begin
-                flags_cf <= opcode_bit3 ? last_out_lsb : last_out_msb;
+                flags_cf <= shift_right ? last_out_lsb : last_out_msb;
                 if (count_raw_r == 5'd1) begin
                     flags_we_of <= 1'b1;
-                    flags_of <= opcode_bit3 ?
+                    flags_of <= shift_right ?
                         (result[shift1_width-1] ^ result[shift1_width-2]) :
                         (result[shift1_width-1] ^ last_out_msb);
                 end

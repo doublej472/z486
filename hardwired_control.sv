@@ -195,7 +195,7 @@ wire jcc_unsafe = uc_exec && ((uc_aluop == ALUJMP_SHIFT2) ||
                               (uc_aluop == ALUJMP_SEZF));
 wire fold_now = i_issue && issue_hardwired && issue_recipe.jcc &&
                 !(alu_write_flags || jcc_unsafe) &&
-                !condition_true(issue_instr.opcode[3:0], flags_live);
+                !condition_true(issue_instr.branch_condition, flags_live);
 assign fold_active = jcc_fold_r && i_first;
 
 wire chain_after_single = i_issue && issue_hardwired &&
@@ -233,7 +233,7 @@ always_ff @(posedge clk) begin
         end else if (i_issue) begin
             jcc_fold_r <= fold_now;
             jcc_issue_valid_r <= issue_recipe.jcc && !jcc_unsafe;
-            jcc_issue_taken_r <= condition_true(issue_instr.opcode[3:0], flags_ahead);
+            jcc_issue_taken_r <= condition_true(issue_instr.branch_condition, flags_ahead);
         end else if (!stall) begin
             jcc_fold_r <= 1'b0;
         end
@@ -246,10 +246,13 @@ always_ff @(posedge clk) begin
             recipe_state.commit_sel <= issue_recipe.commit_sel;
             recipe_state.slot_has_work <= issue_recipe.slot_has_work;
             branch_ustep_r <= issue_hardwired &&
-                ((d2_kind == RECIPE_EARLY_BRANCH) || issue_instr.opcode == 8'hE8) &&
-                issue_instr.data32 && (!issue_instr.stack_op || issue_instr.opcode == 8'hE8) &&
+                ((d2_kind == RECIPE_EARLY_BRANCH) ||
+                 (issue_instr.rel_branch_kind == REL_BRANCH_CALL)) &&
+                issue_instr.data32 &&
+                (!issue_instr.stack_op ||
+                 (issue_instr.rel_branch_kind == REL_BRANCH_CALL)) &&
                 (!issue_recipe.jcc || !jcc_unsafe);
-            branch_ustep_jcc_r <= issue_recipe.jcc;
+            branch_ustep_jcc_r <= issue_instr.rel_branch_kind == REL_BRANCH_JCC;
         end
         if (any_fault || any_fault_r || interrupt_entry) begin
             recipe_state.hardwired <= 1'b0;
@@ -277,7 +280,7 @@ end
 // synthesis translate_off
 always @(posedge clk)
     if (reset_n && fold_active && uc_exec &&
-        condition_true(exec_instr.opcode[3:0], flags_live))
+        condition_true(exec_instr.branch_condition, flags_live))
         $display("%0t JCC-FOLD MISMATCH: opcode=%02x flags=%08x",
                  $time, exec_instr.opcode, flags_live);
 
