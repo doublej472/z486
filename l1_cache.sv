@@ -21,6 +21,7 @@ module l1_cache #(
     input         cpu_write,
     output        cpu_ready,
     output        cpu_resp_valid,
+    output        stores_drained,
 
     // Memory side.
     output [31:0] mem_addr,
@@ -120,6 +121,10 @@ reg        storeq_draining;
 wire storeq_full = (storeq_count == STOREQ_DEPTH_VALUE);
 wire storeq_empty = (storeq_count == {STOREQ_CNT_BITS{1'b0}});
 wire storeq_can_accept = !storeq_full || (storeq_draining && mem_ready);
+// Device transactions are serializing.  The memory fabric uses this status to
+// keep I/O and other direct accesses behind every older posted store.
+assign stores_drained = storeq_empty && !storeq_draining &&
+                        !(req_valid_r && req_write_r && !req_protect_write_r);
 
 // Memory-side registers.
 reg        mem_valid_r;

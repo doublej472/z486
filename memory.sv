@@ -67,6 +67,7 @@ wire [31:0] icache_req_phys_addr = !a20_enable
 wire [31:0] dcache_cpu_dout;
 wire        dcache_cpu_ready;
 wire        dcache_cpu_resp_valid;
+wire        dcache_stores_drained;
 wire [31:0] dcache_mem_addr;
 wire [31:0] dcache_mem_din;
 wire  [3:0] dcache_mem_be;
@@ -110,7 +111,11 @@ wire dcache_read_done = dcache_cpu_resp_valid &&
                         (dcache_cpu_rd_pending || dcache_read_accept);
 wire icache_read_done = icache_cpu_resp_valid &&
                         (icache_cpu_rd_pending || icache_read_accept);
-wire ext_direct_req = dcache_direct_req && !direct_rd_pending &&
+// I/O, INTA, and VGA aperture transactions must not overtake older posted
+// stores.  This is also what makes a CPU-filled Sound Blaster buffer visible
+// before the following DSP command lets DMA consume it.
+wire ext_direct_req = dcache_direct_req && dcache_stores_drained &&
+                      !direct_rd_pending &&
                       !dcache_read_pending && !icache_read_pending;
 wire ext_dcache_req = dcache_mem_valid && !ext_direct_req &&
                       !direct_rd_pending && !icache_read_pending;
@@ -284,6 +289,7 @@ l1_cache #(
     .cpu_write(dcache_req_write),
     .cpu_ready(dcache_cpu_ready),
     .cpu_resp_valid(dcache_cpu_resp_valid),
+    .stores_drained(dcache_stores_drained),
     .mem_addr(dcache_mem_addr),
     .mem_din(dcache_mem_din),
     .mem_dout(din),

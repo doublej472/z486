@@ -14,6 +14,7 @@ module tb_l1_cache;
     reg         cpu_write = 1'b0;
     wire        cpu_ready;
     wire        cpu_resp_valid;
+    wire        stores_drained;
 
     wire [31:0] mem_addr;
     wire [31:0] mem_din;
@@ -45,6 +46,7 @@ module tb_l1_cache;
         .cpu_write(cpu_write),
         .cpu_ready(cpu_ready),
         .cpu_resp_valid(cpu_resp_valid),
+        .stores_drained(stores_drained),
 
         .mem_addr(mem_addr),
         .mem_din(mem_din),
