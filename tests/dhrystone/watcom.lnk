@@ -1,0 +1,10 @@
+system rawbin
+option quiet
+option map=dhry.map
+option start=_start
+name dhry.bin
+file startup.obj
+file main.obj
+file dhry_1.obj
+file dhry_2.obj
+file support.obj

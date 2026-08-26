@@ -20,6 +20,11 @@ DEFAULT_Z386_CACHE = REPO_ROOT / "z386_MiSTer/src/memory/l1_cache.sv"
 BUILD_DIR = THIS_DIR / "build"
 BIN_FILE = BUILD_DIR / "dhrystone.bin"
 HEX_FILE = BUILD_DIR / "dhrystone.hex"
+WATCOM_BUILD_SCRIPT = THIS_DIR / "build_watcom.py"
+WATCOM_BIN_FILES = {
+    "optimized": BUILD_DIR / "watcom" / "optimized" / "DHRY.BIN",
+    "noopt": BUILD_DIR / "watcom" / "noopt" / "DHRY.BIN",
+}
 
 CODE_PHYS_BASE = 0x00010000
 LINEAR_BASE = 0x00010000
@@ -131,12 +136,40 @@ def generate_page_tables() -> dict[int, bytes]:
     return memory
 
 
-def build_benchmark_binary(iters: int, verbose: bool = False) -> None:
-    run_checked(["make", f"DHRY_ITERS={iters}", "all"], cwd=THIS_DIR, verbose=verbose)
+def build_benchmark_binary(
+    iters: int,
+    compiler: str,
+    profile: str,
+    watcom_dir: Path | None,
+    dosbox: str,
+    verbose: bool = False,
+) -> Path:
+    if compiler == "gcc":
+        optimization = "-O2" if profile == "optimized" else "-O0"
+        run_checked(
+            ["make", f"DHRY_ITERS={iters}", f"OPT={optimization}", "all"],
+            cwd=THIS_DIR,
+            verbose=verbose,
+        )
+        return BIN_FILE
+
+    cmd = [
+        sys.executable,
+        str(WATCOM_BUILD_SCRIPT),
+        "--iters", str(iters),
+        "--profile", profile,
+        "--dosbox", dosbox,
+    ]
+    if watcom_dir is not None:
+        cmd.extend(["--watcom-dir", str(watcom_dir)])
+    if verbose:
+        cmd.append("--verbose")
+    run_checked(cmd, cwd=THIS_DIR, verbose=verbose)
+    return WATCOM_BIN_FILES[profile]
 
 
-def build_memory_image() -> None:
-    binary = BIN_FILE.read_bytes()
+def build_memory_image(binary_file: Path) -> None:
+    binary = binary_file.read_bytes()
     if len(binary) > PAGE_COUNT * 0x1000:
         raise RuntimeError(
             f"Dhrystone binary is {len(binary)} bytes, larger than mapped "
@@ -376,6 +409,28 @@ def main() -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--iters", type=int, default=200, help="Dhrystone iterations")
+    parser.add_argument(
+        "--compiler",
+        choices=("gcc", "watcom"),
+        default="gcc",
+        help="compiler used for the freestanding Dhrystone binary",
+    )
+    parser.add_argument(
+        "--compiler-profile",
+        choices=("optimized", "noopt"),
+        default="optimized",
+        help="compiler optimization profile",
+    )
+    parser.add_argument(
+        "--watcom-dir",
+        type=Path,
+        help="Open Watcom installation (defaults to the workspace dos/WATCOM)",
+    )
+    parser.add_argument(
+        "--dosbox",
+        default="dosbox",
+        help="DOSBox executable used to run the Open Watcom DOS tools",
+    )
     parser.add_argument("--cycles", type=int, default=2_000_000, help="simulation cycle limit")
     parser.add_argument("--timeout", type=int, default=120, help="host timeout in seconds")
     parser.add_argument(
@@ -425,9 +480,25 @@ def main() -> int:
     parser.add_argument("-v", "--verbose", action="store_true", help="show build commands/output")
     args = parser.parse_args()
 
-    if not args.no_build:
-        build_benchmark_binary(args.iters, verbose=args.verbose)
-    build_memory_image()
+    if args.no_build:
+        binary_file = (
+            BIN_FILE
+            if args.compiler == "gcc"
+            else WATCOM_BIN_FILES[args.compiler_profile]
+        )
+        if not binary_file.is_file():
+            raise FileNotFoundError(f"benchmark binary does not exist: {binary_file}")
+    else:
+        binary_file = build_benchmark_binary(
+            args.iters,
+            args.compiler,
+            args.compiler_profile,
+            args.watcom_dir,
+            args.dosbox,
+            verbose=args.verbose,
+        )
+    build_memory_image(binary_file)
+    print(f"Dhrystone compiler: {args.compiler} ({args.compiler_profile})")
 
     cores = ["z386_release", "z486_current"] if args.core == "both" else [args.core]
     core_dirs = {

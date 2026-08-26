@@ -20,7 +20,16 @@ static Rec_Type Next_Record_Glob;
 static void
 io_out32 (unsigned short port, unsigned int value)
 {
+#ifdef __WATCOMC__
+  __asm
+  {
+    mov dx, port
+    mov eax, value
+    out dx, eax
+  }
+#else
   __asm__ __volatile__ ("outl %0, %w1" :: "a"(value), "Nd"(port));
+#endif
 }
 
 static unsigned int

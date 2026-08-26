@@ -30,7 +30,7 @@ SRCS := startup.S dhrystone_main.c dhry_1.c dhry_2.c support.c
 OBJS := $(addprefix $(BUILD_DIR)/,$(SRCS:.c=.o))
 OBJS := $(OBJS:.S=.o)
 
-.PHONY: all clean force run compare
+.PHONY: all clean force run compare watcom watcom-noopt
 
 all: $(BUILD_DIR)/dhrystone.bin $(BUILD_DIR)/dhrystone.lst
 
@@ -38,6 +38,12 @@ run: compare
 
 compare:
 	./run_dhrystone.py --iters $(DHRY_ITERS)
+
+watcom:
+	./build_watcom.py --iters $(DHRY_ITERS) --profile optimized
+
+watcom-noopt:
+	./build_watcom.py --iters $(DHRY_ITERS) --profile noopt
 
 $(BUILD_DIR):
 	mkdir -p $@

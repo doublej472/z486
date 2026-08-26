@@ -23,7 +23,25 @@ make dhrystone
 The Dhrystone Makefile uses the host Linux `gcc` by default, with `-m32` to
 produce an i386 freestanding binary. On macOS it defaults to `i686-elf-gcc`
 and the matching binutils. Override with `CROSS=i686-elf-` or `CROSS=` if a
-different toolchain setup is needed.
+different toolchain setup is needed. The optimized GCC profile is the stable
+comparison baseline and uses `-O2`.
+
+Open Watcom is available as a second compiler lane. It compiles the same
+freestanding source with the 80386 register calling convention, flat memory,
+four-byte structure packing, no runtime library, and either `-ox` or `-od`:
+
+```sh
+./run_dhrystone.py --compiler watcom --compiler-profile optimized --iters 200
+./run_dhrystone.py --compiler watcom --compiler-profile noopt --iters 200
+```
+
+The builder runs the DOS Open Watcom tools under DOSBox. By default it looks
+for the compiler below the workspace at `dos/WATCOM`; use `--watcom-dir` and
+`--dosbox` to override those locations. `make watcom` and
+`make watcom-noopt` build the raw images without running the simulator. Each
+profile is kept below `build/watcom/`, together with the Watcom link map,
+per-object assembly listings, and a symbolized linked `dhrystone.lst` suitable
+for `perf.py --lst`.
 
 Or run directly:
 
