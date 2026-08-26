@@ -328,9 +328,9 @@ module tb_l1_icache;
             $fatal(1);
         end
 
-        // If the snoop and fill need the same way RAM, neither the fill tag
-        // nor its data may be installed.  The response is still returned, and
-        // a later access refills instead of hitting mismatched tag/data state.
+        // If the snoop and a different-line fill need the same way RAM, the
+        // fill tag may win: replacing the old tag also invalidates the snooped
+        // line, so both operations are satisfied by the single RAM write.
         do @(negedge clk); while (!cpu_ready);
         cpu_addr = 32'h220;
         cpu_valid = 1'b1;
@@ -352,8 +352,8 @@ module tb_l1_icache;
         repeat (2) @(negedge clk);
         mem_request_before = mem_request_count;
         cache_read(32'h220, 128'h2200_0003_2200_0002_2200_0001_2200_0000);
-        if (mem_request_count != mem_request_before + 1) begin
-            $display("L1 ICACHE SAME-WAY COLLISION incorrectly cached fill");
+        if (mem_request_count != mem_request_before) begin
+            $display("L1 ICACHE SAME-WAY COLLISION lost fill tag");
             $fatal(1);
         end
 

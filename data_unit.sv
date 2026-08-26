@@ -28,6 +28,7 @@ module data_unit
     input  logic        recipe_commit_cancel,     // Cancel deferred recipe commit
     input  logic        load_wb_valid,             // Registered VIPT load WB
     input  logic [2:0]  load_wb_dst,
+    input  logic [7:0]  load_wb_dst_onehot,       // Byte-normalized destination
     input  logic [1:0]  load_wb_size,
     input  logic [31:0] load_wb_data,
     input  logic        load_wb_is_alu,          // Registered memory operand feeds shared ALU
@@ -292,7 +293,6 @@ function automatic logic [31:0] read_ea_gpr(
     input logic [2:0] idx
 );
     logic [31:0] current_value, dly_value, shift_value, load_value;
-    logic [2:0]  load_widx;
     logic        dly_hit, shift_hit, load_hit;
     begin
         current_value = valid ? read_gpr_value(idx, 2'd2) : 32'd0;
@@ -300,10 +300,8 @@ function automatic logic [31:0] read_ea_gpr(
                   (dly_gpr_forward.dst == idx);
         shift_hit = recipe_shift_write.valid && valid &&
                     (recipe_shift_widx == idx);
-        load_widx = (load_wb_size == 2'd0)
-                  ? {1'b0, load_wb_dst[1:0]} : load_wb_dst;
         load_hit = load_wb_valid && !load_wb_is_alu && valid &&
-                   (load_widx == idx);
+                   load_wb_dst_onehot[idx];
 
         // Format each producer before the priority mux. This keeps delay-slot
         // data out of the shift/load mode selection on the D2 EA path.

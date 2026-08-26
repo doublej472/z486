@@ -346,22 +346,17 @@ wire tag_snoop_match2 = snoop_tag_entry2_r[TAG_VALID_BIT] &&
                         (snoop_tag_entry2_r[TAG_BITS-1:0] == snoop_tag_r);
 wire tag_snoop_match3 = snoop_tag_entry3_r[TAG_VALID_BIT] &&
                         (snoop_tag_entry3_r[TAG_BITS-1:0] == snoop_tag_r);
-wire fill_way_snoop_conflict =
-    ((fill_way == 2'd0) && tag_snoop_match0) ||
-    ((fill_way == 2'd1) && tag_snoop_match1) ||
-    ((fill_way == 2'd2) && tag_snoop_match2) ||
-    ((fill_way == 2'd3) && tag_snoop_match3);
 wire registered_snoop_fill_conflict = snoop_valid_r &&
                                       (snoop_set_r == fill_set) &&
                                       (snoop_tag_r == fill_tag);
 // Each way is a separate RAM and can accept its own write.  A snoop matching
 // another way must not suppress the fill tag: doing so while still writing the
 // fill data leaves the victim's old valid tag paired with the new line.  If
-// both writes need the same way RAM, or the snoop targets the line being
-// filled, return the requested line but leave the cache arrays untouched.
+// both operations need the same way RAM for different lines, the fill may
+// win: replacing the old tag also invalidates the snooped line.  Only a snoop
+// targeting the line being filled must leave that fill uncached.
 wire fill_install_allowed = !live_snoop_fill_conflict &&
-                            !registered_snoop_fill_conflict &&
-                            !fill_way_snoop_conflict;
+                            !registered_snoop_fill_conflict;
 
 always_ff @(posedge clk) begin
     if (accept_cpu) begin
@@ -389,29 +384,30 @@ always_ff @(posedge clk) begin
 
     // Keep each tag array in one write process so Quartus can retain the tag
     // memories as M10Ks.  An unrelated snoop and fill can update different
-    // way RAMs together.  A same-way collision leaves the fill uncached.
+    // way RAMs together.  For a same-way/different-line collision the fill
+    // replaces the snooped tag, satisfying both operations with one write.
     if (tag_reset_write) begin
         tag_way0[init_set] <= '0;
         tag_way1[init_set] <= '0;
         tag_way2[init_set] <= '0;
         tag_way3[init_set] <= '0;
     end else begin
-        if (tag_snoop_match0)
-            tag_way0[snoop_set_r] <= '0;
-        else if (tag_fill_write && fill_install_allowed && (fill_way == 2'd0))
+        if (tag_fill_write && fill_install_allowed && (fill_way == 2'd0))
             tag_way0[fill_set] <= tag_fill_entry;
-        if (tag_snoop_match1)
-            tag_way1[snoop_set_r] <= '0;
-        else if (tag_fill_write && fill_install_allowed && (fill_way == 2'd1))
+        else if (tag_snoop_match0)
+            tag_way0[snoop_set_r] <= '0;
+        if (tag_fill_write && fill_install_allowed && (fill_way == 2'd1))
             tag_way1[fill_set] <= tag_fill_entry;
-        if (tag_snoop_match2)
-            tag_way2[snoop_set_r] <= '0;
-        else if (tag_fill_write && fill_install_allowed && (fill_way == 2'd2))
+        else if (tag_snoop_match1)
+            tag_way1[snoop_set_r] <= '0;
+        if (tag_fill_write && fill_install_allowed && (fill_way == 2'd2))
             tag_way2[fill_set] <= tag_fill_entry;
-        if (tag_snoop_match3)
-            tag_way3[snoop_set_r] <= '0;
-        else if (tag_fill_write && fill_install_allowed && (fill_way == 2'd3))
+        else if (tag_snoop_match2)
+            tag_way2[snoop_set_r] <= '0;
+        if (tag_fill_write && fill_install_allowed && (fill_way == 2'd3))
             tag_way3[fill_set] <= tag_fill_entry;
+        else if (tag_snoop_match3)
+            tag_way3[snoop_set_r] <= '0;
     end
 end
 

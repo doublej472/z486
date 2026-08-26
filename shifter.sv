@@ -181,13 +181,17 @@ assign result = overflow ? (is_sar ? sar_overflow_result : 32'd0) : shifted[31:0
 // therefore the selected low-word bit; do not route the full 64-bit barrel
 // result back into the architectural flag write path.
 assign bit_test_cf = alu_value[count[4:0]];
-wire result_pf = ~^result[7:0];
-wire result_zf = overflow ? (is_sar ? !low_sign : 1'b1) :
-                 data_size == 2'd0 ? shifted[7:0] == 8'd0 :
-                 data_size == 2'd1 ? shifted[15:0] == 16'd0 : shifted[31:0] == 32'd0;
-wire result_sf = overflow ? (is_sar ? low_sign : 1'b0) :
-                 data_size == 2'd0 ? shifted[7] :
-                 data_size == 2'd1 ? shifted[15] : shifted[31];
+// SHIFT2 writes the barrel result into SIGMA on the same edge that starts the
+// existing one-cycle deferred flag retirement.  Derive Z/S/P from that
+// registered result during the retirement cycle instead of placing the
+// barrel, width selection, and zero reduction in front of the flag flops.
+// shift1_size is the operand size captured by the preceding SHIFT1 setup.
+assign flags_pf = ~^sigma[7:0];
+assign flags_zf = shift1_size == 2'd0 ? sigma[7:0] == 8'd0 :
+                  shift1_size == 2'd1 ? sigma[15:0] == 16'd0 :
+                                             sigma[31:0] == 32'd0;
+assign flags_sf = shift1_size == 2'd0 ? sigma[7] :
+                  shift1_size == 2'd1 ? sigma[15] : sigma[31];
 
 always_comb begin
     setup_result = alu_dst;
@@ -290,9 +294,6 @@ always_ff @(posedge clk) begin
         flags_commit <= exec && (aluop == ALUJMP_SHIFT2) && count_nonzero;
         if (exec && (aluop == ALUJMP_SHIFT2) && count_nonzero) begin
             flags_we_zsp <= set_zsp;
-            flags_pf <= result_pf;
-            flags_zf <= result_zf;
-            flags_sf <= result_sf;
             flags_we_of <= 1'b0;
             if (instr_is_shxd) begin
                 flags_cf <= shift_right ? last_out_lsb : last_out_msb;

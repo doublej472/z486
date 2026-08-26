@@ -327,6 +327,10 @@ l1_cache #(
     .cpu_be(dcache_req_be),
     .cpu_valid(dcache_cpu_req),
     .cpu_write(dcache_req_write),
+    // I/O, INTA, x87, and VGA/device transactions are routed around this
+    // cache above, so accepted D-cache requests need no physical-address
+    // aperture decode on their register inputs.
+    .cpu_uncacheable(1'b0),
     .cpu_ready(dcache_cpu_ready),
     .cpu_resp_valid(dcache_cpu_resp_valid),
     .stores_drained(dcache_stores_drained),

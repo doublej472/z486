@@ -21,6 +21,7 @@ module l1_cache #(
     input   [3:0] cpu_be,
     input         cpu_valid,
     input         cpu_write,
+    input         cpu_uncacheable,
     output        cpu_ready,
     output        cpu_resp_valid,
     output        stores_drained,
@@ -100,7 +101,7 @@ wire [SET_BITS-1:0] vipt_probe_set = vipt_probe_offset[SET_MSB:SET_LSB];
 wire [WORD_OFFSET_BITS-1:0] vipt_probe_word =
     vipt_probe_offset[LINE_OFFSET_BITS-1:BYTE_OFFSET_BITS];
 wire [SET_BITS-1:0] snoop_set = snoop_addr[SET_MSB:SET_LSB];
-wire cpu_uncacheable = !cache_enable || (cpu_addr[31:17] == 15'h5);
+wire request_uncacheable = !cache_enable || cpu_uncacheable;
 wire cpu_protect_write = PROTECT_UMA_ROM && cpu_write && (cpu_addr[24:18] == 7'b000_0011);
 
 // Tag/data storage.
@@ -593,7 +594,7 @@ always_ff @(posedge clk) begin
                     req_din_r <= cpu_din;
                     req_be_r <= cpu_be;
                     req_write_r <= cpu_write;
-                    req_uncacheable_r <= cpu_uncacheable;
+                    req_uncacheable_r <= request_uncacheable;
                     req_protect_write_r <= cpu_protect_write;
                     req_tag_r <= cpu_tag;
                     req_set_r <= cpu_set;

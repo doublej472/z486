@@ -54,6 +54,7 @@ module tb_l1_cache;
         .cpu_be(cpu_be),
         .cpu_valid(cpu_valid),
         .cpu_write(cpu_write),
+        .cpu_uncacheable(cpu_addr[31:17] == 15'h5),
         .cpu_ready(cpu_ready),
         .cpu_resp_valid(cpu_resp_valid),
         .stores_drained(stores_drained),

@@ -523,6 +523,9 @@ assign     i_issue = d2_valid &&
                      (d2_vipt_load ? d2_vipt_issue_ready : d2_ready);
 
 // synthesis translate_off
+wire [2:0] vipt_load_wb_norm_dst = (vipt_load_wb_size_r == 2'd0)
+                                  ? {1'b0, vipt_load_wb_dst_r[1:0]}
+                                  : vipt_load_wb_dst_r;
 always_ff @(posedge clk) begin
     if (reset_n && (i_issue !== i_issue_reference))
         $fatal(1, "VIPT ISSUE READY MISMATCH: direct=%b generic=%b",
@@ -1284,6 +1287,9 @@ always_ff @(posedge clk) begin
     if (reset_n && vipt_issue_load && vipt_load_ex_r.valid &&
         !vipt_load_ex_hit && vipt_load_replay_r.valid)
         $fatal(1, "VIPT replay token overflow");
+    if (reset_n && vipt_load_wb_valid_r &&
+        (vipt_load_wb_dst_onehot_r !== (8'h01 << vipt_load_wb_norm_dst)))
+        $fatal(1, "VIPT WB destination mask mismatch");
 end
 // synthesis translate_on
 
@@ -2963,6 +2969,7 @@ data_unit data_unit_inst (
     .recipe_commit_cancel(any_fault),
     .load_wb_valid(vipt_load_wb_valid_r),
     .load_wb_dst(vipt_load_wb_dst_r),
+    .load_wb_dst_onehot(vipt_load_wb_dst_onehot_r),
     .load_wb_size(vipt_load_wb_size_r),
     .load_wb_data(vipt_load_wb_data),
     .load_wb_is_alu(vipt_load_wb_is_alu_r),
