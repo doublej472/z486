@@ -21,6 +21,7 @@ module ucode_rom
     output      [6:0]  q_shift_aluop,
     output      [2:0]  q_dly_source,
     output      [8:0]  q_mem_ctrl,
+    output      [8:0]  q_ind_ctrl,
     output             q_fpu_f8
 );
 
@@ -33,6 +34,7 @@ module ucode_rom
 (* preserve *) reg [6:0] q_shift_aluop_r;
 reg [2:0] q_dly_source_r;
 (* preserve *) reg [8:0] q_mem_ctrl_r;
+reg [8:0] q_ind_ctrl_r;
 reg q_fpu_f8_r;
 
 // ALU source 1e is the historical 0x800000f8 coprocessor command port. z486
@@ -190,6 +192,50 @@ function automatic [8:0] mem_ctrl_predecode(input [36:0] w);
     end
 endfunction
 
+// Compact registered controls for architectural IND updates. The address
+// unit needs only an operation class, one source qualifier, one destination
+// class, and STSSAF; keep the raw source/destination/ALU/bus fields out of
+// that high-fanout cone.
+function automatic [8:0] ind_ctrl_predecode(input [36:0] w);
+    logic [3:0] op;
+    logic [2:0] dest_class;
+    logic [5:0] buscode;
+    logic [6:0] dest;
+    begin
+        buscode = w[5:0];
+        dest = w[30:24];
+        case (buscode)
+            BUSOP_IND_PLUS_ALU: op = 4'd1;
+            BUSOP_IND_ALU2:     op = 4'd2;
+            BUSOP_IND_SRC:      op = 4'd3;
+            BUSOP_IND_PLUS:     op = 4'd4;
+            BUSOP_IN_PLUS_D:    op = 4'd5;
+            BUSOP_LAR:          op = 4'd6;
+            BUSOP_LLIM:         op = 4'd7;
+            BUSOP_LBAS:         op = 4'd8;
+            BUSOP_LPCR:         op = 4'd9;
+            default:            op = 4'd0;
+        endcase
+        if (dest == DEST_DESSTK)
+            dest_class = 3'd1;
+        else if (dest == DEST_DESCOD)
+            dest_class = 3'd2;
+        else if ((dest == DEST_DES_ES) || (dest == DEST_DES_OS) ||
+                 (dest == DEST_DES_SR))
+            dest_class = 3'd3;
+        else if (dest == DEST_PFERRC)
+            dest_class = 3'd4;
+        else if (dest == DEST_LATTTF)
+            dest_class = 3'd5;
+        else if (dest == DEST_PDBR)
+            dest_class = 3'd6;
+        else
+            dest_class = 3'd0;
+        ind_ctrl_predecode = {(w[17:11] == ALUJMP_STSSAF), dest_class,
+                              (w[23:18] == SRC_IRF2), op};
+    end
+endfunction
+
 `ifdef Z486_QUARTUS_M10K_UCODE
 wire [39:0] q_mem;
 reg  [50:0] q_r;
@@ -232,6 +278,7 @@ always_ff @(posedge clk) begin
         q_shift_aluop_r <= q_mem[17:11];
         q_dly_source_r <= dly_source_predecode(q_mem[23:18]);
         q_mem_ctrl_r <= mem_ctrl_predecode(q_mem[36:0]);
+        q_ind_ctrl_r <= ind_ctrl_predecode(q_mem[36:0]);
         q_fpu_f8_r <= fpu_f8_predecode(q_mem[36:0]);
     end
 end
@@ -266,6 +313,7 @@ end
 	        q_shift_aluop_r <= q_mem[17:11];
 	        q_dly_source_r <= dly_source_predecode(q_mem[23:18]);
 	        q_mem_ctrl_r <= mem_ctrl_predecode(q_mem[36:0]);
+	        q_ind_ctrl_r <= ind_ctrl_predecode(q_mem[36:0]);
 	        q_fpu_f8_r <= fpu_f8_predecode(q_mem[36:0]);
 	    end
 	end
@@ -284,6 +332,14 @@ assign q_shift_alu_src = q_shift_alu_src_r;
 assign q_shift_aluop = q_shift_aluop_r;
 assign q_dly_source = q_dly_source_r;
 assign q_mem_ctrl = q_mem_ctrl_r;
+assign q_ind_ctrl = q_ind_ctrl_r;
 assign q_fpu_f8 = q_fpu_f8_r;
+
+// synthesis translate_off
+always_ff @(posedge clk)
+    if ((^q[36:0] !== 1'bx) &&
+        (q_ind_ctrl !== ind_ctrl_predecode(q[36:0])))
+        $fatal(1, "IND CONTROL PREDECODE MISMATCH");
+// synthesis translate_on
 
 endmodule

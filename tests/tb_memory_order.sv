@@ -45,6 +45,7 @@ module tb_memory_order;
         .dcache_req_write(dcache_req_write),
         .dcache_req_be(dcache_req_be),
         .dcache_req_wdata(dcache_req_wdata),
+        .dcache_direct_wdata(dcache_req_wdata),
         .dcache_req_is_io(dcache_req_is_io),
         .dcache_req_is_inta(1'b0),
         .dcache_req_is_x87(1'b0),

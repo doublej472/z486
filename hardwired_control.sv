@@ -31,6 +31,7 @@ module hardwired_control
     input  logic [6:0]  uc_aluop,
     input  logic        alu_write_flags,
     input  logic [31:0] flags_live,      // Current-cycle condition flags
+    input  logic        exec_condition_true,
     input  logic [1:0]  op_size,
     input  recipe_pending_write_t mem_commit,   // Deferred load GPR write
     input  recipe_pending_write_t shift_commit, // Deferred shift GPR write
@@ -228,7 +229,13 @@ assign fold_active = jcc_fold_r && i_first;
 // A non-folded Jcc already owns a branch uStep. Evaluate it there, after the
 // predecessor's flags have reached the registered flag-forwarding boundary,
 // rather than carrying the predecessor's live ALU result into an issue FF.
-wire jcc_exec_taken = condition_true(exec_instr.branch_condition, flags_live);
+wire jcc_exec_taken = exec_condition_true;
+// synthesis translate_off
+always_ff @(posedge clk)
+    if (reset_n && (exec_condition_true !==
+                    condition_true(exec_instr.branch_condition, flags_live)))
+        $fatal(1, "FORWARDED JCC CONDITION MISMATCH");
+// synthesis translate_on
 
 wire chain_after_single = i_issue && issue_hardwired &&
     ((!issue_recipe.multi_ustep && !issue_recipe.jcc) || fold_now) && next_chain_safe;

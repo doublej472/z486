@@ -33,9 +33,10 @@ module data_unit
     input  logic [31:0] load_wb_data,
     input  logic        load_wb_is_alu,          // Registered memory operand feeds shared ALU
     input  logic [4:0]  load_wb_alu_op,
-    input  logic        load_alu_dst_capture,    // Capture M3 GPR operand at EX/WB boundary
+    input  logic        load_alu_dst_capture,    // Capture destination GPR at EX/WB boundary
     input  logic [2:0]  load_alu_dst_capture_dst,
     input  logic [1:0]  load_alu_dst_capture_size,
+    input  logic [31:0] load_alu_dst_capture_data,
 
     input  logic [6:0]  aluop,
     input  logic [4:0]  alu_operation,
@@ -112,6 +113,7 @@ module data_unit
     output logic [31:0] tmpg,
     output logic [31:0] opr_w,
     output logic [31:0] protection_source_value, // Source value for protection unit
+    output logic        protection_source_low16_nonzero,
     output logic [15:0] cs_source_value,          // Source value for CS updates
     output logic [31:0] ea_base_value,            // Base GPR value for address unit
     output logic [31:0] ea_index_value,           // Index GPR value for address unit
@@ -120,6 +122,7 @@ module data_unit
     output logic [31:0] flags_backup,
     output logic        flags_backup_active,
     output logic [31:0] eflags_fwd,               // Current-cycle flag forwarding
+    output logic        branch_condition_true,    // Selected forwarded Jcc condition
 
     output recipe_pending_write_t recipe_shift_write, // Deferred shift GPR commit
     output logic [31:0] recipe_shift_data,          // Deferred shift result
@@ -139,7 +142,8 @@ logic        load_wb_alu_exec;
 logic        load_wb_alu_commit;
 logic [31:0] load_wb_alu_result;
 logic [31:0] load_wb_alu_flags;
-logic [31:0] load_wb_alu_dst_r;
+logic [31:0] load_wb_dst_base_r;
+logic [31:0] load_wb_forward_data_r;
 
 logic [31:0] tmpb, tmpd, tmpe, tmpf, tmph;
 logic [31:0] csopcd, fsveip, oproff;
@@ -246,6 +250,28 @@ localparam logic [1:0] EA_FWD_BHI = 2'd1;
 localparam logic [1:0] EA_FWD_W   = 2'd2;
 localparam logic [1:0] EA_FWD_D   = 2'd3;
 
+// Form the plain-load architectural value once at WB.  The destination's
+// prior full-width value was captured from the EX token one cycle earlier, so
+// byte/word merging does not select the GPR bank from the live WB destination
+// on the timing-critical successor-EA path.
+function automatic logic [31:0] merge_load_forward(
+    input logic [31:0] base,
+    input logic [31:0] data,
+    input logic [2:0]  dst,
+    input logic [1:0]  size
+);
+    if (size == 2'd0)
+        merge_load_forward = dst[2]
+            ? {base[31:16], data[7:0], base[7:0]}
+            : {base[31:8], data[7:0]};
+    else if (size == 2'd1)
+        merge_load_forward = {base[31:16], data[15:0]};
+    else
+        merge_load_forward = data;
+endfunction
+
+wire [31:0] load_wb_forward_data = load_wb_forward_data_r;
+
 // WB-to-EX bypass for a hardwired load's immediate successor.  Cache data is
 // already registered in load_wb_data; this mux therefore starts at the WB
 // boundary and does not extend the cache finalize path into the ALU.
@@ -253,12 +279,10 @@ function automatic logic [31:0] read_gpr_load_forwarded(
     input logic [2:0] reg_sel,
     input logic [1:0] size
 );
-    logic [2:0] read_widx, load_widx;
+    logic [2:0] read_widx;
     logic [31:0] merged;
     begin
         read_widx = (size == 2'd0) ? {1'b0, reg_sel[1:0]} : reg_sel;
-        load_widx = (load_wb_size == 2'd0)
-                  ? {1'b0, load_wb_dst[1:0]} : load_wb_dst;
         merged = read_gpr_value(read_widx, 2'd2);
 
         // Plain loads may feed a successor directly from registered cache
@@ -266,16 +290,8 @@ function automatic logic [31:0] read_gpr_load_forwarded(
         // is interlocked until architectural commit instead of creating a
         // private-ALU -> successor-ALU/EA path in one cycle.
         if (load_wb_valid && !load_wb_is_alu &&
-            (load_widx == read_widx)) begin
-            if (load_wb_size == 2'd0)
-                merged = load_wb_dst[2]
-                       ? {merged[31:16], load_wb_data[7:0], merged[7:0]}
-                       : {merged[31:8], load_wb_data[7:0]};
-            else if (load_wb_size == 2'd1)
-                merged = {merged[31:16], load_wb_data[15:0]};
-            else
-                merged = load_wb_data;
-        end
+            load_wb_dst_onehot[read_widx])
+            merged = load_wb_forward_data;
 
         // The legacy ROM load path reaches the same registered-WB boundary
         // through recipe_memory_write.  Forward it as well so address-size 16
@@ -341,15 +357,7 @@ function automatic logic [31:0] read_ea_gpr(
         else
             shift_value = recipe_shift_data;
 
-        if (load_wb_size == 2'd0)
-            load_value = load_wb_dst[2]
-                ? {current_value[31:16], load_wb_data[7:0],
-                   current_value[7:0]}
-                : {current_value[31:8], load_wb_data[7:0]};
-        else if (load_wb_size == 2'd1)
-            load_value = {current_value[31:16], load_wb_data[15:0]};
-        else
-            load_value = load_wb_data;
+        load_value = load_wb_forward_data;
 
         read_ea_gpr = dly_hit   ? dly_value :
                       shift_hit ? shift_value :
@@ -357,16 +365,26 @@ function automatic logic [31:0] read_ea_gpr(
     end
 endfunction
 
-// M3 reads its destination after older architectural writes have settled but
-// before cache data enters the private WB ALU.  Plain-load WB forwarding keeps
-// a chained older load visible at this capture edge without retaining the
-// private-ALU result on the successor combinational paths above.
+// Every direct load reads its destination after older architectural writes
+// have settled but before cache data enters WB. Plain-load WB forwarding keeps
+// a chained older load visible at this capture edge. M3 uses the same value as
+// its private ALU destination.
+wire [2:0] load_capture_widx = (load_alu_dst_capture_size == 2'd0)
+                             ? {1'b0, load_alu_dst_capture_dst[1:0]}
+                             : load_alu_dst_capture_dst;
+wire [31:0] load_capture_base = read_gpr_load_forwarded(load_capture_widx,
+                                                        2'd2);
+
 always_ff @(posedge clk) begin
-    if (!reset_n)
-        load_wb_alu_dst_r <= 32'd0;
-    else if (load_alu_dst_capture)
-        load_wb_alu_dst_r <= read_gpr_load_forwarded(
+    if (!reset_n) begin
+        load_wb_dst_base_r <= 32'd0;
+        load_wb_forward_data_r <= 32'd0;
+    end else if (load_alu_dst_capture) begin
+        load_wb_dst_base_r <= load_capture_base;
+        load_wb_forward_data_r <= merge_load_forward(
+            load_capture_base, load_alu_dst_capture_data,
             load_alu_dst_capture_dst, load_alu_dst_capture_size);
+    end
 end
 
 function automatic logic [31:0] read_alu_source(input logic [5:0] field);
@@ -635,6 +653,7 @@ always_comb begin
     alu_src = fpu_f8 ? 32'h8000_00f8 : read_alu_source(alu_source);
     protection_source_value = read_protection_source(source_live,
                                                      source_value_live);
+    protection_source_low16_nonzero = |protection_source_value[15:0];
     cs_source_value = read_cs_source(source_live, source_value_live);
     ea_base_value = read_ea_gpr(ea_base.valid, ea_base.index);
     ea_index_value = read_ea_gpr(ea_index.valid, ea_index.index);
@@ -966,6 +985,12 @@ always_ff @(posedge clk) begin
     end
 end
 
+// Branch control consumes only the selected condition, not the full forwarded
+// flags bus. Evaluate it beside the forwarding mux so a just-retired shift or
+// ALU result crosses the module boundary as one bit on the redirect path.
+assign branch_condition_true = condition_true(instr.branch_condition,
+                                              eflags_fwd);
+
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         countr <= 32'd0;
@@ -1231,7 +1256,11 @@ end
 assign load_wb_alu_exec = load_wb_valid && load_wb_is_alu;
 assign load_wb_alu_commit = load_wb_alu_exec && !recipe_commit_cancel;
 
-wire [31:0] load_wb_alu_dst = load_wb_alu_dst_r;
+wire [31:0] load_wb_alu_dst = (load_wb_size == 2'd0)
+    ? (load_wb_dst[2] ? {24'd0, load_wb_dst_base_r[15:8]}
+                      : {24'd0, load_wb_dst_base_r[7:0]})
+    : (load_wb_size == 2'd1) ? {16'd0, load_wb_dst_base_r[15:0]}
+                             : load_wb_dst_base_r;
 logic [31:0] load_wb_add_a;
 logic [31:0] load_wb_add_b;
 logic        load_wb_add_cin;

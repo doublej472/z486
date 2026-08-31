@@ -93,6 +93,7 @@ module paging_unit
     output logic        dcache_req_write,     // 1=write
     output logic [3:0]  dcache_req_be,        // Byte enables (pre-computed)
     output logic [31:0] dcache_req_wdata,     // Write data (pre-positioned on bus)
+    output logic [31:0] dcache_direct_wdata,  // Direct/VGA data without live-TLB qualification
     output logic [31:0] x87_req_wdata,        // Registered pseudo-I/O write data
     output logic        dcache_req_is_io,     // Request is IO space
     output logic        dcache_req_is_inta,   // Request is INTA cycle
@@ -193,6 +194,7 @@ reg  [31:0] tlb_lookup_addr_r;
 assign tlb_lookup_addr = tlb_lookup_addr_r;
 
 wire s_idle = (state == PG_IDLE);
+wire invlpg_fire = invlpg_req && invlpg_ack;
 wire idle_data_req = s_idle && mem_req && !mem_servicing;
 wire idle_inta_req = s_idle && mem_inta_req && !mem_servicing;
 wire idle_mem_req = idle_data_req || idle_inta_req;
@@ -200,9 +202,21 @@ wire idle_mem_precheck = s_idle && mem_req_precheck && !mem_servicing;
 wire idle_mem_capture = idle_mem_precheck || idle_inta_req;
 // A direct VIPT miss reaches this registered demand path.  If the normal TLB
 // already owns the translation, populate the sidecar so subsequent accesses
-// do not repeat the slow fallback.  linear_addr is registered at this point.
-wire vipt_refill_valid = vipt_fallback && idle_mem_precheck && pg_enable &&
-                         live_valid && live_tlb_hit;
+// do not repeat the slow fallback. The refill is speculative metadata, so a
+// one-bit token carries it into the already-registered authoritative lookup
+// cycle rather than extending the live-TLB cone into another M10K input.
+wire vipt_refill_capture = vipt_fallback && idle_mem_precheck && pg_enable &&
+                           live_valid;
+reg vipt_refill_pending_r;
+wire vipt_refill_valid = vipt_refill_pending_r && tlb_hit;
+
+always_ff @(posedge clk) begin
+    if (!reset_n || cr3_write || invlpg_fire) begin
+        vipt_refill_pending_r <= 1'b0;
+    end else begin
+        vipt_refill_pending_r <= vipt_refill_capture;
+    end
+end
 // P0/P1 prefetch timing: P0 prefetch toggles pf_req_toggle and presents pf_linear_addr. P1 paging translates the registered prefetch...
 // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-189
 wire idle_pf_req = s_idle && pf_pending && !fast_path_pending && !pf_fast_pending;
@@ -231,9 +245,9 @@ paging_tlb tlb_inst (
     .vipt_user      (vipt_tlb_user),
     .vipt_is_vga_mem(vipt_tlb_is_vga_mem),
     .vipt_refill_valid(vipt_refill_valid),
-    .vipt_refill_linear(linear_addr),
-    .vipt_refill_pfn(live_tlb_physical[31:12]),
-    .vipt_refill_user(live_tlb_user),
+    .vipt_refill_linear(tlb_lookup_addr_r),
+    .vipt_refill_pfn(tlb_physical_addr[31:12]),
+    .vipt_refill_user(tlb_user),
     .update_valid   (tlb_update_valid),
     .update_vpn     (tlb_update_vpn),
     .update_pfn     (tlb_update_pfn),
@@ -279,7 +293,6 @@ reg [31:0] icache_req_phys_addr_r;
 // Walker bus read/write tracking: prevents re-emission while op is in flight
 reg walk_biu_pending;
 assign invlpg_ack = s_idle && !walk_biu_pending;
-wire invlpg_fire = invlpg_req && invlpg_ack;
 wire walker_feed_ready = dcache_req_complete && walk_biu_pending;
 // Walker states are mutually exclusive with the PG_IDLE/PG_MEM_TLB
 // combinational request paths. Only a retained registered request can block
@@ -446,9 +459,10 @@ wire        early_rd_present   = early_rd_idx_drive && mem_ea_read && !idle_mem_
 wire        early_wr_idx_drive = idle_data_req && mem_write && !mem_is_io;
 wire        early_wr_present   = early_wr_idx_drive && !idle_mem_crossing &&
                                  !mem_check_only && live_write_posts;
-// Write data depends on request intent, not on the TLB/permission result that
-// gates early_present. A previously registered request retains ownership.
-wire        early_wr_data_drive = early_wr_idx_drive && !dcache_req_valid_r;
+// Only a write that can actually post owns the live write-data input. Keeping
+// mere request intent out of this select prevents a faulting/missing live
+// translation from coupling into an older registered direct request.
+wire        early_wr_data_drive = early_wr_present && !dcache_req_valid_r;
 wire        early_idx_drive    = early_rd_idx_drive || early_wr_idx_drive;
 wire [31:0] early_phys         = pg_enable ? {live_tlb_physical[31:12], linear_addr[11:0]}
                                           : linear_addr;
@@ -491,6 +505,20 @@ assign dcache_req_wdata = early_wr_data_drive ?
                                           shift_write_data(req_wdata, req_op_size, req_offset)) :
                           dcache_io_wdata_valid_r ? dcache_io_wdata_r :
                                                    dcache_req_wdata_r;
+// External direct requests need the same payload but not the cache-admission
+// qualifier. Keep the live TLB hit and early-write-present cone off the
+// external data register by selecting only from request stage ownership.
+assign dcache_direct_wdata = dcache_req_valid_r
+                           ? (dcache_io_wdata_valid_r ? dcache_io_wdata_r
+                                                     : dcache_req_wdata_r)
+                           : req_mem_present
+                           ? (req_crossing
+                               ? split_write_first(req_wdata, req_offset,
+                                                   req_op_size)
+                               : shift_write_data(req_wdata, req_op_size,
+                                                  req_offset))
+                           : shift_write_data(mem_wdata, mem_op_size,
+                                              linear_addr[1:0]);
 assign x87_req_wdata = dcache_io_wdata_r;
 assign dcache_req_is_io = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_io_r;
 assign dcache_req_is_inta = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_inta_r;
@@ -704,23 +732,27 @@ always_ff @(posedge clk or negedge reset_n) begin
         //=====================================================================
         // BIU completion: write OPR_R / pf_rdata / walker data
         //=====================================================================
-        if (dcache_req_complete) begin
-            if (dcache_read_complete && opr_is_walk_r) begin
-                // Walker: raw data routed to walker via dcache_rdata (combinational)
-                // synthesis translate_off
-                if (TRACE_PAGING_EN)
-                    $display("BIU WALK DONE: data=%08x", dcache_rdata);
-                // synthesis translate_on
-            end else if (dcache_read_complete && !opr_is_write_r && !opr_suppress_r) begin
-                // Memory/IO/INTA read: byte-lane extraction (suppressed for first INTA dummy)
-                write_opr_r_bytes(dcache_rdata, opr_phys_low_r, opr_offset_r, opr_bytes_r);
-                // synthesis translate_off
-                if (TRACE_MEM_EN)
-                    $display("PG MEM RD done: din=%08x phys_low=%0d offset=%0d bytes=%0d",
-                             dcache_rdata, opr_phys_low_r, opr_offset_r, opr_bytes_r + 1);
-                // synthesis translate_on
-            end
+        // read_complete already fully qualifies a valid read response. Do not
+        // nest OPR_R writeback under the broader request-complete signal: that
+        // signal also contains the unrelated same-cycle write-accept path and
+        // would pull live address/TLB arbitration into the readback register.
+        if (dcache_read_complete && opr_is_walk_r) begin
+            // Walker: raw data routed to walker via dcache_rdata (combinational)
+            // synthesis translate_off
+            if (TRACE_PAGING_EN)
+                $display("BIU WALK DONE: data=%08x", dcache_rdata);
+            // synthesis translate_on
+        end else if (dcache_read_complete && !opr_is_write_r && !opr_suppress_r) begin
+            // Memory/IO/INTA read: byte-lane extraction (suppressed for first INTA dummy)
+            write_opr_r_bytes(dcache_rdata, opr_phys_low_r, opr_offset_r, opr_bytes_r);
+            // synthesis translate_off
+            if (TRACE_MEM_EN)
+                $display("PG MEM RD done: din=%08x phys_low=%0d offset=%0d bytes=%0d",
+                         dcache_rdata, opr_phys_low_r, opr_offset_r, opr_bytes_r + 1);
+            // synthesis translate_on
+        end
 
+        if (dcache_req_complete) begin
             // Clear fast_path_pending and ack mem toggle for non-crossing fast path
             if (fast_path_pending) begin
                 fast_path_pending <= 1'b0;
@@ -732,6 +764,10 @@ always_ff @(posedge clk or negedge reset_n) begin
         case (state)
             PG_IDLE: begin
                 if (idle_mem_capture) begin
+                    // Read/write response metadata belongs to the request,
+                    // not to the later cache-accept outcome. Capture it here
+                    // so live translation/address logic cannot select this FF.
+                    opr_is_write_r <= idle_inta_req ? 1'b0 : mem_write;
                     if (mem_is_io || idle_inta_req) begin
                         if (!idle_io_crossing) begin
                             // IO/INTA fast path data (cannot segment-fault)
@@ -743,7 +779,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                             dcache_req_is_x87_r <= !idle_inta_req && idle_x87_io_req;
                             // First INTA cycle (addr=4) is dummy — suppress OPR_R update.
                             // Second INTA (addr=0) delivers the vector to OPR_R.
-                            latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size), mem_write,
+                            latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size),
                                            idle_request_linear[1:0],
                                            idle_inta_req && (idle_request_linear[2:0] == 3'd4),
                                            1'b0);
@@ -760,7 +796,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                             dcache_req_wdata_r <= split_write_first(mem_wdata, linear_addr[1:0], mem_op_size);
                             dcache_io_wdata_valid_r <= 1'b0;
                             latch_biu_meta(2'd0, first_half_bytes(linear_addr[1:0]) - 2'd1,
-                                           mem_write, linear_addr[1:0], 1'b0, 1'b0);
+                                           linear_addr[1:0], 1'b0, 1'b0);
                         end
                     end else begin
                         // synthesis translate_off
@@ -811,7 +847,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                     end else if (early_rd_accept) begin
                         // SET-read-at-019: the dcache accepted the early read (presented this cycle with the live physical), so the SET preread already ran at...
                         // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-753
-                        latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size), 1'b0,
+                        latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size),
                                        linear_addr[1:0], 1'b0, 1'b0);
                         fast_path_pending <= 1'b1;
                         mem_dly_grace <= 1'b1;   // optimistic release for the finalize cycle
@@ -819,7 +855,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                     end else if (early_wr_accept) begin
                         // Early posted write: the store-queue write was enqueued this cycle from the live physical (accept => post), so the access is done. Clear...
                         // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-764
-                        latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size), 1'b1,
+                        latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size),
                                        linear_addr[1:0], 1'b0, 1'b0);
                         rd_ind_active <= 1'b0;
                         mem_servicing <= 1'b0;
@@ -845,10 +881,10 @@ always_ff @(posedge clk or negedge reset_n) begin
                     end else if (req_mem_dcache_accept) begin
                         if (req_crossing) begin
                             latch_biu_meta(2'd0, first_half_bytes(req_offset) - 2'd1,
-                                           req_is_write, req_offset, 1'b0, 1'b0);
+                                           req_offset, 1'b0, 1'b0);
                             state <= req_mem_posted_done ? PG_CROSS_PREP2 : PG_CROSS_WAIT1;
                         end else begin
-                            latch_biu_meta(2'd0, op_size_bytes_m1(req_op_size), req_is_write,
+                            latch_biu_meta(2'd0, op_size_bytes_m1(req_op_size),
                                            req_offset, 1'b0, 1'b0);
                             if (req_mem_posted_done) begin
                                 rd_ind_active <= 1'b0;
@@ -1047,14 +1083,12 @@ endtask
 task automatic latch_biu_meta(
     input [1:0] opr_offset,
     input [1:0] opr_bytes,
-    input       is_write,
     input [1:0] phys_low,
     input       suppress,
     input       is_walk
 );
     opr_offset_r <= opr_offset;
     opr_bytes_r <= opr_bytes;
-    opr_is_write_r <= is_write;
     opr_suppress_r <= suppress;
     opr_phys_low_r <= phys_low;
     opr_is_walk_r <= is_walk;
@@ -1106,7 +1140,8 @@ task automatic emit_walker_biu_req();
     dcache_io_wdata_valid_r <= 1'b0;
     dcache_req_is_io_r <= 1'b0;
     dcache_req_is_inta_r <= 1'b0;
-    latch_biu_meta(2'd0, 2'd0, 1'b0, 2'b00, 1'b0, 1'b1);
+    opr_is_write_r <= 1'b0;
+    latch_biu_meta(2'd0, 2'd0, 2'b00, 1'b0, 1'b1);
     walk_biu_pending <= 1'b1;
 endtask
 
@@ -1121,7 +1156,7 @@ task automatic emit_single(input [31:0] phys_addr);
     dcache_io_wdata_valid_r <= 1'b0;
     dcache_req_is_io_r <= 1'b0;
     dcache_req_is_inta_r <= 1'b0;
-    latch_biu_meta(2'd0, op_size_bytes_m1(req_op_size), req_is_write,
+    latch_biu_meta(2'd0, op_size_bytes_m1(req_op_size),
                    req_offset, 1'b0, 1'b0);
     // synthesis translate_off
     if (TRACE_PAGING_EN)
@@ -1141,7 +1176,7 @@ task automatic emit_first_half(input [31:0] phys_addr);
     dcache_req_is_io_r <= 1'b0;
     dcache_req_is_inta_r <= 1'b0;
     latch_biu_meta(2'd0, first_half_bytes(req_offset) - 2'd1,
-                   req_is_write, req_offset, 1'b0, 1'b0);
+                   req_offset, 1'b0, 1'b0);
     // synthesis translate_off
     if (TRACE_PAGING_EN)
         $display("PG_UNIT EMIT FIRST: phys=%08x be=%04b wr=%0d offset=%0d",
@@ -1161,7 +1196,7 @@ task automatic emit_second_half(input [31:0] phys_addr);
     dcache_req_is_io_r <= 1'b0;
     dcache_req_is_inta_r <= 1'b0;
     latch_biu_meta(fb, second_half_bytes(req_offset, req_op_size) - 2'd1,
-                   req_is_write, 2'b00, 1'b0, 1'b0);
+                   2'b00, 1'b0, 1'b0);
     // synthesis translate_off
     if (TRACE_PAGING_EN)
         $display("PG_UNIT EMIT SECOND: phys=%08x be=%04b wr=%0d opr_offset=%0d",

@@ -15,6 +15,7 @@ module protection_unit
     input        [5:0]  uc_alu_src,
     input        [6:0]  uc_dest,
     input       [31:0]  uc_source_value,
+    input               uc_source_low16_nonzero,
     input       [31:0]  opr_r,
 
     // Selector fields (from segment register or temp register)
@@ -118,7 +119,16 @@ wire [1:0] descriptor_dpl = descriptor_value[14:13];
 wire       descriptor_s = descriptor_value[12];
 wire [3:0] descriptor_type = descriptor_value[11:8];
 wire [1:0] descriptor_rpl = descriptor_value[1:0];
-wire       descriptor_low16_nonzero = |descriptor_value[15:0];
+// PROTUN writes are the timing-sensitive case.  Carry this one-bit fact from
+// the data unit instead of reducing the full source mux after it crosses the
+// unit boundary.  PTOVRR only sets bit 8 when bit 12 is already set, so it
+// cannot change whether the low word is zero.
+wire       descriptor_low16_nonzero = is_ptovrr ? |opr_r[15:0] :
+                                           (uc_alu_src == TST_DES_GRANUL)
+                                               ? |desc_raw_hi_r[15:0]
+                                               : protun_writing
+                                                   ? uc_source_low16_nonzero
+                                                   : |protun_r[15:0];
 
 assign protun_value = protun_r;
 assign desc_raw_hi = desc_raw_hi_r;

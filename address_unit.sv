@@ -26,11 +26,8 @@ module address_unit
 
     input  logic        exec,                // Execute a microcode IND operation
     input  logic        exec_addr32,
-    input  logic [5:0]  busop,
-    input  logic [5:0]  source,
     input  logic [5:0]  alu_source,
-    input  logic [6:0]  destination,
-    input  logic [6:0]  aluop,
+    input  logic [8:0]  ind_ctrl,            // Registered compact IND controls
     input  logic [31:0] source_value,
     input  logic [31:0] alu_value,
     input  logic [31:0] alu_value_hold,
@@ -71,6 +68,28 @@ logic        ind_owner_issue_r;
 logic [31:0] issue_linear_r;
 logic [31:0] exec_linear_r;
 logic        linear_owner_issue_r;
+
+wire [3:0] ind_op = ind_ctrl[3:0];
+wire       ind_source_irf2 = ind_ctrl[4];
+wire [2:0] ind_dest_class = ind_ctrl[7:5];
+wire       ind_stssaf = ind_ctrl[8];
+
+localparam [3:0] INDOP_PLUS_ALU  = 4'd1;
+localparam [3:0] INDOP_ALU2      = 4'd2;
+localparam [3:0] INDOP_SRC       = 4'd3;
+localparam [3:0] INDOP_PLUS      = 4'd4;
+localparam [3:0] INDOP_IN_PLUS_D = 4'd5;
+localparam [3:0] INDOP_LAR       = 4'd6;
+localparam [3:0] INDOP_LLIM      = 4'd7;
+localparam [3:0] INDOP_LBAS      = 4'd8;
+localparam [3:0] INDOP_LPCR      = 4'd9;
+
+localparam [2:0] INDDEST_DESSTK = 3'd1;
+localparam [2:0] INDDEST_DESCOD = 3'd2;
+localparam [2:0] INDDEST_DESSEG = 3'd3;
+localparam [2:0] INDDEST_PFERRC = 3'd4;
+localparam [2:0] INDDEST_LATTTF = 3'd5;
+localparam [2:0] INDDEST_PDBR   = 3'd6;
 
 // Keep D2 and microcode address updates on independent register inputs. This
 // prevents D2 admission from selecting through the much wider execution IND
@@ -197,47 +216,45 @@ logic [31:0] exec_linear_a;
 logic [31:0] exec_linear_b;
 always_comb begin
     exec_linear_write = (seg_cmd == SEG_CMD_DESCSW) ||
-                        (aluop == ALUJMP_STSSAF && seg_sel == SEG_SS);
+                        (ind_stssaf && seg_sel == SEG_SS);
     exec_linear_three_term = 1'b0;
     exec_linear_mask16 = !eff_mask_pending;
     exec_linear_source = ind;
     exec_linear_a = ind;
     exec_linear_b = 32'd0;
 
-    case (busop)
-        BUSOP_IND_PLUS_ALU: begin
-            exec_linear_a = source == SRC_IRF2 ? ind : source_value;
+    case (ind_op)
+        INDOP_PLUS_ALU: begin
+            exec_linear_a = ind_source_irf2 ? ind : source_value;
             exec_linear_b = instr_jcc ? alu_value_hold : alu_value;
-            if (destination == DEST_DESSTK)
+            if (ind_dest_class == INDDEST_DESSTK)
                 exec_linear_mask16 = !pe || !ss_stack32;
-            else if (destination == DEST_DESCOD)
+            else if (ind_dest_class == INDDEST_DESCOD)
                 exec_linear_mask16 = !is_dword;
-            else if (destination == DEST_DES_ES ||
-                     destination == DEST_DES_OS ||
-                     destination == DEST_DES_SR)
+            else if (ind_dest_class == INDDEST_DESSEG)
                 exec_linear_mask16 = !exec_addr32;
             exec_linear_write = 1'b1;
             exec_linear_three_term = 1'b1;
         end
-        BUSOP_IND_ALU2: begin
+        INDOP_ALU2: begin
             exec_linear_write = 1'b1;
             exec_linear_source = alu_value;
         end
-        BUSOP_IND_SRC: begin
+        INDOP_SRC: begin
             exec_linear_write = 1'b1;
             exec_linear_source = source_value;
-            if (destination == DEST_DESSTK && (!pe || !ss_stack32))
+            if (ind_dest_class == INDDEST_DESSTK && (!pe || !ss_stack32))
                 exec_linear_source = {16'd0, source_value[15:0]};
-            else if (destination == DEST_DESCOD && !is_dword)
+            else if (ind_dest_class == INDDEST_DESCOD && !is_dword)
                 exec_linear_source = {16'd0, source_value[15:0]};
         end
-        BUSOP_IND_PLUS: begin
+        INDOP_PLUS: begin
             exec_linear_write = 1'b1;
             exec_linear_three_term = 1'b1;
             exec_linear_a = ind;
             exec_linear_b = alu_value;
         end
-        BUSOP_IN_PLUS_D: begin
+        INDOP_IN_PLUS_D: begin
             exec_linear_write = 1'b1;
             exec_linear_three_term = 1'b1;
             exec_linear_a = ind;
@@ -278,60 +295,56 @@ always_ff @(posedge clk) begin
     end else if (exec) begin
         automatic logic mask16 = !eff_mask_pending;
 
-        case (busop)
-            BUSOP_IND_PLUS_ALU: begin
+        case (ind_op)
+            INDOP_PLUS_ALU: begin
                 automatic logic [31:0] next_ind;
                 automatic logic [31:0] operand1;
                 automatic logic [31:0] operand2;
-                operand1 = source == SRC_IRF2 ? ind : source_value;
+                operand1 = ind_source_irf2 ? ind : source_value;
                 operand2 = instr_jcc ? alu_value_hold : alu_value;
-                if (destination == DEST_DESSTK)
+                if (ind_dest_class == INDDEST_DESSTK)
                     mask16 = !pe || !ss_stack32;
-                else if (destination == DEST_DESCOD)
+                else if (ind_dest_class == INDDEST_DESCOD)
                     mask16 = !is_dword;
-                else if (destination == DEST_DES_ES ||
-                         destination == DEST_DES_OS ||
-                         destination == DEST_DES_SR)
+                else if (ind_dest_class == INDDEST_DESSEG)
                     mask16 = !exec_addr32;
                 next_ind = operand1 + operand2;
-                if (mask16 && (destination == DEST_DESSTK ||
-                               destination == DEST_DESCOD ||
-                               destination == DEST_DES_ES ||
-                               destination == DEST_DES_OS ||
-                               destination == DEST_DES_SR))
+                if (mask16 && (ind_dest_class == INDDEST_DESSTK ||
+                               ind_dest_class == INDDEST_DESCOD ||
+                               ind_dest_class == INDDEST_DESSEG))
                     next_ind = {16'd0, next_ind[15:0]};
                 exec_ind_r <= next_ind;
             end
-            BUSOP_IND_ALU2: exec_ind_r <= alu_value;
-            BUSOP_IND_SRC: begin
+            INDOP_ALU2: exec_ind_r <= alu_value;
+            INDOP_SRC: begin
                 automatic logic [31:0] next_ind = source_value;
-                if (destination == DEST_DESSTK && (!pe || !ss_stack32))
+                if (ind_dest_class == INDDEST_DESSTK && (!pe || !ss_stack32))
                     next_ind = {16'd0, next_ind[15:0]};
-                else if (destination == DEST_DESCOD && !is_dword)
+                else if (ind_dest_class == INDDEST_DESCOD && !is_dword)
                     next_ind = {16'd0, next_ind[15:0]};
                 exec_ind_r <= next_ind;
             end
-            BUSOP_IND_PLUS: begin
+            INDOP_PLUS: begin
                 automatic logic [31:0] next_ind = ind + alu_value;
                 if (!pe && !exec_addr32)
                     next_ind = {16'd0, next_ind[15:0]};
                 exec_ind_r <= next_ind;
             end
-            BUSOP_IN_PLUS_D: begin
+            INDOP_IN_PLUS_D: begin
                 automatic logic [31:0] next_ind = ind + ind_delta;
                 if (!pe ? !exec_addr32
                         : !(descsw_mode ? cs_stack32 : ss_stack32))
                     next_ind = {16'd0, next_ind[15:0]};
                 exec_ind_r <= next_ind;
             end
-            BUSOP_LAR:  exec_ind_r <= lar_result;
-            BUSOP_LLIM: exec_ind_r <= llim_result;
-            BUSOP_LBAS: exec_ind_r <= lbas_result;
-            BUSOP_LPCR: begin
-                case (destination)
-                    DEST_PFERRC: exec_ind_r <= {29'd0, fault_code};
-                    DEST_LATTTF: exec_ind_r <= fault_addr;
-                    DEST_PDBR:   exec_ind_r <= cr3;
+            INDOP_LAR:  exec_ind_r <= lar_result;
+            INDOP_LLIM: exec_ind_r <= llim_result;
+            INDOP_LBAS: exec_ind_r <= lbas_result;
+            INDOP_LPCR: begin
+                case (ind_dest_class)
+                    INDDEST_PFERRC: exec_ind_r <= {29'd0, fault_code};
+                    INDDEST_LATTTF: exec_ind_r <= fault_addr;
+                    INDDEST_PDBR:   exec_ind_r <= cr3;
                     default: ;
                 endcase
             end
@@ -383,8 +396,8 @@ always_ff @(posedge clk) begin
             ind_linear_valid <= 1'b1;
         end
     end else if (exec) begin
-        case (busop)
-            BUSOP_IND_PLUS_ALU: begin
+        case (ind_op)
+            INDOP_PLUS_ALU: begin
                 automatic logic [31:0] operand2;
                 operand2 = instr_jcc ? alu_value_hold : alu_value;
                 if (alu_source != ALUSRC_ZERO)
@@ -392,45 +405,45 @@ always_ff @(posedge clk) begin
                 ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b1;
             end
-            BUSOP_IND_ALU2: begin
+            INDOP_ALU2: begin
                 ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b1;
             end
-            BUSOP_IND_SRC: begin
+            INDOP_SRC: begin
                 ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b1;
             end
-            BUSOP_IND_PLUS: begin
+            INDOP_PLUS: begin
                 ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b1;
                 if (alu_source != ALUSRC_ZERO)
                     ind_delta <= alu_value;
             end
-            BUSOP_IN_PLUS_D: begin
+            INDOP_IN_PLUS_D: begin
                 ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b1;
             end
-            BUSOP_LAR: begin
+            INDOP_LAR: begin
                 ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b0;
             end
-            BUSOP_LLIM: begin
+            INDOP_LLIM: begin
                 ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b0;
             end
-            BUSOP_LBAS: begin
+            INDOP_LBAS: begin
                 ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b0;
             end
-            BUSOP_LPCR: begin
-                case (destination)
-                    DEST_PFERRC: begin
+            INDOP_LPCR: begin
+                case (ind_dest_class)
+                    INDDEST_PFERRC: begin
                         ind_owner_issue_r <= 1'b0;
                     end
-                    DEST_LATTTF: begin
+                    INDDEST_LATTTF: begin
                         ind_owner_issue_r <= 1'b0;
                     end
-                    DEST_PDBR: begin
+                    INDDEST_PDBR: begin
                         ind_owner_issue_r <= 1'b0;
                     end
                     default: ;

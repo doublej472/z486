@@ -69,6 +69,7 @@ module microsequencer
     output logic [6:0]  uc_aluop_shift,
     output logic [2:0]  uc_dly_source,
     output logic [8:0]  uc_mem_ctrl,
+    output logic [8:0]  uc_ind_ctrl,
     output logic        uc_fpu_f8,
     output logic        uc_force_word,
     output logic        uc_ctl_pref
@@ -227,6 +228,7 @@ ucode_rom microcode_rom_inst (
     .q_shift_aluop(uc_aluop_shift),
     .q_dly_source(uc_dly_source),
     .q_mem_ctrl(uc_mem_ctrl),
+    .q_ind_ctrl(uc_ind_ctrl),
     .q_fpu_f8(uc_fpu_f8)
 );
 

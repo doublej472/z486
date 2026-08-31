@@ -86,6 +86,7 @@ reg [31:0] EIP = 32'h0000FFF0;      // Architectural IP (next instruction) - res
 wire [31:0] EFLAGS;
 wire [31:0] uc_flags;               // Internal ALU flags for microcode conditionals
 wire [31:0] eflags_fwd;             // Includes pending ALU/shifter retirement
+wire        branch_condition_true;
 
 // Shared internal registers. Their owning units drive these interconnects.
 wire [31:0] TMPC, TMPG;
@@ -110,7 +111,10 @@ reg [1:0]  srcreg_size_decode;      // Decoded srcreg_size (saved at i_issue, re
 (* preserve *) reg [1:0] op_size_src_decode;
 (* preserve *) reg [1:0] srcreg_size_src;
 (* preserve *) reg [1:0] srcreg_size_src_decode;
-wire       is_dword = (op_size == 2'd2); // Runtime dword flag
+// Keep runtime width consumers on the timing-local source replica. op_size_src
+// is updated in lockstep with op_size but avoids routing the architectural copy
+// back through the address and data-unit cones.
+wire       is_dword = (op_size_src == 2'd2);
 
 // Integer Data Unit interconnect.
 wire [31:0] alu_src;                // ALU source input this cycle
@@ -245,6 +249,7 @@ wire        dcache_req_preread_priority;
 wire        dcache_req_write;
 wire [3:0]  dcache_req_be;
 wire [31:0] dcache_req_wdata;
+wire [31:0] dcache_direct_wdata;
 wire [31:0] x87_req_wdata;
 wire        dcache_req_is_io;
 wire        dcache_req_is_inta;
@@ -658,6 +663,7 @@ wire [5:0]  uc_alu_src_shift;
 wire [6:0]  uc_aluop_shift;
 wire [2:0]  uc_dly_source;
 wire [8:0]  uc_mem_ctrl;
+wire [8:0]  uc_ind_ctrl;
 wire        uc_fpu_f8;
 wire        uc_force_word;
 wire        microcode_rom_ce;
@@ -716,6 +722,7 @@ memory #(
     .dcache_req_write(dcache_req_write),
     .dcache_req_be(dcache_req_be),
     .dcache_req_wdata(dcache_req_wdata),
+    .dcache_direct_wdata(dcache_direct_wdata),
     .dcache_req_is_io(dcache_req_is_io),
     .dcache_req_is_inta(dcache_req_is_inta),
     .dcache_req_is_x87(dcache_req_is_x87),
@@ -983,6 +990,7 @@ hardwired_control hardwired_control_inst (
                      (vipt_load_wb_valid_r && vipt_load_wb_is_alu_r &&
                       !any_fault)),
     .flags_live(eflags_fwd),
+    .exec_condition_true(branch_condition_true),
     .op_size(op_size),
     .mem_commit(recipe_mem_write),
     .shift_commit(recipe_shift_write),
@@ -1107,18 +1115,15 @@ wire vipt_load_ex_hit = vipt_load_ex_r.valid && vipt_load_ex_probed_r &&
                         vipt_translation_ok &&
                         !vipt_tlb_is_vga_mem && !seg_gp_fault &&
                         dcache_vipt_resolve_hit;
-// Capture the destination operand from the registered EX token, independently
-// of translation, segmentation, and cache outcome.  This state is speculative
-// WB metadata and has no architectural side effect; fault/miss handling gates
-// the later valid/commit token.  Keeping outcome qualification off this edge
-// prevents the EA -> segmentation/fault -> GPR-forwarding cone from crossing
-// the EX/WB boundary.
+// Capture the destination operand from every registered EX token,
+// independently of translation, segmentation, and cache outcome. Plain loads
+// use it for byte/word merge forwarding; M3 uses it as the private ALU
+// destination. This speculative state has no architectural side effect;
+// fault/miss handling gates the later valid/commit token.
 wire vipt_load_alu_dst_capture_fast = vipt_load_ex_r.valid &&
-                                      vipt_load_ex_probed_r &&
-                                      vipt_load_ex_r.is_alu;
+                                      vipt_load_ex_probed_r;
 wire vipt_load_alu_dst_capture_slow = vipt_load_slow_wait_r &&
-                                      !mem_servicing &&
-                                      vipt_load_slow_r.is_alu;
+                                      !mem_servicing;
 wire vipt_load_alu_dst_capture = vipt_load_alu_dst_capture_fast ||
                                  vipt_load_alu_dst_capture_slow;
 wire [2:0] vipt_load_alu_dst_capture_dst =
@@ -1127,6 +1132,15 @@ wire [2:0] vipt_load_alu_dst_capture_dst =
 wire [1:0] vipt_load_alu_dst_capture_size =
     vipt_load_alu_dst_capture_fast ? vipt_load_ex_r.write_size
                                    : vipt_load_slow_r.write_size;
+wire [31:0] vipt_load_alu_dst_capture_data =
+    vipt_load_alu_dst_capture_fast
+        ? format_hardwired_load(dcache_vipt_resolve_data,
+                               vipt_load_ex_r.lane,
+                               vipt_load_ex_r.mem_size,
+                               vipt_load_ex_r.result_kind)
+        : format_hardwired_load(OPR_R, 2'd0,
+                               vipt_load_slow_r.mem_size,
+                               vipt_load_slow_r.result_kind);
 wire vipt_replay_try = vipt_load_replay_r.valid &&
                        !vipt_load_ex_r.valid && !vipt_load_slow_busy &&
                        !mem_servicing &&
@@ -1413,8 +1427,7 @@ wire       dly_esp_fwd = dly_gpr_we && (dly_gpr_sel == 3'd4);
 wire       shc_esp_fwd = recipe_shift_write.valid && (recipe_shift_write.dst == 3'd4) &&
                          (recipe_shift_write.size != 2'd0);
 wire       vipt_esp_fwd = vipt_load_wb_valid_r &&
-                          (vipt_load_wb_size_r != 2'd0) &&
-                          (vipt_load_wb_dst_r == 3'd4);
+                          vipt_load_wb_dst_onehot_r[4];
 wire [31:0] vipt_esp_value = (vipt_load_wb_size_r == 2'd1)
                            ? {ESP[31:16], vipt_load_wb_data[15:0]}
                            : vipt_load_wb_data;
@@ -1975,6 +1988,7 @@ paging_unit paging_inst (
     .dcache_req_write   (dcache_req_write),
     .dcache_req_be      (dcache_req_be),
     .dcache_req_wdata   (dcache_req_wdata),
+    .dcache_direct_wdata(dcache_direct_wdata),
     .x87_req_wdata      (x87_req_wdata),
     .dcache_req_is_io   (dcache_req_is_io),
     .dcache_req_is_inta (dcache_req_is_inta),
@@ -2036,6 +2050,7 @@ wire selector_oob_wire = slctr_fwd[2]
 
 wire [1:0]  prot_desc_dpl;
 wire        prot_is_ptovrr;
+wire        protun_write_low16_nonzero;
 
 protection_unit protection_unit_inst (
     .clk(clk),
@@ -2048,6 +2063,7 @@ protection_unit protection_unit_inst (
     .uc_alu_src(uc_alu_src),
     .uc_dest(uc_dest),
     .uc_source_value(protun_write_value),
+    .uc_source_low16_nonzero(protun_write_low16_nonzero),
     .opr_r(OPR_R),
 
     .selector_rpl(slctr_fwd[1:0]),
@@ -2391,6 +2407,7 @@ microsequencer microsequencer_inst (
     .uc_aluop_shift(uc_aluop_shift),
     .uc_dly_source(uc_dly_source),
     .uc_mem_ctrl(uc_mem_ctrl),
+    .uc_ind_ctrl(uc_ind_ctrl),
     .uc_fpu_f8(uc_fpu_f8),
     .uc_force_word(uc_force_word),
     .uc_ctl_pref(uc_ctl_pref)
@@ -2874,11 +2891,8 @@ address_unit address_unit_inst (
     .issue_eff_mask(issue_eff_mask),
     .exec(uc_exec),
     .exec_addr32(i.addr32),
-    .busop(uc_buscode),
-    .source(uc_source),
     .alu_source(uc_alu_src),
-    .destination(uc_dest),
-    .aluop(uc_aluop),
+    .ind_ctrl(uc_ind_ctrl),
     .source_value(dest_value),
     .alu_value(alu_src),
     .alu_value_hold(alu_src_r),
@@ -2983,6 +2997,7 @@ data_unit data_unit_inst (
     .load_alu_dst_capture(vipt_load_alu_dst_capture),
     .load_alu_dst_capture_dst(vipt_load_alu_dst_capture_dst),
     .load_alu_dst_capture_size(vipt_load_alu_dst_capture_size),
+    .load_alu_dst_capture_data(vipt_load_alu_dst_capture_data),
     .aluop(uc_aluop),
     .alu_operation(alu_op5),
     .shift_aluop(uc_aluop_shift),
@@ -2999,8 +3014,11 @@ data_unit data_unit_inst (
     .shift2_next_valid(uc_next_captures_shift_source),
     .shift2_next_source(uc_next_shift2_source),
     .shift_uc_carry(uc_shift_uc_carry),
-    .op_size(op_size),
-    .srcreg_size(srcreg_size),
+    // The source-size replicas are updated in lockstep with the architectural
+    // size state.  Use them for the entire data-unit cone instead of importing
+    // both copies and rebuilding parallel size selects around the ALU/flags.
+    .op_size(op_size_src),
+    .srcreg_size(srcreg_size_src),
     .op_size_src(op_size_src),
     .srcreg_size_src(srcreg_size_src),
     .update_arch_flags(alu_update_flags),
@@ -3057,6 +3075,7 @@ data_unit data_unit_inst (
     .tmpg(TMPG),
     .opr_w(OPR_W),
     .protection_source_value(protun_write_value),
+    .protection_source_low16_nonzero(protun_write_low16_nonzero),
     .cs_source_value(cs_source_value),
     .ea_base_value(ea_base_value),
     .ea_index_value(ea_index_value),
@@ -3065,6 +3084,7 @@ data_unit data_unit_inst (
     .flags_backup(FLAGSB),
     .flags_backup_active(flags_backup_active),
     .eflags_fwd(eflags_fwd),
+    .branch_condition_true(branch_condition_true),
     .recipe_shift_write(recipe_shift_write),
     .recipe_shift_data(recipe_shift_data),
     .recipe_memory_write(recipe_mem_write),

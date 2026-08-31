@@ -18,6 +18,7 @@ module memory #(
     input              dcache_req_write,
     input       [3:0]  dcache_req_be,
     input      [31:0]  dcache_req_wdata,
+    input      [31:0]  dcache_direct_wdata,
     input              dcache_req_is_io,
     input              dcache_req_is_inta,
     input              dcache_req_is_x87,
@@ -155,7 +156,8 @@ logic [1:0]  ext_src_r;
 logic [31:2] ext_addr_r;
 logic [3:0]  ext_be_r;
 logic [7:0]  ext_burstcount_r;
-logic [31:0] ext_dout_r;
+logic [31:0] ext_direct_dout_r;
+logic [31:0] ext_dcache_dout_r;
 logic        ext_write_r;
 logic        ext_io_r;
 logic        ext_inta_r;
@@ -206,7 +208,8 @@ assign icache_rdata = icache_cpu_line;
 assign addr       = ext_addr_r;
 assign be         = ext_be_r;
 assign burstcount = ext_burstcount_r;
-assign dout       = ext_dout_r;
+assign dout       = (ext_src_r == EXT_SRC_DIRECT) ? ext_direct_dout_r :
+                    (ext_src_r == EXT_SRC_DCACHE) ? ext_dcache_dout_r : 32'd0;
 assign valid      = ext_valid_r;
 assign write      = ext_valid_r && ext_write_r;
 assign io         = ext_valid_r && ext_io_r;
@@ -224,7 +227,8 @@ always_ff @(posedge clk) begin
         ext_addr_r <= 30'h0;
         ext_be_r <= 4'h0;
         ext_burstcount_r <= 8'h0;
-        ext_dout_r <= 32'h0;
+        ext_direct_dout_r <= 32'h0;
+        ext_dcache_dout_r <= 32'h0;
         ext_write_r <= 1'b0;
         ext_io_r <= 1'b0;
         ext_inta_r <= 1'b0;
@@ -238,6 +242,12 @@ always_ff @(posedge clk) begin
         icache_write_snoop_data_r <= 32'h0;
         icache_write_snoop_be_r <= 4'h0;
     end else begin
+        // Data is speculative until ext_src_r selects its registered owner.
+        // Capturing both sources unconditionally prevents request arbitration
+        // and live translation from becoming clock-enable muxes on dout.
+        ext_direct_dout_r <= dcache_direct_wdata;
+        ext_dcache_dout_r <= dcache_mem_din;
+
         if (dcache_store_patch_valid &&
             (snoop_valid || icache_write_snoop_pending)) begin
             // The pending patch, when present, is consumed on this edge. Keep
@@ -261,8 +271,6 @@ always_ff @(posedge clk) begin
             ext_addr_r <= dcache_req_phys_addr[31:2];
             ext_be_r <= dcache_req_be;
             ext_burstcount_r <= 8'd1;
-            if (dcache_req_write)
-                ext_dout_r <= dcache_req_wdata;
             ext_write_r <= dcache_req_write;
             ext_io_r <= dcache_req_is_io;
             ext_inta_r <= dcache_req_is_inta;
@@ -272,8 +280,6 @@ always_ff @(posedge clk) begin
             ext_addr_r <= dcache_mem_addr[31:2];
             ext_be_r <= dcache_mem_be;
             ext_burstcount_r <= dcache_mem_burstcount;
-            if (dcache_mem_write)
-                ext_dout_r <= dcache_mem_din;
             ext_write_r <= dcache_mem_write;
             ext_io_r <= 1'b0;
             ext_inta_r <= 1'b0;
@@ -283,7 +289,6 @@ always_ff @(posedge clk) begin
             ext_addr_r <= icache_mem_addr[31:2];
             ext_be_r <= icache_mem_be;
             ext_burstcount_r <= icache_mem_burstcount;
-            ext_dout_r <= 32'h0;
             ext_write_r <= 1'b0;
             ext_io_r <= 1'b0;
             ext_inta_r <= 1'b0;
