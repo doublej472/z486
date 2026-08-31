@@ -49,6 +49,7 @@ int main(int argc, char** argv) {
         delete trace;
     }
 #endif
+    top->final();
     delete top;
     return 0;
 }

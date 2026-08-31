@@ -71,6 +71,8 @@ module tb_protected_mode #(
         .triple_fault_reset(triple_fault_reset)
     );
 
+`include "m0_profile.svh"
+
     // The regular tests use 512KB. Snapshot replay overrides this parameter
     // with the captured physical-memory size.
     reg [7:0] mem [0:MEM_SIZE-1];

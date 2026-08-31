@@ -283,6 +283,7 @@ def build_core(
         "-j",
         "0",
         f"-I{core_dir}",
+        f"-I{THIS_DIR.parent}",
         "-CFLAGS",
         "-std=c++14 -O3",
         "--trace-fst",
@@ -331,6 +332,7 @@ def run_core(
     trace_io: bool = False,
     progress: bool = False,
     cpu_speed: int = 0,
+    profile_m0: bool = False,
 ) -> RunResult:
     cmd = [
         str(exe),
@@ -344,6 +346,8 @@ def run_core(
         cmd.append("+trace_io")
     if progress:
         cmd.append("+progress")
+    if profile_m0 and label == "z486_current":
+        cmd.append("+profile_m0")
     if trace:
         tracefile = BUILD_DIR / label / "dhrystone.fst"
         cmd.extend(["+trace", f"+tracefile={tracefile}"])
@@ -471,6 +475,10 @@ def main() -> int:
     parser.add_argument("--trace-io", action="store_true", help="print benchmark I/O markers")
     parser.add_argument("--progress", action="store_true", help="print simulation progress")
     parser.add_argument(
+        "--profile-m0", action="store_true",
+        help="report sustained issue and frontend-starvation counters",
+    )
+    parser.add_argument(
         "--cpu-speed",
         type=int,
         choices=range(4),
@@ -532,9 +540,21 @@ def main() -> int:
             trace_io=args.trace_io,
             progress=args.progress,
             cpu_speed=args.cpu_speed,
+            profile_m0=args.profile_m0,
         )
         for core in cores
     ]
+
+    if args.profile_m0:
+        for result in results:
+            lines = [line for line in result.output.splitlines()
+                     if line.startswith("M0_")]
+            if lines:
+                profile_log = BUILD_DIR / result.core / "m0_profile.log"
+                profile_log.write_text(result.output)
+                print(f"\n[{result.core}] M0 profile")
+                print("\n".join(lines))
+                print(f"M0 log: {profile_log}")
 
     print_results(args.iters, results)
     failures = [result for result in results if not result.passed]

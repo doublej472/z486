@@ -107,6 +107,10 @@ module tb_dhrystone;
         .dbg_vm()
     );
 
+`ifdef Z486_CURRENT_CORE
+`include "m0_profile.svh"
+`endif
+
     localparam MEM_SIZE = 1 << 19;
     reg [7:0] mem [0:MEM_SIZE-1];
 
