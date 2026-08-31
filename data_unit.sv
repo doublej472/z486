@@ -856,6 +856,16 @@ always_ff @(posedge clk) begin
                 default: ;
             endcase
 
+            // REP STOS records its restartable count only after the element
+            // store has cleared DLY. The loop can then bypass its redundant
+            // COUNTR->eCX word without exposing a decremented count on a
+            // faulting store.
+            if (!instr.has_0f &&
+                ((instr.opcode == 8'hAA) || (instr.opcode == 8'hAB)) &&
+                (instr.rep_lock == PREFIX_REP) &&
+                (dest == DEST_eDI) && (source_field == SRC_SIGMA))
+                write_gpr(3'd1, countr, instr.addr32 ? 2'd2 : 2'd1);
+
             if (recipe_rni && !recipe_commit_cancel &&
                 recipe_state.commit_sel == RECIPE_COMMIT_SIGSRC)
                 write_gpr(src_reg_sel_r, sigma,

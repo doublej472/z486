@@ -304,7 +304,7 @@ always_ff @(posedge clk) begin
         if (i_rni_delay_ea_r && !stall && !page_fault)
             i_rni_delay_ea_r <= 1'b0;
         if ((uc_exec || load_wb_retire) && i_rni && macro_active &&
-            !instr_eip_written &&
+            (!instr_eip_written || (uc_addr == UADDR_RPTI_RNI)) &&
             !any_fault && !i_issue) begin
             i_rni_delay <= 1'b1;
             i_rni_delay_ea_r <= 1'b1;
@@ -339,7 +339,8 @@ function automatic logic reljump_condition(
     case (aluop)
         ALUJMP_JNcond: reljump_condition = c.jncond;
         ALUJMP_JCNTZ: reljump_condition = c.count_zero;
-        ALUJMP_JCNTNZ, ALUJMP_JCNZNI: reljump_condition = c.count_nonzero;
+        ALUJMP_JCNTNZ: reljump_condition = c.count_nonzero;
+        ALUJMP_JCNZNI: reljump_condition = c.count_nonzero && c.no_interrupt;
         ALUJMP_JCT4N1: reljump_condition = c.count_low_not_one;
         ALUJMP_JCNTN1: reljump_condition = c.count_not_one;
         ALUJMP_JCNT1: reljump_condition = c.count_one;

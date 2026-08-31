@@ -104,6 +104,24 @@ start:
     cmp ebx, 0x51A7B102
     jne fail_13
 
+    ; Address-size-16 loads use the same preread/finalize token.  The address
+    ; unit masks the offset before relocation, and a base+index+displacement
+    ; form still takes its deliberate split-EA cycle before issue.
+    mov bx, WIDTH_BASE - 0x100
+    mov si, 0x00f0
+    a16 mov ecx, [bx + si + 0x10]
+    cmp ecx, 0x80FE7F11
+    jne fail_14
+
+    ; A loaded a16 pointer retains the ordinary one-cycle EA interlock and is
+    ; forwarded into the following 32-bit-addressed consumer.
+    xor esi, esi
+    mov bx, WIDTH_BASE
+    a16 mov si, [bx + 0x21]
+    mov ebx, [esi]
+    cmp ebx, 0x51A7B102
+    jne fail_15
+
     mov al, STATUS_PASS
     mov dx, STATUS_PORT
     out dx, al
@@ -149,6 +167,12 @@ fail_12:
     jmp fail
 fail_13:
     mov eax, 13
+    jmp fail
+fail_14:
+    mov eax, 14
+    jmp fail
+fail_15:
+    mov eax, 15
 fail:
     mov dx, DATA_PORT
     out dx, eax

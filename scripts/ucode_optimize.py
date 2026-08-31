@@ -241,6 +241,12 @@ PATCHES = [
     Patch(0x1A0, "AAD shift: barrel result plus explicit carry clear",
           fields=dict(aluop=ALUJMP_USTEP_AAD_SHIFT)),
 
+    # REP STOS has already decremented COUNTR at 267 and records the precise
+    # architectural count beside the EDI update at 269. Loop directly to the
+    # address step while count remains nonzero and no interrupt is pending.
+    Patch(0x268, "REP STOS: skip redundant per-element count check",
+          fields=dict(alusrc=0x3D, aluop=0x47)),
+
     # ---- v52 direct ALU usteps -------------------------------------------
     # Every hardwired ALU retire word owns its architectural write through one
     # destination encoding. This replaces the parallel RECIPE_COMMIT_ALU write

@@ -1866,6 +1866,9 @@ wire        mem_ea_read = x87_direct_mem_req || vipt_slow_submit ||
 // their architectural destination in the original microcode; plain MOV uses
 // DSTREG and may name AH/CH/DH/BH.  Crossing operands are admitted here so EX
 // can transfer their registered address and metadata to normal paging.
+// Both address sizes are eligible: address_unit has already masked a16 offsets
+// and added the selected segment base before issue. Complex base+index+disp
+// forms retain their separate D2 partial-sum cycle.
 // A write uop and its D2 successor can overlap on the edge where paging first
 // captures the write.  The store may still need a dirty-bit page walk, so it
 // is not yet visible to the cache's store queue.  Accept the younger load token
@@ -1900,7 +1903,7 @@ assign d2_vipt_result_kind = !d2_vipt_movx ? LOAD_RESULT_COPY :
 assign d2_vipt_candidate = !hardwired_off &&
                            (i_bus.rep_lock == PREFIX_NOREPLOCK) &&
                            (d2_vipt_plain_mov || d2_vipt_movx || d2_vipt_alu) &&
-                           i_bus.addr32 && i_bus.has_modrm &&
+                           i_bus.has_modrm &&
                            (i_bus.modrm[7:6] != 2'b11) &&
                            !i_bus.has_moffs && !i_bus.stack_op &&
                            !single_step;
