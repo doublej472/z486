@@ -26,7 +26,6 @@ module shifter
 
     input  logic [31:0] alu_dst,
     input  logic [31:0] alu_src,
-    input  logic [31:0] gpr_dst_src_size,
     input  logic [31:0] gpr_src_op_size,
     input  logic [31:0] gpr_dst_shift_size,
     input  logic [31:0] gpr_src_shift_size,
@@ -103,7 +102,9 @@ always_comb begin
     end else begin
         case (source_class)
             4'd1:    source_value = sigma;
-            4'd2:    source_value = gpr_dst_src_size;
+            // The only DSTREG source sites are BITTST, whose operand width is
+            // the same width already selected for the shifter ALU operand.
+            4'd2:    source_value = gpr_dst_shift_size;
             4'd4:    source_value = immediate;
             4'd5:    source_value = tmpb;
             4'd6:    source_value = tmpc;
@@ -130,6 +131,10 @@ always @(posedge clk)
             $fatal(1, "SRCREG SHIFT SIZE MISMATCH: captured=%x live=%x",
                    shift1_size, op_size);
     end
+always @(posedge clk)
+    if (reset_n && exec && (aluop == ALUJMP_BITTST) &&
+        (source_class == 4'd2) && (data_size != op_size))
+        $fatal(1, "BITTST DSTREG source/ALU width mismatch");
 // synthesis translate_on
 
 always_comb begin
@@ -175,6 +180,44 @@ wire        shifted_sign = data_size == 2'd0 ? shifted[7] :
                            data_size == 2'd1 ? shifted[15] : shifted[31];
 wire        shifted_next_sign = data_size == 2'd0 ? shifted[6] :
                                 data_size == 2'd1 ? shifted[14] : shifted[30];
+// Overflow is architecturally defined only for a count of one.  Right
+// operations use a barrel count of one, while left operations are represented
+// as a right shift by width-1.  Select fixed taps for those two cases instead
+// of routing the 64-bit barrel result back into the OF register.
+wire count1_barrel_right = count == 6'd1;
+wire count1_shifted_sign_right = data_size == 2'd0 ? shift_input[8] :
+                                     data_size == 2'd1 ? shift_input[16] :
+                                                         shift_input[32];
+wire count1_shifted_sign_left = data_size == 2'd0 ? shift_input[14] :
+                                    data_size == 2'd1 ? shift_input[30] :
+                                                        shift_input[62];
+wire count1_shifted_next_sign_right = data_size == 2'd0 ? shift_input[7] :
+                                          data_size == 2'd1 ? shift_input[15] :
+                                                              shift_input[31];
+wire count1_shifted_next_sign_left = data_size == 2'd0 ? shift_input[13] :
+                                         data_size == 2'd1 ? shift_input[29] :
+                                                             shift_input[61];
+wire count1_last_out_msb_right = data_size == 2'd0 ? shift_input[9] :
+                                    data_size == 2'd1 ? shift_input[17] :
+                                                        shift_input[33];
+wire count1_last_out_msb_left = data_size == 2'd0 ? shift_input[15] :
+                                   data_size == 2'd1 ? shift_input[31] :
+                                                       shift_input[63];
+wire count1_shifted_sign = count1_barrel_right ? count1_shifted_sign_right :
+                                                count1_shifted_sign_left;
+wire count1_shifted_next_sign = count1_barrel_right ?
+    count1_shifted_next_sign_right : count1_shifted_next_sign_left;
+wire count1_last_out_msb = count1_barrel_right ? count1_last_out_msb_right :
+                                                count1_last_out_msb_left;
+
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && exec && is_shift2 && (count_raw_r == 5'd1) &&
+        ((count1_shifted_sign !== shifted_sign) ||
+         (count1_shifted_next_sign !== shifted_next_sign) ||
+         (count1_last_out_msb !== last_out_msb)))
+        $fatal(1, "count-one fixed shift taps disagree with barrel result");
+// synthesis translate_on
 
 assign result = overflow ? (is_sar ? sar_overflow_result : 32'd0) : shifted[31:0];
 // Every BITTST site uses a right-count setup with swap clear.  Its carry is
@@ -291,8 +334,8 @@ always_ff @(posedge clk) begin
     if (!reset_n) begin
         flags_commit <= 1'b0;
     end else begin
-        flags_commit <= exec && (aluop == ALUJMP_SHIFT2) && count_nonzero;
-        if (exec && (aluop == ALUJMP_SHIFT2) && count_nonzero) begin
+        flags_commit <= exec && is_shift2 && count_nonzero;
+        if (exec && is_shift2 && count_nonzero) begin
             flags_we_zsp <= set_zsp;
             flags_we_of <= 1'b0;
             if (instr_is_shxd) begin
@@ -300,8 +343,8 @@ always_ff @(posedge clk) begin
                 if (count_raw_r == 5'd1) begin
                     flags_we_of <= 1'b1;
                     flags_of <= shift_right ?
-                        (shifted_sign ^ shifted_next_sign) :
-                        (shifted_sign ^ last_out_msb);
+                        (count1_shifted_sign ^ count1_shifted_next_sign) :
+                        (count1_shifted_sign ^ count1_last_out_msb);
                 end
             end else begin
                 case (operation)
@@ -319,7 +362,8 @@ always_ff @(posedge clk) begin
                     case (operation)
                         SHL: begin
                             flags_we_of <= 1'b1;
-                            flags_of <= shifted_sign ^ last_out_msb;
+                            flags_of <= count1_shifted_sign ^
+                                        count1_last_out_msb;
                         end
                         SHR: begin
                             flags_we_of <= 1'b1;
@@ -332,7 +376,8 @@ always_ff @(posedge clk) begin
                         ROR,
                         RCR: begin
                             flags_we_of <= 1'b1;
-                            flags_of <= shifted_sign ^ shifted_next_sign;
+                            flags_of <= count1_shifted_sign ^
+                                        count1_shifted_next_sign;
                         end
                         default: ;
                     endcase

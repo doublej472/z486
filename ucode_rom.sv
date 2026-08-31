@@ -19,6 +19,7 @@ module ucode_rom
     output             q_shift_uc_carry,
     output      [5:0]  q_shift_alu_src,
     output      [6:0]  q_shift_aluop,
+    output      [1:0]  q_shift_sigma_sel,
     output      [2:0]  q_dly_source,
     output      [8:0]  q_mem_ctrl,
     output      [8:0]  q_ind_ctrl,
@@ -32,6 +33,7 @@ module ucode_rom
 (* preserve *) reg q_shift_uc_carry_r;
 (* preserve *) reg [5:0] q_shift_alu_src_r;
 (* preserve *) reg [6:0] q_shift_aluop_r;
+(* preserve *) reg [1:0] q_shift_sigma_sel_r;
 reg [2:0] q_dly_source_r;
 (* preserve *) reg [8:0] q_mem_ctrl_r;
 reg [8:0] q_ind_ctrl_r;
@@ -90,6 +92,22 @@ function automatic logic shift_uc_carry_predecode(input [36:0] w);
     shift_uc_carry_predecode = (w[17:11] == ALUJMP_SHIFT2) &&
                                (w[23:18] == SRC_TMPC) &&
                                (w[36:31] == ALUSRC_TMPB);
+endfunction
+
+// Compact result selector for the SIGMA write path. Keep the raw seven-bit
+// ALU/jump field out of the barrel-result mux and SHIFT2 flag capture.
+function automatic [1:0] shift_sigma_predecode(input [6:0] aluop);
+    case (aluop)
+        ALUJMP_SHIFT1:
+            shift_sigma_predecode = 2'd1;
+        ALUJMP_SHIFT,
+        ALUJMP_USTEP_AAD_SHIFT,
+        ALUJMP_SHIFT2,
+        ALUJMP_BITTST:
+            shift_sigma_predecode = 2'd2;
+        default:
+            shift_sigma_predecode = 2'd0;
+    endcase
 endfunction
 
 // Compact source class for the barrel path. The immutable ROM uses only this
@@ -276,6 +294,7 @@ always_ff @(posedge clk) begin
         q_shift_uc_carry_r <= shift_uc_carry_predecode(q_mem[36:0]);
         q_shift_alu_src_r <= q_mem[36:31];
         q_shift_aluop_r <= q_mem[17:11];
+        q_shift_sigma_sel_r <= shift_sigma_predecode(q_mem[17:11]);
         q_dly_source_r <= dly_source_predecode(q_mem[23:18]);
         q_mem_ctrl_r <= mem_ctrl_predecode(q_mem[36:0]);
         q_ind_ctrl_r <= ind_ctrl_predecode(q_mem[36:0]);
@@ -311,6 +330,7 @@ end
 	        q_shift_uc_carry_r <= shift_uc_carry_predecode(q_mem[36:0]);
 	        q_shift_alu_src_r <= q_mem[36:31];
 	        q_shift_aluop_r <= q_mem[17:11];
+	        q_shift_sigma_sel_r <= shift_sigma_predecode(q_mem[17:11]);
 	        q_dly_source_r <= dly_source_predecode(q_mem[23:18]);
 	        q_mem_ctrl_r <= mem_ctrl_predecode(q_mem[36:0]);
 	        q_ind_ctrl_r <= ind_ctrl_predecode(q_mem[36:0]);
@@ -330,6 +350,7 @@ assign q_is_shift2 = q_is_shift2_r;
 assign q_shift_uc_carry = q_shift_uc_carry_r;
 assign q_shift_alu_src = q_shift_alu_src_r;
 assign q_shift_aluop = q_shift_aluop_r;
+assign q_shift_sigma_sel = q_shift_sigma_sel_r;
 assign q_dly_source = q_dly_source_r;
 assign q_mem_ctrl = q_mem_ctrl_r;
 assign q_ind_ctrl = q_ind_ctrl_r;
@@ -340,6 +361,10 @@ always_ff @(posedge clk)
     if ((^q[36:0] !== 1'bx) &&
         (q_ind_ctrl !== ind_ctrl_predecode(q[36:0])))
         $fatal(1, "IND CONTROL PREDECODE MISMATCH");
+always_ff @(posedge clk)
+    if ((^q[36:0] !== 1'bx) &&
+        (q_shift_sigma_sel !== shift_sigma_predecode(q[17:11])))
+        $fatal(1, "SHIFT SIGMA PREDECODE MISMATCH");
 // synthesis translate_on
 
 endmodule

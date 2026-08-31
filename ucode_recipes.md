@@ -51,5 +51,7 @@ The generated 40-bit ROM image stores the D2 early kind in bits 39:37.
 | overlay | architectural entry | effective entry | action | target usteps | hazards |
 | --- | ---: | ---: | --- | --- | --- |
 | `x87-m32-load` | `4D7` | `9C5` | `X87_M32_LOAD` | `9C5 9C6` | ea, paging, x87-order |
+| `rmw-m-r-fast` | `04A` | `9CB` | `RMW_FAST` | `9CB 9CC 9CD` | ea, paging, store-order |
+| `rmw-unary-fast` | `04E` | `9CE` | `RMW_FAST` | `9CE 9CF 9D0` | ea, paging, store-order |
 
-Qualified overlays: 1.
+Qualified overlays: 3.

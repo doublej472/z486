@@ -67,6 +67,7 @@ module microsequencer
     output logic        uc_shift_uc_carry,
     output logic [5:0]  uc_alu_src_shift,
     output logic [6:0]  uc_aluop_shift,
+    output logic [1:0]  uc_shift_sigma_sel,
     output logic [2:0]  uc_dly_source,
     output logic [8:0]  uc_mem_ctrl,
     output logic [8:0]  uc_ind_ctrl,
@@ -184,6 +185,15 @@ always_comb begin
             exec_redirect.target = UADDR_CALL_GATE_386;
         end
     end
+
+    // Recipe rejection may be registered after its speculative overlay word
+    // has executed. It owns no architectural micro-op in that cycle, so let
+    // it redirect the ROM while uc_exec remains suppressed. This keeps the
+    // VIPT/TLB result out of the same-cycle ROM-address cone.
+    if (recipe_redirect_valid && !uc_exec) begin
+        exec_redirect.valid = 1'b1;
+        exec_redirect.target = recipe_redirect_target;
+    end
 end
 
 always_comb begin
@@ -226,6 +236,7 @@ ucode_rom microcode_rom_inst (
     .q_shift_uc_carry(uc_shift_uc_carry),
     .q_shift_alu_src(uc_alu_src_shift),
     .q_shift_aluop(uc_aluop_shift),
+    .q_shift_sigma_sel(uc_shift_sigma_sel),
     .q_dly_source(uc_dly_source),
     .q_mem_ctrl(uc_mem_ctrl),
     .q_ind_ctrl(uc_ind_ctrl),

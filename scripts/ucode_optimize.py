@@ -80,6 +80,8 @@ class OverlayQualifier(IntEnum):
     """Structured decoder predicates for optimizer-owned entry overlays."""
 
     X87_M32_FLOAT = 1
+    RMW_MEMORY = 2
+    RMW_UNARY = 3
 
 
 class RecipeAction(IntEnum):
@@ -88,6 +90,7 @@ class RecipeAction(IntEnum):
     NONE = 0
     X87_M32_LOAD = 1
     INVLPG = 2
+    RMW_FAST = 3
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,7 @@ class OverlayRecipe:
     action: RecipeAction
     commit: str
     hazards: tuple[str, ...] = ()
+    retire_in_delay: bool = False
 
 
 PATCHES = [
@@ -157,6 +161,23 @@ PATCHES = [
           copy_from=0x20E),
     Patch(0x9C6, "x87 m32 direct-load overlay: retire after x87 queue accepts operand",
           copy_from=0x20F),
+
+    # Cached RMW alternate entries. RD_FAST/WR_FAST are semantic actions owned
+    # by the entry, while the ordinary fields keep ALU, flags, OPR_R/OPR_W and
+    # RNI behavior in the microcode/data-unit path. Rejected RD_FAST probes
+    # redirect to the untouched 04A/04E routines.
+    Patch(0x9CB, "ALU m,r RD_FAST read_write entry",
+          copy_from=0x04A, fields=dict(bus=0x3F)),
+    Patch(0x9CC, "ALU m,r fast ALU from OPR_R plus RNI",
+          copy_from=0x04D, fields=dict(src=0x2D, op=0)),
+    Patch(0x9CD, "ALU m,r WR_FAST in RNI delay slot",
+          copy_from=0x046, fields=dict(bus=0x3F, op=7)),
+    Patch(0x9CE, "unary memory RD_FAST read_write entry",
+          copy_from=0x04E, fields=dict(bus=0x3F, alusrc=0x3E)),
+    Patch(0x9CF, "unary memory fast ALU from OPR_R plus RNI",
+          copy_from=0x050, fields=dict(op=0)),
+    Patch(0x9D0, "unary memory WR_FAST in RNI delay slot",
+          copy_from=0x046, fields=dict(bus=0x3F, op=7)),
 
     # ---- Original 386 microcode repairs ---------------------------------
     # BSR's loop leaves the final bit index in TMPC. The extracted routine's
@@ -436,6 +457,14 @@ OVERLAY_RECIPES = [
                   (0x9C5, 0x9C6), OverlayQualifier.X87_M32_FLOAT,
                   RecipeAction.X87_M32_LOAD, "x87-direct-m32",
                   ("ea", "paging", "x87-order")),
+    OverlayRecipe("rmw-m-r-fast", 0x04A, 0x9CB, EarlyKind.RMW,
+                  (0x9CB, 0x9CC, 0x9CD), OverlayQualifier.RMW_MEMORY,
+                  RecipeAction.RMW_FAST, "store/flags",
+                  ("ea", "paging", "store-order"), True),
+    OverlayRecipe("rmw-unary-fast", 0x04E, 0x9CE, EarlyKind.RMW,
+                  (0x9CE, 0x9CF, 0x9D0), OverlayQualifier.RMW_UNARY,
+                  RecipeAction.RMW_FAST, "store/flags",
+                  ("ea", "paging", "store-order"), True),
 ]
 
 # Semantic execution actions for ordinary generated microcode entries.  Keep
@@ -560,35 +589,33 @@ def validate_recipes(words: list[int]) -> None:
                     )
 
     overlay_entries: set[int] = set()
-    overlay_actions: set[RecipeAction] = set()
     for recipe in OVERLAY_RECIPES:
         if recipe.entry in entries or recipe.entry in overlay_entries:
             raise ValueError(f"overlay {recipe.name}: duplicate entry 0x{recipe.entry:03X}")
         if recipe.source_entry == recipe.entry:
             raise ValueError(f"overlay {recipe.name}: source and overlay entries match")
-        if recipe.action == RecipeAction.NONE or recipe.action in overlay_actions:
-            raise ValueError(f"overlay {recipe.name}: invalid or duplicate action {recipe.action}")
+        if recipe.action == RecipeAction.NONE:
+            raise ValueError(f"overlay {recipe.name}: invalid action {recipe.action}")
         if not 1 <= len(recipe.targets) <= 3 or recipe.targets[0] != recipe.entry:
             raise ValueError(f"overlay {recipe.name}: target must be 1..3 words from its entry")
         for addr in recipe.targets:
             if not 0 <= addr < ROM_DEPTH or words[addr] == default_word:
                 raise ValueError(f"overlay {recipe.name}: invalid target word 0x{addr:03X}")
-        if get_field(words[recipe.targets[-1]], "op") != 0:
-            raise ValueError(f"overlay {recipe.name}: final target word is not RNI")
+        rni_addr = recipe.targets[-2] if recipe.retire_in_delay else recipe.targets[-1]
+        if get_field(words[rni_addr], "op") != 0:
+            raise ValueError(f"overlay {recipe.name}: retirement word is not RNI")
         overlay_entries.add(recipe.entry)
-        overlay_actions.add(recipe.action)
 
     for entry, action in ENTRY_ACTIONS.items():
         if not 0 <= entry < ROM_DEPTH or words[entry] == default_word:
             raise ValueError(f"entry action {action.name}: invalid word 0x{entry:03X}")
-        if action == RecipeAction.NONE or action in overlay_actions:
-            raise ValueError(f"entry action 0x{entry:03X}: invalid or duplicate action {action}")
+        if action == RecipeAction.NONE:
+            raise ValueError(f"entry action 0x{entry:03X}: invalid action {action}")
         if (action == RecipeAction.INVLPG and
                 get_field(words[entry], "dst") != DEST_USTEP_INVLPG):
             raise ValueError(
                 f"entry action 0x{entry:03X}: INVLPG marker is missing from microcode"
             )
-        overlay_actions.add(action)
 
 
 def render_recipe_manifest(words: list[int]) -> str:
@@ -646,6 +673,13 @@ def render_recipe_svh(words: list[int]) -> str:
     def overlay_qualifier_expr(recipe: OverlayRecipe) -> str:
         if recipe.qualifier == OverlayQualifier.X87_M32_FLOAT:
             return "(opcode == 8'hD8) || ((opcode == 8'hD9) && (modrm[5:3] == 3'd0))"
+        if recipe.qualifier == OverlayQualifier.RMW_UNARY:
+            return "(modrm[7:6] != 2'b11) && ((((opcode == 8'hF6) || (opcode == 8'hF7)) && " \
+                   "((modrm[5:3] == 3'd2) || (modrm[5:3] == 3'd3))) || " \
+                   "(((opcode == 8'hFE) || (opcode == 8'hFF)) && " \
+                   "((modrm[5:3] == 3'd0) || (modrm[5:3] == 3'd1))))"
+        if recipe.qualifier == OverlayQualifier.RMW_MEMORY:
+            return "modrm[7:6] != 2'b11"
         raise ValueError(f"overlay {recipe.name}: unhandled qualifier {recipe.qualifier}")
 
     lines = [
@@ -1003,6 +1037,13 @@ def render_recipe_svh(words: list[int]) -> str:
                 f"            12'h{recipe.entry:03X}: begin",
                 "                // Variable-latency direct transport; normal sequencer retirement.",
                 "                r.commit_sel = RECIPE_ACTION_X87_DIRECT; r.uses_ea = 1'b1;",
+                "            end",
+            ]
+        elif recipe.action == RecipeAction.RMW_FAST:
+            lines += [
+                f"            12'h{recipe.entry:03X}: begin",
+                "                // Sequenced BRAM overlay; RD_FAST/WR_FAST own memory only.",
+                "                r.uses_ea = 1'b1;",
                 "            end",
             ]
         else:

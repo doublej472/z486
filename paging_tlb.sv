@@ -34,7 +34,9 @@ module paging_tlb
     input        [31:0] vipt_linear_addr,
     output reg          vipt_hit,
     output reg   [31:0] vipt_physical_addr,
+    output reg          vipt_writable,
     output reg          vipt_user,
+    output reg          vipt_dirty,
     output              vipt_is_vga_mem,
 
     // Refill the direct sidecar after a registered demand falls back to an
@@ -43,7 +45,9 @@ module paging_tlb
     input               vipt_refill_valid,
     input        [31:0] vipt_refill_linear,
     input        [19:0] vipt_refill_pfn,
+    input               vipt_refill_writable,
     input               vipt_refill_user,
+    input               vipt_refill_dirty,
 
     // Update interface (from page walker)
     input               update_valid,
@@ -132,9 +136,9 @@ wire vipt_refill_write = vipt_refill_valid && !update_valid;
 reg [31:0] vipt_linear_r;
 reg        vipt_hazard_r;
 reg [VIPT_TLB_ENTRIES-1:0] vipt_valid;
-// {VPN tag[19:5], PFN[19:0], user, VGA}
-(* ramstyle = "M10K, no_rw_check" *) reg [36:0] vipt_tlb [0:VIPT_TLB_ENTRIES-1];
-reg [36:0] vipt_tlb_q;
+// {VPN tag[19:5], PFN[19:0], writable, user, dirty, VGA}
+(* ramstyle = "M10K, no_rw_check" *) reg [38:0] vipt_tlb [0:VIPT_TLB_ENTRIES-1];
+reg [38:0] vipt_tlb_q;
 
 always_ff @(posedge clk) begin
     if (vipt_preread) begin
@@ -150,28 +154,35 @@ always_ff @(posedge clk) begin
 end
 
 wire vipt_match = vipt_valid[vipt_linear_r[16:12]] && !vipt_hazard_r &&
-                  (vipt_tlb_q[36:22] == vipt_linear_r[31:17]);
+                  (vipt_tlb_q[38:24] == vipt_linear_r[31:17]);
 assign vipt_is_vga_mem = vipt_match && vipt_tlb_q[0];
 
 always_comb begin
     vipt_hit = vipt_match;
-    vipt_physical_addr = {vipt_tlb_q[21:2], vipt_linear_r[11:0]};
-    vipt_user = vipt_tlb_q[1];
+    vipt_physical_addr = {vipt_tlb_q[23:4], vipt_linear_r[11:0]};
+    vipt_writable = vipt_tlb_q[3];
+    vipt_user = vipt_tlb_q[2];
+    vipt_dirty = vipt_tlb_q[1];
     if (!vipt_match) begin
         vipt_physical_addr = vipt_linear_r;
+        vipt_writable = 1'b0;
         vipt_user = 1'b0;
+        vipt_dirty = 1'b0;
     end
 end
 
 always_ff @(posedge clk) begin
     if (update_valid)
         vipt_tlb[update_vpn[4:0]] <= {update_vpn[19:5], update_pfn,
-                                      update_user,
+                                      update_writable, update_user,
+                                      update_dirty,
                                       update_pfn[19:5] == 15'h5};
     else if (vipt_refill_write)
         vipt_tlb[vipt_refill_index] <= {vipt_refill_linear[31:17],
                                         vipt_refill_pfn,
+                                        vipt_refill_writable,
                                         vipt_refill_user,
+                                        vipt_refill_dirty,
                                         vipt_refill_pfn[19:5] == 15'h5};
 end
 

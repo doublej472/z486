@@ -65,8 +65,15 @@ module paging_unit
     input               vipt_fallback,
     output              vipt_tlb_hit,
     output       [31:0] vipt_tlb_phys_addr,
+    output              vipt_tlb_writable,
     output              vipt_tlb_user,
+    output              vipt_tlb_dirty,
     output              vipt_tlb_is_vga_mem,
+
+    // A qualified side-effect-free VIPT finalize commits a fully formatted
+    // result to the normal operand register. Rejected probes use demand paging.
+    input               fast_opr_commit,
+    input        [31:0] fast_opr_data,
 
     //=========================================================================
     // Prefetch request (toggle protocol)
@@ -242,12 +249,16 @@ paging_tlb tlb_inst (
     .vipt_linear_addr(vipt_linear_addr),
     .vipt_hit       (vipt_tlb_hit),
     .vipt_physical_addr(vipt_tlb_phys_addr),
+    .vipt_writable  (vipt_tlb_writable),
     .vipt_user      (vipt_tlb_user),
+    .vipt_dirty     (vipt_tlb_dirty),
     .vipt_is_vga_mem(vipt_tlb_is_vga_mem),
     .vipt_refill_valid(vipt_refill_valid),
     .vipt_refill_linear(tlb_lookup_addr_r),
     .vipt_refill_pfn(tlb_physical_addr[31:12]),
+    .vipt_refill_writable(tlb_writable),
     .vipt_refill_user(tlb_user),
+    .vipt_refill_dirty(tlb_dirty),
     .update_valid   (tlb_update_valid),
     .update_vpn     (tlb_update_vpn),
     .update_pfn     (tlb_update_pfn),
@@ -339,13 +350,15 @@ wire slow_tlb_access_ok = slow_tlb_user_ok && slow_tlb_write_ok;
 // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-292
 wire live_is_user     = (cpl == 2'd3);
 wire live_user_ok     = !live_is_user || live_tlb_user;
-wire live_write_ok    = !mem_write || live_tlb_writable || (!live_is_user && !wp_enable);
-wire live_dirty_ok    = !mem_write || live_tlb_dirty;
+wire live_store_perm_ok = live_tlb_writable ||
+                          (!live_is_user && !wp_enable);
 // live_valid gates the optimistic write-post: when the live-TLB input is a
 // registered don't-care (complex modrm whose true linear is seg_linear, only
 // in req_linear), defer the write instead of trusting the wrong-address lookup.
-wire live_write_posts = !pg_enable || (live_valid && live_tlb_hit && live_user_ok && live_write_ok && live_dirty_ok);
-reg  write_will_post; // registered live_write_posts, valid in the PG_MEM_TLB cycle
+wire live_store_posts = !pg_enable ||
+    (live_valid && live_tlb_hit && live_user_ok && live_store_perm_ok &&
+     live_tlb_dirty);
+reg  write_will_post; // registered live_store_posts, valid in the PG_MEM_TLB cycle
 
 // Prefetch is always a read at the current CPL, so only the U/S check matters.
 wire pf_tlb_user_ok = (cpl != 2'd3) || tlb_user;
@@ -458,7 +471,7 @@ wire        early_rd_present   = early_rd_idx_drive && mem_ea_read && !idle_mem_
 // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-415
 wire        early_wr_idx_drive = idle_data_req && mem_write && !mem_is_io;
 wire        early_wr_present   = early_wr_idx_drive && !idle_mem_crossing &&
-                                 !mem_check_only && live_write_posts;
+                                 !mem_check_only && live_store_posts;
 // Only a write that can actually post owns the live write-data input. Keeping
 // mere request intent out of this select prevents a faulting/missing live
 // translation from coupling into an older registered direct request.
@@ -752,11 +765,15 @@ always_ff @(posedge clk or negedge reset_n) begin
             // synthesis translate_on
         end
 
+        // RD_FAST commits on the ending edge of its own uStep. The following
+        // ordinary microinstruction therefore reads normal registered OPR_R.
+        if (fast_opr_commit)
+            OPR_R <= fast_opr_data;
+
         if (dcache_req_complete) begin
             // Clear fast_path_pending and ack mem toggle for non-crossing fast path
             if (fast_path_pending) begin
                 fast_path_pending <= 1'b0;
-                rd_ind_active <= 1'b0;
                 mem_servicing <= 1'b0;
             end
         end
@@ -783,12 +800,10 @@ always_ff @(posedge clk or negedge reset_n) begin
                                            idle_request_linear[1:0],
                                            idle_inta_req && (idle_request_linear[2:0] == 3'd4),
                                            1'b0);
-                            rd_ind_active <= 1'b0;
                         end else begin
                             // IO crossing: split into two DWORD-aligned bus cycles
                             latch_mem_request(linear_addr, 1'b1);
                             req_is_io <= 1'b1;
-                            rd_ind_active <= 1'b0;
                             // First half data
                             dcache_req_phys_addr_r <= linear_addr;
                             dcache_req_write_r <= mem_write;
@@ -851,20 +866,18 @@ always_ff @(posedge clk or negedge reset_n) begin
                                        linear_addr[1:0], 1'b0, 1'b0);
                         fast_path_pending <= 1'b1;
                         mem_dly_grace <= 1'b1;   // optimistic release for the finalize cycle
-                        rd_ind_active <= 1'b0;
                     end else if (early_wr_accept) begin
                         // Early posted write: the store-queue write was enqueued this cycle from the live physical (accept => post), so the access is done. Clear...
                         // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-764
                         latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size),
                                        linear_addr[1:0], 1'b0, 1'b0);
-                        rd_ind_active <= 1'b0;
                         mem_servicing <= 1'b0;
                     end else begin
                         state <= PG_MEM_TLB;
                         // Loop 1: precompute (from the live TLB) whether this
                         // memory write will post next cycle, so the post-write
                         // DLY grace carries no live TLB cone into uc_exec.
-                        write_will_post <= mem_write && live_write_posts;
+                        write_will_post <= mem_write && live_store_posts;
                     end
                 end
             end
@@ -887,7 +900,6 @@ always_ff @(posedge clk or negedge reset_n) begin
                             latch_biu_meta(2'd0, op_size_bytes_m1(req_op_size),
                                            req_offset, 1'b0, 1'b0);
                             if (req_mem_posted_done) begin
-                                rd_ind_active <= 1'b0;
                                 mem_servicing <= 1'b0;
                                 fast_path_pending <= 1'b0;
                                 state <= PG_IDLE;
@@ -1095,7 +1107,6 @@ task automatic latch_biu_meta(
 endtask
 
 task automatic complete_mem_request();
-    rd_ind_active <= 1'b0;
     mem_servicing <= 1'b0;
     state <= PG_IDLE;
 endtask
@@ -1209,5 +1220,12 @@ task automatic emit_pf_biu_req(input [31:0] phys_addr);
     icache_req_valid_r <= 1'b1;
     icache_req_phys_addr_r <= phys_addr;
 endtask
+
+// synthesis translate_off
+always_ff @(posedge clk)
+    if (reset_n && fast_opr_commit && dcache_read_complete &&
+        !opr_is_write_r && !opr_suppress_r)
+        $fatal(1, "simultaneous demand and RD_FAST OPR_R commits");
+// synthesis translate_on
 
 endmodule

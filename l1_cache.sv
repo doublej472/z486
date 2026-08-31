@@ -40,6 +40,7 @@ module l1_cache #(
     input         vipt_probe_valid,
     output        vipt_probe_ready,
     output        vipt_probe_accepted,
+    output        vipt_probe_direct_accepted,
     input  [31:0] vipt_resolve_phys_addr,
     input         vipt_resolve_valid,
     output [31:0] vipt_resolve_data,
@@ -315,8 +316,17 @@ wire [3:0] vipt_hit_vec = {
     rd_valid0_r && (rd_tag0_r == vipt_resolve_tag)
 };
 wire [1:0] vipt_hit_way = way_encode(vipt_hit_vec);
-assign vipt_resolve_data = way_data_mux(
+wire [31:0] vipt_way_data = way_data_mux(
     vipt_hit_way, rd_data0_r, rd_data1_r, rd_data2_r, rd_data3_r);
+// A younger VIPT lookup may share the preread used to capture an older store
+// to the same word. The store reaches S_LOOKUP while that younger request
+// finalizes, so forward its registered bytes over the RAM's old data.
+wire vipt_lookup_store_match = (state == S_LOOKUP) && req_valid_r &&
+    req_write_r && !req_protect_write_r &&
+    (req_addr_r[31:2] == vipt_resolve_phys_addr[31:2]);
+assign vipt_resolve_data = vipt_lookup_store_match
+                         ? merge32(vipt_way_data, req_din_r, req_be_r)
+                         : vipt_way_data;
 assign vipt_resolve_hit = vipt_resolve_valid && cache_enable &&
                           (vipt_resolve_phys_addr[31:17] != 15'h5) &&
                           (|vipt_hit_vec);
@@ -464,7 +474,19 @@ wire vipt_probe_fire = vipt_probe_valid &&
                        (idle_preread || (store_lookup_preread &&
                                         !store_lookup_alias)) &&
                        !cpu_preread_priority;
-assign vipt_probe_accepted = vipt_probe_fire;
+// When an accepted demand store owns the preread RAM at the same page offset,
+// its RAM address is also the exact VIPT lookup address. Share that read
+// instead of rejecting and replaying the younger instruction. Demand reads
+// retain exclusive priority and the existing replay contract.
+wire vipt_probe_share = vipt_probe_valid && cpu_preread_priority &&
+                        idle_preread && cpu_write &&
+                        (vipt_probe_set == cpu_preread_set) &&
+                        (vipt_probe_word == cpu_preread_word);
+assign vipt_probe_accepted = vipt_probe_fire || vipt_probe_share;
+// Replay is mutually exclusive with a demand request and therefore cannot
+// use the address-qualified sharing arm.  Expose the direct acceptance fact
+// so its EX capture does not inherit the paging preread address cone.
+assign vipt_probe_direct_accepted = vipt_probe_fire;
 wire [SET_BITS-1:0] preread_set =
     vipt_probe_fire ? vipt_probe_set : cpu_preread_set;
 wire [WORD_OFFSET_BITS-1:0] preread_word =
@@ -713,7 +735,13 @@ end
 always_ff @(posedge clk) begin
     if (!reset && state != S_RESET_INIT && cpu_valid && !cpu_ready && !(state == S_IDLE))
         ;
-    if (!reset && vipt_resolve_valid && state != S_IDLE)
+    // A VIPT probe sharing an accepted store's preread resolves while that
+    // registered store is in S_LOOKUP. vipt_lookup_store_match forwards the
+    // store payload over the preread result, so this is an intentional second
+    // legal finalize state rather than a cache ownership collision.
+    if (!reset && vipt_resolve_valid && state != S_IDLE &&
+        !(state == S_LOOKUP && req_valid_r && req_write_r &&
+          !req_protect_write_r))
         $fatal(1, "VIPT resolve while cache is not idle");
 end
 // synthesis translate_on

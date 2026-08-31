@@ -11,6 +11,7 @@ localparam logic [2:0] RECIPE_EARLY_STACK  = 3'd7;
 localparam logic [1:0] RECIPE_ACTION_NONE = 2'd0;
 localparam logic [1:0] RECIPE_ACTION_X87_M32_LOAD = 2'd1;
 localparam logic [1:0] RECIPE_ACTION_INVLPG = 2'd2;
+localparam logic [1:0] RECIPE_ACTION_RMW_FAST = 2'd3;
 
 // Resolve opcode-qualified overlays during D1 structural decode.
 function automatic logic [11:0] recipe_effective_entry(
@@ -24,6 +25,14 @@ function automatic logic [11:0] recipe_effective_entry(
             if ((opcode == 8'hD8) || ((opcode == 8'hD9) && (modrm[5:3] == 3'd0)))
                 recipe_effective_entry = 12'h9C5;
         end
+        12'h04A: begin
+            if (modrm[7:6] != 2'b11)
+                recipe_effective_entry = 12'h9CB;
+        end
+        12'h04E: begin
+            if ((modrm[7:6] != 2'b11) && ((((opcode == 8'hF6) || (opcode == 8'hF7)) && ((modrm[5:3] == 3'd2) || (modrm[5:3] == 3'd3))) || (((opcode == 8'hFE) || (opcode == 8'hFF)) && ((modrm[5:3] == 3'd0) || (modrm[5:3] == 3'd1)))))
+                recipe_effective_entry = 12'h9CE;
+        end
         12'h0B6: begin
             if (opcode == 8'h90)
                 recipe_effective_entry = 12'h9C9;
@@ -35,6 +44,8 @@ endfunction
 function automatic logic [11:0] recipe_fallback_entry(input logic [11:0] entry);
     unique case (entry)
         12'h9C5: recipe_fallback_entry = 12'h4D7;
+        12'h9CB: recipe_fallback_entry = 12'h04A;
+        12'h9CE: recipe_fallback_entry = 12'h04E;
         default: recipe_fallback_entry = entry;
     endcase
 endfunction
@@ -42,6 +53,8 @@ endfunction
 function automatic logic [1:0] recipe_action(input logic [11:0] entry);
     unique case (entry)
         12'h9C5: recipe_action = RECIPE_ACTION_X87_M32_LOAD;
+        12'h9CB: recipe_action = RECIPE_ACTION_RMW_FAST;
+        12'h9CE: recipe_action = RECIPE_ACTION_RMW_FAST;
         12'h9C7: recipe_action = RECIPE_ACTION_INVLPG;
         default: recipe_action = RECIPE_ACTION_NONE;
     endcase
@@ -53,7 +66,7 @@ function automatic logic [2:0] recipe_early_kind(input logic [11:0] entry);
         12'h0B9: recipe_early_kind = RECIPE_EARLY_EA;
         12'h019, 12'h027, 12'h02C, 12'h031, 12'h035, 12'h1EB, 12'h1F3, 12'h9C5: recipe_early_kind = RECIPE_EARLY_LOAD;
         12'h013, 12'h015: recipe_early_kind = RECIPE_EARLY_STORE;
-        12'h039, 12'h04A: recipe_early_kind = RECIPE_EARLY_RMW;
+        12'h039, 12'h04A, 12'h9CB, 12'h9CE: recipe_early_kind = RECIPE_EARLY_RMW;
         12'h065, 12'h06A: recipe_early_kind = RECIPE_EARLY_BRANCH;
         12'h072, 12'h075, 12'h086, 12'h09B, 12'h09D, 12'h09F: recipe_early_kind = RECIPE_EARLY_STACK;
         default: recipe_early_kind = RECIPE_EARLY_SEQ;
@@ -318,6 +331,14 @@ function automatic recipe_meta_t recipe_metadata(input dec_entry_t e);
             12'h9C5: begin
                 // Variable-latency direct transport; normal sequencer retirement.
                 r.commit_sel = RECIPE_ACTION_X87_DIRECT; r.uses_ea = 1'b1;
+            end
+            12'h9CB: begin
+                // Sequenced BRAM overlay; RD_FAST/WR_FAST own memory only.
+                r.uses_ea = 1'b1;
+            end
+            12'h9CE: begin
+                // Sequenced BRAM overlay; RD_FAST/WR_FAST own memory only.
+                r.uses_ea = 1'b1;
             end
             default: ;
         endcase

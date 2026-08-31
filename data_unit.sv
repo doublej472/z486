@@ -28,7 +28,6 @@ module data_unit
     input  logic        recipe_commit_cancel,     // Cancel deferred recipe commit
     input  logic        load_wb_valid,             // Registered VIPT load WB
     input  logic [2:0]  load_wb_dst,
-    input  logic [7:0]  load_wb_dst_onehot,       // Byte-normalized destination
     input  logic [1:0]  load_wb_size,
     input  logic [31:0] load_wb_data,
     input  logic        load_wb_is_alu,          // Registered memory operand feeds shared ALU
@@ -41,6 +40,7 @@ module data_unit
     input  logic [6:0]  aluop,
     input  logic [4:0]  alu_operation,
     input  logic [6:0]  shift_aluop,             // ROM-early ALU/jump field for shifter
+    input  logic [1:0]  shift_sigma_sel,         // Registered barrel SIGMA selector
     input  logic [6:0]  dest,
     input  logic [5:0]  source_field,
     input  logic [5:0]  source_live,             // Timing-selected live source field
@@ -271,6 +271,8 @@ function automatic logic [31:0] merge_load_forward(
 endfunction
 
 wire [31:0] load_wb_forward_data = load_wb_forward_data_r;
+wire [2:0] load_wb_widx = (load_wb_size == 2'd0)
+                         ? {1'b0, load_wb_dst[1:0]} : load_wb_dst;
 
 // WB-to-EX bypass for a hardwired load's immediate successor.  Cache data is
 // already registered in load_wb_data; this mux therefore starts at the WB
@@ -290,7 +292,7 @@ function automatic logic [31:0] read_gpr_load_forwarded(
         // is interlocked until architectural commit instead of creating a
         // private-ALU -> successor-ALU/EA path in one cycle.
         if (load_wb_valid && !load_wb_is_alu &&
-            load_wb_dst_onehot[read_widx])
+            (load_wb_widx == read_widx))
             merged = load_wb_forward_data;
 
         // The legacy ROM load path reaches the same registered-WB boundary
@@ -333,7 +335,7 @@ function automatic logic [31:0] read_ea_gpr(
         shift_hit = recipe_shift_write.valid && valid &&
                     (recipe_shift_widx == idx);
         load_hit = load_wb_valid && !load_wb_is_alu && valid &&
-                   load_wb_dst_onehot[idx];
+                   (load_wb_widx == idx);
 
         // Format each producer before the priority mux. This keeps delay-slot
         // data out of the shift/load mode selection on the D2 EA path.
@@ -939,7 +941,11 @@ always_ff @(posedge clk) begin
         end else if (gate_detect) begin
             sigma <= {16'd0, tmpc[31:16]};
         end else if (exec) begin
-            case (aluop)
+            if (shift_sigma_sel == 2'd1)
+                sigma <= shift_setup_result;
+            else if (shift_sigma_sel == 2'd2)
+                sigma <= shift_result;
+            else case (aluop)
                 ALUJMP_ALU,
                 ALUJMP_INCDEC,
                 ALUJMP_IMCS,
@@ -957,13 +963,6 @@ always_ff @(posedge clk) begin
                 ALUJMP_AAAAAS,
                 ALUJMP_DAADAS,
                 ALUJMP_SERECO: sigma <= alu_result;
-
-                ALUJMP_SHIFT1: sigma <= shift_setup_result;
-
-                ALUJMP_SHIFT,
-                ALUJMP_USTEP_AAD_SHIFT,
-                ALUJMP_SHIFT2,
-                ALUJMP_BITTST: sigma <= shift_result;
 
                 ALUJMP_IMUL3,
                 ALUJMP_IMUL4,
@@ -1414,7 +1413,6 @@ shifter shifter_inst (
     .op_size(op_size),
     .alu_dst(alu_dst),
     .alu_src(alu_src),
-    .gpr_dst_src_size(read_gpr_load_forwarded(dst_reg_sel_r, srcreg_size)),
     .gpr_src_op_size(read_gpr_load_forwarded(src_reg_sel_r, op_size)),
     .gpr_dst_shift_size(read_gpr_load_forwarded(dst_reg_sel_r, shift_data_size)),
     .gpr_src_shift_size(read_gpr_load_forwarded(src_reg_sel_r, shift_data_size)),

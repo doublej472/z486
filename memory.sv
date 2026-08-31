@@ -28,12 +28,22 @@ module memory #(
     output             dcache_read_complete, // Read data is valid this cycle
     output     [31:0]  dcache_rdata,
 
+    // Retained, already-qualified physical store from a microcode fast path.
+    // Acceptance transfers irrevocable ownership to the ordinary cache/store
+    // queue; the cache may perform its internal enqueue on the following edge.
+    input              fast_store_valid,
+    input      [31:0]  fast_store_phys_addr_raw,
+    input       [3:0]  fast_store_be,
+    input      [31:0]  fast_store_wdata,
+    output             fast_store_accepted,
+
     // Non-owning hardwired-load preread. A miss is retried through the demand
     // request interface above; this port never starts a fill by itself.
     input              dcache_vipt_probe_valid,
     input      [11:0]  dcache_vipt_probe_offset,
     output             dcache_vipt_probe_ready,
     output             dcache_vipt_probe_accepted,
+    output             dcache_vipt_probe_direct_accepted,
     input              dcache_vipt_resolve_valid,
     input      [31:0]  dcache_vipt_resolve_phys_addr_raw,
     output             dcache_vipt_resolve_hit,
@@ -77,6 +87,9 @@ wire [31:0] dcache_req_phys_addr = (!a20_enable && !dcache_req_is_io)
 wire [31:0] dcache_vipt_resolve_phys_addr = !a20_enable
                                       ? (dcache_vipt_resolve_phys_addr_raw & ~32'h0010_0000)
                                       : dcache_vipt_resolve_phys_addr_raw;
+wire [31:0] fast_store_phys_addr = !a20_enable
+                                      ? (fast_store_phys_addr_raw & ~32'h0010_0000)
+                                      : fast_store_phys_addr_raw;
 wire [31:0] icache_req_phys_addr = !a20_enable
                                       ? (icache_req_phys_addr_raw & ~32'h0010_0000)
                                       : icache_req_phys_addr_raw;
@@ -118,15 +131,30 @@ assign x87_req_selected = ENABLE_X87 && dcache_req_valid && dcache_req_is_x87;
 
 // VGA aperture accesses are device transactions. Bypass the posted L1 store
 // queue so an ET4000 bank-register write cannot overtake framebuffer writes.
-wire dcache_cpu_req = dcache_req_valid && !dcache_req_is_io &&
-                      !dcache_req_is_inta && !dcache_req_is_vga_mem &&
-                      !x87_req_selected;
+wire normal_cache_req = dcache_req_valid && !dcache_req_is_io &&
+                        !dcache_req_is_inta && !dcache_req_is_vga_mem &&
+                        !x87_req_selected;
+wire dcache_cpu_req = fast_store_valid || normal_cache_req;
+wire [31:0] dcache_cpu_addr = fast_store_valid ? fast_store_phys_addr
+                                              : dcache_req_phys_addr;
+wire [31:0] dcache_cpu_wdata = fast_store_valid ? fast_store_wdata
+                                               : dcache_req_wdata;
+wire [3:0] dcache_cpu_be = fast_store_valid ? fast_store_be : dcache_req_be;
+wire dcache_cpu_write = fast_store_valid || dcache_req_write;
+// WR_FAST already owns a translated physical address.  Its request must also
+// own the synchronous RAM preread; leaving the normal paging preread here
+// makes the following S_LOOKUP compare against an unrelated set.
+wire [11:0] dcache_cpu_preread_offset = fast_store_valid
+                                      ? fast_store_phys_addr[11:0]
+                                      : dcache_req_preread_offset;
+wire dcache_cpu_preread_priority = fast_store_valid ||
+                                   dcache_req_preread_priority;
 wire dcache_direct_req = dcache_req_valid && !x87_req_selected &&
                          (dcache_req_is_io || dcache_req_is_inta ||
                           dcache_req_is_vga_mem);
 wire dcache_read_pending = (dcache_rd_pending != 8'd0);
 wire icache_read_pending = (icache_rd_pending != 8'd0);
-wire dcache_read_accept = dcache_cpu_req && !dcache_req_write && dcache_cpu_ready;
+wire dcache_read_accept = normal_cache_req && !dcache_req_write && dcache_cpu_ready;
 wire icache_read_accept = icache_req_valid && icache_cpu_ready;
 wire dcache_read_done = dcache_cpu_resp_valid &&
                         (dcache_cpu_rd_pending || dcache_read_accept);
@@ -189,15 +217,18 @@ wire [3:0] icache_write_patch_be = icache_write_snoop_pending
                                  ? icache_write_snoop_be_r
                                  : dcache_store_patch_be;
 
-wire normal_req_accepted = dcache_cpu_req ? dcache_cpu_ready : ext_direct_accept;
+wire normal_req_accepted = normal_cache_req ? (dcache_cpu_ready && !fast_store_valid)
+                                            : ext_direct_accept;
 wire normal_req_complete = dcache_cpu_resp_valid ||
-                           (dcache_cpu_req && dcache_req_write && dcache_cpu_ready) ||
+                           (normal_cache_req && dcache_req_write &&
+                            dcache_cpu_ready && !fast_store_valid) ||
                            direct_rd_resp_now ||
                            (ext_direct_accept && ext_write_r);
 wire normal_read_complete = dcache_cpu_resp_valid || direct_rd_resp_now;
 wire [31:0] normal_rdata = dcache_cpu_resp_valid ? dcache_cpu_dout : din;
 
 assign dcache_req_accepted = x87_req_selected ? x87_req_accepted : normal_req_accepted;
+assign fast_store_accepted = fast_store_valid && dcache_cpu_ready;
 assign dcache_req_complete = normal_req_complete || x87_req_complete;
 assign dcache_read_complete = normal_read_complete || x87_read_complete;
 assign dcache_rdata = x87_read_complete ? x87_rdata : normal_rdata;
@@ -327,14 +358,14 @@ l1_cache #(
 ) dcache_inst (
     .clk(clk),
     .reset(!reset_n),
-    .cpu_addr(dcache_req_phys_addr),
-    .cpu_preread_offset(dcache_req_preread_offset),
-    .cpu_preread_priority(dcache_req_preread_priority),
-    .cpu_din(dcache_req_wdata),
+    .cpu_addr(dcache_cpu_addr),
+    .cpu_preread_offset(dcache_cpu_preread_offset),
+    .cpu_preread_priority(dcache_cpu_preread_priority),
+    .cpu_din(dcache_cpu_wdata),
     .cpu_dout(dcache_cpu_dout),
-    .cpu_be(dcache_req_be),
+    .cpu_be(dcache_cpu_be),
     .cpu_valid(dcache_cpu_req),
-    .cpu_write(dcache_req_write),
+    .cpu_write(dcache_cpu_write),
     // I/O, INTA, x87, and VGA/device transactions are routed around this
     // cache above, so accepted D-cache requests need no physical-address
     // aperture decode on their register inputs.
@@ -350,6 +381,7 @@ l1_cache #(
     .vipt_probe_valid(dcache_vipt_probe_valid),
     .vipt_probe_ready(dcache_vipt_probe_ready),
     .vipt_probe_accepted(dcache_vipt_probe_accepted),
+    .vipt_probe_direct_accepted(dcache_vipt_probe_direct_accepted),
     .vipt_resolve_phys_addr(dcache_vipt_resolve_phys_addr),
     .vipt_resolve_valid(dcache_vipt_resolve_valid),
     .vipt_resolve_data(dcache_vipt_resolve_data),
