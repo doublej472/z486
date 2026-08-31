@@ -417,7 +417,7 @@ reg [7:0]  vipt_load_wb_dst_onehot_r;
 reg [1:0]  vipt_load_wb_size_r;
 reg        vipt_load_wb_is_alu_r;
 reg [4:0]  vipt_load_wb_alu_op_r;
-reg        vipt_load_rom_shadow_r;     // Held D2 load owns the resident 019 RD
+reg        vipt_load_rom_shadow_r;     // Held VIPT D2 owns the resident ROM word
 reg        vipt_load_overlap_r;        // Plain-load successor owns EX while load completes
 wire       vipt_load_slow_busy = vipt_load_slow_req_r || vipt_load_slow_wait_r;
 wire       vipt_load_busy = vipt_load_ex_r.valid || vipt_load_replay_r.valid ||
@@ -587,7 +587,7 @@ wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight)
 
 // uc_exec: master enable for microcode execution
 wire       d2_release_hold = d2_valid && (d2_waited_r || d2_stale_slot_r);
-// A blocked direct load leaves the Jcc ROM delay word resident after the
+// A blocked direct load/RMW leaves the Jcc ROM delay word resident after the
 // synthetic branch uStep. Keep its stale PREF from redirecting the frontend.
 wire       vipt_load_overlap_wb = vipt_load_overlap_r &&
                      vipt_load_wb_valid_r && !vipt_load_ex_r.valid &&
@@ -1232,9 +1232,11 @@ always_ff @(posedge clk) begin
         if (i_issue && d2_plain_load_overlap_ready)
             vipt_load_overlap_r <= 1'b1;
 
-        if (i_rni_delay && d2_vipt_candidate)
+        if (i_rni_delay && (d2_vipt_candidate || d2_vipt_rmw_candidate))
             vipt_load_rom_shadow_r <= 1'b1;
-        if (i_issue || !d2_valid || !d2_vipt_candidate || q_flush || any_fault)
+        if (i_issue || !d2_valid ||
+            !(d2_vipt_candidate || d2_vipt_rmw_candidate) ||
+            q_flush || any_fault)
             vipt_load_rom_shadow_r <= 1'b0;
 
         // The EX slot normally advances or empties every cycle.
@@ -2666,6 +2668,13 @@ always_ff @(posedge clk) begin
         if (!stall)
             interrupt_entry <= 1'b0;
 
+        // Interrupt dispatch owns this registered cleanup cycle before the
+        // first handler uStep can execute.  Clear the RPTI ownership marker
+        // from that local pulse rather than extending its input mux with the
+        // live interrupt-recognition cone.
+        if (interrupt_entry)
+            instr_eip_written <= 1'b0;
+
         if (i_rni_delay && !stall && !page_fault) begin
             dbg_first_done <= 1'b1;
             if (single_step)
@@ -2746,6 +2755,16 @@ end
 always @(posedge clk)
     if (reset_n && throttle_parked_r && !d2_valid)
         $fatal(1, "throttle parked without a resident D2 successor");
+
+// RPTI marks its restarted instruction by writing EIP before presenting an
+// interrupt boundary. That ownership must not leak into interrupt delivery,
+// where it suppresses the delivery routine's normal completion boundary.
+reg interrupt_entry_check_r;
+always @(posedge clk)
+    interrupt_entry_check_r <= interrupt_entry;
+always @(posedge clk)
+    if (reset_n && interrupt_entry_check_r && instr_eip_written)
+        $fatal(1, "restart EIP ownership leaked into interrupt delivery");
 // synthesis translate_on
 
 // Instruction Signals (latched at i_issue)

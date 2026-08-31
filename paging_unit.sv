@@ -477,6 +477,9 @@ wire        early_wr_present   = early_wr_idx_drive && !idle_mem_crossing &&
 // translation from coupling into an older registered direct request.
 wire        early_wr_data_drive = early_wr_present && !dcache_req_valid_r;
 wire        early_idx_drive    = early_rd_idx_drive || early_wr_idx_drive;
+// The live physical frame is consumed only after live_tlb_hit qualifies an
+// early request.  The TLB therefore need not synthesize a linear-address
+// fallback into this already-deep cache-finalize path.
 wire [31:0] early_phys         = pg_enable ? {live_tlb_physical[31:12], linear_addr[11:0]}
                                           : linear_addr;
 wire        early_is_vga_mem   = pg_enable ? live_tlb_is_vga_mem

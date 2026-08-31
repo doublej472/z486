@@ -249,8 +249,7 @@ always_comb begin
         ({20{live_hit0}} & tlb[live_set0][0].pfn) |
         ({20{live_hit1}} & tlb[live_set1][1].pfn) |
         ({20{live_hit2}} & tlb[live_set2][2].pfn) |
-        ({20{live_hit3}} & tlb[live_set3][3].pfn) |
-        ({20{!live_hit}} & linear_addr_live[31:12]),
+        ({20{live_hit3}} & tlb[live_set3][3].pfn),
         linear_addr_live[11:0]
     };
     live_writable = !live_hit |
