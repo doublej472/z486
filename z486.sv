@@ -659,6 +659,7 @@ wire [6:0]  uc_aluop_shift;
 wire [2:0]  uc_dly_source;
 wire [8:0]  uc_mem_ctrl;
 wire        uc_fpu_f8;
+wire        uc_force_word;
 wire        microcode_rom_ce;
 wire [2:0]  d2_kind;
 
@@ -1746,7 +1747,8 @@ end
 // Ordinary accesses use source width: MOVZX/MOVSX read byte/word operands
 // even though their architectural destination and op_size are dword.
 wire ind_delta_dword = (IND_DELTA == 32'd4) || (IND_DELTA == -32'd4);
-wire [1:0] mem_eff_size = uc_is_word_op ? (ind_delta_dword ? 2'd2 : 2'd1) :
+wire [1:0] mem_eff_size = uc_is_word_op
+                          ? ((ind_delta_dword && !uc_force_word) ? 2'd2 : 2'd1) :
                           uc_is_dword_op ? 2'd2 : srcreg_size;
 
 wire [31:0] mem_wdata = (uc_buscode == BUSOP_WR_OPR ||
@@ -2387,6 +2389,7 @@ microsequencer microsequencer_inst (
     .uc_dly_source(uc_dly_source),
     .uc_mem_ctrl(uc_mem_ctrl),
     .uc_fpu_f8(uc_fpu_f8),
+    .uc_force_word(uc_force_word),
     .uc_ctl_pref(uc_ctl_pref)
 );
 

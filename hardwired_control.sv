@@ -209,8 +209,10 @@ wire loaduse_conflict =
 wire head_chain_safe = !decq_empty && d2_push && issue_recipe.hardwired &&
     (!issue_recipe.reads_flags || !recipe_state.writes_flags || issue_recipe.jcc) &&
     (!issue_recipe.uses_ea || !ea2_conflict) &&
-    !((recipe_state.commit_sel == RECIPE_COMMIT_MEM ||
-       recipe_state.commit_sel == RECIPE_COMMIT_SHIFT) &&
+    // Loads forward their deferred OPR_R value to all GPR data readers.  EA
+    // base/index dependencies remain covered by ea2_conflict and therefore
+    // retain the i486 one-cycle pointer-load interlock.
+    !((recipe_state.commit_sel == RECIPE_COMMIT_SHIFT) &&
       loaduse_conflict) && !mem_confN && !shift_confN;
 
 //=============================================================================

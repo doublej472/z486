@@ -52,6 +52,25 @@ start:
     fild qword [int64]
     fistp qword [int64_out]
 
+    ; Packed BCD stores use the ten-byte output protocol and pop ST0.
+    fild dword [bcd_positive]
+    fbstp tword [bcd_positive_out]
+    cmp dword [bcd_positive_out], 0x12345678
+    jne fail
+    cmp dword [bcd_positive_out + 4], 0
+    jne fail
+    cmp word [bcd_positive_out + 8], 0
+    jne fail
+
+    fild dword [bcd_negative]
+    fbstp tword [bcd_negative_out]
+    cmp dword [bcd_negative_out], 0x09012345
+    jne fail
+    cmp dword [bcd_negative_out + 4], 0
+    jne fail
+    cmp word [bcd_negative_out + 8], 0x8000
+    jne fail
+
     ; Environment and complete-state streams.
     fnstenv [env_image]
     fldenv [env_image]
@@ -59,6 +78,13 @@ start:
     frstor [save_image]
 
     mov al, STATUS_PASS
+    mov dx, STATUS_PORT
+    out dx, al
+    hlt
+    jmp $
+
+fail:
+    mov al, 0xff
     mov dx, STATUS_PORT
     out dx, al
     hlt
@@ -74,6 +100,10 @@ int32:              dd -12345678
 int32_out:          dd 0
 int64:              dq -1234567890123
 int64_out:          dq 0
+bcd_positive:       dd 12345678
+bcd_positive_out:   times 10 db 0xff
+bcd_negative:       dd -9012345
+bcd_negative_out:   times 10 db 0xff
 real32:             dd 0x3fc00000               ; 1.5
 real32_out:         dd 0
 real64:             dq 0x4004000000000000       ; 2.5

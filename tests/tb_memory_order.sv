@@ -12,6 +12,7 @@ module tb_memory_order;
     reg   [3:0] dcache_req_be = 4'hF;
     reg  [31:0] dcache_req_wdata = 32'h0;
     reg         dcache_req_is_io = 1'b0;
+    reg         dcache_req_is_vga_mem = 1'b0;
     wire        dcache_req_accepted;
     wire        dcache_req_complete;
     wire        dcache_read_complete;
@@ -47,7 +48,7 @@ module tb_memory_order;
         .dcache_req_is_io(dcache_req_is_io),
         .dcache_req_is_inta(1'b0),
         .dcache_req_is_x87(1'b0),
-        .dcache_req_is_vga_mem(1'b0),
+        .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
         .dcache_req_accepted(dcache_req_accepted),
         .dcache_req_complete(dcache_req_complete),
         .dcache_read_complete(dcache_read_complete),
@@ -145,6 +146,35 @@ module tb_memory_order;
         dcache_req_write = 1'b0;
         dcache_req_is_io = 1'b0;
         ready = 1'b0;
+
+        // Reset the queue, then verify that a direct VGA-memory request can
+        // win arbitration against an unrelated posted RAM-store drain.  VGA
+        // transactions all use this direct path, so their mutual ordering is
+        // still preserved.
+        reset_n = 1'b0;
+        repeat (5) @(posedge clk);
+        reset_n = 1'b1;
+        repeat (20) @(posedge clk);
+
+        @(negedge clk);
+        dcache_req_phys_addr_raw = 32'h0000_2000;
+        dcache_req_wdata = 32'h1234_5678;
+        dcache_req_write = 1'b1;
+        dcache_req_is_io = 1'b0;
+        dcache_req_is_vga_mem = 1'b0;
+        dcache_req_valid = 1'b1;
+        do @(negedge clk); while (!dcache_req_accepted);
+
+        dcache_req_phys_addr_raw = 32'h000B_8000;
+        dcache_req_write = 1'b0;
+        dcache_req_is_vga_mem = 1'b1;
+
+        do @(negedge clk); while (!valid);
+        if (io || write || addr !== 30'h0002_E000) begin
+            $display("MEMORY ORDER FAIL VGA bypass: io=%0b write=%0b addr=%08x",
+                     io, write, {addr, 2'b00});
+            $fatal(1);
+        end
 
         $display("Memory device-ordering unit test PASS");
         $finish;

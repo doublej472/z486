@@ -138,6 +138,12 @@ logic         store_pop;
 logic         store_source_empty;
 x87_reg_t     store_source;
 logic [79:0]  store_source_raw;
+logic         store_bcd;
+logic         bcd_convert_pending;
+logic [63:0]  bcd_binary;
+logic [71:0]  bcd_digits;
+logic  [6:0]  bcd_shift_count;
+logic         bcd_sign;
 logic         pop_pending;
 logic         result_write_pending;    // Serialized architectural stack replacement.
 logic [2:0]   result_write_index;
@@ -537,12 +543,36 @@ task automatic start_store(
     begin
         source_empty = stack_empty(st0_index);
         store_pending <= 1'b1;
+        store_bcd <= 1'b0;
         store_integer <= integer_store;
         store_width <= width;
         store_pop <= pop;
         store_source_empty <= source_empty;
         // Store commands request CPU reads only after converted words enter
         // the output FIFO.
+        command_complete_pulse <= 1'b0;
+        if (source_empty) begin
+            raise_stack_fault(1'b0);
+            store_source <= x87_indefinite();
+            store_source_raw <= x87_to_m80(x87_indefinite());
+        end else begin
+            store_source <= stack_read_data_a;
+            store_source_raw <= stack_read_raw_a;
+            status_flags[9] <= 1'b0;
+        end
+    end
+endtask
+
+task automatic start_bcd_store;
+    logic source_empty;
+    begin
+        source_empty = stack_empty(st0_index);
+        store_pending <= 1'b1;
+        store_bcd <= 1'b1;
+        store_integer <= 1'b1;
+        store_width <= 2'd2;
+        store_pop <= 1'b1;
+        store_source_empty <= source_empty;
         command_complete_pulse <= 1'b0;
         if (source_empty) begin
             raise_stack_fault(1'b0);
@@ -609,7 +639,7 @@ wire core_cmd_ready = ((rx_kind == RX_NONE) || restartable_rx_command) &&
                    !command_pending && !stack_write_a && !stack_write_b &&
                    !push_pending &&
                    (!memory_math_pending || restartable_rx_command) &&
-                   !store_pending && !pop_pending &&
+                   !store_pending && !bcd_convert_pending && !pop_pending &&
                    !result_write_pending &&
                    !v2_exec_pending &&
                    !v2_exec_busy && !v2_exec_done &&
@@ -634,10 +664,20 @@ wire [2:0] tx_entry_bytes = transfer_byte_count(transfer_pop_data[35:32]);
 wire [2:0] tx_request_bytes = transfer_byte_count(read_req_be);
 wire tx_entry_consumed = tx_byte_offset + tx_request_bytes >= tx_entry_bytes;
 wire v2_exec_start = v2_exec_pending && !v2_exec_busy;
+logic [71:0] bcd_adjusted;
+integer bcd_digit;
+always_comb begin
+    bcd_adjusted = bcd_digits;
+    for (bcd_digit = 0; bcd_digit < 18; bcd_digit = bcd_digit + 1)
+        if (bcd_digits[bcd_digit*4 +: 4] >= 4'd5)
+            bcd_adjusted[bcd_digit*4 +: 4] =
+                bcd_digits[bcd_digit*4 +: 4] + 4'd3;
+end
 wire signed [32:0] fscale_scaled_exp =
     $signed({18'b0, fscale_value.exp}) + fscale_delta;
 assign busy_n = !(((v2_exec_owner == EXEC_MATH) &&
                    (v2_exec_pending || v2_exec_busy)) ||
+                  bcd_convert_pending ||
                   (fscale_phase != FSCALE_IDLE) ||
                   (command_pending && command_is_arithmetic));
 // PEREQ releases the 80386 coprocessor-wait microcode as well as requesting
@@ -648,7 +688,8 @@ assign pereq = (rx_kind != RX_NONE) ||
                direct_m32_pending || command_pending ||
                stack_write_a || stack_write_b ||
                push_pending || memory_math_pending ||
-               store_pending || pop_pending || result_write_pending ||
+               store_pending || bcd_convert_pending ||
+               pop_pending || result_write_pending ||
                v2_exec_pending || v2_exec_busy || v2_exec_done ||
                fptan_trans_pending || fptan_div_pending ||
                fptan_push_after_result ||
@@ -852,6 +893,12 @@ always_ff @(posedge clk) begin
         store_source_empty <= 1'b0;
         store_source <= x87_empty();
         store_source_raw <= 80'h0;
+        store_bcd <= 1'b0;
+        bcd_convert_pending <= 1'b0;
+        bcd_binary <= 64'h0;
+        bcd_digits <= 72'h0;
+        bcd_shift_count <= 7'd0;
+        bcd_sign <= 1'b0;
         pop_pending <= 1'b0;
         result_write_pending <= 1'b0;
         result_write_index <= 3'd0;
@@ -969,7 +1016,14 @@ always_ff @(posedge clk) begin
         end
 
         if (store_pending) begin
-            if (!store_integer && (store_width == 2'd2)) begin
+            if (store_bcd) begin
+                v2_exec_op <= X87_CONVERT_FIST;
+                v2_exec_owner <= EXEC_STORE;
+                v2_exec_size <= 2'd2;
+                arith_operand_a <= store_source;
+                v2_exec_transfer <= 64'h0;
+                v2_exec_pending <= 1'b1;
+            end else if (!store_integer && (store_width == 2'd2)) begin
                 logic [79:0] store_m80_value;
                 store_m80_value = store_source_raw;
                 tx_state_shift <= {80'h0, store_m80_value};
@@ -1008,15 +1062,43 @@ always_ff @(posedge clk) begin
                         raise_invalid();
                 end
                 X87_COMMIT_TRANSFER: begin
-                    tx_state_shift <= {96'h0, v2_exec_transfer_out};
-                    tx_count <= ((store_integer && (store_width == 2'd2)) ||
-                                 (!store_integer && (store_width == 2'd1)))
-                              ? 2'd2 : 2'd1;
-                    tx_last_be <= (store_integer && (store_width == 2'd0))
-                                ? 4'h3 : 4'hf;
-                    tx_index <= 5'd0;
-                    tx_kind <= TX_VALUE;
-                    tx_generation_done <= 1'b0;
+                    if (store_bcd) begin
+                        logic [63:0] bcd_magnitude;
+                        bcd_magnitude = v2_exec_transfer_out[63]
+                                      ? (~v2_exec_transfer_out + 64'd1)
+                                      : v2_exec_transfer_out;
+                        if (v2_exec_invalid ||
+                            (bcd_magnitude > 64'd999999999999999999)) begin
+                            tx_state_shift <= {
+                                80'h0, 80'hffff_c000_0000_0000_0000};
+                            tx_count <= 2'd3;
+                            tx_last_be <= 4'h3;
+                            tx_index <= 5'd0;
+                            tx_kind <= TX_VALUE;
+                            tx_generation_done <= 1'b0;
+                            store_bcd <= 1'b0;
+                            if (!v2_exec_invalid)
+                                raise_invalid();
+                            if (store_pop && control_word[0])
+                                pop_pending <= 1'b1;
+                        end else begin
+                            bcd_binary <= bcd_magnitude;
+                            bcd_digits <= 72'h0;
+                            bcd_shift_count <= 7'd64;
+                            bcd_sign <= v2_exec_transfer_out[63];
+                            bcd_convert_pending <= 1'b1;
+                        end
+                    end else begin
+                        tx_state_shift <= {96'h0, v2_exec_transfer_out};
+                        tx_count <= ((store_integer && (store_width == 2'd2)) ||
+                                     (!store_integer && (store_width == 2'd1)))
+                                  ? 2'd2 : 2'd1;
+                        tx_last_be <= (store_integer && (store_width == 2'd0))
+                                    ? 4'h3 : 4'hf;
+                        tx_index <= 5'd0;
+                        tx_kind <= TX_VALUE;
+                        tx_generation_done <= 1'b0;
+                    end
                     if (v2_exec_invalid)
                         raise_invalid();
                     if (v2_exec_overflow) begin
@@ -1040,7 +1122,7 @@ always_ff @(posedge clk) begin
                             status_flags[15] <= 1'b1;
                         end
                     end
-                    if (store_pop &&
+                    if (!store_bcd && store_pop &&
                         (store_integer
                          ? (!(v2_exec_invalid || store_source_empty) ||
                             control_word[0])
@@ -1049,6 +1131,26 @@ always_ff @(posedge clk) begin
                 end
                 default: ;
             endcase
+        end
+
+        if (bcd_convert_pending) begin
+            bcd_binary <= {bcd_binary[62:0], 1'b0};
+            bcd_digits <= {bcd_adjusted[70:0], bcd_binary[63]};
+            bcd_shift_count <= bcd_shift_count - 7'd1;
+            if (bcd_shift_count == 7'd1) begin
+                tx_state_shift <= {
+                    80'h0, {bcd_sign, 7'h00,
+                            bcd_adjusted[70:0], bcd_binary[63]}};
+                tx_count <= 2'd3;
+                tx_last_be <= 4'h3;
+                tx_index <= 5'd0;
+                tx_kind <= TX_VALUE;
+                tx_generation_done <= 1'b0;
+                bcd_convert_pending <= 1'b0;
+                store_bcd <= 1'b0;
+                if (store_pop && (!store_source_empty || control_word[0]))
+                    pop_pending <= 1'b1;
+            end
         end
 
         if (pop_pending) begin
@@ -1917,6 +2019,8 @@ always_ff @(posedge clk) begin
                         command_decode.argument[0],
                         command_decode.argument[2:1],
                         command_decode.argument[3]);
+                X87_CMD_STORE_BCD:
+                    start_bcd_store();
                 default: ;
             endcase
         end

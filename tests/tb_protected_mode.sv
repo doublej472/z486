@@ -625,7 +625,10 @@ module tb_protected_mode #(
     bit snapshot_mode;
     bit stop_eip_valid;
     int stop_eip, stop_cs;
-    int checksum_start, checksum_bytes;
+    int stop_occurrence, stop_match_count;
+    int checksum_count;
+    int checksum_start [0:3];
+    int checksum_bytes [0:3];
 
     logic [31:0] init_eax, init_ebx, init_ecx, init_edx;
     logic [31:0] init_esi, init_edi, init_ebp, init_esp, init_eflags;
@@ -878,8 +881,29 @@ module tb_protected_mode #(
 
         stop_eip_valid = $value$plusargs("stop_eip=%h", stop_eip);
         if (!$value$plusargs("stop_cs=%h", stop_cs)) stop_cs = init_cs;
-        if (!$value$plusargs("checksum_start=%h", checksum_start)) checksum_start = 0;
-        if (!$value$plusargs("checksum_bytes=%h", checksum_bytes)) checksum_bytes = 0;
+        if (!$value$plusargs("stop_occurrence=%d", stop_occurrence)) stop_occurrence = 1;
+        if (stop_occurrence < 1) stop_occurrence = 1;
+        stop_match_count = 0;
+        if (!$value$plusargs("checksum_count=%d", checksum_count)) begin
+            checksum_count = 1;
+            if (!$value$plusargs("checksum_start=%h", checksum_start[0])) checksum_start[0] = 0;
+            if (!$value$plusargs("checksum_bytes=%h", checksum_bytes[0])) checksum_bytes[0] = 0;
+        end else begin
+            if (checksum_count < 1) checksum_count = 1;
+            if (checksum_count > 4) checksum_count = 4;
+            for (int i = 0; i < 4; i++) begin
+                checksum_start[i] = 0;
+                checksum_bytes[i] = 0;
+            end
+            void'($value$plusargs("checksum0_start=%h", checksum_start[0]));
+            void'($value$plusargs("checksum0_bytes=%h", checksum_bytes[0]));
+            void'($value$plusargs("checksum1_start=%h", checksum_start[1]));
+            void'($value$plusargs("checksum1_bytes=%h", checksum_bytes[1]));
+            void'($value$plusargs("checksum2_start=%h", checksum_start[2]));
+            void'($value$plusargs("checksum2_bytes=%h", checksum_bytes[2]));
+            void'($value$plusargs("checksum3_start=%h", checksum_start[3]));
+            void'($value$plusargs("checksum3_bytes=%h", checksum_bytes[3]));
+        end
 
         x87_control_arg = 16'h037f; x87_status_arg = 0;
         x87_tag_arg = 16'hffff; x87_top_arg = 0;
@@ -986,36 +1010,46 @@ module tb_protected_mode #(
                 $finish;
             end
 
-            // Count instructions
+            // Count architectural issue transfers. RNI can remain asserted on
+            // adjacent boundaries, so edge-counting it undercounts throughput.
             prev_instruction_boundary <= instruction_boundary;
-            if (instruction_boundary && !prev_instruction_boundary)
+            if (dut.i_issue)
                 instruction_count <= instruction_count + 1;
 
-            // Snapshot completion is the first instruction at the saved
-            // return address. EIP still names that instruction on i_issue.
+            // EIP still names the matching instruction on i_issue.  Counting
+            // occurrences permits stable loop/body boundaries as well as a
+            // traditional first return-address stop.
             if (stop_eip_valid && dut.i_issue &&
                 (dut.CS == stop_cs[15:0]) && (dut.EIP == stop_eip)) begin
-                longint unsigned checksum;
-                checksum = 64'hcbf29ce484222325;
-                for (int i = 0; i < checksum_bytes; i++) begin
-                    if ((checksum_start + i) < MEM_SIZE) begin
-                        checksum = checksum ^ mem[checksum_start + i];
-                        checksum = checksum * 64'h00000100000001b3;
+                if ((stop_match_count + 1) < stop_occurrence) begin
+                    stop_match_count <= stop_match_count + 1;
+                end else begin
+                    longint unsigned checksum [0:3];
+                    for (int range_index = 0; range_index < checksum_count; range_index++) begin
+                        checksum[range_index] = 64'hcbf29ce484222325;
+                        for (int i = 0; i < checksum_bytes[range_index]; i++) begin
+                            if ((checksum_start[range_index] + i) < MEM_SIZE) begin
+                                checksum[range_index] = checksum[range_index] ^
+                                                        mem[checksum_start[range_index] + i];
+                                checksum[range_index] = checksum[range_index] *
+                                                        64'h00000100000001b3;
+                            end
+                        end
                     end
-                end
-                $display("");
-                $display("========================================");
-                $display("  SNAPSHOT COMPLETE");
-                $display("  Total cycles: %0d", cycle);
-                $display("  Total instructions: %0d", instruction_count);
-                $display("  CPI: %f", instruction_count ?
-                         real'(cycle) / real'(instruction_count) : 0.0);
-                $display("  x87 commands: %0d", x87_command_count);
-                $display("  x87 direct loads: %0d", x87_direct_load_count);
-                $display("  x87 control busy cycles: %0d", x87_control_busy_cycles);
-                $display("  x87 executor busy cycles: %0d", x87_executor_busy_cycles);
-                $display("  x87 WAIT stall cycles: %0d", x87_wait_stall_cycles);
-                if ($test$plusargs("profile_x87")) begin
+                    $display("");
+                    $display("========================================");
+                    $display("  SNAPSHOT COMPLETE");
+                    $display("  Stop occurrence: %0d", stop_occurrence);
+                    $display("  Total cycles: %0d", cycle);
+                    $display("  Total instructions: %0d", instruction_count);
+                    $display("  CPI: %f", instruction_count ?
+                             real'(cycle) / real'(instruction_count) : 0.0);
+                    $display("  x87 commands: %0d", x87_command_count);
+                    $display("  x87 direct loads: %0d", x87_direct_load_count);
+                    $display("  x87 control busy cycles: %0d", x87_control_busy_cycles);
+                    $display("  x87 executor busy cycles: %0d", x87_executor_busy_cycles);
+                    $display("  x87 WAIT stall cycles: %0d", x87_wait_stall_cycles);
+                    if ($test$plusargs("profile_x87")) begin
                     for (int i = 0; i < 2048; i++) begin
                         if (x87_fop_count[i] != 0)
                             $display("X87_FOP protocol %03x %0d", i, x87_fop_count[i]);
@@ -1030,7 +1064,7 @@ module tb_protected_mode #(
                                      x87_exec_busy_count[i]);
                     end
                 end
-                if ($test$plusargs("profile_cpu")) begin
+                    if ($test$plusargs("profile_cpu")) begin
                     for (int i = 0; i < 4096; i++) begin
                         if (cpu_entry_count[i] != 0)
                             $display("CPU_ENTRY %03x %0d %0d %0d %0d %0d", i,
@@ -1082,12 +1116,15 @@ module tb_protected_mode #(
                                      cpu_store_next_opcode_gap[i][3]);
                     end
                 end
-                $display("  FNV64[%08x+%08x]: %016x",
-                         checksum_start, checksum_bytes, checksum);
-                $display("  CS:EIP: %04X:%08X", dut.CS, dut.EIP);
-                $display("========================================");
-                #50;
-                $finish;
+                    for (int range_index = 0; range_index < checksum_count; range_index++)
+                        $display("  FNV64[%08x+%08x]: %016x",
+                                 checksum_start[range_index], checksum_bytes[range_index],
+                                 checksum[range_index]);
+                    $display("  CS:EIP: %04X:%08X", dut.CS, dut.EIP);
+                    $display("========================================");
+                    #50;
+                    $finish;
+                end
             end
 
             // Test completed

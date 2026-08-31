@@ -131,10 +131,13 @@ wire dcache_read_done = dcache_cpu_resp_valid &&
                         (dcache_cpu_rd_pending || dcache_read_accept);
 wire icache_read_done = icache_cpu_resp_valid &&
                         (icache_cpu_rd_pending || icache_read_accept);
-// I/O, INTA, and VGA aperture transactions must not overtake older posted
-// stores.  This is also what makes a CPU-filled Sound Blaster buffer visible
-// before the following DSP command lets DMA consume it.
-wire ext_direct_req = dcache_direct_req && dcache_stores_drained &&
+// I/O and INTA transactions must not overtake older posted stores.  This is
+// what makes a CPU-filled Sound Blaster buffer visible before the following
+// DSP command lets DMA consume it.  VGA memory already bypasses the posted
+// queue, so direct VGA accesses remain mutually ordered without draining
+// unrelated normal-RAM stores first.
+wire direct_req_ordered = dcache_req_is_vga_mem || dcache_stores_drained;
+wire ext_direct_req = dcache_direct_req && direct_req_ordered &&
                       !direct_rd_pending &&
                       !dcache_read_pending && !icache_read_pending;
 wire ext_dcache_req = dcache_mem_valid && !ext_direct_req &&

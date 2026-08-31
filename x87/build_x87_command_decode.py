@@ -13,7 +13,7 @@ ACTIONS = {
             "FRNDINT", "FDECSTP", "FINCSTP", "TX_ENV", "TX_STATE",
             "RX_ENV", "RX_STATE", "ARITH", "FLD_ST", "FXCH", "FFREE",
             "FSTP_ST", "MEMORY_MATH", "LOAD", "STORE", "FYL2X",
-            "F2XM1", "FSCALE", "FPREM",
+            "F2XM1", "FSCALE", "FPREM", "STORE_BCD",
         )
     )
 }
@@ -196,6 +196,8 @@ def fields(fop: int) -> dict[str, int]:
     elif not register_form(fop) and group(fop) == 7 and operation(fop) == 7:
         result.update(action=ACTIONS["STORE"],
                       parameter=(1 << 0) | (1 << 3) | (2 << 1))
+    elif not register_form(fop) and group(fop) == 7 and operation(fop) == 6:
+        result.update(action=ACTIONS["STORE_BCD"])
     return result
 
 

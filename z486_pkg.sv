@@ -1051,6 +1051,7 @@ localparam [11:0] UADDR_HARDWARE_IRQ   = 12'h82D;  // INTR handler entry point
 localparam [11:0] UADDR_NMI            = 12'h836;  // NMI handler entry point
 localparam [11:0] UADDR_SINGLE_STEP    = 12'h93F;  // #DB(1) - TF single-step trap
 localparam [11:0] UADDR_TSS_PROBLEM    = 12'h85D;  // #TS path used by protected-mode descriptor checks
+localparam [11:0] UADDR_FPU_STORE_TAIL = 12'h57B;  // Final 16-bit word of an m80 store
 localparam [11:0] UADDR_PAGE_FAULT     = 12'h8E9;  // #PF(14) - page fault
 localparam [11:0] UADDR_INVALID_LOCK   = 12'h82B;  // #UD for invalid LOCK usage
 localparam [11:0] UADDR_BSWAP          = 12'h9C4;  // Optimizer-owned 486 BSWAP entry

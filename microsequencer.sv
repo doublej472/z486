@@ -70,6 +70,7 @@ module microsequencer
     output logic [2:0]  uc_dly_source,
     output logic [8:0]  uc_mem_ctrl,
     output logic        uc_fpu_f8,
+    output logic        uc_force_word,
     output logic        uc_ctl_pref
 );
 
@@ -284,6 +285,7 @@ always_ff @(posedge clk) begin
         jump_taken_prev <= 1'b0;
         pref_suppress_prev <= 1'b0;
         uc_ctl_pref <= 1'b0;
+        uc_force_word <= 1'b0;
     end else begin
         uaddr <= uaddr_next;
 
@@ -291,6 +293,9 @@ always_ff @(posedge clk) begin
             uc_addr_mem <= rom_addr;
         if (rom_q_ce) begin
             uc_addr <= uc_addr_mem;
+            // The m80 store tail executes after a dword-stride loop, but its
+            // immutable `wr W` word writes only the final two bytes.
+            uc_force_word <= uc_addr_mem == UADDR_FPU_STORE_TAIL;
             uc_ctl_pref <= (rom_q_early[5:0] == BUSOP_PREF);
         end
 

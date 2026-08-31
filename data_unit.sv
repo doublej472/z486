@@ -146,6 +146,8 @@ logic [31:0] csopcd, fsveip, oproff;
 logic [2:0] src_reg_sel_r;           // EX-local copies of issued GPR selectors
 logic [2:0] dst_reg_sel_r;
 logic [2:0] recipe_shift_widx;       // Byte-normalized deferred-shift GPR
+logic [7:0] recipe_memory_dst_onehot;// Byte-normalized deferred-load GPR
+logic [1:0] recipe_memory_mode;      // Byte-low/high, word, or dword merge
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
@@ -239,6 +241,11 @@ function automatic logic [31:0] read_gpr_value(
     endcase
 endfunction
 
+localparam logic [1:0] EA_FWD_BLO = 2'd0;
+localparam logic [1:0] EA_FWD_BHI = 2'd1;
+localparam logic [1:0] EA_FWD_W   = 2'd2;
+localparam logic [1:0] EA_FWD_D   = 2'd3;
+
 // WB-to-EX bypass for a hardwired load's immediate successor.  Cache data is
 // already registered in load_wb_data; this mux therefore starts at the WB
 // boundary and does not extend the cache finalize path into the ALU.
@@ -270,6 +277,20 @@ function automatic logic [31:0] read_gpr_load_forwarded(
                 merged = load_wb_data;
         end
 
+        // The legacy ROM load path reaches the same registered-WB boundary
+        // through recipe_memory_write.  Forward it as well so address-size 16
+        // and other non-VIPT loads obey the same no-bubble data-use rule.
+        if (recipe_memory_write.valid &&
+            recipe_memory_dst_onehot[read_widx]) begin
+            case (recipe_memory_mode)
+                EA_FWD_BLO: merged = {merged[31:8], opr_r[7:0]};
+                EA_FWD_BHI: merged = {merged[31:16], opr_r[7:0],
+                                      merged[7:0]};
+                EA_FWD_W:   merged = {merged[31:16], opr_r[15:0]};
+                default:    merged = opr_r;
+            endcase
+        end
+
         if (size == 2'd0)
             read_gpr_load_forwarded = reg_sel[2]
                                     ? {24'd0, merged[15:8]}
@@ -280,11 +301,6 @@ function automatic logic [31:0] read_gpr_load_forwarded(
             read_gpr_load_forwarded = merged;
     end
 endfunction
-
-localparam logic [1:0] EA_FWD_BLO = 2'd0;
-localparam logic [1:0] EA_FWD_BHI = 2'd1;
-localparam logic [1:0] EA_FWD_W   = 2'd2;
-localparam logic [1:0] EA_FWD_D   = 2'd3;
 
 // D2 reads the architectural GPR bank with delay-slot and deferred-shift
 // forwarding. Delay-slot data wins if both producers name the same register.
@@ -722,6 +738,8 @@ always_ff @(posedge clk) begin
         recipe_shift_write <= '0;
         recipe_shift_widx <= 3'd0;
         recipe_memory_write <= '0;
+        recipe_memory_dst_onehot <= 8'd0;
+        recipe_memory_mode <= EA_FWD_D;
     end else if (pipeline_advance) begin
         recipe_memory_write.valid <= recipe_rni && exec && instr_start &&
                                    !recipe_commit_cancel &&
@@ -730,6 +748,12 @@ always_ff @(posedge clk) begin
             (recipe_state.commit_sel == RECIPE_COMMIT_MEM)) begin
             recipe_memory_write.dst <= dst_reg_sel_r;
             recipe_memory_write.size <= op_size;
+            recipe_memory_dst_onehot <= 8'b1 << ((op_size == 2'd0)
+                                               ? {1'b0, dst_reg_sel_r[1:0]}
+                                               : dst_reg_sel_r);
+            recipe_memory_mode <= (op_size == 2'd0)
+                                ? (dst_reg_sel_r[2] ? EA_FWD_BHI : EA_FWD_BLO)
+                                : (op_size == 2'd1 ? EA_FWD_W : EA_FWD_D);
         end
 
         recipe_shift_write.valid <= recipe_rni && exec && !recipe_commit_cancel &&
