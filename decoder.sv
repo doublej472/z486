@@ -1,5 +1,6 @@
 // Z486 Instruction Decoder
 
+`include "z486_platform.svh"
 module decoder
     import z486_pkg::*;
 (
@@ -89,6 +90,7 @@ reg            d1_sib;      // SIB sub-cycle pending (cursor held)
 decoder_work_t pend_work;   // struct_work parked across the SIB sub-cycle
 decoder_work_t skid;        // one registered D1 successor ahead of D2
 reg            skid_v;
+reg            skel_v;
 reg [4:0]      skid_lit_off;
 reg            skid_one_d2;
 reg [31:0]     skid_raw_lo_r;
@@ -103,6 +105,7 @@ wire [7:0] modrm  = win_d1[15:8];
 wire [7:0] sib_b  = win_d1[23:16];
 wire       data32 = code32_r ^ prefix_66;
 wire       addr32 = code32_r ^ prefix_67;
+wire [15:0] entry_rom_sel;
 
 wire consume_prefix = !d1_sib && !prefix_0f && is_prefix(opcode) &&
                       (d1_avail >= 6'd1);
@@ -111,7 +114,14 @@ wire consume_0f     = !d1_sib && !prefix_0f && (opcode == 8'h0f) &&
 
 decoder_work_t struct_work;
 logic [2:0]    struct_len;
-always_comb build_struct_work(struct_work, struct_len);
+// Some simulators do not include signals referenced only inside a task in an
+// always_comb sensitivity set. Pass the task's live decode inputs explicitly
+// so structural decode is reevaluated when the D1 window advances.
+wire [45:0] struct_work_inputs = {
+    opcode, modrm, prefix_0f, prefix_rep, prefix_count, data32, addr32,
+    prefix_rep_lock, prefix_seg, entry_rom_sel, pe_enable
+};
+always_comb build_struct_work(struct_work_inputs, struct_work, struct_len);
 
 wire struct_bytes_ok = !d1_sib && (d1_avail >= {3'b000, struct_len});
 wire sib_bytes_ok    = d1_sib && (d1_avail >= 6'd3);   // opcode+modrm+sib in view
@@ -153,7 +163,7 @@ end
 
 wire [9:0] entry_rom_addr = {win_d1_early[7:0],
                              prefix_rep_early, prefix_0f_early};
-(* ramstyle = "M10K" *) reg [63:0] entry_rom [0:1023];
+`Z486_BLOCK_RAM reg [63:0] entry_rom [0:1023];
 initial $readmemh("pla_entry_rom.hex", entry_rom);
 reg [63:0] entry_rom_q;
 always_ff @(posedge clk)
@@ -173,15 +183,13 @@ always_ff @(posedge clk or negedge reset_n) begin
 end
 wire [63:0] entry_rom_current = entry_rom_use_q_r
                               ? entry_rom_q : entry_rom_hold_r;
-wire [15:0] entry_rom_sel =
-    entry_rom_current[{data32, pe_enable}*16 +: 16];
+assign entry_rom_sel = entry_rom_current[{data32, pe_enable}*16 +: 16];
 
 // The first-level group code already encodes data-size and opcode-map mode.
 // Keep the ModR/M-dependent second-level entry table in an asynchronous ROM so
 // Quartus can constant-fold it as one compact lookup rather than retaining the
 // original deep priority PLA on the D1 -> microcode-address cone.
-/* synthesis syn_ramstyle = "MLAB, no_rw_check" */
-reg [15:0] group_entry_rom [0:1023];
+`Z486_DISTRIBUTED_RAM reg [15:0] group_entry_rom [0:1023];
 initial $readmemh("pla_group_entry.hex", group_entry_rom);
 
 decoder_work_t handoff_work;
@@ -197,6 +205,15 @@ always_comb begin
     handoff_d2 = handoff_work;
     handoff_d2.entry.entry_point = handoff_entry_point;
     handoff_d2.entry.ucode_action = recipe_action(handoff_entry_point);
+    // Resolve the direct ALU memory-load class in D1. Re-decoding opcode and
+    // ModR/M from i_bus put this classification in series with VIPT hit
+    // resolution and same-edge chained issue on the microcode-ROM address path.
+    handoff_d2.entry.vipt_alu = !handoff_work.entry.has_0f &&
+        (handoff_work.entry.opcode[7:6] == 2'b00) &&
+        !handoff_work.entry.opcode[2] && handoff_work.entry.opcode[1] &&
+        handoff_work.entry.has_modrm &&
+        (handoff_work.entry.modrm[7:6] != 2'b11) &&
+        (handoff_work.entry.opcode[5:3] != 3'b111);
     // The recipe hazard mask is derived from this registered structural entry
     // during D2. Keeping it out of D1 avoids serializing entry-PLA decode and
     // mask generation on the raw-window-to-skeleton path.
@@ -275,7 +292,6 @@ assign d1_preread_adv = (consume_prefix || consume_0f) ? 4'd1 :
 //=============================================================================
 
 decoder_work_t skel;
-reg            skel_v;
 reg [4:0]      skel_lit_off;
 reg [31:0]     skel_raw_hi_r;    // upper half of the opcode-relative D1 window
 reg [1:0]      skel_raw_lit_off_r;
@@ -652,6 +668,7 @@ assign decq_has_jmp_call =
 //=============================================================================
 
 task automatic build_struct_work(
+    input logic [45:0]    sensitivity_inputs,
     output decoder_work_t w,
     output logic [2:0]    s_len
 );

@@ -14,30 +14,38 @@
 //   9. Address and Data Units (EA, ALU, register file, shifter, flags)
 //  10. x87 Coprocessor
 
+`include "z486_platform.svh"
 module z486
     import z486_pkg::*;
 #(
     parameter PROTECT_UMA_ROM = 0,
-    parameter DCACHE_SET_BITS = 8,   // dcache size: 8 = 16KB, 7 = 8KB
-    parameter ICACHE_SET_BITS = 8,   // icache size: 8 = 16KB, 7 = 8KB
+    parameter DCACHE_SET_BITS = 7,   // dcache size: 7 = 8KB, 8 = 16KB
+    parameter ICACHE_SET_BITS = 7,   // icache size: 7 = 8KB, 8 = 16KB
     parameter ENABLE_X87 = 0,
+    parameter ENABLE_DEVICE_MMIO = 0,
+    parameter [31:0] DEVICE_MMIO_MASK = 32'hff00_0000,
     parameter [6:0] CLOCK_RATE_MHZ = 7'd85
 )
 (
     input              clk,
     input              reset_n,
+    input              device_mmio_enable,
+    input      [31:0]  device_mmio_base,
 
     // 32-bit bus interface (ready/valid handshake)
     output     [31:2]  addr,        // Physical address [31:2]
     output      [3:0]  be,          // Byte enables
     output      [7:0]  burstcount,  // Burst length in DWORDs
+    output             line_read,   // Request is one complete cache line
     input      [31:0]  din,         // Data input
+    input      [127:0] line_din,    // Complete aligned cache-line response
     output     [31:0]  dout,        // Data output
     output             valid,       // Request valid (held until ready)
     input              ready,       // Handshake: transfer on valid && ready
     output             write,       // 1=write, 0=read (stable while valid)
     output             io,          // I/O vs memory (1=I/O, 0=memory)
     input              resp_valid,  // Read data valid (1-cycle pulse)
+    input              line_resp_valid, // line_din valid (1-cycle pulse)
 
     // Interrupts
     input              intr,        // Maskable interrupt request
@@ -107,10 +115,10 @@ reg [1:0]  op_size;                 // Runtime operand size: 0=byte, 1=word, 2=d
 reg [1:0]  op_size_decode;          // Decoded operand size (saved at i_issue, restored by BITSDE)
 reg [1:0]  srcreg_size;             // Same as op_size most of the time, different for MOVZX/MOVSX and etc
 reg [1:0]  srcreg_size_decode;      // Decoded srcreg_size (saved at i_issue, restored by BITSDE)
-(* preserve *) reg [1:0] op_size_src;            // Local copy for generic source mux fanout
-(* preserve *) reg [1:0] op_size_src_decode;
-(* preserve *) reg [1:0] srcreg_size_src;
-(* preserve *) reg [1:0] srcreg_size_src_decode;
+`Z486_KEEP reg [1:0] op_size_src;            // Local copy for generic source mux fanout
+`Z486_KEEP reg [1:0] op_size_src_decode;
+`Z486_KEEP reg [1:0] srcreg_size_src;
+`Z486_KEEP reg [1:0] srcreg_size_src_decode;
 // Keep runtime width consumers on the timing-local source replica. op_size_src
 // is updated in lockstep with op_size but avoids routing the architectural copy
 // back through the address and data-unit cones.
@@ -133,6 +141,32 @@ wire [31:0] memory_write_source_value;
 wire [31:0] alu_src_data;
 wire [31:0] protun_write_value;
 wire [15:0] cs_source_value;
+wire        uc_exec;
+wire        prot_is_ptovrr;
+wire [11:0] uc_addr;
+wire [6:0]  uc_dest;
+wire [5:0]  uc_source;
+wire [31:0] dest_value;
+wire        uc_pref_suppress_prev;
+wire        stall;
+wire        decq_empty;
+wire        vipt_load_ex_hit;
+wire        uc_busreq;
+wire        mem_req_current;
+wire        uc_is_wio;
+wire        uc_is_rpt;
+wire        cr3_write;
+wire [1:0]  pg_cpl;
+wire        seg_gp_fault;
+wire [31:0] issue_ind_linear;
+wire [1:0]  issue_ind_linear_low;
+wire        dly_gpr_we;
+wire        eff_mask_pending;
+reg  [3:0]  seg_cmd;
+wire        gate_detect_cond;
+wire [31:0] br_target;
+reg         rmw_fallback_delay_r;
+reg         early_redirected;
 
 // Segmentation and protection state shared across the address pipeline.
 reg [15:0] ES = 16'h0000;
@@ -199,6 +233,7 @@ wire       pf_full;
 wire       q_flush;                 // Flush queue (branch/jump) - combinational for i.immediate gating
 wire       pe_mode_toggle_now;      // CR0.PE changed this cycle: re-decode next bytes in new mode
 wire       uc_ctl_pref;             // Previous-cycle predecode: current uop is BUSOP_PREF
+wire       early_redirect;
 
 // The live compare read dest_value[0] -- doc/z486/old/core_notes_v51.md #1
 wire cr0_wr_bit0 = (uc_source == SRC_MDTMP) ? muldiv_result[0] :
@@ -295,14 +330,11 @@ wire        x87_direct_mem_req;
 // After a jump, the next micro-op still executes (delay slot) before jump takes effect.
 wire [11:0] uaddr_next;             // Next address, launched early to the ucode ROM
 wire [11:0] uaddr;                  // Address being fetched in the current ucode pipeline
-wire [11:0] uc_addr;                // Address of current uc (for debug)
 wire [11:0] uc_addr_mem_r;          // Address aligned with the ROM q_mem stage
 wire [50:0] uc;                     // Current microcode word + pre-computed bits (50:37)
 wire [50:0] uc_next;
 wire [5:0]  uc_buscode;             // Bus operation code from microcode
-wire [6:0]  uc_dest;                // Destination field from microcode
-wire [5:0]  uc_source;              // Source field from microcode
-wire [31:0] dest_value;             // Data Unit-selected destination value
+wire [5:0]  uc_alu_src;             // ALU source / micro-jump offset field
 wire [6:0]  uc_aluop;               // ALU operation / microcode jump condition
 wire [2:0]  uc_opcode;              // RNI/RPT operation field
 wire        uc_is_rni;
@@ -406,6 +438,17 @@ wire [1:0] d2_vipt_write_size;
 hardwired_load_result_t d2_vipt_result_kind;
 hardwired_load_token_t vipt_load_ex_r; // D2-owned preread resolves in EX
 hardwired_load_token_t vipt_load_replay_r; // Younger probe saved behind a miss
+// These nets feed module ports before their generating logic appears below.
+// Declare them here so XSim cannot create disconnected implicit one-bit nets.
+wire [31:0] spec_target_lin;
+wire        pf_spec_req;
+reg         pf_spec_owner_r;
+wire        pf_spec_store;
+wire [31:0] pf_spec_store_linear;
+wire        pf_spec_global_kill;
+wire        vipt_issue_load;
+wire        prot_redirect_prev;
+wire        prot_redirect_taken;
 hardwired_load_payload_t vipt_load_slow_r; // Miss owned by normal paging
 reg        vipt_load_slow_req_r;
 reg        vipt_load_slow_wait_r;
@@ -433,7 +476,6 @@ reg        rmw_fast_active_r;           // Qualified address owned through WR_FA
 reg [31:0] rmw_fast_phys_r;
 reg [1:0]  rmw_fast_size_r;
 reg [1:0]  rmw_fast_lane_r;
-reg        rmw_fallback_delay_r;        // Hold rejected overlay until slow entry arrives
 wire       fast_store_accepted;
 wire       fast_store_valid = rmw_fast_active_r && i_rni_delay;
 wire [3:0] fast_store_be = calc_be(rmw_fast_size_r, rmw_fast_lane_r);
@@ -569,7 +611,8 @@ wire       mem_block_busy = (uc_bus_or_dly && !dly_grace_now && !posted_write_re
                             mem_opt_wait || mem_write_wait; // demand op in flight
 wire       mem_block_idle = (uc_busreq && !mem_accepted);  // uop wants the bus, paging not ready
 wire       stall_mem = mem_servicing ? mem_block_busy : (mem_req_current && !mem_accepted);
-wire       stall_wio = (uc_is_wio && !interrupt_pending && !single_step);
+wire       stall_wio = uc_active && uc_is_wio &&
+                       !interrupt_pending && !single_step;
 wire       stall_x87_direct;
 wire       stall_invlpg;
 // An entry may reach the ROM before its D2 literals arrive. Let the ending
@@ -577,8 +620,8 @@ wire       stall_invlpg;
 // word until D2 can transfer it to EX. The RNI cycle can also prepare a split
 // EA; stalling it would suppress the current instruction's delay-slot writeback.
 wire       stall_d2 = d2_valid && !d2_payload_ready && !i_rni && !i_rni_delay;
-wire       stall = stall_mem || stall_wio || stall_d2 || stall_x87_direct ||
-                   stall_invlpg || stall_fast_store;
+assign stall = stall_mem || stall_wio || stall_d2 || stall_x87_direct ||
+               stall_invlpg || stall_fast_store;
 
 // Repeat
 wire       prot_result_now;
@@ -593,12 +636,12 @@ wire       vipt_load_overlap_wb = vipt_load_overlap_r &&
                      vipt_load_wb_valid_r && !vipt_load_ex_r.valid &&
                      !vipt_load_replay_r.valid && !vipt_load_slow_busy;
 wire       vipt_load_exec_block = vipt_load_busy && !vipt_load_overlap_wb;
-wire       uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) &&
-                     !stall_wio && !stall_d2 && !stall_x87_direct && !stall_invlpg &&
-                     !stall_fast_store &&
-                     !d2_release_hold && !throttle_parked_r && !recipe_slot_stale &&
-                     !vipt_load_exec_block && !rmw_fallback_delay_r &&
-                     !(vipt_load_rom_shadow_r && recipe_state.jcc);
+assign uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) &&
+                 !stall_wio && !stall_d2 && !stall_x87_direct && !stall_invlpg &&
+                 !stall_fast_store &&
+                 !d2_release_hold && !throttle_parked_r && !recipe_slot_stale &&
+                 !vipt_load_exec_block && !rmw_fallback_delay_r &&
+                 !(vipt_load_rom_shadow_r && recipe_state.jcc);
 wire       uc_exec_writeback = uc_exec;  // local copies for reducing fanout
 wire       uc_exec_shift = uc_exec;
 
@@ -606,7 +649,6 @@ assign     seg_cmd_valid = i_issue || uc_exec;
 
 dec_entry_t i_bus;            // Instruction resident in unified D2
 wire       decq_has_jmp_call; // D1/D2 holds a JMP/CALL rel (halt speculative prefetch)
-wire       decq_empty;        // Legacy name: unified D2 has no skeleton
 dec_entry_t i_bus2;           // Registered D1 skid successor
 dec_entry_t i;                // Current instruction (latched at i_issue; written far below)
 wire       decq_has2;         // i_bus2 is valid
@@ -678,7 +720,7 @@ assign d2_start_entry = d2_start_entry_arch;
 // into q only on the D2->EX transfer edge.
 wire        d2_rom_cancel = interrupt_at_boundary || any_fault || any_fault_issue;
 wire        microcode_rom_base_ce = !stall_mem && !stall_wio && !repeat_active;
-(* noprune *) reg [2:0] early_kind_probe_r;
+`Z486_NO_PRUNE reg [2:0] early_kind_probe_r;
 wire [5:0]  uc_source_shift;
 wire [3:0]  uc_shift_source_class;
 wire [1:0]  uc_shift2_source;
@@ -735,11 +777,15 @@ memory #(
     .PROTECT_UMA_ROM(PROTECT_UMA_ROM),
     .DCACHE_SET_BITS(DCACHE_SET_BITS),
     .ICACHE_SET_BITS(ICACHE_SET_BITS),
-    .ENABLE_X87(ENABLE_X87)
+    .ENABLE_X87(ENABLE_X87),
+    .ENABLE_DEVICE_MMIO(ENABLE_DEVICE_MMIO),
+    .DEVICE_MMIO_MASK(DEVICE_MMIO_MASK)
 ) memory_inst (
     .clk(clk),
     .reset_n(reset_n),
     .a20_enable(a20_enable),
+    .device_mmio_enable(device_mmio_enable),
+    .device_mmio_base(device_mmio_base),
 
     .dcache_req_valid(dcache_req_valid),
     .dcache_req_phys_addr_raw(dcache_req_phys_addr_raw),
@@ -790,13 +836,16 @@ memory #(
     .addr(addr),
     .be(be),
     .burstcount(burstcount),
+    .line_read(line_read),
     .din(din),
+    .line_din(line_din),
     .dout(dout),
     .valid(valid),
     .ready(ready),
     .write(write),
     .io(io),
     .resp_valid(resp_valid),
+    .line_resp_valid(line_resp_valid),
     .inta(inta)
 );
 
@@ -855,15 +904,13 @@ wire [31:0] spec_disp      = i_bus.branch_rel8 ? {{24{i_bus.displacement[7]}}, i
 // Stale-EIP pop guard: a pop CHAINED into a control transfer's
 wire        spec_eip_stale = uc_exec && recipe_rni && (uc_dest == DEST_eIP);
 wire [31:0] spec_target_eip = EIP + ({27'd0, i_bus.length} + spec_disp);
-wire [31:0] spec_target_lin = CS_base + spec_target_eip;
-wire        pf_spec_req    = i_issue && (i_bus.rel_branch_kind != REL_BRANCH_NONE) &&
-                             i_bus.data32 && !hardwired_off &&
-                             !spec_eip_stale;
+assign spec_target_lin = CS_base + spec_target_eip;
+assign pf_spec_req = i_issue && (i_bus.rel_branch_kind != REL_BRANCH_NONE) &&
+                     i_bus.data32 && !hardwired_off && !spec_eip_stale;
 // Ownership: set when an instruction's i_issue requests a spec fetch, cleared
 // by any later pop, flush, or interrupt entry - so it is only up while the
 // requesting branch itself is the current instruction, which is exactly when
 // its taken-flush address provably equals the spec target.
-reg pf_spec_owner_r;
 always_ff @(posedge clk) begin
     if (!reset_n)
         pf_spec_owner_r <= 1'b0;
@@ -877,8 +924,6 @@ end
 
 // Store invalidation is line-selective inside prefetch. External coherence or
 // an address-space change invalidates the speculative line conservatively.
-wire        pf_spec_store;
-wire [31:0] pf_spec_store_linear;
 reg         pf_snoop_kill_r;
 always_ff @(posedge clk) begin
     if (!reset_n)
@@ -886,8 +931,8 @@ always_ff @(posedge clk) begin
     else
         pf_snoop_kill_r <= snoop_valid;
 end
-wire        pf_spec_global_kill = pf_snoop_kill_r || cr3_write ||
-                                  (uc_exec && (uc_dest == DEST_CR0));
+assign pf_spec_global_kill = pf_snoop_kill_r || cr3_write ||
+                             (uc_exec && (uc_dest == DEST_CR0));
 
 //=============================================================================
 // Unit 2: Decode1 (structural decode)
@@ -1145,11 +1190,11 @@ wire vipt_load_ex_contained =
      (vipt_load_ex_r.lane != 2'd3)) ||
     ((vipt_load_ex_r.mem_size == 2'd2) &&
      (vipt_load_ex_r.lane == 2'd0));
-wire vipt_load_ex_hit = vipt_load_ex_r.valid && vipt_load_ex_probed_r &&
-                        vipt_load_ex_contained &&
-                        vipt_translation_ok &&
-                        !vipt_tlb_is_vga_mem && !seg_gp_fault &&
-                        dcache_vipt_resolve_hit;
+assign vipt_load_ex_hit = vipt_load_ex_r.valid && vipt_load_ex_probed_r &&
+                          vipt_load_ex_contained &&
+                          vipt_translation_ok &&
+                          !vipt_tlb_is_vga_mem && !seg_gp_fault &&
+                          dcache_vipt_resolve_hit;
 // Capture the destination operand from every registered EX token,
 // independently of translation, segmentation, and cache outcome. Plain loads
 // use it for byte/word merge forwarding; M3 uses it as the private ALU
@@ -1180,7 +1225,7 @@ wire vipt_replay_try = vipt_load_replay_r.valid &&
                        !vipt_load_ex_r.valid && !vipt_load_slow_busy &&
                        !mem_servicing &&
                        dcache_vipt_probe_ready;
-wire vipt_issue_load = i_issue && d2_vipt_load;
+assign vipt_issue_load = i_issue && d2_vipt_load;
 wire rd_fast_issue = i_issue &&
                      (i_bus.ucode_action == RECIPE_ACTION_RMW_FAST);
 wire vipt_issue_rmw = rd_fast_issue && d2_vipt_rmw;
@@ -1543,8 +1588,8 @@ end
 // ROM cycle, including the uncommon COUNTR-selected IRF destination.
 // !recipe_slot_stale: a hardwired instruction's slot word is stale and writes nothing;
 // its result committed at the entry-word cycle, so the register file is current.
-wire       dly_gpr_we   = i_rni_delay_ea && !recipe_slot_stale &&
-                          dly_gpr_we_pre_r;
+assign dly_gpr_we = i_rni_delay_ea && !recipe_slot_stale &&
+                    dly_gpr_we_pre_r;
 wire [2:0] dly_gpr_sel  = dly_gpr_sel_pre_r;
 wire [1:0] dly_gpr_mode = dly_gpr_mode_pre_r;
 gpr_forward_t dly_gpr_forward;
@@ -1579,8 +1624,6 @@ gpr_ref_t ea_index_ref;
 wire [31:0] ea_base_value;
 wire [31:0] ea_index_value;
 wire [31:0] ea_early;
-wire [31:0] issue_ind_linear;
-wire [1:0]  issue_ind_linear_low;
 
 // D2-AGU observer
 assign d2_agu_dec = ea_decode_of(d2_entry);
@@ -1713,13 +1756,11 @@ wire        descsw_mode;
 wire        mem_is_dtable;
 wire        tss_access_flag;
 wire [31:0] seg_base_pending;  // next seg_base_r from seg unit; for unified linear_address relocate
-wire        eff_mask_pending;  // next (addr_size||is_dtable) from seg unit; 0 => mask offset to 16b
 wire [31:0] seg_base_exec;     // microcode relocation view, excluding issue INIT_SEG
 wire        eff_mask_exec;
 wire [31:0] seg_lar_result, seg_llim_result, seg_lbas_result;
 
 // Segmentation unit command encoder
-reg  [3:0]  seg_cmd;
 reg  [3:0]  seg_cmd_target;
 reg  [31:0] seg_cmd_data;
 reg  [3:0]  uc_seg_cmd;
@@ -1753,7 +1794,6 @@ wire [1:0] gp_access_adj = uc_is_word_op ? 2'd1 :
                            (srcreg_size == 2'd0) ? 2'd0 : (srcreg_size == 2'd2) ? 2'd3 : 2'd1;
 
 wire        mem_op_eligible, gp_fault_mem_op, gp_fault_wr_op, ss_segment_fault;
-wire        seg_gp_fault;
 prot_transition_t prot_transition;
 
 segmentation_unit seg_unit (
@@ -1941,7 +1981,7 @@ wire [31:0] pg_cr2_out = data_page_fault ? data_cr2_out : ifetch_fault_addr;
 assign page_fault = data_page_fault || ifetch_page_fault;
 
 // CR3 write detection for TLB flush
-wire cr3_write = uc_exec && uc_buscode == BUSOP_SPCR && uc_dest == DEST_PDBR;
+assign cr3_write = uc_exec && uc_buscode == BUSOP_SPCR && uc_dest == DEST_PDBR;
 
 // IO request detection
 wire mem_is_io = mem_seg_is_io;     // registered in segmentation_unit alongside seg_sel
@@ -1963,8 +2003,8 @@ assign mem_op_eligible = core_live && !mem_servicing &&
 wire uc_data_busreq = !prot_redirect_prev &&
                       ((uc_is_mem_busop && !mem_is_io) ||
                        io_busop_rd || io_busop_wr);
-wire uc_busreq = uc_data_busreq || iack_busop;
-wire mem_req_current = mem_op_eligible && uc_busreq;    // drives paging unit
+assign uc_busreq = uc_data_busreq || iack_busop;
+assign mem_req_current = mem_op_eligible && uc_busreq;  // drives paging unit
 // Delay prefetch on upcoming demand memory
 wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || d2_valid);
 
@@ -1972,7 +2012,7 @@ wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || d2_valid);
 // stack writes use CPL=0 for paging regardless of current CPL.
 wire implicit_supervisor = mem_is_dtable || (mem_seg_sel == SEG_TR) ||
                            descsw_mode || (vm && CS[1:0] == 2'b00);
-wire [1:0] pg_cpl = implicit_supervisor ? 2'b00 : cpl;
+assign pg_cpl = implicit_supervisor ? 2'b00 : cpl;
 
 // Registered fault redirect state.
 reg         gp_fault_r;
@@ -2030,11 +2070,7 @@ wire d2_vipt_movx = i_bus.has_0f && i_bus.data32 &&
                      (i_bus.opcode == 8'hB7) ||
                      (i_bus.opcode == 8'hBE) ||
                      (i_bus.opcode == 8'hBF));
-assign d2_vipt_alu = !i_bus.has_0f &&
-                     (i_bus.opcode[7:6] == 2'b00) &&
-                     !i_bus.opcode[2] && i_bus.opcode[1] &&
-                     i_bus.has_modrm && (i_bus.modrm[7:6] != 2'b11) &&
-                     (i_bus.opcode[5:3] != 3'b111);
+assign d2_vipt_alu = i_bus.vipt_alu;
 assign d2_vipt_dst = d2_vipt_movx ? i_bus.src_reg_sel
                                   : i_bus.dst_reg_sel;
 assign d2_vipt_mem_size = d2_vipt_movx ? i_bus.source_size
@@ -2217,7 +2253,6 @@ wire selector_oob_wire = slctr_fwd[2]
     : (gdt_limit[15:0] < selector_desc_end);
 
 wire [1:0]  prot_desc_dpl;
-wire        prot_is_ptovrr;
 wire        protun_write_low16_nonzero;
 
 protection_unit protection_unit_inst (
@@ -2289,7 +2324,7 @@ wire       fault_start = any_fault && !fault_seen_r;
 wire       double_fault_start = (fault_delivery_state == FAULT_DELIVERING) &&
                                 fault_combine_active;
 
-wire [5:0] uc_alu_src   = uc[36:31];  // ABCDEF: ALU source / jump offset
+assign uc_alu_src       = uc[36:31];  // ABCDEF: ALU source / jump offset
 assign uc_dest          = uc[30:24];  // GHIJKLM: destination
 assign uc_source        = uc[23:18];  // NOPQRS: source
 assign uc_aluop         = uc[17:11];  // TUVWXYZ: ALU operation / jump condition
@@ -2312,9 +2347,6 @@ assign uc_p_pure_dly     = uc[48];
 assign uc_p_rpt          = uc[49];
 assign uc_p_wio          = uc[50];
 wire       uc_jump_taken_prev;          // Jump taken last cycle (for RNi: terminate only in delay slot)
-wire       uc_pref_suppress_prev;       // Taken LOOP/Jcc micro-jump cancels its speculative PREF delay slot
-
-wire       prot_redirect_prev;      // Previous protection redirect suppresses its delay slot
 
 wire [31:0] countr_masked = i.addr32 ? COUNTR : {16'h0, COUNTR[15:0]};
 reg [31:0] TMPeIP;                  // Saved EIP for RPTI (repeat instruction)
@@ -2348,7 +2380,7 @@ wire        br_is_jmp_rel  = i.rel_branch_kind == REL_BRANCH_JMP;
 wire        br_is_call_rel = i.rel_branch_kind == REL_BRANCH_CALL;
 wire [31:0] br_disp        = i.branch_rel8 ? {{24{i.displacement[7]}}, i.displacement[7:0]}
                                         : i.displacement;
-wire [31:0] br_target      = EIP + br_disp;
+assign br_target = EIP + br_disp;
 `ifdef Z486_DEBUG_BRANCH_TARGET
 // synthesis translate_off
 always @(posedge clk) begin
@@ -2362,9 +2394,8 @@ end
 `endif
 
 // i_first PRECISE early branch redirect (NOT a prediction).
-wire early_redirect = branch_ustep_redirect ||
-                      (i_first && is_dword && br_is_call_rel);
-reg  early_redirected;
+assign early_redirect = branch_ustep_redirect ||
+                        (i_first && is_dword && br_is_call_rel);
 // A fault or interrupt abandons the instruction that owned an early redirect.
 // Clear that ownership before its handler's microcode PREF reaches q_flush.
 always_ff @(posedge clk or negedge reset_n) begin
@@ -2374,8 +2405,8 @@ always_ff @(posedge clk or negedge reset_n) begin
     else if (i_entry || i_issue)                   early_redirected <= 1'b0;
 end
 
-wire uc_is_wio = uc_p_wio;  // WIO: wait for interrupt/IO (HLT, only with RPT)
-wire uc_is_rpt = uc_p_rpt;
+assign uc_is_wio = uc_p_wio;  // WIO: wait for interrupt/IO (HLT, only with RPT)
+assign uc_is_rpt = uc_p_rpt;
 
 // LOOP/REP Condition Logic
 wire instr_is_loop = i.repeat_kind != REPEAT_KIND_REP;
@@ -2459,7 +2490,6 @@ always_ff @(posedge clk) begin
     end
 end
 
-wire prot_redirect_taken;
 // Qualified overlays launch without live architectural state on the ROM
 // address. Their first ustep redirects unsafe cases to original microcode;
 // the following overlay word is the architectural jump delay slot.
@@ -2467,8 +2497,9 @@ wire recipe_fallback_taken =
     (uc_exec && i_first &&
      (i.ucode_action == RECIPE_ACTION_X87_M32_LOAD) &&
      !x87_direct_active) || rmw_fallback_delay_r;
-wire gate_detect_cond = pe && (uc_buscode == BUSOP_SDEL) &&
-                        !gate_in_progress && !desc_raw_hi[12] && (desc_raw_hi[11:8] == 4'hC);
+assign gate_detect_cond = pe && (uc_buscode == BUSOP_SDEL) &&
+                          !gate_in_progress && !desc_raw_hi[12] &&
+                          (desc_raw_hi[11:8] == 4'hC);
 wire gate_detect_now = uc_exec && gate_detect_cond;
 
 assign seq_advance = ((((i_issue && !d2_waited_r) | uc_exec |
@@ -2657,6 +2688,7 @@ end
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         uc_active <= 1'b0;
+        halted <= 1'b0;
         instr_eip_written <= 1'b0;
         dbg_first_done <= 1'b0;
         debug_ip <= 32'h0;

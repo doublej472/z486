@@ -1,5 +1,6 @@
 // Two synchronous ports store the eight architectural 80-bit x87 registers.
 // Decode happens at the consumer so untouched m80 values round-trip exactly.
+`include "z486_platform.svh"
 module x87_stack_mem (
     input  logic        clk,
 
@@ -14,7 +15,7 @@ module x87_stack_mem (
     output logic [79:0] read_data_b
 );
 
-`ifdef ALTERA_RESERVED_QIS
+`ifdef Z486_USE_ALTERA_MEMORY
 
 altsyncram #(
     .address_reg_a("CLOCK0"),

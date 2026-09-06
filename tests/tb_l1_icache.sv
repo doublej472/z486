@@ -13,11 +13,17 @@ module tb_l1_icache;
 
     wire [31:0] mem_addr;
     reg [31:0] mem_dout = 32'h0;
+    reg [127:0] mem_line_dout = 128'h0;
     wire [3:0] mem_be;
     wire [7:0] mem_burstcount;
     reg mem_ready = 1'b0;
     wire mem_valid;
     reg mem_resp_valid = 1'b0;
+    reg mem_line_resp_valid = 1'b0;
+    reg wide_mode = 1'b0;
+    reg wide_pending = 1'b0;
+    reg [31:0] wide_addr = 32'h0;
+    integer line_response_count = 0;
 
     reg [31:0] patch_addr = 32'h0;
     reg [31:0] patch_data = 32'h0;
@@ -36,12 +42,14 @@ module tb_l1_icache;
         .cpu_resp_valid(cpu_resp_valid),
         .mem_addr(mem_addr),
         .mem_dout(mem_dout),
+        .mem_line_dout(mem_line_dout),
         .mem_be(mem_be),
         .mem_burstcount(mem_burstcount),
         .mem_busy(1'b0),
         .mem_valid(mem_valid),
         .mem_ready(mem_ready),
         .mem_resp_valid(mem_resp_valid),
+        .mem_line_resp_valid(mem_line_resp_valid),
         .patch_addr(patch_addr),
         .patch_data(patch_data),
         .patch_be(patch_be),
@@ -97,6 +105,17 @@ module tb_l1_icache;
     always_ff @(posedge clk) begin
         mem_ready <= 1'b0;
         mem_resp_valid <= 1'b0;
+        mem_line_resp_valid <= 1'b0;
+
+        if (wide_pending) begin
+            mem_line_dout <= {mem_get32(wide_addr + 32'd12),
+                              mem_get32(wide_addr + 32'd8),
+                              mem_get32(wide_addr + 32'd4),
+                              mem_get32(wide_addr)};
+            mem_line_resp_valid <= 1'b1;
+            wide_pending <= 1'b0;
+            line_response_count <= line_response_count + 1;
+        end
 
         if (rd_left != 8'd0) begin
             mem_resp_valid <= 1'b1;
@@ -105,10 +124,15 @@ module tb_l1_icache;
             rd_left <= rd_left - 8'd1;
         end
 
-        if (mem_valid && !mem_ready && rd_left == 8'd0) begin
+        if (mem_valid && !mem_ready && rd_left == 8'd0 && !wide_pending) begin
             mem_ready <= 1'b1;
-            rd_addr <= mem_addr;
-            rd_left <= mem_burstcount == 8'd0 ? 8'd1 : mem_burstcount;
+            if (wide_mode && mem_burstcount == 8'd4) begin
+                wide_addr <= mem_addr;
+                wide_pending <= 1'b1;
+            end else begin
+                rd_addr <= mem_addr;
+                rd_left <= mem_burstcount == 8'd0 ? 8'd1 : mem_burstcount;
+            end
             mem_request_count <= mem_request_count + 1;
         end
     end
@@ -354,6 +378,30 @@ module tb_l1_icache;
         cache_read(32'h220, 128'h2200_0003_2200_0002_2200_0001_2200_0000);
         if (mem_request_count != mem_request_before) begin
             $display("L1 ICACHE SAME-WAY COLLISION lost fill tag");
+            $fatal(1);
+        end
+
+        // A native KV260 DDR line arrives as one 128-bit response pulse.
+        reset = 1'b1;
+        repeat (5) @(posedge clk);
+        reset = 1'b0;
+        repeat (20) @(posedge clk);
+        mem_put_line(32'h400, 32'h4000_0000, 32'h4000_0001,
+                     32'h4000_0002, 32'h4000_0003);
+        wide_mode = 1'b1;
+        mem_request_before = mem_request_count;
+        cache_read(32'h400,
+                   128'h4000_0003_4000_0002_4000_0001_4000_0000);
+        if (line_response_count != 1) begin
+            $display("L1 ICACHE WIDE FILL expected one line response, got %0d",
+                     line_response_count);
+            $fatal(1);
+        end
+        cache_read(32'h400,
+                   128'h4000_0003_4000_0002_4000_0001_4000_0000);
+        if (mem_request_count != mem_request_before + 1) begin
+            $display("L1 ICACHE WIDE FILL request count before=%0d after=%0d",
+                     mem_request_before, mem_request_count);
             $fatal(1);
         end
 

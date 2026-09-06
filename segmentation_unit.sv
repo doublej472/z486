@@ -29,7 +29,7 @@ module segmentation_unit
     output logic [31:0] gdt_base,
     output logic [19:0] gdt_limit,
     output     [31:0]  lar_result,         // LAR combinational readback (keyed by seg_target)
-    output     [31:0]  llim_result,        // LLIM combinational readback (keyed by seg_target)
+    output logic [31:0] llim_result,       // LLIM combinational readback (keyed by seg_target)
     output     [31:0]  lbas_result,        // LBAS combinational readback (keyed by seg_target)
 
     // Segment state (set by commands, used by address translation and z486)

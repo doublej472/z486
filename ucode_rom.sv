@@ -1,5 +1,6 @@
 // Microcode ROM with predecode. The physical ROM stores a 37-bit native microcode word plus a 3-bit v52 D2 early kind. Execution still...
 // Details: doc/z486/implementation_notes.md#src-24-z486-ucode-rom-sv-1
+`include "z486_platform.svh"
 module ucode_rom
     import z486_pkg::*;
 #(
@@ -26,16 +27,16 @@ module ucode_rom
     output             q_fpu_f8
 );
 
-(* preserve *) reg [5:0] q_shift_source_r;
-(* preserve *) reg [3:0] q_shift_source_class_r;
-(* preserve *) reg [1:0] q_shift2_source_r;
-(* preserve *) reg q_is_shift2_r;
-(* preserve *) reg q_shift_uc_carry_r;
-(* preserve *) reg [5:0] q_shift_alu_src_r;
-(* preserve *) reg [6:0] q_shift_aluop_r;
-(* preserve *) reg [1:0] q_shift_sigma_sel_r;
+`Z486_KEEP reg [5:0] q_shift_source_r;
+`Z486_KEEP reg [3:0] q_shift_source_class_r;
+`Z486_KEEP reg [1:0] q_shift2_source_r;
+`Z486_KEEP reg q_is_shift2_r;
+`Z486_KEEP reg q_shift_uc_carry_r;
+`Z486_KEEP reg [5:0] q_shift_alu_src_r;
+`Z486_KEEP reg [6:0] q_shift_aluop_r;
+`Z486_KEEP reg [1:0] q_shift_sigma_sel_r;
 reg [2:0] q_dly_source_r;
-(* preserve *) reg [8:0] q_mem_ctrl_r;
+`Z486_KEEP reg [8:0] q_mem_ctrl_r;
 reg [8:0] q_ind_ctrl_r;
 reg q_fpu_f8_r;
 
@@ -254,7 +255,7 @@ function automatic [8:0] ind_ctrl_predecode(input [36:0] w);
     end
 endfunction
 
-`ifdef Z486_QUARTUS_M10K_UCODE
+`ifdef Z486_USE_ALTERA_UCODE_ROM
 wire [39:0] q_mem;
 reg  [50:0] q_r;
 
@@ -306,10 +307,10 @@ assign q = q_r;
 assign q_early = {ucode_predecode(q_mem[36:0]), q_mem[36:0]};
 assign q_kind_early = q_mem[39:37];
 `else
-`ifdef Z486_QUARTUS_LOGIC_UCODE
+`ifdef Z486_USE_LOGIC_UCODE_ROM
 (* ramstyle = "logic" *) reg [39:0] microcode_rom [0:2559];
 `else
-(* ram_style = "block" *) reg [39:0] microcode_rom [0:2559] /* synthesis syn_ramstyle = "block_ram" */;
+`Z486_BLOCK_RAM reg [39:0] microcode_rom [0:2559];
 `endif
 	reg [39:0] q_mem;
 	reg [50:0] q_r;

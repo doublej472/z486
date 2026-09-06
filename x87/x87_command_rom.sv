@@ -1,5 +1,6 @@
 // Synchronous x87 command decoder. The generated image replaces repeated
 // ESC/FOP comparisons in the control unit with a BRAM lookup.
+`include "z486_platform.svh"
 module x87_command_rom
     import x87_ucode_pkg::*;
 (
@@ -11,7 +12,7 @@ module x87_command_rom
 logic [22:0] raw_decode;
 assign decode = x87_command_decode_t'(raw_decode);
 
-`ifdef ALTERA_RESERVED_QIS
+`ifdef Z486_USE_ALTERA_MEMORY
 
 altsyncram #(
     .operation_mode("ROM"),

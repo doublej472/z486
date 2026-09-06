@@ -2,13 +2,17 @@
 // Owns both L1 caches, A20 masking, refill arbitration, and response tracking.
 module memory #(
     parameter PROTECT_UMA_ROM = 0,
-    parameter DCACHE_SET_BITS = 8,
-    parameter ICACHE_SET_BITS = 8,
-    parameter ENABLE_X87 = 0
+    parameter DCACHE_SET_BITS = 7,
+    parameter ICACHE_SET_BITS = 7,
+    parameter ENABLE_X87 = 0,
+    parameter ENABLE_DEVICE_MMIO = 0,
+    parameter [31:0] DEVICE_MMIO_MASK = 32'hff00_0000
 ) (
     input              clk,
     input              reset_n,
     input              a20_enable,
+    input              device_mmio_enable,
+    input      [31:0]  device_mmio_base,
 
     // Paging-unit demand request
     input              dcache_req_valid,
@@ -71,13 +75,16 @@ module memory #(
     output     [31:2]  addr,
     output      [3:0]  be,
     output      [7:0]  burstcount,
+    output             line_read,             // Request is one complete cache line
     input      [31:0]  din,
+    input      [127:0] line_din,
     output     [31:0]  dout,
     output             valid,                // External request is present
     input              ready,                // External request was accepted
     output             write,
     output             io,
     input              resp_valid,           // External read beat returned
+    input              line_resp_valid,      // Complete aligned line returned
     output             inta
 );
 
@@ -93,8 +100,18 @@ wire [31:0] fast_store_phys_addr = !a20_enable
 wire [31:0] icache_req_phys_addr = !a20_enable
                                       ? (icache_req_phys_addr_raw & ~32'h0010_0000)
                                       : icache_req_phys_addr_raw;
+wire dcache_req_is_device_mmio = ENABLE_DEVICE_MMIO &&
+                                  device_mmio_enable &&
+                                  ((dcache_req_phys_addr & DEVICE_MMIO_MASK) ==
+                                   (device_mmio_base & DEVICE_MMIO_MASK));
+wire dcache_vipt_is_device_mmio = ENABLE_DEVICE_MMIO &&
+                                   device_mmio_enable &&
+                                   ((dcache_vipt_resolve_phys_addr &
+                                     DEVICE_MMIO_MASK) ==
+                                    (device_mmio_base & DEVICE_MMIO_MASK));
 
 wire [31:0] dcache_cpu_dout;
+wire        dcache_vipt_resolve_hit_cache;
 wire        dcache_cpu_ready;
 wire        dcache_cpu_resp_valid;
 wire        dcache_stores_drained;
@@ -110,6 +127,7 @@ wire        dcache_mem_valid;
 wire        dcache_mem_write;
 wire        dcache_mem_ready;
 wire        dcache_mem_resp_valid;
+wire        dcache_mem_line_resp_valid;
 
 wire [127:0] icache_cpu_line;
 wire         icache_cpu_ready;
@@ -120,6 +138,10 @@ wire  [7:0]  icache_mem_burstcount;
 wire         icache_mem_valid;
 wire         icache_mem_ready;
 wire         icache_mem_resp_valid;
+wire         icache_mem_line_resp_valid;
+
+assign dcache_vipt_resolve_hit = dcache_vipt_resolve_hit_cache &&
+                                  !dcache_vipt_is_device_mmio;
 
 logic [7:0] dcache_rd_pending;
 logic [7:0] icache_rd_pending;
@@ -133,6 +155,7 @@ assign x87_req_selected = ENABLE_X87 && dcache_req_valid && dcache_req_is_x87;
 // queue so an ET4000 bank-register write cannot overtake framebuffer writes.
 wire normal_cache_req = dcache_req_valid && !dcache_req_is_io &&
                         !dcache_req_is_inta && !dcache_req_is_vga_mem &&
+                        !dcache_req_is_device_mmio &&
                         !x87_req_selected;
 wire dcache_cpu_req = fast_store_valid || normal_cache_req;
 wire [31:0] dcache_cpu_addr = fast_store_valid ? fast_store_phys_addr
@@ -151,7 +174,8 @@ wire dcache_cpu_preread_priority = fast_store_valid ||
                                    dcache_req_preread_priority;
 wire dcache_direct_req = dcache_req_valid && !x87_req_selected &&
                          (dcache_req_is_io || dcache_req_is_inta ||
-                          dcache_req_is_vga_mem);
+                          dcache_req_is_vga_mem ||
+                          dcache_req_is_device_mmio);
 wire dcache_read_pending = (dcache_rd_pending != 8'd0);
 wire icache_read_pending = (icache_rd_pending != 8'd0);
 wire dcache_read_accept = normal_cache_req && !dcache_req_write && dcache_cpu_ready;
@@ -239,6 +263,10 @@ assign icache_rdata = icache_cpu_line;
 assign addr       = ext_addr_r;
 assign be         = ext_be_r;
 assign burstcount = ext_burstcount_r;
+assign line_read  = ext_valid_r && !ext_write_r &&
+                    (ext_burstcount_r == 8'd4) &&
+                    ((ext_src_r == EXT_SRC_DCACHE) ||
+                     (ext_src_r == EXT_SRC_ICACHE));
 assign dout       = (ext_src_r == EXT_SRC_DIRECT) ? ext_direct_dout_r :
                     (ext_src_r == EXT_SRC_DCACHE) ? ext_dcache_dout_r : 32'd0;
 assign valid      = ext_valid_r;
@@ -250,6 +278,8 @@ assign dcache_mem_ready = ext_dcache_accept;
 assign icache_mem_ready = ext_icache_accept;
 assign dcache_mem_resp_valid = dcache_read_pending && resp_valid;
 assign icache_mem_resp_valid = icache_read_pending && resp_valid;
+assign dcache_mem_line_resp_valid = dcache_read_pending && line_resp_valid;
+assign icache_mem_line_resp_valid = icache_read_pending && line_resp_valid;
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
@@ -327,11 +357,15 @@ always_ff @(posedge clk) begin
 
         if (ext_dcache_accept && !dcache_mem_write)
             dcache_rd_pending <= dcache_mem_burstcount;
+        else if (dcache_read_pending && line_resp_valid)
+            dcache_rd_pending <= 8'd0;
         else if (dcache_read_pending && resp_valid)
             dcache_rd_pending <= dcache_rd_pending - 8'd1;
 
         if (ext_icache_accept)
             icache_rd_pending <= icache_mem_burstcount;
+        else if (icache_read_pending && line_resp_valid)
+            icache_rd_pending <= 8'd0;
         else if (icache_read_pending && resp_valid)
             icache_rd_pending <= icache_rd_pending - 8'd1;
 
@@ -385,10 +419,11 @@ l1_cache #(
     .vipt_resolve_phys_addr(dcache_vipt_resolve_phys_addr),
     .vipt_resolve_valid(dcache_vipt_resolve_valid),
     .vipt_resolve_data(dcache_vipt_resolve_data),
-    .vipt_resolve_hit(dcache_vipt_resolve_hit),
+    .vipt_resolve_hit(dcache_vipt_resolve_hit_cache),
     .mem_addr(dcache_mem_addr),
     .mem_din(dcache_mem_din),
     .mem_dout(din),
+    .mem_line_dout(line_din),
     .mem_be(dcache_mem_be),
     .mem_burstcount(dcache_mem_burstcount),
     .mem_busy(ext_valid_r || direct_rd_pending || icache_read_pending),
@@ -396,6 +431,7 @@ l1_cache #(
     .mem_write(dcache_mem_write),
     .mem_ready(dcache_mem_ready),
     .mem_resp_valid(dcache_mem_resp_valid),
+    .mem_line_resp_valid(dcache_mem_line_resp_valid),
     .snoop_addr(snoop_addr),
     .snoop_valid(snoop_valid),
     .cache_enable(1'b1)
@@ -413,6 +449,7 @@ l1_icache #(
     .cpu_resp_valid(icache_cpu_resp_valid),
     .mem_addr(icache_mem_addr),
     .mem_dout(din),
+    .mem_line_dout(line_din),
     .mem_be(icache_mem_be),
     .mem_burstcount(icache_mem_burstcount),
     .mem_busy(ext_valid_r || direct_rd_pending || dcache_read_pending ||
@@ -420,6 +457,7 @@ l1_icache #(
     .mem_valid(icache_mem_valid),
     .mem_ready(icache_mem_ready),
     .mem_resp_valid(icache_mem_resp_valid),
+    .mem_line_resp_valid(icache_mem_line_resp_valid),
     .patch_addr(icache_write_patch_addr),
     .patch_data(icache_write_patch_data),
     .patch_be(icache_write_patch_be),

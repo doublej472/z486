@@ -1,5 +1,6 @@
 // Integer Data Unit. Owns integer register state, source/destination selection,
 // arithmetic engines, and architectural/microcode flags.
+`include "z486_platform.svh"
 module data_unit
     import z486_pkg::*;
 (
@@ -1375,7 +1376,7 @@ always_comb begin
     endcase
 end
 
-`ifdef Z486_ALTERA_ALU
+`ifdef Z486_USE_ALTERA_ALU
 alu_alt alu_inst (
 `else
 alu alu_inst (

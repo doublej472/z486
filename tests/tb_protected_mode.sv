@@ -48,13 +48,16 @@ module tb_protected_mode #(
         .addr(addr),
         .be(be),
         .burstcount(burstcount),
+        .line_read(),
         .din(din),
+        .line_din(128'd0),
         .dout(dout),
         .valid(valid),
         .write(write),
         .io(io),
         .ready(ready),
         .resp_valid(resp_valid),
+        .line_resp_valid(1'b0),
         .intr(intr),
         .nmi(nmi),
         .inta(inta),
@@ -104,6 +107,19 @@ module tb_protected_mode #(
     longint cpu_stall_cycles [0:9];
     longint cpu_load_chain [0:11];
     longint cpu_load_intervals [0:16];
+    longint cpu_load_issue [0:7];
+    longint cpu_load_result [0:7];
+    longint cpu_load_successor [0:1][0:3];
+    longint cpu_load_path_interval [0:2][0:16];
+    longint cpu_load_path_successor_count [0:2][0:3];
+    longint cpu_load_path_successor_cycles [0:2][0:3];
+    longint cpu_load_form_count [0:2][0:1][0:2][0:2][0:3];
+    longint cpu_load_form_cycles [0:2][0:1][0:2][0:2][0:3];
+    longint cpu_load_next_entry_count [0:2][0:4095];
+    longint cpu_load_next_entry_cycles [0:2][0:4095];
+    longint cpu_branch_result [0:7];
+    longint cpu_rep_elements [0:4];
+    longint cpu_x87_wait_reason [0:7];
     longint cpu_store_intervals [0:16];
     longint cpu_store_states [0:9];
     longint cpu_store_next_entry [0:4095];
@@ -115,6 +131,13 @@ module tb_protected_mode #(
     logic [7:0] cpu_current_opcode;
     logic cpu_current_hardwired;
     logic [2:0] cpu_current_commit;
+    logic [7:0] cpu_current_load_dst_mask;
+    logic cpu_current_load_direct;
+    logic [1:0] cpu_current_load_path;
+    logic cpu_current_load_addr32;
+    logic [1:0] cpu_current_load_size;
+    logic [1:0] cpu_current_load_ea_class;
+    logic [1:0] cpu_current_load_alignment;
     logic cpu_profile_active;
     event load_snapshot_x87_state;
 
@@ -152,10 +175,48 @@ module tb_protected_mode #(
                     cpu_hardwired_cycles[cpu_current_hardwired] += cycle - cpu_current_start;
                     cpu_commit_cycles[cpu_current_commit] += cycle - cpu_current_start;
                     if (cpu_current_entry == 12'h019) begin
+                        automatic logic load_data_dependency;
+                        automatic logic load_ea_dependency;
+                        automatic int load_dependency;
+                        automatic int load_interval;
                         if ((cycle - cpu_current_start) >= 16)
                             cpu_load_intervals[16] += 1;
                         else
                             cpu_load_intervals[cycle - cpu_current_start] += 1;
+                        load_interval = (cycle - cpu_current_start) >= 16
+                                      ? 16 : cycle - cpu_current_start;
+                        load_data_dependency =
+                            |(cpu_current_load_dst_mask &
+                              dut.i_bus.recipe_gpr_read_mask);
+                        load_ea_dependency =
+                            |(cpu_current_load_dst_mask &
+                              (dut.i_bus.ea_base_onehot |
+                               dut.i_bus.ea_index_onehot));
+                        cpu_load_successor[cpu_current_load_direct]
+                            [{load_ea_dependency, load_data_dependency}] += 1;
+                        load_dependency = {load_ea_dependency,
+                                           load_data_dependency};
+                        cpu_load_path_interval[cpu_current_load_path]
+                                              [load_interval] += 1;
+                        cpu_load_path_successor_count[cpu_current_load_path]
+                                                     [load_dependency] += 1;
+                        cpu_load_path_successor_cycles[cpu_current_load_path]
+                                                      [load_dependency] +=
+                            cycle - cpu_current_start;
+                        cpu_load_form_count[cpu_current_load_path]
+                            [cpu_current_load_addr32][cpu_current_load_size]
+                            [cpu_current_load_ea_class]
+                            [cpu_current_load_alignment] += 1;
+                        cpu_load_form_cycles[cpu_current_load_path]
+                            [cpu_current_load_addr32][cpu_current_load_size]
+                            [cpu_current_load_ea_class]
+                            [cpu_current_load_alignment] +=
+                                cycle - cpu_current_start;
+                        cpu_load_next_entry_count[cpu_current_load_path]
+                                                 [dut.i_bus.entry_point] += 1;
+                        cpu_load_next_entry_cycles[cpu_current_load_path]
+                                                  [dut.i_bus.entry_point] +=
+                            cycle - cpu_current_start;
                     end
                     if (cpu_current_entry == 12'h013) begin
                         automatic int store_gap;
@@ -176,11 +237,115 @@ module tb_protected_mode #(
                 cpu_current_opcode = dut.i_bus.opcode;
                 cpu_current_hardwired = dut.d2_recipe.hardwired;
                 cpu_current_commit = dut.d2_recipe.commit_sel;
+                cpu_current_load_dst_mask =
+                    8'h01 << ((dut.i_bus.operand_size == 2'd0)
+                            ? {1'b0, dut.i_bus.dst_reg_sel[1:0]}
+                            : dut.i_bus.dst_reg_sel);
+                cpu_current_load_direct = dut.d2_vipt_load;
                 cpu_entry_count[dut.i_bus.entry_point] += 1;
                 cpu_opcode_count[dut.i_bus.opcode] += 1;
                 cpu_hardwired_count[dut.d2_recipe.hardwired] += 1;
                 cpu_commit_count[dut.d2_recipe.commit_sel] += 1;
                 cpu_profile_active = 1'b1;
+
+                if (dut.i_bus.entry_point == 12'h019) begin
+                    automatic int load_bytes;
+                    automatic int load_terms;
+                    cpu_load_issue[0] += 1;
+                    if (dut.d2_vipt_candidate)
+                        cpu_load_issue[1] += 1;
+                    if (dut.d2_vipt_load)
+                        cpu_load_issue[2] += 1;
+                    if (!dut.i_bus.addr32)
+                        cpu_load_issue[3] += 1;
+                    if (dut.i_bus.ea_complex)
+                        cpu_load_issue[4] += 1;
+                    if (dut.i_bus.rep_lock != z486_pkg::PREFIX_NOREPLOCK)
+                        cpu_load_issue[5] += 1;
+                    if (dut.d2_vipt_candidate && !dut.dcache_vipt_probe_ready)
+                        cpu_load_issue[6] += 1;
+                    if (dut.d2_vipt_candidate && dut.d2_vipt_older_store)
+                        cpu_load_issue[7] += 1;
+                    cpu_current_load_path = dut.d2_vipt_load ? 2'd0 :
+                        dut.d2_recipe.hardwired ? 2'd1 : 2'd2;
+                    cpu_current_load_addr32 = dut.i_bus.addr32;
+                    cpu_current_load_size = dut.d2_vipt_mem_size;
+                    load_terms = (|dut.i_bus.ea_base_onehot) +
+                                 (|dut.i_bus.ea_index_onehot) +
+                                 (dut.i_bus.displacement != 32'd0);
+                    cpu_current_load_ea_class = dut.i_bus.ea_complex ? 2'd2 :
+                                                (load_terms >= 2) ? 2'd1 : 2'd0;
+                    load_bytes = 1 << dut.d2_vipt_mem_size;
+                    if (({1'b0, dut.issue_ind_linear[11:0]} + load_bytes) > 4096)
+                        cpu_current_load_alignment = 2'd3;
+                    else if (({1'b0, dut.issue_ind_linear[3:0]} + load_bytes) > 16)
+                        cpu_current_load_alignment = 2'd2;
+                    else if ((dut.issue_ind_linear & (load_bytes - 1)) != 0)
+                        cpu_current_load_alignment = 2'd1;
+                    else
+                        cpu_current_load_alignment = 2'd0;
+                end
+
+                if (dut.i_bus.entry_point == 12'h065) begin
+                    cpu_branch_result[0] += 1;
+                    if (dut.pf_spec_req)
+                        cpu_branch_result[1] += 1;
+                end
+            end
+
+            if (dut.vipt_load_ex_r.valid && dut.vipt_load_ex_probed_r) begin
+                cpu_load_result[0] += 1;
+                if (dut.vipt_load_ex_hit)
+                    cpu_load_result[1] += 1;
+                else if (!dut.vipt_load_ex_contained)
+                    cpu_load_result[2] += 1;
+                else if (!dut.vipt_translation_ok)
+                    cpu_load_result[3] += 1;
+                else if (dut.vipt_tlb_is_vga_mem)
+                    cpu_load_result[4] += 1;
+                else if (dut.seg_gp_fault)
+                    cpu_load_result[5] += 1;
+                else
+                    cpu_load_result[6] += 1;
+            end
+            if (dut.vipt_load_slow_req_r && dut.mem_accepted)
+                cpu_load_result[7] += 1;
+
+            if (dut.jcc_fold_active && dut.uc_exec)
+                cpu_branch_result[2] += 1;
+            if (dut.branch_ustep_exec) begin
+                if (dut.branch_ustep_redirect)
+                    cpu_branch_result[3] += 1;
+                else
+                    cpu_branch_result[4] += 1;
+            end
+            if (dut.q_flush && dut.pf_spec_owner_r) begin
+                if (dut.prefetch_inst.spec_line_match)
+                    cpu_branch_result[5] += 1;
+                else if (dut.prefetch_inst.spec_data_now)
+                    cpu_branch_result[6] += 1;
+                else
+                    cpu_branch_result[7] += 1;
+            end
+
+            // Count completed REP elements at the architectural memory
+            // handshake. This is stable across memory latency and DLY holds.
+            if (dut.mem_accepted) begin
+                if ((cpu_current_entry == 12'h1f8) &&
+                    ((dut.uc_addr == 12'h1ff) || (dut.uc_addr == 12'h203)))
+                    cpu_rep_elements[0] += 1;
+                if ((cpu_current_entry == 12'h218) &&
+                    (dut.uc_addr == 12'h222))
+                    cpu_rep_elements[1] += 1;
+                if ((cpu_current_entry == 12'h235) &&
+                    (dut.uc_addr == 12'h23d))
+                    cpu_rep_elements[2] += 1;
+                if ((cpu_current_entry == 12'h24e) &&
+                    (dut.uc_addr == 12'h252))
+                    cpu_rep_elements[3] += 1;
+                if ((cpu_current_entry == 12'h263) &&
+                    (dut.uc_addr == 12'h267))
+                    cpu_rep_elements[4] += 1;
             end
 
             cpu_stall_cycles[0] += dut.stall_mem;
@@ -243,8 +408,91 @@ module tb_protected_mode #(
 
     generate
     if (ENABLE_X87) begin : gen_snapshot_x87_counters
+        logic x87_event_window_active = 1'b0;
+        longint x87_event_window_start = 0;
+        logic [10:0] x87_event_window_fop = 11'h0;
+        logic [11:0] x87_event_window_entry = 12'h0;
+        longint x87_event_window_mem = 0;
+        longint x87_event_window_port = 0;
+        longint x87_event_window_guest_mem = 0;
+        longint x87_event_window_wio = 0;
+        longint x87_event_window_direct = 0;
+        longint x87_event_window_frontend = 0;
+
         always @(posedge clk) begin
             if (reset_n) begin
+                if ($test$plusargs("profile_x87_events")) begin
+                    if (dut.i_issue) begin
+                        if (x87_event_window_active)
+                            $display("X87_EVENT WINDOW %0d %0d %0d %03x %03x %0d %0d %0d %0d %0d %0d",
+                                     x87_event_window_start, cycle,
+                                     cycle - x87_event_window_start,
+                                     x87_event_window_fop,
+                                     x87_event_window_entry,
+                                     x87_event_window_mem,
+                                     x87_event_window_port,
+                                     x87_event_window_guest_mem,
+                                     x87_event_window_wio,
+                                     x87_event_window_direct,
+                                     x87_event_window_frontend);
+                        x87_event_window_active =
+                            (dut.i_bus.opcode >= 8'hd8) &&
+                            (dut.i_bus.opcode <= 8'hdf);
+                        x87_event_window_start = cycle;
+                        x87_event_window_fop = dut.i_bus.fop;
+                        x87_event_window_entry = dut.i_bus.entry_point;
+                        x87_event_window_mem = 0;
+                        x87_event_window_port = 0;
+                        x87_event_window_guest_mem = 0;
+                        x87_event_window_wio = 0;
+                        x87_event_window_direct = 0;
+                        x87_event_window_frontend = 0;
+                        if (x87_event_window_active)
+                            $display("X87_EVENT ISSUE %0d %0d %02x %03x %03x %04x %0d",
+                                     cycle, instruction_count,
+                                     dut.i_bus.opcode, dut.i_bus.fop,
+                                     dut.i_bus.entry_point,
+                                     dut.x87.gen_x87.control.control_word,
+                                     dut.x87.gen_x87.control.top);
+                    end else if (x87_event_window_active) begin
+                        x87_event_window_mem += dut.stall_mem;
+                        x87_event_window_port +=
+                            dut.stall_mem &&
+                            ((dut.x87.gen_x87.bridge.state != 0) ||
+                             dut.dcache_req_is_x87);
+                        x87_event_window_guest_mem +=
+                            dut.stall_mem &&
+                            (dut.x87.gen_x87.bridge.state == 0) &&
+                            !dut.dcache_req_is_x87;
+                        x87_event_window_wio += dut.stall_wio;
+                        x87_event_window_direct += dut.stall_x87_direct;
+                        x87_event_window_frontend +=
+                            !dut.stall && !dut.throttle_parked_r &&
+                            !dut.uc_active;
+                    end
+                    if (dut.x87.gen_x87.cmd_valid &&
+                        dut.x87.gen_x87.cmd_ready)
+                        $display("X87_EVENT ACCEPT %0d protocol %03x",
+                                 cycle, dut.x87.gen_x87.cmd_fop);
+                    if (dut.x87.direct_valid && dut.x87.direct_ready)
+                        $display("X87_EVENT ACCEPT %0d direct %03x",
+                                 cycle, dut.i.fop);
+                    if (dut.x87.gen_x87.control.v2_exec_start)
+                        $display("X87_EVENT EXEC_START %0d %0d %0d %03x %0d %0d %0d",
+                                 cycle,
+                                 dut.x87.gen_x87.control.v2_exec_op,
+                                 dut.x87.gen_x87.control.v2_exec_owner,
+                                 dut.x87.gen_x87.control.last_fop,
+                                 dut.x87.gen_x87.control.top,
+                                 dut.x87.gen_x87.control.arith_dest_index,
+                                 dut.x87.gen_x87.control.control_word[9:8]);
+                    if (dut.x87.gen_x87.control.v2_exec_done)
+                        $display("X87_EVENT EXEC_DONE %0d %0d %0d %03x",
+                                 cycle,
+                                 dut.x87.gen_x87.control.v2_exec_op,
+                                 dut.x87.gen_x87.control.v2_exec_owner,
+                                 dut.x87.gen_x87.control.last_fop);
+                end
                 if (dut.x87.gen_x87.cmd_valid && dut.x87.gen_x87.cmd_ready) begin
                     x87_command_count <= x87_command_count + 1;
                     x87_fop_count[dut.x87.gen_x87.cmd_fop] <=
@@ -267,6 +515,26 @@ module tb_protected_mode #(
                         x87_exec_busy_count[dut.x87.gen_x87.control.v2_exec_op] + 1;
                 if (dut.stall_wio)
                     x87_wait_stall_cycles <= x87_wait_stall_cycles + 1;
+                if ($test$plusargs("profile_cpu")) begin
+                    if (dut.stall_x87_direct) begin
+                        cpu_x87_wait_reason[0] += 1;
+                        if (!dut.x87.direct_issued_r)
+                            cpu_x87_wait_reason[1] += 1;
+                        else if (!dut.x87.direct_data_valid_r)
+                            cpu_x87_wait_reason[2] += 1;
+                        else if (!dut.x87.direct_ready)
+                            cpu_x87_wait_reason[3] += 1;
+                    end
+                    if (dut.stall_wio) begin
+                        cpu_x87_wait_reason[4] += 1;
+                        if (!dut.x87_busy_n)
+                            cpu_x87_wait_reason[5] += 1;
+                        if (dut.x87.gen_x87.control.executor.busy)
+                            cpu_x87_wait_reason[6] += 1;
+                        if (dut.x87.gen_x87.control.direct_m32_pending)
+                            cpu_x87_wait_reason[7] += 1;
+                    end
+                end
             end
         end
     end
@@ -752,6 +1020,38 @@ module tb_protected_mode #(
             cpu_load_chain[i] = 0;
         for (int i = 0; i < 17; i++)
             cpu_load_intervals[i] = 0;
+        for (int i = 0; i < 8; i++) begin
+            cpu_load_issue[i] = 0;
+            cpu_load_result[i] = 0;
+            cpu_branch_result[i] = 0;
+            cpu_x87_wait_reason[i] = 0;
+        end
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 4; j++)
+                cpu_load_successor[i][j] = 0;
+        for (int path = 0; path < 3; path++) begin
+            for (int interval = 0; interval < 17; interval++)
+                cpu_load_path_interval[path][interval] = 0;
+            for (int dependency = 0; dependency < 4; dependency++) begin
+                cpu_load_path_successor_count[path][dependency] = 0;
+                cpu_load_path_successor_cycles[path][dependency] = 0;
+            end
+            for (int entry = 0; entry < 4096; entry++) begin
+                cpu_load_next_entry_count[path][entry] = 0;
+                cpu_load_next_entry_cycles[path][entry] = 0;
+            end
+            for (int addr32 = 0; addr32 < 2; addr32++)
+                for (int size = 0; size < 3; size++)
+                    for (int ea_class = 0; ea_class < 3; ea_class++)
+                        for (int alignment = 0; alignment < 4; alignment++) begin
+                            cpu_load_form_count[path][addr32][size]
+                                               [ea_class][alignment] = 0;
+                            cpu_load_form_cycles[path][addr32][size]
+                                                [ea_class][alignment] = 0;
+                        end
+        end
+        for (int i = 0; i < 5; i++)
+            cpu_rep_elements[i] = 0;
         for (int i = 0; i < 17; i++)
             cpu_store_intervals[i] = 0;
         for (int i = 0; i < 10; i++)
@@ -761,6 +1061,13 @@ module tb_protected_mode #(
         cpu_current_opcode = 0;
         cpu_current_hardwired = 0;
         cpu_current_commit = 0;
+        cpu_current_load_dst_mask = 0;
+        cpu_current_load_direct = 0;
+        cpu_current_load_path = 0;
+        cpu_current_load_addr32 = 0;
+        cpu_current_load_size = 0;
+        cpu_current_load_ea_class = 0;
+        cpu_current_load_alignment = 0;
         cpu_profile_active = 0;
 
         // Get max cycles
@@ -1095,6 +1402,60 @@ module tb_protected_mode #(
                     for (int i = 0; i < 17; i++)
                         $display("CPU_LOAD_INTERVAL %0d %0d", i,
                                  cpu_load_intervals[i]);
+                    for (int i = 0; i < 8; i++) begin
+                        $display("CPU_LOAD_ISSUE %0d %0d", i,
+                                 cpu_load_issue[i]);
+                        $display("CPU_LOAD_RESULT %0d %0d", i,
+                                 cpu_load_result[i]);
+                        $display("CPU_BRANCH_RESULT %0d %0d", i,
+                                 cpu_branch_result[i]);
+                        $display("CPU_X87_WAIT_REASON %0d %0d", i,
+                                 cpu_x87_wait_reason[i]);
+                    end
+                    for (int i = 0; i < 2; i++)
+                        for (int j = 0; j < 4; j++)
+                            $display("CPU_LOAD_SUCCESSOR %0d %0d %0d", i, j,
+                                     cpu_load_successor[i][j]);
+                    for (int path = 0; path < 3; path++) begin
+                        for (int interval = 0; interval < 17; interval++) begin
+                            if (cpu_load_path_interval[path][interval] != 0)
+                                $display("CPU_LOAD_PATH_INTERVAL %0d %0d %0d",
+                                         path, interval,
+                                         cpu_load_path_interval[path][interval]);
+                        end
+                        for (int dependency = 0; dependency < 4; dependency++) begin
+                            if (cpu_load_path_successor_count[path][dependency] != 0)
+                                $display("CPU_LOAD_PATH_SUCCESSOR %0d %0d %0d %0d",
+                                         path, dependency,
+                                         cpu_load_path_successor_count[path][dependency],
+                                         cpu_load_path_successor_cycles[path][dependency]);
+                        end
+                        for (int entry = 0; entry < 4096; entry++) begin
+                            if (cpu_load_next_entry_count[path][entry] != 0)
+                                $display("CPU_LOAD_NEXT_ENTRY %0d %03x %0d %0d",
+                                         path, entry,
+                                         cpu_load_next_entry_count[path][entry],
+                                         cpu_load_next_entry_cycles[path][entry]);
+                        end
+                        for (int addr32 = 0; addr32 < 2; addr32++)
+                            for (int size = 0; size < 3; size++)
+                                for (int ea_class = 0; ea_class < 3; ea_class++)
+                                    for (int alignment = 0; alignment < 4;
+                                         alignment++) begin
+                                        if (cpu_load_form_count[path][addr32][size]
+                                                               [ea_class][alignment] != 0)
+                                            $display("CPU_LOAD_FORM %0d %0d %0d %0d %0d %0d %0d",
+                                                path, addr32, size, ea_class,
+                                                alignment,
+                                                cpu_load_form_count[path][addr32][size]
+                                                                   [ea_class][alignment],
+                                                cpu_load_form_cycles[path][addr32][size]
+                                                                    [ea_class][alignment]);
+                                    end
+                    end
+                    for (int i = 0; i < 5; i++)
+                        $display("CPU_REP_ELEMENTS %0d %0d", i,
+                                 cpu_rep_elements[i]);
                     for (int i = 0; i < 17; i++)
                         $display("CPU_STORE_INTERVAL %0d %0d", i,
                                  cpu_store_intervals[i]);

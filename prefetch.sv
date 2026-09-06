@@ -1,6 +1,7 @@
 // Prefetch Unit - 32-byte circular buffer, filled one 16-byte cache line at a time M2v2 two-cursor read protocol (doc/z486/old/m2v2.md): *...
 // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-1
 
+`include "z486_platform.svh"
 module prefetch
     import z486_pkg::*;
 (
@@ -410,7 +411,7 @@ end
 
 // Keep the queue/decoder boundary physical. Quartus retiming this register
 // turns an icache response into a same-cycle cache -> aligner -> D1 PLA path.
-(* preserve *) reg [63:0] win_d1_r;
+`Z486_KEEP reg [63:0] win_d1_r;
 assign win_d1 = win_d1_r;
 
 always_ff @(posedge clk or negedge reset_n) begin

@@ -1,12 +1,13 @@
 // Registered arctangent table for the serialized Q80 CORDIC. Quartus maps
 // the constants to M10Ks; simulation uses the generated case table below.
+`include "z486_platform.svh"
 module x87_cordic_rom (
     input  logic               clk,
     input  logic         [6:0] address, // CORDIC iteration/atan table index.
     output logic signed [82:0] value    // Registered Q80 arctangent constant.
 );
 
-`ifdef ALTERA_RESERVED_QIS
+`ifdef Z486_USE_ALTERA_MEMORY
 
 logic [82:0] value_raw;
 assign value = value_raw;

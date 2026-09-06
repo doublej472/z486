@@ -1,5 +1,6 @@
 // Microcode ROM pipeline and control-flow state. Producers retain their
 // timing-critical target generation; this unit owns final address arbitration.
+`include "z486_platform.svh"
 module microsequencer
     import z486_pkg::*;
 (
@@ -84,7 +85,7 @@ logic        d2_rom_mem_id_r;
 logic        d2_rom_q_id_r;
 logic [2:0]  d2_rom_q_kind_r;
 logic        d2_slot_prefetched_r;
-(* preserve *) logic i_rni_delay_ea_r;
+`Z486_KEEP logic i_rni_delay_ea_r;
 
 assign i_rni_delay_ea = i_rni_delay_ea_r;
 logic [11:0] return_stack [0:3];

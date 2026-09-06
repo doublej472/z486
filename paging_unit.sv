@@ -1,6 +1,7 @@
 // Paging Unit for 80386 Processor Integrates TLB and Page Walker for address translation. Also handles DWORD-crossing splits: receives...
 // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-1
 
+`include "z486_platform.svh"
 module paging_unit
     import z486_pkg::*;
 (
@@ -91,7 +92,7 @@ module paging_unit
     // Demand-side physical request interface
     //=========================================================================
     output logic        dcache_req_valid,     // Demand/page-walk/IO request valid
-    (* syn_replicate = 1 *)
+    `Z486_REPLICATE
     output logic [31:0] dcache_req_phys_addr, // Physical address (full 32-bit); the
                                               // cache indexes off [11:2] (page-offset,
                                               // TLB-free), tags off [31:12]
@@ -215,6 +216,7 @@ wire idle_mem_capture = idle_mem_precheck || idle_inta_req;
 wire vipt_refill_capture = vipt_fallback && idle_mem_precheck && pg_enable &&
                            live_valid;
 reg vipt_refill_pending_r;
+reg fast_path_pending; // A fast-path BIU request is in flight
 wire vipt_refill_valid = vipt_refill_pending_r && tlb_hit;
 
 always_ff @(posedge clk) begin
@@ -388,9 +390,6 @@ reg        opr_is_write_r;   // Is write (no OPR_R update on writes)
 reg        opr_suppress_r;  // Suppress OPR_R update (INTA first cycle)
 reg [1:0]  opr_phys_low_r;   // Physical address [1:0] for byte extraction
 reg        opr_is_walk_r;    // Is walker request (no OPR_R)
-
-// Fast path metadata (mem non-crossing emits directly from PG_IDLE)
-reg        fast_path_pending; // A fast-path BIU request is in flight
 
 // PIPT cache completion is deliberately registered through mem_servicing clear.
 // Do not feed cache response/tag-compare timing back into the microsequencer.

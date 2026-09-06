@@ -1,7 +1,9 @@
 // Read-only physically indexed, physically tagged L1 instruction cache. CPU-side contract: * cpu_addr is a physical byte address. * A...
 // Details: doc/z486/implementation_notes.md#src-24-z486-l1-icache-sv-1
+`include "z486_platform.svh"
 module l1_icache #(
-    parameter integer SET_BITS = 8   // 16KB icache (256 sets x 4 ways x 16 B); =7 was 8KB
+    // 8KB icache (128 sets x 4 ways x 16 B); use SET_BITS=8 for 16KB.
+    parameter integer SET_BITS = 7
 ) (
     input         clk,
     input         reset,
@@ -16,12 +18,14 @@ module l1_icache #(
     // Memory side.
     output [31:0] mem_addr,
     input  [31:0] mem_dout,
+    input [127:0] mem_line_dout,
     output  [3:0] mem_be,
     output  [7:0] mem_burstcount,
     input         mem_busy,
     output        mem_valid,
     input         mem_ready,
     input         mem_resp_valid,
+    input         mem_line_resp_valid,
 
     // CPU stores patch matching cached words; external DMA writes only
     // invalidate. Separate addresses keep DMA out of the hit-response cone.
@@ -66,16 +70,16 @@ wire [WORD_OFFSET_BITS-1:0] patch_word = patch_addr[LINE_OFFSET_BITS-1:BYTE_OFFS
 // bypass without corrupting branch targets in the middle of the line.
 wire cpu_uncacheable = !cache_enable;
 
-(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1];
-(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1];
-(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way2 [0:NUM_SETS-1];
-(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way3 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [TAG_RAM_BITS-1:0] tag_way2 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [TAG_RAM_BITS-1:0] tag_way3 [0:NUM_SETS-1];
 reg [2:0] plru_set [0:NUM_SETS-1];
 
-(* ramstyle = "M10K" *) reg [127:0] data_way0 [0:NUM_SETS-1];
-(* ramstyle = "M10K" *) reg [127:0] data_way1 [0:NUM_SETS-1];
-(* ramstyle = "M10K" *) reg [127:0] data_way2 [0:NUM_SETS-1];
-(* ramstyle = "M10K" *) reg [127:0] data_way3 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [127:0] data_way0 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [127:0] data_way1 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [127:0] data_way2 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [127:0] data_way3 [0:NUM_SETS-1];
 
 // Register each complete tag word as one RAM read.  Keeping the valid bit in
 // the otherwise unused tag-RAM bit removes four 256-bit register arrays while
@@ -282,6 +286,7 @@ logic patchq_snoop_hit;
 logic [31:0] fill_word_next;
 logic [127:0] fill_line_base;
 logic [127:0] fill_line_next;
+logic [127:0] wide_line_next;
 
 always_comb begin
     patchq_snoop_match = {PATCHQ_DEPTH{1'b0}};
@@ -307,25 +312,33 @@ always_comb begin
     if (patch_valid && line_match_dw(patch_addr[31:2], fill_tag, fill_set))
         fill_line_base = patch_line_word_be(fill_line_base, patch_word, patch_data, patch_be);
     fill_line_next = patch_line_word(fill_line_base, fill_count, fill_word_next);
+
+    // A native DDR backend returns the complete line in one cycle. Apply the
+    // same pending self-modifying-code patches that the legacy DWORD path
+    // applies one beat at a time.
+    wide_line_next = mem_line_dout;
+    for (int p = 0; p < PATCHQ_DEPTH; p++) begin
+        if (patchq_valid[p] && line_match_dw(patchq_addr[p], fill_tag, fill_set))
+            wide_line_next = patch_line_word_be(wide_line_next,
+                patchq_addr[p][WORD_OFFSET_BITS-1:0], patchq_data[p], patchq_be[p]);
+    end
+    if (snoop_valid_r && snoop_patch_r &&
+        line_match_dw(snoop_addr_dw_r, fill_tag, fill_set))
+        wide_line_next = patch_line_word_be(wide_line_next, snoop_word_r,
+                                             snoop_data_r, snoop_be_r);
+    if (patch_valid && line_match_dw(patch_addr[31:2], fill_tag, fill_set))
+        wide_line_next = patch_line_word_be(wide_line_next, patch_word,
+                                             patch_data, patch_be);
 end
 
 assign cpu_line = lookup_read_hit_now ? lookup_way_line : line_r;
 assign cpu_resp_valid = lookup_read_hit_now || resp_valid_r;
 
-task automatic write_cache_line(input [1:0] way, input [SET_BITS-1:0] set, input [127:0] line);
-begin
-    case (way)
-        2'd0: data_way0[set] <= line;
-        2'd1: data_way1[set] <= line;
-        2'd2: data_way2[set] <= line;
-        default: data_way3[set] <= line;
-    endcase
-end
-endtask
-
 wire tag_reset_write = (state == S_RESET_INIT);
-wire tag_fill_write = (state == S_FILL) && mem_resp_valid &&
-                      (fill_count == {WORD_OFFSET_BITS{1'b1}});
+wire tag_fill_write = (state == S_FILL) &&
+                      (mem_line_resp_valid ||
+                       (mem_resp_valid &&
+                        fill_count == {WORD_OFFSET_BITS{1'b1}}));
 wire [TAG_RAM_BITS-1:0] tag_fill_entry =
     {{(TAG_RAM_BITS-TAG_BITS-1){1'b0}}, 1'b1, fill_tag};
 wire snoop_capture = invalidate_valid || patch_valid;
@@ -357,6 +370,7 @@ wire registered_snoop_fill_conflict = snoop_valid_r &&
 // targeting the line being filled must leave that fill uncached.
 wire fill_install_allowed = !live_snoop_fill_conflict &&
                             !registered_snoop_fill_conflict;
+wire data_fill_write = tag_fill_write && fill_install_allowed;
 
 always_ff @(posedge clk) begin
     if (accept_cpu) begin
@@ -369,6 +383,22 @@ always_ff @(posedge clk) begin
         rd_line2_r <= data_way2[cpu_set];
         rd_line3_r <= data_way3[cpu_set];
         rd_plru_r <= plru_set[cpu_set];
+    end
+
+    // Keep each data RAM's synchronous read and write in the same process.
+    // Vivado otherwise implements the 4 x 256 x 128-bit instruction cache as
+    // flip-flops instead of inferring simple dual-port block RAMs.
+    if (data_fill_write) begin
+        case (fill_way)
+            2'd0: data_way0[fill_set] <= mem_line_resp_valid ?
+                                              wide_line_next : fill_line_next;
+            2'd1: data_way1[fill_set] <= mem_line_resp_valid ?
+                                              wide_line_next : fill_line_next;
+            2'd2: data_way2[fill_set] <= mem_line_resp_valid ?
+                                              wide_line_next : fill_line_next;
+            default: data_way3[fill_set] <= mem_line_resp_valid ?
+                                              wide_line_next : fill_line_next;
+        endcase
     end
 
     // The second synchronous tag read is launched from the live snoop input
@@ -544,12 +574,17 @@ always_ff @(posedge clk) begin
                     fill_requested <= 1'b1;
                 end
 
-                if (mem_resp_valid) begin
+                if (mem_line_resp_valid) begin
+                    fill_line <= wide_line_next;
+                    line_r <= wide_line_next;
+                    resp_valid_r <= 1'b1;
+                    plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                    state <= S_IDLE;
+                    ready_r <= 1'b1;
+                end else if (mem_resp_valid) begin
                     fill_line <= fill_line_next;
 
                     if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
-                        if (fill_install_allowed)
-                            write_cache_line(fill_way, fill_set, fill_line_next);
                         line_r <= fill_line_next;
                         resp_valid_r <= 1'b1;
                         // Only the tag-RAM fill write sets valid for fill_way.

@@ -1,5 +1,6 @@
 // Two mirrored memories implement a two-read, one-write scratch file. The
 // synchronous read boundary keeps scratch data out of sequencer address logic.
+`include "z486_platform.svh"
 module x87_cordic_scratch (
     input  logic        clk,
     input  logic  [3:0] read_addr_a, // Current coordinate or accumulator limb.
@@ -11,8 +12,8 @@ module x87_cordic_scratch (
     input  logic [27:0] write_data
 );
 
-(* ramstyle = "M10K, no_rw_check" *) logic [27:0] words_a [0:15];
-(* ramstyle = "M10K, no_rw_check" *) logic [27:0] words_b [0:15];
+`Z486_BLOCK_RAM_NO_RW_CHECK logic [27:0] words_a [0:15];
+`Z486_BLOCK_RAM_NO_RW_CHECK logic [27:0] words_b [0:15];
 
 always_ff @(posedge clk) begin
     if (write_enable) begin

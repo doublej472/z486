@@ -1,5 +1,6 @@
 // Synchronous x87 control store. The generated image is the source
 // of truth; simulation and Quartus consume equivalent generated forms.
+`include "z486_platform.svh"
 module x87_ucode_rom
     import x87_ucode_pkg::*;
 (
@@ -11,7 +12,18 @@ module x87_ucode_rom
 logic [63:0] raw_uop;
 assign uop = x87_uop_t'(raw_uop);
 
-`ifdef ALTERA_RESERVED_QIS
+`ifdef Z486_XILINX
+
+// Keep the dense image in block RAM. Vivado otherwise recognizes the sparse
+// case function below as logic and implements this 16 Kibit control store in
+// thousands of LUTs.
+`Z486_BLOCK_RAM logic [63:0] control_store [0:255];
+initial $readmemh("x87_ucode.mem", control_store);
+
+always_ff @(posedge clk)
+    raw_uop <= control_store[address];
+
+`elsif Z486_USE_ALTERA_MEMORY
 
 altsyncram #(
     .operation_mode("ROM"),

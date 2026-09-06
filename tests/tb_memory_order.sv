@@ -32,11 +32,15 @@ module tb_memory_order;
 
     memory #(
         .DCACHE_SET_BITS(3),
-        .ICACHE_SET_BITS(3)
+        .ICACHE_SET_BITS(3),
+        .ENABLE_DEVICE_MMIO(1'b1),
+        .DEVICE_MMIO_MASK(32'hff00_0000)
     ) dut (
         .clk(clk),
         .reset_n(reset_n),
         .a20_enable(1'b1),
+        .device_mmio_enable(1'b1),
+        .device_mmio_base(32'hd000_0000),
 
         .dcache_req_valid(dcache_req_valid),
         .dcache_req_phys_addr_raw(dcache_req_phys_addr_raw),
@@ -55,10 +59,17 @@ module tb_memory_order;
         .dcache_read_complete(dcache_read_complete),
         .dcache_rdata(dcache_rdata),
 
+        .fast_store_valid(1'b0),
+        .fast_store_phys_addr_raw(32'd0),
+        .fast_store_be(4'd0),
+        .fast_store_wdata(32'd0),
+        .fast_store_accepted(),
+
         .dcache_vipt_probe_valid(1'b0),
         .dcache_vipt_probe_offset(12'h000),
         .dcache_vipt_probe_ready(),
         .dcache_vipt_probe_accepted(),
+        .dcache_vipt_probe_direct_accepted(),
         .dcache_vipt_resolve_valid(1'b0),
         .dcache_vipt_resolve_phys_addr_raw(32'h0),
         .dcache_vipt_resolve_hit(),
@@ -82,13 +93,16 @@ module tb_memory_order;
         .addr(addr),
         .be(be),
         .burstcount(burstcount),
+        .line_read(),
         .din(din),
+        .line_din(128'd0),
         .dout(dout),
         .valid(valid),
         .ready(ready),
         .write(write),
         .io(io),
         .resp_valid(resp_valid),
+        .line_resp_valid(1'b0),
         .inta(inta)
     );
 
@@ -174,6 +188,50 @@ module tb_memory_order;
         if (io || write || addr !== 30'h0002_E000) begin
             $display("MEMORY ORDER FAIL VGA bypass: io=%0b write=%0b addr=%08x",
                      io, write, {addr, 2'b00});
+            $fatal(1);
+        end
+
+        // Complete the VGA read before starting the device-aperture test.
+        ready = 1'b1;
+        @(negedge clk);
+        ready = 1'b0;
+        resp_valid = 1'b1;
+        @(negedge clk);
+        resp_valid = 1'b0;
+        dcache_req_valid = 1'b0;
+        dcache_req_is_vga_mem = 1'b0;
+
+        // A Voodoo-style memory BAR also bypasses L1, but unlike VGA it is
+        // ordered after older posted normal-memory stores.
+        reset_n = 1'b0;
+        repeat (5) @(posedge clk);
+        reset_n = 1'b1;
+        repeat (20) @(posedge clk);
+
+        @(negedge clk);
+        dcache_req_phys_addr_raw = 32'h0000_3000;
+        dcache_req_wdata = 32'h7654_3210;
+        dcache_req_write = 1'b1;
+        dcache_req_valid = 1'b1;
+        do @(negedge clk); while (!dcache_req_accepted);
+
+        dcache_req_phys_addr_raw = 32'hd000_0040;
+        dcache_req_write = 1'b0;
+        do @(negedge clk); while (!valid);
+        if (io || !write || addr !== 30'h0000_0c00) begin
+            $display("MEMORY ORDER FAIL older store before device MMIO: io=%0b write=%0b addr=%08x",
+                     io, write, {addr, 2'b00});
+            $fatal(1);
+        end
+
+        ready = 1'b1;
+        @(negedge clk);
+        ready = 1'b0;
+        do @(negedge clk); while (!valid);
+        if (io || write || addr !== 30'h3400_0010 ||
+            burstcount !== 8'd1) begin
+            $display("MEMORY ORDER FAIL uncached device MMIO: io=%0b write=%0b addr=%08x burst=%0d",
+                     io, write, {addr, 2'b00}, burstcount);
             $fatal(1);
         end
 

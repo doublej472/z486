@@ -14,6 +14,7 @@ X87_DIR := $(Z486_DIR)/x87
 X87_REF_DIR := x87_reference
 X87_UCODE_GEN := $(X87_DIR)/x87_ucode.svh \
 			$(X87_DIR)/x87_ucode.mif \
+			$(X87_DIR)/x87_ucode.mem \
 			$(X87_DIR)/x87_entries.svh
 X87_COMMAND_GEN := $(X87_DIR)/x87_command_decode.svh \
 			$(X87_DIR)/x87_command_decode.mif

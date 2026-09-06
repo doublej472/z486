@@ -1,0 +1,9 @@
+**/build/
+**/build-fmax/
+**/build-x87/
+**/build-cpu/
+**/build-cpu-x87/
+**/.Xil/
+**/*.jou
+firmware/blink.bin
+firmware/blink.hex

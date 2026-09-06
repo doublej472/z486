@@ -1,9 +1,10 @@
 // Physically indexed, physically tagged L1 cache for z486. CPU-side contract: * cpu_addr is a physical byte address. * A cache-hit...
 // Details: doc/z486/implementation_notes.md#src-24-z486-l1-cache-sv-1
+`include "z486_platform.svh"
 module l1_cache #(
-    // Four ways, 16 bytes per line. SET_BITS=8 gives a 16KB data cache
-    // (256 sets x 4 ways x 16 B); =7 was 8KB.
-    parameter integer SET_BITS = 8,
+    // Four ways, 16 bytes per line. SET_BITS=7 gives the default 8KB data
+    // cache (128 sets x 4 ways x 16 B); use 8 for 16KB.
+    parameter integer SET_BITS = 7,
     parameter PROTECT_UMA_ROM = 0
 ) (
     input         clk,
@@ -50,6 +51,7 @@ module l1_cache #(
     output [31:0] mem_addr,
     output [31:0] mem_din,
     input  [31:0] mem_dout,
+    input [127:0] mem_line_dout,
     output  [3:0] mem_be,
     output  [7:0] mem_burstcount,
     input         mem_busy,
@@ -57,6 +59,7 @@ module l1_cache #(
     output        mem_write,
     input         mem_ready,
     input         mem_resp_valid,
+    input         mem_line_resp_valid,
 
     // Physical-address snoop.  The first implementation invalidates a whole
     // set; this is conservative and keeps snoop matching off the read hit path.
@@ -109,16 +112,16 @@ wire cpu_protect_write = PROTECT_UMA_ROM && cpu_write && (cpu_addr[24:18] == 7'b
 // Keep validity in the otherwise under-filled tag RAM word. This removes four
 // asynchronously indexed 256-bit register arrays from the preread address
 // path without changing the synchronous lookup boundary.
-(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1];
-(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1];
-(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way2 [0:NUM_SETS-1];
-(* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way3 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [TAG_RAM_BITS-1:0] tag_way2 [0:NUM_SETS-1];
+`Z486_BLOCK_RAM reg [TAG_RAM_BITS-1:0] tag_way3 [0:NUM_SETS-1];
 reg [2:0] plru_set [0:NUM_SETS-1];
 
-reg [31:0] data_way0 [0:(NUM_SETS << WORD_OFFSET_BITS)-1];
-reg [31:0] data_way1 [0:(NUM_SETS << WORD_OFFSET_BITS)-1];
-reg [31:0] data_way2 [0:(NUM_SETS << WORD_OFFSET_BITS)-1];
-reg [31:0] data_way3 [0:(NUM_SETS << WORD_OFFSET_BITS)-1];
+`Z486_BLOCK_RAM reg [31:0] data_way0 [0:(NUM_SETS << WORD_OFFSET_BITS)-1];
+`Z486_BLOCK_RAM reg [31:0] data_way1 [0:(NUM_SETS << WORD_OFFSET_BITS)-1];
+`Z486_BLOCK_RAM reg [31:0] data_way2 [0:(NUM_SETS << WORD_OFFSET_BITS)-1];
+`Z486_BLOCK_RAM reg [31:0] data_way3 [0:(NUM_SETS << WORD_OFFSET_BITS)-1];
 
 // Synchronous cache read result for the request accepted in the previous cycle.
 // Register each complete tag word as one RAM read; Quartus 17 otherwise treats
@@ -201,6 +204,8 @@ reg [1:0] fill_way;
 reg [2:0] fill_plru_r;
 reg fill_requested;
 reg fill_target_returned;
+reg [127:0] wide_fill_line;
+reg wide_fill_install;
 
 reg [31:0] dout_r;
 reg resp_valid_r;
@@ -224,6 +229,24 @@ function automatic [31:0] merge32(input [31:0] old_data, input [31:0] new_data, 
 begin
     mask = be_mask(be);
     merge32 = (old_data & ~mask) | (new_data & mask);
+end
+endfunction
+
+function automatic [127:0] forward_storeq_line_slot(
+    input [127:0] value,
+    input         slot_live,
+    input  [29:0] slot_addr,
+    input  [31:0] slot_data,
+    input   [3:0] slot_be,
+    input  [27:0] line_addr
+);
+    automatic reg [127:0] result;
+begin
+    result = value;
+    if (slot_live && slot_addr[29:2] == line_addr)
+        result[{slot_addr[1:0], 5'b0} +: 32] =
+            merge32(result[{slot_addr[1:0], 5'b0} +: 32], slot_data, slot_be);
+    forward_storeq_line_slot = result;
 end
 endfunction
 
@@ -339,6 +362,7 @@ wire [29:0] fill_addr_dw = {req_addr_r[31:4], fill_count};
 logic [31:0] lookup_forward_data;
 logic [31:0] fill_word_data;
 logic [31:0] bypass_forward_data;
+logic [127:0] wide_line_data;
 wire lookup_read_hit_now = (state == S_LOOKUP) && req_valid_r &&
                            !req_write_r && !req_uncacheable_r && lookup_hit;
 
@@ -384,6 +408,7 @@ always_comb begin
     lookup_forward_data = lookup_way_data;
     fill_word_data = mem_dout;
     bypass_forward_data = mem_dout;
+    wide_line_data = mem_line_dout;
 
     unique case (storeq_tail)
         2'd0: begin
@@ -391,16 +416,19 @@ always_comb begin
                 lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
                 fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], fill_addr_dw);
                 bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
+                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_r[31:4]);
             end
             if (storeq_count > 1) begin
                 lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
                 fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], fill_addr_dw);
                 bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
+                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_r[31:4]);
             end
             if (storeq_count > 2) begin
                 lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
                 fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], fill_addr_dw);
                 bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
+                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_r[31:4]);
             end
         end
         2'd1: begin
@@ -408,16 +436,19 @@ always_comb begin
                 lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
                 fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], fill_addr_dw);
                 bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
+                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_r[31:4]);
             end
             if (storeq_count > 1) begin
                 lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
                 fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], fill_addr_dw);
                 bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
+                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_r[31:4]);
             end
             if (storeq_count > 2) begin
                 lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
                 fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], fill_addr_dw);
                 bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
+                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_r[31:4]);
             end
         end
         default: begin
@@ -425,31 +456,23 @@ always_comb begin
                 lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
                 fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], fill_addr_dw);
                 bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
+                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_r[31:4]);
             end
             if (storeq_count > 1) begin
                 lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
                 fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], fill_addr_dw);
                 bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
+                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_r[31:4]);
             end
             if (storeq_count > 2) begin
                 lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
                 fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], fill_addr_dw);
                 bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
+                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_r[31:4]);
             end
         end
     endcase
 end
-
-task automatic write_cache_word(input [1:0] way, input [BRAM_ADDR_BITS-1:0] addr, input [31:0] data);
-begin
-    case (way)
-        2'd0: data_way0[addr] <= data;
-        2'd1: data_way1[addr] <= data;
-        2'd2: data_way2[addr] <= data;
-        default: data_way3[addr] <= data;
-    endcase
-end
-endtask
 
 // Preread runs on every ready idle cycle, with no cpu_valid/TLB gating: when
 // no request is accepted the preread results are garbage that S_LOOKUP never
@@ -492,11 +515,26 @@ wire [SET_BITS-1:0] preread_set =
 wire [WORD_OFFSET_BITS-1:0] preread_word =
     vipt_probe_fire ? vipt_probe_word : cpu_preread_word;
 wire [BRAM_ADDR_BITS-1:0] preread_bram_addr = {preread_set, preread_word};
+wire data_store_write = (state == S_LOOKUP) && req_valid_r && req_write_r &&
+                        !req_protect_write_r && lookup_hit &&
+                        !req_uncacheable_r;
+wire data_fill_write = (state == S_FILL) &&
+                       (mem_resp_valid || wide_fill_install);
+wire [1:0] data_write_way = data_store_write ? lookup_way : fill_way;
+wire [BRAM_ADDR_BITS-1:0] data_write_addr = data_store_write ?
+                                            req_bram_addr :
+                                            {fill_set, fill_count};
+wire [31:0] data_write_value = data_store_write ?
+                               merge32(lookup_way_data, req_din_r, req_be_r) :
+                               wide_fill_install ?
+                               wide_fill_line[{fill_count, 5'b0} +: 32] :
+                               fill_word_data;
 
 // Keep each tag array in one conventional synchronous-read/synchronous-write
 // process. Quartus 17 will not infer a block RAM when the packed valid bit is
 // written from the snoop, reset-init, and fill branches of the cache FSM.
-wire tag_fill_write = (state == S_FILL) && mem_resp_valid &&
+wire tag_fill_write = (state == S_FILL) &&
+                      (mem_resp_valid || wide_fill_install) &&
                       (fill_count == {WORD_OFFSET_BITS{1'b1}});
 wire tag_clear_all = (state == S_RESET_INIT) || snoop_valid_r;
 wire [SET_BITS-1:0] tag_clear_set = (state == S_RESET_INIT) ?
@@ -521,6 +559,18 @@ always_ff @(posedge clk) begin
         rd_plru_r <= plru_set[preread_set];
     end
 
+    // A single process for both ports is recognized as simple dual-port RAM
+    // by Vivado and Quartus. The former split-process task form mapped the
+    // cache storage to registers in Vivado.
+    if (data_store_write || data_fill_write) begin
+        case (data_write_way)
+            2'd0: data_way0[data_write_addr] <= data_write_value;
+            2'd1: data_way1[data_write_addr] <= data_write_value;
+            2'd2: data_way2[data_write_addr] <= data_write_value;
+            default: data_way3[data_write_addr] <= data_write_value;
+        endcase
+    end
+
     if (tag_clear_all || tag_fill_way0)
         tag_way0[tag_fill_way0 ? fill_set : tag_clear_set] <=
             tag_fill_way0 ? tag_fill_entry : '0;
@@ -536,8 +586,6 @@ always_ff @(posedge clk) begin
 end
 
 always_ff @(posedge clk) begin
-    automatic reg [31:0] patched;
-
     if (reset) begin
         state <= S_RESET_INIT;
         init_set <= {SET_BITS{1'b0}};
@@ -557,6 +605,8 @@ always_ff @(posedge clk) begin
         storeq_draining <= 1'b0;
         fill_requested <= 1'b0;
         fill_target_returned <= 1'b0;
+        wide_fill_line <= 128'd0;
+        wide_fill_install <= 1'b0;
         snoop_set_r <= {SET_BITS{1'b0}};
         snoop_valid_r <= 1'b0;
         for (integer i = 0; i < STOREQ_DEPTH; i = i + 1)
@@ -652,8 +702,6 @@ always_ff @(posedge clk) begin
                     end
                     storeq_count <= storeq_count_wr_next;
                     if (lookup_hit && !req_uncacheable_r) begin
-                        patched = merge32(lookup_way_data, req_din_r, req_be_r);
-                        write_cache_word(lookup_way, req_bram_addr, patched);
                         plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
                     end
                     state <= S_IDLE;
@@ -681,6 +729,7 @@ always_ff @(posedge clk) begin
                     fill_target_word <= req_word_r;
                     fill_requested <= 1'b0;
                     fill_target_returned <= 1'b0;
+                    wide_fill_install <= 1'b0;
                     state <= S_FILL;
                 end
             end
@@ -696,9 +745,21 @@ always_ff @(posedge clk) begin
                     fill_requested <= 1'b1;
                 end
 
-                if (mem_resp_valid) begin
-                    write_cache_word(fill_way, {fill_set, fill_count}, fill_word_data);
-
+                if (wide_fill_install) begin
+                    if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
+                        plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                        wide_fill_install <= 1'b0;
+                        state <= S_IDLE;
+                        ready_r <= ready_when_idle;
+                    end
+                    fill_count <= fill_count + 1'b1;
+                end else if (mem_line_resp_valid) begin
+                    wide_fill_line <= wide_line_data;
+                    wide_fill_install <= 1'b1;
+                    dout_r <= wide_line_data[{fill_target_word, 5'b0} +: 32];
+                    resp_valid_r <= 1'b1;
+                    fill_target_returned <= 1'b1;
+                end else if (mem_resp_valid) begin
                     if (fill_count == fill_target_word && !fill_target_returned) begin
                         dout_r <= fill_word_data;
                         resp_valid_r <= 1'b1;

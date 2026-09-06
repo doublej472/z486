@@ -71,6 +71,10 @@ module tb_dhrystone;
         .be(read_be),
 `ifdef DHRY_INTERNAL_CPU_CACHE
         .burstcount(cpu_burstcount),
+`ifdef Z486_CURRENT_CORE
+        .line_read(),
+        .line_din(128'd0),
+`endif
 `endif
         .din(cpu_din),
         .dout(read_data),
@@ -80,6 +84,9 @@ module tb_dhrystone;
         .ready(read_ready),
         .resp_valid(cpu_resp_valid),
 `ifdef DHRY_INTERNAL_CPU_CACHE
+`ifdef Z486_CURRENT_CORE
+        .line_resp_valid(1'b0),
+`endif
         .snoop_addr(32'h0),
         .snoop_valid(1'b0),
         .a20_enable(1'b1),
@@ -172,6 +179,7 @@ module tb_dhrystone;
         .mem_addr      (cache_mem_addr),
         .mem_din       (cache_mem_din),
         .mem_dout      (bus_din),
+        .mem_line_dout (128'd0),
         .mem_be        (cache_mem_be),
         .mem_burstcount(cache_mem_burstcount),
         .mem_busy      (1'b0),
@@ -179,6 +187,7 @@ module tb_dhrystone;
         .mem_write     (cache_mem_write),
         .mem_ready     (bus_ready),
         .mem_resp_valid(bus_resp_valid),
+        .mem_line_resp_valid(1'b0),
 
         .snoop_addr    (32'h0),
         .snoop_valid   (1'b0),

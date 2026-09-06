@@ -1,6 +1,7 @@
 // TLB (Translation Lookaside Buffer) for 80386 Paging Unit 32-entry 4-way set-associative cache with PLRU replacement per set 8 sets × 4...
 // Details: doc/z486/implementation_notes.md#src-24-z486-paging-tlb-sv-1
 `timescale 1ns/1ns
+`include "z486_platform.svh"
 
 module paging_tlb
     import z486_pkg::*;
@@ -101,10 +102,10 @@ wire [1:0] hit_way = hit0 ? 2'd0 :
 
 // Live demand lookup address decomposition. linear_addr_live (z486 paging_live_linear) is a very high-fanout net: its set bits drive the...
 // Details: doc/z486/implementation_notes.md#src-24-z486-paging-tlb-sv-77
-(* keep *) wire [31:0] lal_w0 = linear_addr_live;
-(* keep *) wire [31:0] lal_w1 = linear_addr_live;
-(* keep *) wire [31:0] lal_w2 = linear_addr_live;
-(* keep *) wire [31:0] lal_w3 = linear_addr_live;
+`Z486_KEEP wire [31:0] lal_w0 = linear_addr_live;
+`Z486_KEEP wire [31:0] lal_w1 = linear_addr_live;
+`Z486_KEEP wire [31:0] lal_w2 = linear_addr_live;
+`Z486_KEEP wire [31:0] lal_w3 = linear_addr_live;
 
 wire [2:0] live_set0 = lal_w0[14:12];  wire [16:0] live_tag0 = lal_w0[31:15];
 wire [2:0] live_set1 = lal_w1[14:12];  wire [16:0] live_tag1 = lal_w1[31:15];
@@ -137,7 +138,7 @@ reg [31:0] vipt_linear_r;
 reg        vipt_hazard_r;
 reg [VIPT_TLB_ENTRIES-1:0] vipt_valid;
 // {VPN tag[19:5], PFN[19:0], writable, user, dirty, VGA}
-(* ramstyle = "M10K, no_rw_check" *) reg [38:0] vipt_tlb [0:VIPT_TLB_ENTRIES-1];
+`Z486_BLOCK_RAM_NO_RW_CHECK reg [38:0] vipt_tlb [0:VIPT_TLB_ENTRIES-1];
 reg [38:0] vipt_tlb_q;
 
 always_ff @(posedge clk) begin

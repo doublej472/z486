@@ -1,5 +1,6 @@
 // Owns the architectural address registers and their relocated linear form.
 // D2 supplies an effective address; segmentation supplies the active base/mask.
+`include "z486_platform.svh"
 module address_unit
     import z486_pkg::*;
 (
@@ -190,7 +191,7 @@ function automatic logic [31:0] relocate_issue(input logic [31:0] offset);
 endfunction
 
 // Preserve the dedicated microcode relocation cone used before extraction.
-(* keep *) wire [31:0] seg_base_pending_exec = seg_base_pending;
+`Z486_KEEP wire [31:0] seg_base_pending_exec = seg_base_pending;
 
 function automatic logic [31:0] relocate_exec(input logic [31:0] offset);
     relocate_exec = (eff_mask_pending ? offset : {16'd0, offset[15:0]}) +

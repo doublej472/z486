@@ -1,13 +1,14 @@
 // Synchronous lookup ROM shared by FYL2X and F2XM1. Each word returns the
 // selected Q52 sample and its precomputed delta to the successor. Address
 // ranges 0/256/512 select log2/exp2/exp2(-x); 768 and 769 are exp2 endpoints.
+`include "z486_platform.svh"
 module x87_logexp_rom (
     input  logic         clk,
     input  logic   [9:0] address,
     output logic  [99:0] q
 );
 
-`ifdef ALTERA_RESERVED_QIS
+`ifdef Z486_USE_ALTERA_MEMORY
 
 altsyncram #(
     .operation_mode("ROM"),
@@ -17,7 +18,7 @@ altsyncram #(
     .outdata_reg_a("UNREGISTERED"),
     .address_aclr_a("NONE"),
     .outdata_aclr_a("NONE"),
-    .init_file("src/z486/x87/x87_logexp_tables.mif"),
+    .init_file("x87_logexp_tables.mif"),
     .ram_block_type("M10K"),
     .intended_device_family("Cyclone V"),
     .lpm_type("altsyncram")

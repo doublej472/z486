@@ -27,13 +27,24 @@ module tb_l1_cache;
     wire [31:0] mem_addr;
     wire [31:0] mem_din;
     reg  [31:0] mem_dout = 32'h0;
+    reg [127:0] mem_line_dout = 128'h0;
     wire  [3:0] mem_be;
     wire  [7:0] mem_burstcount;
     reg         mem_ready = 1'b0;
     wire        mem_valid;
     wire        mem_write;
     reg         mem_resp_valid = 1'b0;
+    reg         mem_line_resp_valid = 1'b0;
     reg         mem_stall = 1'b0;
+    reg         wide_mode = 1'b0;
+    reg         wide_pending = 1'b0;
+    reg  [31:0] wide_addr = 32'h0;
+    integer     mem_request_count = 0;
+    integer     narrow_response_count = 0;
+    integer     line_response_count = 0;
+    integer     mem_request_before;
+    integer     narrow_response_before;
+    integer     line_response_before;
     reg         check_uncached_order = 1'b0;
     reg         saw_uncached_write_104 = 1'b0;
 
@@ -70,6 +81,7 @@ module tb_l1_cache;
         .mem_addr(mem_addr),
         .mem_din(mem_din),
         .mem_dout(mem_dout),
+        .mem_line_dout(mem_line_dout),
         .mem_be(mem_be),
         .mem_burstcount(mem_burstcount),
         .mem_busy(1'b0),
@@ -77,6 +89,7 @@ module tb_l1_cache;
         .mem_write(mem_write),
         .mem_ready(mem_ready),
         .mem_resp_valid(mem_resp_valid),
+        .mem_line_resp_valid(mem_line_resp_valid),
 
         .snoop_addr(snoop_addr),
         .snoop_valid(snoop_valid),
@@ -143,17 +156,31 @@ module tb_l1_cache;
     always_ff @(posedge clk) begin
         mem_ready <= 1'b0;
         mem_resp_valid <= 1'b0;
+        mem_line_resp_valid <= 1'b0;
         mem_dout <= 32'h0;
+
+        if (wide_pending) begin
+            mem_line_dout <= {mem_get32(wide_addr + 32'd12),
+                              mem_get32(wide_addr + 32'd8),
+                              mem_get32(wide_addr + 32'd4),
+                              mem_get32(wide_addr)};
+            mem_line_resp_valid <= 1'b1;
+            wide_pending <= 1'b0;
+            line_response_count <= line_response_count + 1;
+        end
 
         if (rd_left != 8'd0) begin
             mem_resp_valid <= 1'b1;
             mem_dout <= mem_get32(rd_addr);
             rd_addr <= rd_addr + 32'd4;
             rd_left <= rd_left - 8'd1;
+            narrow_response_count <= narrow_response_count + 1;
         end
 
-        if (mem_valid && !mem_ready && rd_left == 8'd0 && !mem_stall) begin
+        if (mem_valid && !mem_ready && rd_left == 8'd0 && !wide_pending &&
+            !mem_stall) begin
             mem_ready <= 1'b1;
+            mem_request_count <= mem_request_count + 1;
             if (mem_write) begin
                 if (check_uncached_order && mem_addr == 32'h000A_0104)
                     saw_uncached_write_104 <= 1'b1;
@@ -161,6 +188,9 @@ module tb_l1_cache;
                 if (mem_be[1]) mem[mem_addr[11:0] + 1] <= mem_din[15:8];
                 if (mem_be[2]) mem[mem_addr[11:0] + 2] <= mem_din[23:16];
                 if (mem_be[3]) mem[mem_addr[11:0] + 3] <= mem_din[31:24];
+            end else if (wide_mode && mem_burstcount == 8'd4) begin
+                wide_addr <= mem_addr;
+                wide_pending <= 1'b1;
             end else begin
                 if (check_uncached_order && mem_addr == 32'h000A_0108 && !saw_uncached_write_104) begin
                     $display("L1 ORDER FAIL uncached read bypassed older posted write");
@@ -308,6 +338,30 @@ module tb_l1_cache;
         @(posedge clk);
         snoop_valid <= 1'b0;
         cache_read(32'h40, 4'hF, 32'hCAFE_BABE);       // snoop invalidated line
+
+        // The KV260 DDR backend returns a complete 16-byte cache line in one
+        // response. No four-DWORD response sequence is required at this port.
+        mem_put32(32'h180, 32'h1800_0000);
+        mem_put32(32'h184, 32'h1800_0001);
+        mem_put32(32'h188, 32'h1800_0002);
+        mem_put32(32'h18C, 32'h1800_0003);
+        wide_mode = 1'b1;
+        do @(negedge clk); while (!cpu_ready);
+        mem_request_before = mem_request_count;
+        narrow_response_before = narrow_response_count;
+        line_response_before = line_response_count;
+        cache_read(32'h188, 4'hF, 32'h1800_0002);
+        if (line_response_count != line_response_before + 1 ||
+            narrow_response_count != narrow_response_before) begin
+            $display("L1 WIDE FILL response counts line=%0d narrow=%0d",
+                     line_response_count, narrow_response_count);
+            $fatal(1);
+        end
+        cache_read(32'h180, 4'hF, 32'h1800_0000);
+        if (mem_request_count != mem_request_before + 1) begin
+            $display("L1 WIDE FILL was not installed after one line response");
+            $fatal(1);
+        end
 
         $display("L1 PIPT cache unit test PASS");
         $finish;

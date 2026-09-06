@@ -382,6 +382,10 @@ assign pla_test_input = {p1, p2, b13, b12, p,
 //==============================================================================
 // Main PLA4 Logic (Protection Decision)
 //==============================================================================
+logic [11:0] pla_test_addr;
+logic [3:0]  pla_test_flags;
+logic        pla_test_cpl_transition;
+
 always_comb begin
     // Default: test passes (continue execution)
     pla_test_addr  = 12'h000;
@@ -1282,10 +1286,6 @@ assign pla_test_output = {pla_test_flags, pla_test_addr, 2'b00};
 
 // Output Extraction
 // Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-1249
-
-logic [11:0] pla_test_addr;      // Computed by always_comb block
-logic [3:0]  pla_test_flags;     // Computed by always_comb block
-logic        pla_test_cpl_transition;
 
 //==============================================================================
 // Stage 2: Register PLA4 outputs (posedge clk when pipe_en)

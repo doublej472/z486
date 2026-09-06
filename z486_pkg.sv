@@ -267,6 +267,7 @@ typedef struct packed {
 
     // Special flags
     logic        has_moffs;            // A0-A3: MOV AL/eAX,moffs - immediate field contains direct address
+    logic        vipt_alu;             // Direct ALU register,memory load candidate
     logic        cmptest_is_cmp;       // CMPTST selects CMP rather than TEST
     logic        port_io;              // IN/OUT/INS/OUTS require VM86 bitmap checks
     logic        ind_is_ea;            // First-cycle IND is an effective address
