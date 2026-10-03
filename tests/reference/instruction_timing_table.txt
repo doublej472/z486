@@ -1,0 +1,40 @@
+| Instruction class              | 80386 target | 80486 target | z386 0.4 | z486 current |
+| --- | ---: | ---: | ---: | ---: |
+| mov eax, [esi]                 |            4 |            1 |        3 |            1 |
+| mov [edi], eax                 |            2 |            1 |        2 |            1 |
+| push eax                       |            2 |            1 |        2 |            2 |
+| mov eax, ebx                   |            2 |            1 |        2 |            1 |
+| mov eax, imm32                 |            2 |            1 |        2 |            1 |
+| add eax, ebx                   |            2 |            1 |        2 |            1 |
+| pop eax                        |            4 |            1 |        3 |            2 |
+| jnz not-taken forward          |            3 |            1 |        3 |            1 |
+| jnz not-taken backward         |            3 |            1 |        3 |            1 |
+| jnz taken forward              |         9.25 |            3 |        7 |            3 |
+| lea eax, [esi+edi*4+0x20]      |            2 |            1 |        2 |            2 |
+| rol eax, cl                    |            3 |            3 |        3 |            3 |
+| xchg ecx, ebx                  |            3 |            3 |        3 |            3 |
+| xchg [edi], eax                |            5 |            5 |        5 |            5 |
+| push imm32                     |            2 |            1 |        2 |            1 |
+| push ds                        |            2 |            3 |        2 |            1 |
+| push dword [esi]               |            5 |            4 |        5 |            5 |
+| pop dword [edi]                |            5 |            5 |        5 |            5 |
+| add eax, [esi]                 |            5 |            2 |        5 |            3 |
+| mov al, [esi]                  |            4 |            1 |        3 |            1 |
+| mov [edi], al                  |            2 |            1 |        2 |            1 |
+| shr eax, 4                     |            3 |            2 |        3 |            3 |
+| cmp ebx, imm32                 |            2 |            1 |        2 |            1 |
+| rep movsb (64B)                |          261 |          204 |      333 |          331 |
+| add [edi], eax                 |            7 |            3 |        6 |            3 |
+| shld r32, r32, 8               |            3 |            2 |        3 |            2 |
+| inc dword [edi]                |            6 |            3 |        5 |            3 |
+| mov ax, [esi]                  |            4 |            1 |        - |            1 |
+| movzx eax, byte [esi]          |            4 |            1 |        - |            1 |
+| movzx eax, word [esi]          |            4 |            1 |        - |            1 |
+| movsx eax, byte [esi]          |            4 |            1 |        - |            1 |
+| movsx eax, word [esi]          |            4 |            1 |        - |            1 |
+| jnz taken backward             |         9.25 |            3 |        6 |            3 |
+| jmp taken backward             |         9.25 |            3 |        6 |            3 |
+| call taken                     |         9.25 |            3 |        7 |            4 |
+| mov eax,[esi] -> add ebx,eax   |            - |            1 |        - |            1 |
+| mov esi,[edi] -> mov eax,[esi] |            - |            2 |        - |            2 |
+

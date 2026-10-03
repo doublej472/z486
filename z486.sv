@@ -72,7 +72,7 @@ module z486
     output     [31:0]  dbg_x87_state,
 
     // A fault while delivering #DF shuts down the 386 and requests reset.
-    output reg          triple_fault_reset
+    output triple_fault_reset
 );
 
 //=============================================================================
@@ -80,9 +80,9 @@ module z486
 //=============================================================================
 
 // Architectural state and externally visible debug state.
-reg dbg_first_done;                 // Debug: first instruction finished execution
-reg halted;                         // Tracks when the core is halted
-reg [31:0] debug_ip;                // Debug: IP at instruction completion
+wire dbg_first_done;  // Debug: first instruction finished execution
+wire halted;  // Tracks when the core is halted
+wire [31:0] debug_ip;  // Debug: IP at instruction completion
 
 reg [31:0] CR0, CR2, CR3;
 reg [31:0] DR6, DR7;
@@ -163,7 +163,7 @@ wire [1:0]  issue_ind_linear_low;
 wire        dly_gpr_we;
 wire        eff_mask_pending;
 reg  [3:0]  seg_cmd;
-wire        gate_detect_cond;
+wire gate_detect_cond;
 wire [31:0] br_target;
 reg         rmw_fallback_delay_r;
 reg         early_redirected;
@@ -214,18 +214,18 @@ assign dbg_pe  = pe;
 assign dbg_vm  = vm;
 wire [1:0] cpl = vm ? 2'd3 : !pe ? 2'd0 : CS[1:0];
 
-reg [2:0]  latched_pf_code;         // Latched page fault error code (for LPCR microcode access)
-reg [31:0] latched_pf_addr;         // Latched faulting linear address (for LPCR microcode access)
+wire [2:0] latched_pf_code;  // Latched page fault error code (for LPCR microcode access)
+wire [31:0] latched_pf_addr;  // Latched faulting linear address (for LPCR microcode access)
 
 // Frontend interconnect.
-wire [63:0] win_d1;                 // registered raw window at the prefetcher's D1 cursor
-wire [63:0] win_d1_early;           // speculative next D1 window for entry ROM
-wire [5:0]  d1_avail;               // bytes fetched beyond the D1 cursor
-wire [3:0]  d1_adv;                 // D1 cursor advance this cycle (a prefix, or
+wire [63:0] k1q;                 // registered raw window at the prefetcher's D1 cursor
+wire [63:0] k1q_early;           // speculative next D1 window for entry ROM
+wire [5:0]  k1q_avail;               // bytes fetched beyond the D1 cursor
+wire [3:0]  k1p_adv;                 // D1 cursor advance this cycle (a prefix, or
                                     //   the instruction rest at handoff, 0-11)
-wire [3:0]  d1_preread_adv;         // structural advance without D2 backpressure
-wire [31:0] win_lit;                // D2 literal window at pop_cursor + lit_off
-wire [5:0]  lit_avail;              // bytes fetched beyond that point
+wire [3:0]  k1p_preread_adv;         // structural advance without D2 backpressure
+wire [31:0] k2q;                // D2 literal window at pop_cursor + k2p_off
+wire [5:0]  k2q_avail;              // bytes fetched beyond that point
 wire [4:0]  dec_lit_off;            // literal offset from the pop cursor
 wire        dec_pop_now;            // one instruction completed D2: pop its bytes
 wire [4:0]  dec_pop_len;            //   (registered length from the skeleton)
@@ -375,8 +375,8 @@ wire       intr_pending;
 wire       nmi_request_active;
 wire       interrupt_pending;
 wire       inhibit_interrupts;
-reg        tf_active_r;
-reg        tf_trap_suppress_r;
+wire tf_active_r;
+wire tf_trap_suppress_r;
 
 // Fault requests cross the address, data, D2, and sequencer boundaries.
 wire       any_fault_issue;
@@ -397,9 +397,9 @@ reg        throttle_parked_r;       // predecessor retired; successor D2 waits f
 wire [11:0] d2_entry_r;             // Effective entry resident in D2
 wire        d2_rom_mem_resident;    // D2 entry tag aligned with ROM q_mem
 wire       init_cycle = d2_valid_r; // Temporary waveform alias; not control logic
-reg        uc_active;               // Tracks when instruction execution has begun
-reg        fault_suppress_delay_slot;   // Fault handling: suppress delay slot after fault triggers
-reg        interrupt_entry;         // Interrupt handler is being entered
+wire uc_active;  // Tracks when instruction execution has begun
+wire fault_suppress_delay_slot;  // Fault handling: suppress delay slot after fault triggers
+wire interrupt_entry;  // Interrupt handler is being entered
 reg        stack_init_pending;      // Cycle after i_issue for a stack operation
 wire       prot_test_inflight;      // Protection test is waiting for a result
 wire [31:0] COUNTR;                 // Data Unit counter register
@@ -481,6 +481,11 @@ wire       fast_store_valid = rmw_fast_active_r && i_rni_delay;
 wire [3:0] fast_store_be = calc_be(rmw_fast_size_r, rmw_fast_lane_r);
 wire [31:0] fast_store_wdata = SIGMA << {rmw_fast_lane_r, 3'b000};
 wire       stall_fast_store = fast_store_valid && !fast_store_accepted;
+// A qualified RMW whose D2 preread was denied (for example by an older store
+// still in L1 lookup in the same set) holds its overlay entry uStep and
+// replays the preread from the registered linear address, instead of taking
+// the full original-routine fallback. The select terms are registered.
+wire       stall_rmw_probe = rd_fast_valid_r && !rd_fast_probed_r && i_first;
 wire       direct_wb_retire = vipt_load_retire;
 
 function automatic [31:0] format_hardwired_load(
@@ -621,7 +626,7 @@ wire       stall_invlpg;
 // EA; stalling it would suppress the current instruction's delay-slot writeback.
 wire       stall_d2 = d2_valid && !d2_payload_ready && !i_rni && !i_rni_delay;
 assign stall = stall_mem || stall_wio || stall_d2 || stall_x87_direct ||
-               stall_invlpg || stall_fast_store;
+               stall_invlpg || stall_fast_store || stall_rmw_probe;
 
 // Repeat
 wire       prot_result_now;
@@ -638,7 +643,7 @@ wire       vipt_load_overlap_wb = vipt_load_overlap_r &&
 wire       vipt_load_exec_block = vipt_load_busy && !vipt_load_overlap_wb;
 assign uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) &&
                  !stall_wio && !stall_d2 && !stall_x87_direct && !stall_invlpg &&
-                 !stall_fast_store &&
+                 !stall_fast_store && !stall_rmw_probe &&
                  !d2_release_hold && !throttle_parked_r && !recipe_slot_stale &&
                  !vipt_load_exec_block && !rmw_fallback_delay_r &&
                  !(vipt_load_rom_shadow_r && recipe_state.jcc);
@@ -719,7 +724,9 @@ assign d2_start_entry = d2_start_entry_arch;
 // q is EX-owned. A completed ROM lookup may wait in q_mem, but it advances
 // into q only on the D2->EX transfer edge.
 wire        d2_rom_cancel = interrupt_at_boundary || any_fault || any_fault_issue;
-wire        microcode_rom_base_ce = !stall_mem && !stall_wio && !repeat_active;
+// A replayed RMW preread holds the overlay entry word resident, like DLY.
+wire        microcode_rom_base_ce = !stall_mem && !stall_wio && !repeat_active &&
+                                    !stall_rmw_probe;
 `Z486_NO_PRUNE reg [2:0] early_kind_probe_r;
 wire [5:0]  uc_source_shift;
 wire [3:0]  uc_shift_source_class;
@@ -854,14 +861,14 @@ prefetch prefetch_inst (
     .clk(clk),
     .reset_n(reset_n),
     // Queue output to decoder
-    .win_d1(win_d1),
-    .win_d1_early(win_d1_early),
-    .d1_avail(d1_avail),
-    .d1_adv(d1_adv),
-    .d1_preread_adv(d1_preread_adv),
-    .win_lit(win_lit),
-    .lit_avail(lit_avail),
-    .lit_off(dec_lit_off),
+    .k1q(k1q),
+    .k1q_early(k1q_early),
+    .k1q_avail(k1q_avail),
+    .k1p_adv(k1p_adv),
+    .k1p_preread_adv(k1p_preread_adv),
+    .k2q(k2q),
+    .k2q_avail(k2q_avail),
+    .k2p_off(dec_lit_off),
     .q_full(pf_full),
     .pop_now(dec_pop_now),
     .pop_len(dec_pop_len),
@@ -942,14 +949,14 @@ decoder decoder_inst (
     .reset_n    (reset_n),
 
     // Prefetch queue interface (two-cursor protocol)
-    .win_d1     (win_d1),
-    .win_d1_early(win_d1_early),
-    .d1_avail   (d1_avail),
-    .d1_adv     (d1_adv),
-    .d1_preread_adv(d1_preread_adv),
-    .win_lit    (win_lit),
-    .lit_avail  (lit_avail),
-    .lit_off    (dec_lit_off),
+    .k1q     (k1q),
+    .k1q_early(k1q_early),
+    .k1q_avail   (k1q_avail),
+    .k1p_adv     (k1p_adv),
+    .k1p_preread_adv(k1p_preread_adv),
+    .k2q    (k2q),
+    .k2q_avail  (k2q_avail),
+    .k2p_off    (dec_lit_off),
     .pop_now    (dec_pop_now),
     .pop_len    (dec_pop_len),
 
@@ -1230,12 +1237,19 @@ wire rd_fast_issue = i_issue &&
                      (i_bus.ucode_action == RECIPE_ACTION_RMW_FAST);
 wire vipt_issue_rmw = rd_fast_issue && d2_vipt_rmw;
 wire vipt_issue_store_wait = vipt_issue_load && d2_vipt_older_store;
+// The older load replay has priority; neither replay can coincide with a D2
+// issue probe because the replaying instruction still owns EX.
+wire rmw_replay_try = stall_rmw_probe && !vipt_replay_try &&
+                      !vipt_load_ex_r.valid && !vipt_load_slow_busy &&
+                      !mem_servicing && dcache_vipt_probe_ready;
 wire [31:0] vipt_probe_linear = vipt_replay_try
                               ? vipt_load_replay_r.linear_addr
+                              : stall_rmw_probe
+                              ? rd_fast_linear_r
                               : issue_ind_linear;
 
 assign dcache_vipt_probe_valid = vipt_issue_load || vipt_issue_rmw ||
-                                 vipt_replay_try;
+                                 vipt_replay_try || rmw_replay_try;
 assign dcache_vipt_probe_offset = vipt_probe_linear[11:0];
 assign dcache_vipt_resolve_valid = ((vipt_load_ex_r.valid &&
                                      vipt_load_ex_probed_r) ||
@@ -1437,6 +1451,8 @@ always_ff @(posedge clk) begin
             rd_fast_size_r <= i_bus.operand_size;
             rd_fast_lane_r <= issue_ind_linear_low;
         end
+        if (rmw_replay_try && dcache_vipt_probe_direct_accepted)
+            rd_fast_probed_r <= 1'b1;
 
         if (rd_fast_finish) begin
             rd_fast_valid_r <= 1'b0;
@@ -1843,7 +1859,50 @@ segmentation_unit seg_unit (
     .seg_base_exec    (seg_base_exec),
     .eff_mask_exec    (eff_mask_exec),
     .seg_fault        (seg_gp_fault),
-    .is_stack_fault   (ss_segment_fault)
+    .is_stack_fault   (ss_segment_fault),
+    // Decoder D2: issuing instruction, EA recipe, displacement and D2 segment base (ISLA/IESSEG, K2Q)
+    .au_instr_issue(i_issue),
+    .au_instr(i_bus),
+    .au_d2_start(d2_start),
+    .au_d2_ea(d2_start_ea_dec),
+    .au_split_ea_prepare(d2_ea_three_term && d2_valid && !i_issue),
+    .au_split_ea_use(d2_ea_three_term && d2_ea_split_done_r),
+    .au_split_ea_adjust(d2_entry.ea_uses_post_pop_esp ? (d2_entry.data32 ? 3'd4 : 3'd2) : 3'd0),
+    .au_displacement(d2_agu_dec.disp),
+    .au_branch_relative(i_bus.rel_branch_kind != REL_BRANCH_NONE),
+    .au_branch_target_eip(spec_target_eip),
+    .au_issue_seg_base(issue_seg_base),
+    .au_issue_eff_mask(issue_eff_mask),
+    // Datapath: I-bus base/index reads and E-stage operands
+    .au_ea_base(ea_base_ref),
+    .au_ea_index(ea_index_ref),
+    .au_ea_base_value(ea_base_value),
+    .au_ea_index_value(ea_index_value),
+    .au_forwarded_esp(forwarded_esp),
+    .au_source_value(dest_value),
+    .au_alu_value(alu_src),
+    .au_alu_value_hold(alu_src_r),
+    .au_is_dword(is_dword),
+    // Microsequencer: E-stage IND control
+    .au_exec(uc_exec),
+    .au_exec_addr32(i.addr32),
+    .au_alu_source(uc_alu_src),
+    .au_ind_ctrl(uc_ind_ctrl),
+    .au_instr_jcc(i.rel_branch_kind == REL_BRANCH_JCC),
+    // Paging and control registers: fault readback
+    .au_fault_code(latched_pf_code),
+    .au_fault_addr(latched_pf_addr),
+    .au_cr3(CR3),
+    // LA bus to paging and cache
+    .au_issue_linear(issue_ind_linear),
+    .au_issue_linear_low(issue_ind_linear_low),
+    .au_ind_linear(ind_linear),
+    .au_ind_linear_valid(ind_linear_valid),
+    // EA bus and IND to control and datapath
+    .au_issue_ea(ea_early),
+    .au_ea(ea_reg),
+    .au_ind(IND),
+    .au_ind_delta(IND_DELTA)
 );
 
 // Decode the older microcode command without issue-time priority.  The
@@ -2311,18 +2370,106 @@ protection_unit protection_unit_inst (
 // "chaining" means hardwired issue into a reclaimed microcode slot.
 //=============================================================================
 
-// Fault delivery is sequencer control state. Address and data units contribute
-// requests through the cross-unit fault signals declared at the front.
-localparam logic [1:0] FAULT_IDLE       = 2'd0;
-localparam logic [1:0] FAULT_DELIVERING = 2'd1;
-localparam logic [1:0] FAULT_DOUBLE     = 2'd2;
-reg  [1:0] fault_delivery_state;
-reg        fault_seen_r;
-reg        fault_combine_active;
-reg        gp_fault_double_r;
-wire       fault_start = any_fault && !fault_seen_r;
-wire       double_fault_start = (fault_delivery_state == FAULT_DELIVERING) &&
-                                fault_combine_active;
+wire double_fault_start;
+wire gate_detect_now;
+wire instr_eip_written;
+wire misc2_flag;
+wire recipe_fallback_taken;
+event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
+    // Clock and reset
+    .clk(clk),
+    .reset_n(reset_n),
+    // Microsequencer and E-stage lifecycle (current microword and its enables)
+    .uc_addr(uc_addr),
+    .uc_aluop(uc_aluop),
+    .uc_buscode(uc_buscode),
+    .uc_dest(uc_dest),
+    .uc_exec(uc_exec),
+    .uc_flags(uc_flags),
+    .uc_jpereq_fwd(uc_jpereq_fwd),
+    .stall(stall),
+    .repeat_active(repeat_active),
+    .q_flush(q_flush),
+    .d2_valid(d2_valid),
+    .d2_waited_r(d2_waited_r),
+    .i_issue(i_issue),
+    .i_first(i_first),
+    .i_rni(i_rni),
+    .i_rni_delay(i_rni_delay),
+    .direct_wb_retire(direct_wb_retire),
+    .rmw_fallback_delay_r(rmw_fallback_delay_r),
+    .throttle_parked_r(throttle_parked_r),
+    .x87_direct_active(x87_direct_active),
+    // Decoder: D2 entry and the EX instruction register
+    .i_bus(i_bus),
+    .i(i),
+    // Datapath and architectural state
+    .COUNTR(COUNTR),
+    .CS(CS),
+    .EIP(EIP),
+    .EFLAGS(EFLAGS),
+    .eflags_fwd(eflags_fwd),
+    .IND(IND),
+    .alu_result(alu_result),
+    .ea_reg(ea_reg),
+    .is_dword(is_dword),
+    .pe(pe),
+    .vm(vm),
+    .cpl(cpl),
+    .pe_mode_toggle_now(pe_mode_toggle_now),
+    .branch_ustep_redirect(branch_ustep_redirect),
+    .flags_backup_active(flags_backup_active),
+    // Segmentation and protection test unit
+    .desc_cache(desc_cache),
+    .desc_raw_hi(desc_raw_hi),
+    .tss_access_flag(tss_access_flag),
+    // Fault requests (segmentation, paging, datapath)
+    .any_fault(any_fault),
+    .any_fault_r(any_fault_r),
+    .gp_fault_trigger(gp_fault_trigger),
+    .gp_fault_r(gp_fault_r),
+    .ss_segment_fault(ss_segment_fault),
+    .ss_fault_r(ss_fault_r),
+    .page_fault(page_fault),
+    .pg_fault_code(pg_fault_code),
+    .pg_cr2_out(pg_cr2_out),
+    .div_overflow(div_overflow),
+    // Interrupt controller and debug traps
+    .intr_pending(intr_pending),
+    .nmi_request_active(nmi_request_active),
+    .interrupt_pending(interrupt_pending),
+    .inhibit_interrupts(inhibit_interrupts),
+    .tf_trap_pending(tf_trap_pending),
+    .single_step(single_step),
+    // FPU handshake
+    .x87_pereq(x87_pereq),
+    .x87_busy_n(x87_busy_n),
+    .x87_error_n(x87_error_n),
+    // To the microsequencer: conditions and redirect commands
+    .seq_advance(seq_advance),
+    .seq_conditions(seq_conditions),
+    .seq_fault_redirect(seq_fault_redirect),
+    .seq_boundary_redirect(seq_boundary_redirect),
+    .recipe_fallback_taken(recipe_fallback_taken),
+    .gate_detect_now(gate_detect_now),
+    .gate_detect_cond(gate_detect_cond),
+    .double_fault_start(double_fault_start),
+    // Macro-instruction lifecycle and delivery state
+    .uc_active(uc_active),
+    .halted(halted),
+    .instr_eip_written(instr_eip_written),
+    .interrupt_entry(interrupt_entry),
+    .fault_suppress_delay_slot(fault_suppress_delay_slot),
+    .tf_active_r(tf_active_r),
+    .tf_trap_suppress_r(tf_trap_suppress_r),
+    .latched_pf_code(latched_pf_code),
+    .latched_pf_addr(latched_pf_addr),
+    .misc2_flag(misc2_flag),
+    // Debug and board
+    .dbg_first_done(dbg_first_done),
+    .debug_ip(debug_ip),
+    .triple_fault_reset(triple_fault_reset)
+);
 
 assign uc_alu_src       = uc[36:31];  // ABCDEF: ALU source / jump offset
 assign uc_dest          = uc[30:24];  // GHIJKLM: destination
@@ -2348,22 +2495,12 @@ assign uc_p_rpt          = uc[49];
 assign uc_p_wio          = uc[50];
 wire       uc_jump_taken_prev;          // Jump taken last cycle (for RNi: terminate only in delay slot)
 
-wire [31:0] countr_masked = i.addr32 ? COUNTR : {16'h0, COUNTR[15:0]};
 reg [31:0] TMPeIP;                  // Saved EIP for RPTI (repeat instruction)
 reg [31:0] wr_restart_eip;          // TMPeIP captured at every demand-write issue: a write
                                     // fault (perm/walk/crossing) may surface after the issuing
                                     // instruction chained away and TMPeIP moved on
 reg [31:0] TMPeSP;                  // Saved ESP for fault handling
 wire       flags_backup_active;     // Set at i_issue/FLGSBA, cleared on interrupt_entry - guards FLAGSB writes
-reg        misc1_flag;              // Set by SMISC1 {-33-}, tested by JMISC1 {-53-}
-reg        misc2_flag;              // Set by SMISC2 {-35-}, tested by JMISC2 {-55-}
-reg        error_code_flag;         // Set by SERRCF {-36-}, tested by JNERRC {-56-}
-reg        interrupt_hw;            // Set for hardware interrupts, tested by JINTSW {-52-}
-reg        task_saved_flag;         // STSKS/CTSKS latch: outgoing TSS has been saved during this switch
-reg        no_fault_flag;           // SNOFLT/JNOFLT: descriptor probes fail by clearing ZF, not raising #GP
-reg        rep_fault_flag;          // SREPF/CREPF/JREP: interrupted REP MOVS needs index/count correction
-reg        instr_eip_written;       // EIP was written during instruction (RPTI restart)
-reg        gate_in_progress;        // Prevent second LDTST (at 5C3) from re-triggering gate detection
 
 // Hardwired relative-branch target and microcode PREF restart selection.
 // Target formation remains beside EIP/redirect ownership, while chain_start
@@ -2408,141 +2545,12 @@ end
 assign uc_is_wio = uc_p_wio;  // WIO: wait for interrupt/IO (HLT, only with RPT)
 assign uc_is_rpt = uc_p_rpt;
 
-// LOOP/REP Condition Logic
-wire instr_is_loop = i.repeat_kind != REPEAT_KIND_REP;
-wire loop_zf_sense = instr_is_loop ? (i.repeat_kind == REPEAT_KIND_LOOPE)
-                                   : i.rep_lock[0];
-wire countr_will_be_nonzero = instr_is_loop ? (countr_masked != 32'h1) : (countr_masked != 32'h0);
-wire zf_check = instr_is_loop ? (loop_zf_sense == EFLAGS[6]) : (loop_zf_sense != EFLAGS[6]);
-wire loopne_condition = instr_is_loop ? (countr_will_be_nonzero && zf_check)
-                                      : (!countr_will_be_nonzero || zf_check);
-
 // GP Fault Detection — handled by segmentation_unit
 assign gp_fault_mem_op = invlpg_active || x87_direct_mem_req ||
                          rd_fast_valid_r ||
                          (uc_is_mem_busop && (uc_buscode != BUSOP_RD_D));
 assign gp_fault_wr_op = rd_fast_valid_r || uc_is_write ||
                         uc_is_check_write;
-
-always_comb begin
-    seq_conditions = '0;
-    seq_conditions.jncond = !condition_true(i.branch_condition, eflags_fwd);
-    seq_conditions.count_zero = (countr_masked == 32'h0);
-    seq_conditions.count_nonzero = (countr_masked != 32'h0);
-    seq_conditions.count_low_not_one = (countr_masked[3:0] != 4'h1);
-    seq_conditions.count_not_one = (countr_masked != 32'h1);
-    seq_conditions.count_one = (countr_masked == 32'h1);
-    seq_conditions.loopne = instr_is_loop ? !loopne_condition : loopne_condition;
-    seq_conditions.greater = !uc_flags[6] && (uc_flags[7] == uc_flags[11]);
-    seq_conditions.no_carry = !uc_flags[0];
-    seq_conditions.no_overflow = !uc_flags[11];
-    // PEREQ branches while the request signal is inactive.
-    seq_conditions.pereq_inactive = ENABLE_X87 ? !x87_pereq : uc_jpereq_fwd;
-    seq_conditions.flags_backup_inactive = !flags_backup_active;
-    seq_conditions.tss_access = tss_access_flag;
-    seq_conditions.interrupt_hw = interrupt_hw;
-    seq_conditions.misc1 = misc1_flag;
-    seq_conditions.task_unsaved = !task_saved_flag;
-    seq_conditions.misc2 = misc2_flag;
-    seq_conditions.no_error_code = !error_code_flag;
-    seq_conditions.no_fault = no_fault_flag;
-    seq_conditions.rep_fault = rep_fault_flag;
-    seq_conditions.nested_task = EFLAGS[14];
-    seq_conditions.io_ok = !pe ||
-        (cpl <= EFLAGS[13:12] && (!vm || !i.port_io));
-    seq_conditions.no_interrupt = !interrupt_pending;
-    seq_conditions.x87_not_busy = ENABLE_X87 ? x87_busy_n : 1'b1;
-    seq_conditions.x87_error = ENABLE_X87 ? !x87_error_n : 1'b0;
-    seq_conditions.task_16bit = !desc_cache[6].seg_type[3];
-    seq_conditions.desc_accessed = desc_raw_hi[8];
-end
-
-always_ff @(posedge clk) begin
-    if (!reset_n) begin
-        task_saved_flag <= 1'b0;
-    end else if (uc_exec) begin
-        if (uc_aluop == ALUJMP_STSKS)
-            task_saved_flag <= 1'b1;
-        else if (uc_aluop == ALUJMP_CTSKS)
-            task_saved_flag <= 1'b0;
-    end
-end
-
-always_ff @(posedge clk) begin
-    if (!reset_n) begin
-        no_fault_flag  <= 1'b0;
-        rep_fault_flag <= 1'b0;
-    end else begin
-        // Fault/interrupt entry does not pulse i_issue, so these remain visible
-        // to the corresponding fault-handler microcode.
-        if (i_issue) begin
-            no_fault_flag  <= 1'b0;
-            rep_fault_flag <= 1'b0;
-        end
-        if (uc_exec) begin
-            if (uc_aluop == ALUJMP_SNOFLT)
-                no_fault_flag <= 1'b1;
-            if (uc_aluop == ALUJMP_SREPF)
-                rep_fault_flag <= 1'b1;
-            else if (uc_aluop == ALUJMP_CREPF)
-                rep_fault_flag <= 1'b0;
-        end
-    end
-end
-
-// Qualified overlays launch without live architectural state on the ROM
-// address. Their first ustep redirects unsafe cases to original microcode;
-// the following overlay word is the architectural jump delay slot.
-wire recipe_fallback_taken =
-    (uc_exec && i_first &&
-     (i.ucode_action == RECIPE_ACTION_X87_M32_LOAD) &&
-     !x87_direct_active) || rmw_fallback_delay_r;
-assign gate_detect_cond = pe && (uc_buscode == BUSOP_SDEL) &&
-                          !gate_in_progress && !desc_raw_hi[12] &&
-                          (desc_raw_hi[11:8] == 4'hC);
-wire gate_detect_now = uc_exec && gate_detect_cond;
-
-assign seq_advance = ((((i_issue && !d2_waited_r) | uc_exec |
-                        direct_wb_retire) |
-                       (fault_suppress_delay_slot & !stall)) &
-                      !halted && !repeat_active);
-
-// Fault redirects override macro and chained entries. A page fault has priority over a
-// simultaneous segment/general-protection fault, matching the original tree.
-always_comb begin
-    seq_fault_redirect = '0;
-    if (gp_fault_r) begin
-        seq_fault_redirect.valid = 1'b1;
-        seq_fault_redirect.target = gp_fault_double_r ? UADDR_DOUBLE_FAULT :
-                                    (ss_fault_r ? UADDR_STACK_FAULT :
-                                                  UADDR_GENERAL_FAULT1);
-    end
-    if (page_fault) begin
-        seq_fault_redirect.valid = 1'b1;
-        seq_fault_redirect.target = double_fault_start
-                                  ? UADDR_DOUBLE_FAULT : UADDR_PAGE_FAULT;
-    end
-end
-
-// Interrupt dispatch is a macro-instruction boundary redirect. The explicit
-// page-fault gate preserves fault priority without feeding this command back
-// into demand-memory control.
-always_comb begin
-    seq_boundary_redirect = '0;
-    if (i_rni_delay && !stall && !page_fault) begin
-        if (tf_trap_pending && !single_step) begin
-            seq_boundary_redirect.valid = 1'b1;
-            seq_boundary_redirect.target = UADDR_SINGLE_STEP;
-        end else if (nmi_request_active && !single_step) begin
-            seq_boundary_redirect.valid = 1'b1;
-            seq_boundary_redirect.target = UADDR_NMI;
-        end else if (intr_pending && EFLAGS[9] && !single_step &&
-                     !inhibit_interrupts) begin
-            seq_boundary_redirect.valid = 1'b1;
-            seq_boundary_redirect.target = UADDR_HARDWARE_IRQ;
-        end
-    end
-end
 
 // The sequencer consumes the execution, fault, and instruction-boundary
 // commands above and owns the microcode ROM pipeline and address arbitration.
@@ -2615,190 +2623,6 @@ microsequencer microsequencer_inst (
     .uc_ctl_pref(uc_ctl_pref)
 );
 
-wire fault_delivery_done = uc_exec &&
-    ((uc_aluop == ALUJMP_USTEP_FAULT_DONE) ||
-     (uc_dest == DEST_USTEP_FAULT_DONE));
-
-// Interrupt paths clear delivery state only after committing handler CS/SS.
-// A fault while #DF is being delivered requests processor reset.
-always_ff @(posedge clk) begin
-    if (!reset_n) begin
-        fault_delivery_state <= FAULT_IDLE;
-        fault_seen_r <= 1'b0;
-        fault_combine_active <= 1'b0;
-        gp_fault_double_r <= 1'b0;
-        triple_fault_reset <= 1'b0;
-    end else begin
-        fault_seen_r <= any_fault;
-        triple_fault_reset <= 1'b0;
-
-        if (gp_fault_trigger)
-            gp_fault_double_r <= double_fault_start;
-
-        if (uc_exec && uc_aluop == ALUJMP_SCNTFF)
-            fault_combine_active <= 1'b1;
-
-        if (fault_start) begin
-            case (fault_delivery_state)
-                FAULT_IDLE: begin
-                    fault_delivery_state <= FAULT_DELIVERING;
-                    fault_combine_active <= 1'b0;
-                end
-                FAULT_DELIVERING: begin
-                    if (fault_combine_active) begin
-                        fault_delivery_state <= FAULT_DOUBLE;
-                        fault_combine_active <= 1'b0;
-                    end
-                end
-                default:          triple_fault_reset <= 1'b1;
-            endcase
-        end
-
-        if (fault_delivery_done && !any_fault) begin
-            fault_delivery_state <= FAULT_IDLE;
-            fault_combine_active <= 1'b0;
-        end
-    end
-end
-
-// synthesis translate_off
-reg trace_fault_state_en = 1'b0;
-initial trace_fault_state_en = $test$plusargs("trace_fault_state");
-
-always @(posedge clk) begin
-    if (reset_n && trace_fault_state_en) begin
-        if (fault_start)
-            $display("%0t FAULT-START state=%0d combine=%b gp=%b ss=%b pf=%b div=%b uaddr=%03x CS:EIP=%04x:%08x addr=%08x",
-                     $time, fault_delivery_state, fault_combine_active,
-                     gp_fault_trigger, ss_segment_fault, page_fault, div_overflow, uc_addr,
-                     CS, EIP, page_fault ? pg_cr2_out : IND);
-        if (uc_exec && uc_aluop == ALUJMP_SCNTFF)
-            $display("%0t FAULT-COMBINE state=%0d uaddr=%03x", $time,
-                     fault_delivery_state, uc_addr);
-        if (fault_delivery_done)
-            $display("%0t FAULT-DONE state=%0d", $time, fault_delivery_state);
-        if (triple_fault_reset)
-            $display("%0t TRIPLE-FAULT RESET", $time);
-    end
-end
-// synthesis translate_on
-
-// Macro-instruction execution lifecycle and architectural boundary handling.
-// This state consumes sequencer events but does not select microcode addresses.
-always_ff @(posedge clk) begin
-    if (!reset_n) begin
-        uc_active <= 1'b0;
-        halted <= 1'b0;
-        instr_eip_written <= 1'b0;
-        dbg_first_done <= 1'b0;
-        debug_ip <= 32'h0;
-        gate_in_progress <= 1'b0;
-        interrupt_entry <= 1'b0;
-        tf_active_r <= 1'b0;
-        tf_trap_suppress_r <= 1'b0;
-    end else begin
-        if (!stall)
-            interrupt_entry <= 1'b0;
-
-        // Interrupt dispatch owns this registered cleanup cycle before the
-        // first handler uStep can execute.  Clear the RPTI ownership marker
-        // from that local pulse rather than extending its input mux with the
-        // live interrupt-recognition cone.
-        if (interrupt_entry)
-            instr_eip_written <= 1'b0;
-
-        if (i_rni_delay && !stall && !page_fault) begin
-            dbg_first_done <= 1'b1;
-            if (single_step)
-                halted <= 1'b1;
-            if (!i_issue && !d2_valid)
-                uc_active <= 1'b0;
-        end
-
-        if (uc_exec) begin
-            if ((uc_aluop == ALUJMP_PTSELE) && gate_in_progress)
-                gate_in_progress <= 1'b0;
-
-            if (i_rni && uc_active && !instr_eip_written && !any_fault) begin
-                if (branch_ustep_redirect)
-                    debug_ip <= ea_reg;
-                else if (uc_dest == DEST_EIP || uc_dest == DEST_eIP)
-                    debug_ip <= is_dword ? alu_result : {EIP[31:16], alu_result[15:0]};
-                else
-                    debug_ip <= EIP;
-            end
-
-            if (uc_dest == DEST_USTEP_RPTI_EIP)
-                instr_eip_written <= 1'b1;
-
-            if (i_rni && uc_active && instr_eip_written && !stall)
-                uc_active <= 1'b0;  // RPTI restart
-
-            if (gate_detect_now)
-                gate_in_progress <= 1'b1;
-        end
-
-        if (direct_wb_retire && uc_active && !instr_eip_written && !any_fault)
-            debug_ip <= EIP;
-
-        fault_suppress_delay_slot <= any_fault || any_fault_r ||
-                                     (fault_suppress_delay_slot && stall);
-
-        if (i_issue) begin
-            uc_active <= 1'b1;
-            tf_active_r <= EFLAGS[8];
-            tf_trap_suppress_r <=
-                (i_bus.boundary_action == BOUNDARY_ACTION_LOAD_SS) ||
-                (i_bus.boundary_action == BOUNDARY_ACTION_SOFT_INT) ||
-                ((i_bus.boundary_action == BOUNDARY_ACTION_INTO) && EFLAGS[11]);
-            instr_eip_written <= 1'b0;
-            gate_in_progress <= 1'b0;
-        end
-
-        if (q_flush && pe_mode_toggle_now)
-            uc_active <= 1'b0;
-
-        // Fetch faults may arrive while no uop is active.
-        if (page_fault) begin
-            uc_active <= 1'b1;
-            latched_pf_code <= pg_fault_code;
-            latched_pf_addr <= pg_cr2_out;
-        end
-
-        // Interrupt recognition is last so it overrides speculative successor state.
-        if (i_rni_delay && !stall && !page_fault) begin
-            if (tf_trap_pending && !single_step) begin
-                uc_active <= 1'b1;
-                interrupt_entry <= 1'b1;
-                tf_active_r <= 1'b0;
-                tf_trap_suppress_r <= 1'b0;
-            end else if (nmi_request_active && !single_step) begin
-                uc_active <= 1'b1;
-                interrupt_entry <= 1'b1;
-            end else if (intr_pending && EFLAGS[9] && !single_step && !inhibit_interrupts) begin
-                uc_active <= 1'b1;
-                interrupt_entry <= 1'b1;
-            end
-        end
-    end
-end
-
-// synthesis translate_off
-always @(posedge clk)
-    if (reset_n && throttle_parked_r && !d2_valid)
-        $fatal(1, "throttle parked without a resident D2 successor");
-
-// RPTI marks its restarted instruction by writing EIP before presenting an
-// interrupt boundary. That ownership must not leak into interrupt delivery,
-// where it suppresses the delivery routine's normal completion boundary.
-reg interrupt_entry_check_r;
-always @(posedge clk)
-    interrupt_entry_check_r <= interrupt_entry;
-always @(posedge clk)
-    if (reset_n && interrupt_entry_check_r && instr_eip_written)
-        $fatal(1, "restart EIP ownership leaked into interrupt delivery");
-// synthesis translate_on
-
 // Instruction Signals (latched at i_issue)
 always_ff @(posedge clk) begin
     if (!reset_n) begin
@@ -2812,33 +2636,6 @@ always_ff @(posedge clk) begin
 end
 
 
-
-// Sequencer predicates are control state, not architectural flags.
-always_ff @(posedge clk) begin
-    if (!reset_n) begin
-        misc1_flag <= 1'b0;
-        misc2_flag <= 1'b0;
-        error_code_flag <= 1'b0;
-        interrupt_hw <= 1'b0;
-    end else begin
-        if (i_issue && !halted) begin
-            misc1_flag <= 1'b0;
-            misc2_flag <= 1'b0;
-            error_code_flag <= 1'b0;
-            interrupt_hw <= 1'b0;
-        end
-        if (uc_exec) begin
-            case (uc_aluop)
-                ALUJMP_SMISC1: misc1_flag <= 1'b1;
-                ALUJMP_SMISC2: misc2_flag <= 1'b1;
-                ALUJMP_CMISC2: misc2_flag <= 1'b0;
-                ALUJMP_SERRCF: error_code_flag <= 1'b1;
-                ALUJMP_SINTHW: interrupt_hw <= 1'b1;
-                default: ;
-            endcase
-        end
-    end
-end
 
 //=============================================================================
 // Unit 8: Same-cycle architectural commit
@@ -3087,59 +2884,7 @@ end
 // Unit 9: Address and integer datapath
 //=============================================================================
 
-address_unit address_unit_inst (
-    .clk(clk),
-    .reset_n(reset_n),
-    .instr_issue(i_issue),
-    .instr(i_bus),
-    .d2_start(d2_start),
-    .d2_ea(d2_start_ea_dec),
-    .split_ea_prepare(d2_ea_three_term && d2_valid && !i_issue),
-    .split_ea_use(d2_ea_three_term && d2_ea_split_done_r),
-    .split_ea_adjust(d2_entry.ea_uses_post_pop_esp ?
-                     (d2_entry.data32 ? 3'd4 : 3'd2) : 3'd0),
-    .displacement(d2_agu_dec.disp),
-    .ea_base(ea_base_ref),
-    .ea_index(ea_index_ref),
-    .ea_base_value(ea_base_value),
-    .ea_index_value(ea_index_value),
-    .branch_relative(i_bus.rel_branch_kind != REL_BRANCH_NONE),
-    .branch_target_eip(spec_target_eip),
-    .forwarded_esp(forwarded_esp),
-    .ss_stack32(desc_cache[SEG_SS].D_B),
-    .issue_seg_base(issue_seg_base),
-    .issue_eff_mask(issue_eff_mask),
-    .exec(uc_exec),
-    .exec_addr32(i.addr32),
-    .alu_source(uc_alu_src),
-    .ind_ctrl(uc_ind_ctrl),
-    .source_value(dest_value),
-    .alu_value(alu_src),
-    .alu_value_hold(alu_src_r),
-    .instr_jcc(i.rel_branch_kind == REL_BRANCH_JCC),
-    .pe(pe),
-    .is_dword(is_dword),
-    .descsw_mode(descsw_mode),
-    .cs_stack32(desc_cache[SEG_CS].D_B),
-    .seg_cmd(uc_seg_cmd),
-    .seg_sel(mem_seg_sel),
-    .seg_base_pending(seg_base_exec),
-    .eff_mask_pending(eff_mask_exec),
-    .lar_result(seg_lar_result),
-    .llim_result(seg_llim_result),
-    .lbas_result(seg_lbas_result),
-    .fault_code(latched_pf_code),
-    .fault_addr(latched_pf_addr),
-    .cr3(CR3),
-    .ind(IND),
-    .ind_delta(IND_DELTA),
-    .ind_linear(ind_linear),
-    .ind_linear_valid(ind_linear_valid),
-    .ea(ea_reg),
-    .issue_ea(ea_early),
-    .issue_linear(issue_ind_linear),
-    .issue_linear_low(issue_ind_linear_low)
-);
+
 
 // Derive control signals from ALU opcode
 // INC=11000, DEC=11001, INC2=11100, DEC2=11101: all have op[4:3]==11 && op[1]==0
@@ -3185,28 +2930,65 @@ end
 endfunction
 
 data_unit data_unit_inst (
+    // Clock and reset
     .clk(clk),
     .reset_n(reset_n),
+    // Microsequencer: current microword fields and E-stage enables
     .exec(uc_exec),
     .shift_exec(uc_exec_shift),
+    .pipeline_advance(!stall),
+    .repeat_active(repeat_active),
+    .aluop(uc_aluop),
+    .alu_operation(alu_op5),
+    .update_arch_flags(alu_update_flags),
+    .update_carry(alu_update_carry),
+    .dest(uc_dest),
+    .source_field(uc_source_shift),
+    .source_live(uc_source),
+    .alu_source(uc_alu_src_shift),
+    .alu_source_live(uc_alu_src),
+    .fpu_f8(uc_fpu_f8),
+    .shift_aluop(uc_aluop_shift),
+    .shift_sigma_sel(uc_shift_sigma_sel),
+    .shift_source_class(uc_shift_source_class),
+    .shift2_source(uc_shift2_source),
+    .shift_is_shift2(uc_is_shift2),
+    .shift2_capture_ce(microcode_rom_ce),
+    .shift2_next_valid(uc_next_captures_shift_source),
+    .shift2_next_source(uc_next_shift2_source),
+    .shift_uc_carry(uc_shift_uc_carry),
+    // Event control: instruction lifecycle, faults and interrupt delivery
     .instr_start(i_issue),
+    .uc_active(uc_active),
     .halted(halted),
     .ifetch_page_fault(ifetch_page_fault),
     .interrupt_entry(interrupt_entry),
-    .repeat_active(repeat_active),
+    .any_fault(any_fault_r),
     .clear_rf(clear_rf),
-    .pipeline_advance(!stall),
+    .gate_detect(gate_detect_now),
+    .flags_backup_active(flags_backup_active),
+    // Decoder: EX and D2 instruction, operand sizes, stack-operation class (ispval)
+    .instr(i),
+    .next_instr(i_bus),
+    .op_size(op_size_src),
+    .srcreg_size(srcreg_size_src),
+    .op_size_src(op_size_src),
+    .srcreg_size_src(srcreg_size_src),
+    .is_dword(is_dword),
+    .is_signed_mul(is_signed_mul),
     .stack_op(i_bus.stack_op),
     .stack_dir(i_bus.stack_dir),
     .stack_data32(i_bus.data32),
     .stack32(desc_cache[SEG_SS].D_B),
-    .gate_detect(gate_detect_now),
-    .any_fault(any_fault_r),
-    .uc_active(uc_active),
+    // Hardwired control: recipe state and deferred recipe commits
     .recipe_rni(recipe_rni),
     .recipe_state(recipe_state),
     .hardwired_off(hardwired_off),
     .recipe_commit_cancel(any_fault),
+    .recipe_shift_write(recipe_shift_write),
+    .recipe_shift_data(recipe_shift_data),
+    .recipe_memory_write(recipe_mem_write),
+    // Load pipeline: registered VIPT load write-back into the register file
     .load_wb_valid(vipt_load_wb_valid_r),
     .load_wb_dst(vipt_load_wb_dst_r),
     .load_wb_size(vipt_load_wb_size_r),
@@ -3217,49 +2999,19 @@ data_unit data_unit_inst (
     .load_alu_dst_capture_dst(vipt_load_alu_dst_capture_dst),
     .load_alu_dst_capture_size(vipt_load_alu_dst_capture_size),
     .load_alu_dst_capture_data(vipt_load_alu_dst_capture_data),
-    .aluop(uc_aluop),
-    .alu_operation(alu_op5),
-    .shift_aluop(uc_aluop_shift),
-    .shift_sigma_sel(uc_shift_sigma_sel),
-    .dest(uc_dest),
-    .source_field(uc_source_shift),
-    .source_live(uc_source),
-    .alu_source(uc_alu_src_shift),
-    .alu_source_live(uc_alu_src),
-    .fpu_f8(uc_fpu_f8),
-    .shift_source_class(uc_shift_source_class),
-    .shift2_source(uc_shift2_source),
-    .shift_is_shift2(uc_is_shift2),
-    .shift2_capture_ce(microcode_rom_ce),
-    .shift2_next_valid(uc_next_captures_shift_source),
-    .shift2_next_source(uc_next_shift2_source),
-    .shift_uc_carry(uc_shift_uc_carry),
-    // The source-size replicas are updated in lockstep with the architectural
-    // size state.  Use them for the entire data-unit cone instead of importing
-    // both copies and rebuilding parallel size selects around the ALU/flags.
-    .op_size(op_size_src),
-    .srcreg_size(srcreg_size_src),
-    .op_size_src(op_size_src),
-    .srcreg_size_src(srcreg_size_src),
-    .update_arch_flags(alu_update_flags),
-    .update_carry(alu_update_carry),
-    .instr(i),
-    .next_instr(i_bus),
-    .pe(pe),
-    .cpl(cpl),
-    .is_dword(is_dword),
-    .is_signed_mul(is_signed_mul),
-    .eip(EIP),
-    .cr0(CR0),
-    .cr2(CR2),
-    .tmpeip(TMPeIP),
-    .tmpesp(TMPeSP),
-    .dr6(DR6),
-    .dr7(DR7),
-    .slctr(SLCTR),
-    .protun(PROTUN),
+    // Shorters (US5142635): bypasses around the register file
+    .dly_gpr_forward(dly_gpr_forward),
+    .eflags_fwd(eflags_fwd),
+    .branch_condition_true(branch_condition_true),
+    // Segmentation: I-bus base/index reads and address registers
+    .ea_base(ea_base_ref),
+    .ea_index(ea_index_ref),
+    .ea_base_value(ea_base_value),
+    .ea_index_value(ea_index_value),
+    .forwarded_esp(forwarded_esp),
     .ind(IND),
     .ea(ea_reg),
+    // Segmentation and protection: selectors, descriptor and protection sources
     .es(ES),
     .cs(CS),
     .ss(SS),
@@ -3269,20 +3021,27 @@ data_unit data_unit_inst (
     .ldtr(LDTR),
     .tr(TR),
     .seg_reg_sel(i.seg_reg_sel),
-    .forwarded_esp(forwarded_esp),
     .desc_raw_hi(desc_raw_hi),
+    .slctr(SLCTR),
+    .protun(PROTUN),
+    .pe(pe),
+    .cpl(cpl),
+    .protection_source_value(protun_write_value),
+    .protection_source_low16_nonzero(protun_write_low16_nonzero),
+    .cs_source_value(cs_source_value),
+    // Cache and bus unit: memory operand in (R bus) and write data out
     .opr_r(OPR_R),
-    .ea_base(ea_base_ref),
-    .ea_index(ea_index_ref),
-    .dly_gpr_forward(dly_gpr_forward),
-    .sigma(SIGMA),
-    .countr(COUNTR),
-    .alu_src_hold(alu_src_r),
-    .source_value_live(source_value_live),
+    .opr_w(OPR_W),
     .memory_write_source_value(memory_write_source_value),
-    .alu_source_value_live(alu_src_data),
-    .dest_value(dest_value),
-    .alu_src(alu_src),
+    // Control registers and restart state read as microcode sources
+    .eip(EIP),
+    .cr0(CR0),
+    .cr2(CR2),
+    .dr6(DR6),
+    .dr7(DR7),
+    .tmpeip(TMPeIP),
+    .tmpesp(TMPeSP),
+    // Register file, internal registers and flags (datapath state)
     .eax(EAX),
     .ecx(ECX),
     .edx(EDX),
@@ -3293,25 +3052,21 @@ data_unit data_unit_inst (
     .edi(EDI),
     .tmpc(TMPC),
     .tmpg(TMPG),
-    .opr_w(OPR_W),
-    .protection_source_value(protun_write_value),
-    .protection_source_low16_nonzero(protun_write_low16_nonzero),
-    .cs_source_value(cs_source_value),
-    .ea_base_value(ea_base_value),
-    .ea_index_value(ea_index_value),
+    .countr(COUNTR),
     .eflags(EFLAGS),
     .uc_flags(uc_flags),
     .flags_backup(FLAGSB),
-    .flags_backup_active(flags_backup_active),
-    .eflags_fwd(eflags_fwd),
-    .branch_condition_true(branch_condition_true),
-    .recipe_shift_write(recipe_shift_write),
-    .recipe_shift_data(recipe_shift_data),
-    .recipe_memory_write(recipe_mem_write),
+    // E-stage results
+    .sigma(SIGMA),
     .alu_result(alu_result),
     .shift_result(shift_result),
     .muldiv_result(muldiv_result),
-    .div_overflow(div_overflow)
+    .div_overflow(div_overflow),
+    .alu_src(alu_src),
+    .alu_src_hold(alu_src_r),
+    .source_value_live(source_value_live),
+    .alu_source_value_live(alu_src_data),
+    .dest_value(dest_value)
 );
 
 // Debug tap (read by tb_z486 hierarchically; not used in the core).

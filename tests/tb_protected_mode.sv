@@ -652,7 +652,7 @@ module tb_protected_mode #(
 
             resp_valid <= 1'b1;
             if (rd_io_pending) begin
-                din <= 32'hFFFFFFFF;
+                din <= (rd_byte_addr[15:0] == 16'h00FC) ? cycle : 32'hFFFFFFFF;
             end else begin
                 din <= {mem[byte_addr+3], mem[byte_addr+2],
                         mem[byte_addr+1], mem[byte_addr+0]};
@@ -723,8 +723,10 @@ module tb_protected_mode #(
                                 mem[byte_addr+1], mem[byte_addr+0]};
                     end
                 end else if (mem_latency <= 1) begin
+                    // Port 0xFC reads the testbench cycle counter so directed
+                    // programs can assert instruction intervals.
                     resp_valid <= 1'b1;
-                    din <= 32'hFFFFFFFF;
+                    din <= ({addr[15:2], 2'b00} == 16'h00FC) ? cycle : 32'hFFFFFFFF;
                 end
                 rd_remaining <= (mem_latency <= 1 && burst_len > 8'd1) ?
                                 (burst_len - 8'd1) : burst_len;

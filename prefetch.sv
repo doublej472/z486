@@ -1,6 +1,27 @@
-// Prefetch Unit - 32-byte circular buffer, filled one 16-byte cache line at a time M2v2 two-cursor read protocol (doc/z486/old/m2v2.md): *...
-// Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-1
-
+// Prefetcher (i486 "K" unit front end; v71 M2 step 1 naming).
+//
+// US5293592 Fig. 2: prefetch register 26 (32 bytes) feeds mux 27, which
+// drives two decoder ports: K1Q, any three adjacent bytes at pointer K1P, to
+// the D1 decoder; and K2Q, any four adjacent bytes at pointer K2P, carrying
+// the displacement or immediate to D2/segmentation. After a jump the
+// prefetcher returns K1PJ, the byte where the new code begins. Fu/Saini: the
+// queue is two 16-byte buffers filled a whole line per clock over the 128-bit
+// cache path; prefetch has the lowest LA-bus priority (US5255377).
+//
+// Signal map (patent -> RTL):
+//   register 26 (32 bytes)             prefetch_queue[0:7]
+//   K1Q / K1P (D1 decode window)       k1q, k1q_early, k1q_avail / k1p_word, k1p_boff, k1p_adv
+//   K2Q / K2P (literal window)         k2q, k2q_avail / k2p_off (from the pop cursor)
+//   K1PJ (jump start byte)             k1pj_boff (with pf_fetch_word_start)
+//   K1V / K2V port valid               k1q_avail / k2q_avail
+//   instruction retire from the queue  pop_now, pop_len (pf_rptr, pf_byte_offset)
+//   128-bit line from the cache        pf_rdata via the paging toggle interface
+//
+// FPGA deviations: K1Q is 8 bytes wide (a 64-bit window) so D1 can decode an
+// instruction's full structural length in one clock, and k1q_early reads the
+// synchronous entry ROM a cycle ahead; K2Q is addressed relative to the pop
+// cursor; a one-line speculative branch-target buffer (spec_*) prefetches a
+// relative branch's target line.
 `include "z486_platform.svh"
 module prefetch
     import z486_pkg::*;
@@ -9,15 +30,15 @@ module prefetch
     input             reset_n,
 
     // Queue read interface to the decoder (two cursors, one pop point)
-    output     [63:0] win_d1,        // registered raw window at the D1 cursor
-    output     [63:0] win_d1_early,  // speculative window for synchronous entry ROM
-    output     [5:0]  d1_avail,      // bytes fetched beyond the D1 cursor
-    input      [3:0]  d1_adv,        // D1 cursor advance this cycle (0-11: a
+    output     [63:0] k1q,        // registered raw window at the D1 cursor
+    output     [63:0] k1q_early,  // speculative window for synchronous entry ROM
+    output     [5:0]  k1q_avail,      // bytes fetched beyond the D1 cursor
+    input      [3:0]  k1p_adv,        // D1 cursor advance this cycle (0-11: a
                                      //   prefix, or the instruction rest at handoff)
-    input      [3:0]  d1_preread_adv,// structural advance independent of D2 availability
-    output     [31:0] win_lit,       // 4 bytes at pop_cursor + lit_off
-    output     [5:0]  lit_avail,     // bytes fetched beyond that point
-    input      [4:0]  lit_off,       // literal offset from the pop cursor
+    input      [3:0]  k1p_preread_adv,// structural advance independent of D2 availability
+    output     [31:0] k2q,       // 4 bytes at pop_cursor + k2p_off
+    output     [5:0]  k2q_avail,     // bytes fetched beyond that point
+    input      [4:0]  k2p_off,       // literal offset from the pop cursor
     output            q_full,
     input             pop_now,       // one instruction completed D2
     input      [4:0]  pop_len,       // its full byte length (registered source)
@@ -66,8 +87,8 @@ reg [31:0] prefetch_queue [7:0];
 reg [3:0]  pf_rptr;                  // Pop cursor word (0-7) with wraparound bit
 reg [3:0]  pf_wptr;                  // Write pointer (0-7) with wraparound bit
 reg [1:0]  pf_byte_offset;           // Pop cursor byte offset within dword (0-3)
-reg [3:0]  d1_word;                  // D1 cursor word, >= pop cursor
-reg [1:0]  d1_boff;                  // D1 cursor byte offset
+reg [3:0]  k1p_word;                  // D1 cursor word, >= pop cursor
+reg [1:0]  k1p_boff;                  // D1 cursor byte offset
 reg [1:0]  pf_fetch_word_start;      // First word to keep from next fetched line
 reg        pf_suspended;             // Prefetch suspended (page fault until flush)
 reg        pf_fault_reported;        // retained fault has been sent to the core
@@ -100,7 +121,7 @@ wire spec_kill = spec_global_kill || spec_store_hit;
 // synthesis translate_off
 bit TRACE_FLUSH_EN;
 initial TRACE_FLUSH_EN = $test$plusargs("trace_flush");
-// Sim-only: the queue powers up X.  win_d1 is reset to 0, but win_lit
+// Sim-only: the queue powers up X.  k1q is reset to 0, but k2q
 // (combinational over the queue) would be X until the first fill.  Hardware
 // defines the queue via reset+fill before any decode; zero it here so sim
 // matches.
@@ -123,24 +144,24 @@ assign q_full = (pf_word_count == 4'd8);
 // write pointer (a skeleton handoff advances it past literal bytes that are
 // still being fetched), so derive it as pop-relative lead vs the buffered
 // byte count and clamp at zero.
-wire [3:0] d1_lead_words = d1_word - pf_rptr;
-wire [6:0] d1_lead = {1'b0, d1_lead_words, 2'b00} + {5'b00000, d1_boff} -
+wire [3:0] k1p_lead_words = k1p_word - pf_rptr;
+wire [6:0] k1p_lead = {1'b0, k1p_lead_words, 2'b00} + {5'b00000, k1p_boff} -
                      {5'b00000, pf_byte_offset};
-wire [7:0] d1_avail_s = {2'b00, pf_byte_count} - {1'b0, d1_lead};
-assign d1_avail = d1_avail_s[7] ? 6'd0 : d1_avail_s[5:0];
+wire [7:0] k1q_avail_s = {2'b00, pf_byte_count} - {1'b0, k1p_lead};
+assign k1q_avail = k1q_avail_s[7] ? 6'd0 : k1q_avail_s[5:0];
 
-// D2 literal window: pop_cursor + lit_off, over REGISTERED queue words.
-wire [5:0] lit_sum  = {4'b0000, pf_byte_offset} + {1'b0, lit_off};
-wire [3:0] lit_word = pf_rptr + {1'b0, lit_sum[4:2]};
-wire [31:0] lit_word_cur = prefetch_queue[ptr_idx(lit_word)];
-wire [31:0] lit_word_nxt = prefetch_queue[ptr_idx(lit_word + 4'd1)];
-assign win_lit =
-    lit_sum[1:0] == 2'd0 ? lit_word_cur :
-    lit_sum[1:0] == 2'd1 ? {lit_word_nxt[7:0],  lit_word_cur[31:8]} :
-    lit_sum[1:0] == 2'd2 ? {lit_word_nxt[15:0], lit_word_cur[31:16]} :
-                           {lit_word_nxt[23:0], lit_word_cur[31:24]};
-wire [6:0] lit_avail_s = {1'b0, pf_byte_count} - {2'b00, lit_off};
-assign lit_avail = lit_avail_s[6] ? 6'd0 : lit_avail_s[5:0];
+// D2 literal window: pop_cursor + k2p_off, over REGISTERED queue words.
+wire [5:0] k2p_sum  = {4'b0000, pf_byte_offset} + {1'b0, k2p_off};
+wire [3:0] k2p_word = pf_rptr + {1'b0, k2p_sum[4:2]};
+wire [31:0] k2p_word_cur = prefetch_queue[ptr_idx(k2p_word)];
+wire [31:0] k2p_word_nxt = prefetch_queue[ptr_idx(k2p_word + 4'd1)];
+assign k2q =
+    k2p_sum[1:0] == 2'd0 ? k2p_word_cur :
+    k2p_sum[1:0] == 2'd1 ? {k2p_word_nxt[7:0],  k2p_word_cur[31:8]} :
+    k2p_sum[1:0] == 2'd2 ? {k2p_word_nxt[15:0], k2p_word_cur[31:16]} :
+                           {k2p_word_nxt[23:0], k2p_word_cur[31:24]};
+wire [6:0] k2q_avail_s = {1'b0, pf_byte_count} - {2'b00, k2p_off};
+assign k2q_avail = k2q_avail_s[6] ? 6'd0 : k2q_avail_s[5:0];
 
 wire pf_inflight = (pf_req_toggle != pf_ack_toggle);
 
@@ -179,6 +200,13 @@ wire spec_adopt        = spec_inflight && !spec_poison && !pf_ack_edge && spec_o
 wire spec_data_now     = spec_inflight && !spec_poison && pf_ack_edge && !pf_fault &&
                          spec_owner;
 wire spec_flush_hit    = q_flush && (spec_line_match || spec_data_now);
+// K1PJ (US5293592): the byte where code begins after a jump, returned with
+// the refilled line. The buffered target line supplies its latched offset.
+wire [1:0] k1pj_boff = spec_flush_hit ? spec_off[1:0] : pf_flush_addr[1:0];
+wire [1:0] flush_word = spec_flush_hit ? spec_off[3:2] : pf_flush_addr[3:2];
+// An unaligned seed starts from an empty queue; this delta moves every cursor
+// onto the seed word's slot.
+wire [3:0] seed_delta = {pf_wptr[3:2], pf_fetch_addr[3:2]} - pf_wptr;
 wire [127:0] spec_hit_line = spec_data_now ? pf_rdata : spec_line;
 
 function automatic [31:0] line_word(input [127:0] line, input [1:0] word);
@@ -197,22 +225,22 @@ wire seed_now = pf_can_fetch && !good_ack && q_empty &&
 // (skel.length from the decoder), up to 15 bytes + offset 3 -> 5 bits.
 wire [5:0] byte_advance = {4'b0000, pf_byte_offset} + {1'b0, pop_len};
 // D1 cursor advance: a prefix byte or the instruction rest at handoff.
-wire [3:0] d1_sum = {2'b00, d1_boff} + d1_adv;
-wire [3:0] d1_preread_sum = {2'b00, d1_boff} + d1_preread_adv;
+wire [3:0] k1p_sum = {2'b00, k1p_boff} + k1p_adv;
+wire [3:0] k1p_preread_sum = {2'b00, k1p_boff} + k1p_preread_adv;
 
 logic [3:0]  rptr_next;
 logic [3:0]  wptr_next;
 logic [1:0]  byte_offset_next;
-logic [3:0]  d1_word_next;
-logic [1:0]  d1_boff_next;
+logic [3:0]  k1p_word_next;
+logic [1:0]  k1p_boff_next;
 logic [31:0] queue_next [7:0];
 
 always_comb begin
     rptr_next = pf_rptr;
     wptr_next = pf_wptr;
     byte_offset_next = pf_byte_offset;
-    d1_word_next = d1_word + {2'b00, d1_sum[3:2]};
-    d1_boff_next = d1_sum[1:0];
+    k1p_word_next = k1p_word + {2'b00, k1p_sum[3:2]};
+    k1p_boff_next = k1p_sum[1:0];
     for (int k = 0; k < 8; k++)
         queue_next[k] = prefetch_queue[k];
 
@@ -221,70 +249,41 @@ always_comb begin
         rptr_next = pf_rptr + byte_advance[5:2];
     end
 
+    // Queue slots are aligned to line words: line word j always lands in
+    // slot {half, j}. After a flush the pointers start at the target's word
+    // within the line (see below), so a fill needs no per-slot word mux.
     if (fill_commit) begin
-        unique case (pf_fetch_word_start)
-            2'd0: begin
-                queue_next[ptr_idx(pf_wptr)] = line_word(pf_rdata, 2'd0);
-                queue_next[ptr_idx(pf_wptr + 4'd1)] = line_word(pf_rdata, 2'd1);
-                queue_next[ptr_idx(pf_wptr + 4'd2)] = line_word(pf_rdata, 2'd2);
-                queue_next[ptr_idx(pf_wptr + 4'd3)] = line_word(pf_rdata, 2'd3);
-            end
-            2'd1: begin
-                queue_next[ptr_idx(pf_wptr)] = line_word(pf_rdata, 2'd1);
-                queue_next[ptr_idx(pf_wptr + 4'd1)] = line_word(pf_rdata, 2'd2);
-                queue_next[ptr_idx(pf_wptr + 4'd2)] = line_word(pf_rdata, 2'd3);
-            end
-            2'd2: begin
-                queue_next[ptr_idx(pf_wptr)] = line_word(pf_rdata, 2'd2);
-                queue_next[ptr_idx(pf_wptr + 4'd1)] = line_word(pf_rdata, 2'd3);
-            end
-            default: begin
-                queue_next[ptr_idx(pf_wptr)] = line_word(pf_rdata, 2'd3);
-            end
-        endcase
+        for (int j = 0; j < 4; j++)
+            if (2'(j) >= pf_fetch_word_start)
+                queue_next[{pf_wptr[2], 2'(j)}] = line_word(pf_rdata, 2'(j));
         wptr_next = pf_wptr + {1'b0, fetch_write_words};
     end
 
     if (q_flush) begin
-        rptr_next = 4'h0;
-        wptr_next = 4'h0;
-        byte_offset_next = spec_flush_hit ? spec_off[1:0] : pf_flush_addr[1:0];
-        d1_word_next = 4'h0;
-        d1_boff_next = spec_flush_hit ? spec_off[1:0] : pf_flush_addr[1:0];
+        rptr_next = {2'b00, flush_word};
+        wptr_next = {2'b00, flush_word};
+        byte_offset_next = k1pj_boff;
+        k1p_word_next = {2'b00, flush_word};
+        k1p_boff_next = k1pj_boff;
         if (spec_flush_hit) begin
             // Seed the queue from the buffered target line right now. All
             // placement selects come from the LATCHED spec_off - only the hit
             // control bit sees the late flush address.
-            unique case (spec_off[3:2])
-                2'd0: begin
-                    queue_next[0] = line_word(spec_hit_line, 2'd0);
-                    queue_next[1] = line_word(spec_hit_line, 2'd1);
-                    queue_next[2] = line_word(spec_hit_line, 2'd2);
-                    queue_next[3] = line_word(spec_hit_line, 2'd3);
-                    wptr_next = 4'd4;
-                end
-                2'd1: begin
-                    queue_next[0] = line_word(spec_hit_line, 2'd1);
-                    queue_next[1] = line_word(spec_hit_line, 2'd2);
-                    queue_next[2] = line_word(spec_hit_line, 2'd3);
-                    wptr_next = 4'd3;
-                end
-                2'd2: begin
-                    queue_next[0] = line_word(spec_hit_line, 2'd2);
-                    queue_next[1] = line_word(spec_hit_line, 2'd3);
-                    wptr_next = 4'd2;
-                end
-                default: begin
-                    queue_next[0] = line_word(spec_hit_line, 2'd3);
-                    wptr_next = 4'd1;
-                end
-            endcase
+            for (int j = 0; j < 4; j++)
+                if (2'(j) >= spec_off[3:2])
+                    queue_next[j] = line_word(spec_hit_line, 2'(j));
+            wptr_next = 4'd4;
         end
     end
 
     if (seed_now) begin
+        // The queue is empty: rebase the pointers onto the seed word so the
+        // aligned fill places it at the pop cursor.
+        rptr_next = pf_rptr + seed_delta;
+        wptr_next = pf_wptr + seed_delta;
+        k1p_word_next = k1p_word_next + seed_delta;
         byte_offset_next = pf_fetch_addr[1:0];
-        d1_boff_next = pf_fetch_addr[1:0];
+        k1p_boff_next = pf_fetch_addr[1:0];
     end
 end
 
@@ -292,15 +291,15 @@ end
 reg PF_CUR = 1'b0;
 initial if ($test$plusargs("pf_cur")) PF_CUR = 1'b1;
 always @(posedge clk) begin
-    if (PF_CUR && (pop_now || (d1_adv != 4'd0) || q_flush || fill_commit))
+    if (PF_CUR && (pop_now || (k1p_adv != 4'd0) || q_flush || fill_commit))
         $display("%0t PFCUR pop=%b len=%0d adv=%0d flush=%b fill=%b | rptr=%0d.%0d wptr=%0d d1=%0d.%0d cnt=%0d d1av=%0d litoff=%0d litav=%0d",
-                 $time, pop_now, pop_len, d1_adv, q_flush, fill_commit,
-                 pf_rptr, pf_byte_offset, pf_wptr, d1_word, d1_boff,
-                 pf_byte_count, d1_avail, lit_off, lit_avail);
+                 $time, pop_now, pop_len, k1p_adv, q_flush, fill_commit,
+                 pf_rptr, pf_byte_offset, pf_wptr, k1p_word, k1p_boff,
+                 pf_byte_count, k1q_avail, k2p_off, k2q_avail);
     if (reset_n && pop_now && ({1'b0, pf_byte_count} < {2'b00, pop_len}))
         $fatal(1, "PF: pop_now for %0d bytes with only %0d buffered (rptr=%0d.%0d wptr=%0d d1=%0d.%0d flush=%b)",
                pop_len, pf_byte_count, pf_rptr, pf_byte_offset, pf_wptr,
-               d1_word, d1_boff, q_flush);
+               k1p_word, k1p_boff, q_flush);
 end
 // synthesis translate_on
 
@@ -330,97 +329,98 @@ end
 // D1 window: registered from the queue's NEXT state at the NEXT cursor, so the decoder always sees the byte rotate of the new cursor...
 // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-342
 // If D2 backpressure blocks a structural handoff, the D1 cursor holds. Build
-// that hold window without the late d1_adv/i_issue cursor adder; the already
+// that hold window without the late k1p_adv/i_issue cursor adder; the already
 // required preread window below supplies the advancing case. The late control
 // path therefore ends at one 64-bit select instead of traversing an add and
 // byte aligner.
-wire [31:0] d1_hold_word_cur = queue_next[ptr_idx(d1_word)];
-wire [31:0] d1_hold_word_nxt = queue_next[ptr_idx(d1_word + 4'd1)];
-wire [31:0] d1_hold_word_2nd = queue_next[ptr_idx(d1_word + 4'd2)];
-wire [63:0] win_d1_hold_next =
-    d1_boff == 2'd0 ? {d1_hold_word_nxt,       d1_hold_word_cur} :
-    d1_boff == 2'd1 ? {d1_hold_word_2nd[7:0],  d1_hold_word_nxt,
-                                                d1_hold_word_cur[31:8]} :
-    d1_boff == 2'd2 ? {d1_hold_word_2nd[15:0], d1_hold_word_nxt,
-                                                d1_hold_word_cur[31:16]} :
-                      {d1_hold_word_2nd[23:0], d1_hold_word_nxt,
-                                                d1_hold_word_cur[31:24]};
+wire [31:0] k1p_hold_word_cur = queue_next[ptr_idx(k1p_word)];
+wire [31:0] k1p_hold_word_nxt = queue_next[ptr_idx(k1p_word + 4'd1)];
+wire [31:0] k1p_hold_word_2nd = queue_next[ptr_idx(k1p_word + 4'd2)];
+wire [63:0] k1q_hold_next =
+    k1p_boff == 2'd0 ? {k1p_hold_word_nxt,       k1p_hold_word_cur} :
+    k1p_boff == 2'd1 ? {k1p_hold_word_2nd[7:0],  k1p_hold_word_nxt,
+                                                k1p_hold_word_cur[31:8]} :
+    k1p_boff == 2'd2 ? {k1p_hold_word_2nd[15:0], k1p_hold_word_nxt,
+                                                k1p_hold_word_cur[31:16]} :
+                      {k1p_hold_word_2nd[23:0], k1p_hold_word_nxt,
+                                                k1p_hold_word_cur[31:24]};
 
 // Run the entry-table cursor from structural decode alone. If the real D1
 // cursor is held by D2, the decoder keeps the prior table output; therefore
 // this address never needs issue, VIPT, paging, or execution readiness.
-logic [3:0] d1_preread_word;
-logic [1:0] d1_preread_boff;
+logic [3:0] k1p_preread_word;
+logic [1:0] k1p_preread_boff;
 always_comb begin
-    d1_preread_word = d1_word + {2'b00, d1_preread_sum[3:2]};
-    d1_preread_boff = d1_preread_sum[1:0];
+    k1p_preread_word = k1p_word + {2'b00, k1p_preread_sum[3:2]};
+    k1p_preread_boff = k1p_preread_sum[1:0];
     if (q_flush) begin
-        d1_preread_word = 4'h0;
-        d1_preread_boff = spec_flush_hit ? spec_off[1:0] : pf_flush_addr[1:0];
+        k1p_preread_word = {2'b00, flush_word};
+        k1p_preread_boff = k1pj_boff;
     end else if (seed_now) begin
-        d1_preread_boff = pf_fetch_addr[1:0];
+        k1p_preread_word = k1p_preread_word + seed_delta;
+        k1p_preread_boff = pf_fetch_addr[1:0];
     end
 end
 
-wire [31:0] d1_preread_word_cur = queue_next[ptr_idx(d1_preread_word)];
-wire [31:0] d1_preread_word_nxt = queue_next[ptr_idx(d1_preread_word + 4'd1)];
-wire [31:0] d1_preread_word_2nd = queue_next[ptr_idx(d1_preread_word + 4'd2)];
-wire [63:0] win_d1_preread_next =
-    d1_preread_boff == 2'd0 ? {d1_preread_word_nxt,
-                                d1_preread_word_cur} :
-    d1_preread_boff == 2'd1 ? {d1_preread_word_2nd[7:0],
-                                d1_preread_word_nxt,
-                                d1_preread_word_cur[31:8]} :
-    d1_preread_boff == 2'd2 ? {d1_preread_word_2nd[15:0],
-                                d1_preread_word_nxt,
-                                d1_preread_word_cur[31:16]} :
-                               {d1_preread_word_2nd[23:0],
-                                d1_preread_word_nxt,
-                                d1_preread_word_cur[31:24]};
-assign win_d1_early = win_d1_preread_next;
+wire [31:0] k1p_preread_word_cur = queue_next[ptr_idx(k1p_preread_word)];
+wire [31:0] k1p_preread_word_nxt = queue_next[ptr_idx(k1p_preread_word + 4'd1)];
+wire [31:0] k1p_preread_word_2nd = queue_next[ptr_idx(k1p_preread_word + 4'd2)];
+wire [63:0] k1q_preread_next =
+    k1p_preread_boff == 2'd0 ? {k1p_preread_word_nxt,
+                                k1p_preread_word_cur} :
+    k1p_preread_boff == 2'd1 ? {k1p_preread_word_2nd[7:0],
+                                k1p_preread_word_nxt,
+                                k1p_preread_word_cur[31:8]} :
+    k1p_preread_boff == 2'd2 ? {k1p_preread_word_2nd[15:0],
+                                k1p_preread_word_nxt,
+                                k1p_preread_word_cur[31:16]} :
+                               {k1p_preread_word_2nd[23:0],
+                                k1p_preread_word_nxt,
+                                k1p_preread_word_cur[31:24]};
+assign k1q_early = k1q_preread_next;
 
 // q_flush gives both cursor views the same redirected origin. Otherwise the
 // real cursor advances exactly when structural preread and committed advance
 // agree; disagreement means D2 held the handoff.
-wire d1_commit_preread = q_flush || (d1_adv == d1_preread_adv);
-wire [63:0] win_d1_next = d1_commit_preread
-                        ? win_d1_preread_next : win_d1_hold_next;
+wire k1p_commit_preread = q_flush || (k1p_adv == k1p_preread_adv);
+wire [63:0] k1q_next = k1p_commit_preread
+                        ? k1q_preread_next : k1q_hold_next;
 
 // synthesis translate_off
-wire [31:0] d1_reference_word_cur = queue_next[ptr_idx(d1_word_next)];
-wire [31:0] d1_reference_word_nxt = queue_next[ptr_idx(d1_word_next + 4'd1)];
-wire [31:0] d1_reference_word_2nd = queue_next[ptr_idx(d1_word_next + 4'd2)];
-wire [63:0] win_d1_reference =
-    d1_boff_next == 2'd0 ? {d1_reference_word_nxt,
-                             d1_reference_word_cur} :
-    d1_boff_next == 2'd1 ? {d1_reference_word_2nd[7:0],
-                             d1_reference_word_nxt,
-                             d1_reference_word_cur[31:8]} :
-    d1_boff_next == 2'd2 ? {d1_reference_word_2nd[15:0],
-                             d1_reference_word_nxt,
-                             d1_reference_word_cur[31:16]} :
-                           {d1_reference_word_2nd[23:0],
-                             d1_reference_word_nxt,
-                             d1_reference_word_cur[31:24]};
+wire [31:0] k1p_reference_word_cur = queue_next[ptr_idx(k1p_word_next)];
+wire [31:0] k1p_reference_word_nxt = queue_next[ptr_idx(k1p_word_next + 4'd1)];
+wire [31:0] k1p_reference_word_2nd = queue_next[ptr_idx(k1p_word_next + 4'd2)];
+wire [63:0] k1q_reference =
+    k1p_boff_next == 2'd0 ? {k1p_reference_word_nxt,
+                             k1p_reference_word_cur} :
+    k1p_boff_next == 2'd1 ? {k1p_reference_word_2nd[7:0],
+                             k1p_reference_word_nxt,
+                             k1p_reference_word_cur[31:8]} :
+    k1p_boff_next == 2'd2 ? {k1p_reference_word_2nd[15:0],
+                             k1p_reference_word_nxt,
+                             k1p_reference_word_cur[31:16]} :
+                           {k1p_reference_word_2nd[23:0],
+                             k1p_reference_word_nxt,
+                             k1p_reference_word_cur[31:24]};
 always_ff @(posedge clk) begin
-    if (reset_n && (win_d1_next !== win_d1_reference))
+    if (reset_n && (k1q_next !== k1q_reference))
         $fatal(1, "PF D1 WINDOW MISMATCH: selected=%h reference=%h",
-               win_d1_next, win_d1_reference);
+               k1q_next, k1q_reference);
 end
 // synthesis translate_on
 
 // Keep the queue/decoder boundary physical. Quartus retiming this register
 // turns an icache response into a same-cycle cache -> aligner -> D1 PLA path.
-`Z486_KEEP reg [63:0] win_d1_r;
-assign win_d1 = win_d1_r;
+`Z486_KEEP reg [63:0] k1q_r;
+assign k1q = k1q_r;
 
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
         pf_rptr <= 4'h0;
         pf_wptr <= 4'h0;
         pf_byte_offset <= 2'h0;
-        d1_word <= 4'h0;
-        d1_boff <= 2'h0;
+        k1p_word <= 4'h0;
+        k1p_boff <= 2'h0;
         pf_fetch_word_start <= 2'h0;
         pf_suspended <= 1'b0;
         ifetch_fault <= 1'b0;
@@ -433,7 +433,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         pf_linear_addr <= 32'h0;
         pf_redirect_queued <= 1'b0;
         pf_ack_prev <= 1'b0;
-        win_d1_r <= 64'h0;
+        k1q_r <= 64'h0;
         spec_pend <= 1'b0;
         spec_inflight <= 1'b0;
         spec_valid <= 1'b0;
@@ -449,9 +449,9 @@ always_ff @(posedge clk or negedge reset_n) begin
         pf_rptr <= rptr_next;
         pf_wptr <= wptr_next;
         pf_byte_offset <= byte_offset_next;
-        d1_word <= d1_word_next;
-        d1_boff <= d1_boff_next;
-        win_d1_r <= win_d1_next;
+        k1p_word <= k1p_word_next;
+        k1p_boff <= k1p_boff_next;
+        k1q_r <= k1q_next;
         for (int k = 0; k < 8; k++)
             prefetch_queue[k] <= queue_next[k];
 

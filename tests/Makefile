@@ -38,13 +38,13 @@ X87_RTL := $(X87_DIR)/x87_pkg.sv \
 RTL_SRCS := $(Z486_DIR)/z486_pkg.sv $(X87_DIR)/x87_pkg.sv \
 			$(X87_DIR)/x87_ucode_pkg.sv $(Z486_DIR)/z486.sv \
 			$(Z486_DIR)/cpu_throttle.sv $(Z486_DIR)/interrupt_controller.sv \
-			$(Z486_DIR)/ucode_rom.sv $(Z486_DIR)/microsequencer.sv $(Z486_DIR)/hardwired_control.sv \
+			$(Z486_DIR)/ucode_rom.sv $(Z486_DIR)/microsequencer.sv $(Z486_DIR)/event_control.sv $(Z486_DIR)/hardwired_control.sv \
 			$(Z486_DIR)/data_unit.sv $(Z486_DIR)/address_unit.sv \
 			$(Z486_DIR)/shifter.sv $(Z486_DIR)/mul_div.sv \
 			$(Z486_DIR)/decoder.sv \
 			$(Z486_DIR)/alu.sv $(Z486_DIR)/prefetch.sv \
 			$(Z486_DIR)/paging_unit.sv $(Z486_DIR)/paging_tlb.sv $(Z486_DIR)/paging_walker.sv \
-			$(Z486_DIR)/memory.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv \
+			$(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv \
 			$(filter-out $(X87_DIR)/x87_pkg.sv $(X87_DIR)/x87_ucode_pkg.sv,$(X87_RTL)) \
 			$(Z486_DIR)/dsp_mul.sv $(Z486_DIR)/protection.sv $(Z486_DIR)/segmentation_unit.sv
 RTL_DEPS := $(Z486_DIR)/ucode_recipes.svh $(X87_GEN) \
@@ -177,10 +177,10 @@ obj_dir/Vtb_l1_icache: $(Z486_DIR)/l1_icache.sv $(TB_L1I_SRCS) $(CPP_L1I_SRCS)
 	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_l1_icache $(TB_L1I_SRCS) $(Z486_DIR)/l1_icache.sv $(CPP_L1I_SRCS)
 	@echo "Build complete: obj_dir/Vtb_l1_icache"
 
-obj_dir/Vtb_memory_order: $(Z486_DIR)/memory.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv $(TB_MEMORY_ORDER_SRCS) $(CPP_MEMORY_ORDER_SRCS)
+obj_dir/Vtb_memory_order: $(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv $(TB_MEMORY_ORDER_SRCS) $(CPP_MEMORY_ORDER_SRCS)
 	@echo "Building memory ordering unit test with Verilator..."
 	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_memory_order $(TB_MEMORY_ORDER_SRCS) \
-		$(Z486_DIR)/memory.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv $(CPP_MEMORY_ORDER_SRCS)
+		$(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv $(CPP_MEMORY_ORDER_SRCS)
 	@echo "Build complete: obj_dir/Vtb_memory_order"
 
 obj_dir/Vtb_x87_bridge: $(X87_DIR)/x87_bridge.sv $(TB_X87_BRIDGE_SRCS) $(CPP_X87_BRIDGE_SRCS)

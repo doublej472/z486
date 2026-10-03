@@ -1,5 +1,9 @@
-// z486 cache and external-memory fabric.
-// Owns both L1 caches, A20 masking, refill arbitration, and response tracking.
+// z486 memory side: the bus interface unit and the cache unit.
+//
+// This wrapper holds only the two owners and their interconnect:
+//   bus_unit    external arbitration, cycle types, response tracking (US5073969)
+//   cache_unit  A20 masking, D-cache (with its store queue as the write
+//               buffer) and I-cache, VIPT preread, request steering
 module memory #(
     parameter PROTECT_UMA_ROM = 0,
     parameter DCACHE_SET_BITS = 7,
@@ -88,383 +92,176 @@ module memory #(
     output             inta
 );
 
-wire [31:0] dcache_req_phys_addr = (!a20_enable && !dcache_req_is_io)
-                                      ? (dcache_req_phys_addr_raw & ~32'h0010_0000)
-                                      : dcache_req_phys_addr_raw;
-wire [31:0] dcache_vipt_resolve_phys_addr = !a20_enable
-                                      ? (dcache_vipt_resolve_phys_addr_raw & ~32'h0010_0000)
-                                      : dcache_vipt_resolve_phys_addr_raw;
-wire [31:0] fast_store_phys_addr = !a20_enable
-                                      ? (fast_store_phys_addr_raw & ~32'h0010_0000)
-                                      : fast_store_phys_addr_raw;
-wire [31:0] icache_req_phys_addr = !a20_enable
-                                      ? (icache_req_phys_addr_raw & ~32'h0010_0000)
-                                      : icache_req_phys_addr_raw;
-wire dcache_req_is_device_mmio = ENABLE_DEVICE_MMIO &&
-                                  device_mmio_enable &&
-                                  ((dcache_req_phys_addr & DEVICE_MMIO_MASK) ==
-                                   (device_mmio_base & DEVICE_MMIO_MASK));
-wire dcache_vipt_is_device_mmio = ENABLE_DEVICE_MMIO &&
-                                   device_mmio_enable &&
-                                   ((dcache_vipt_resolve_phys_addr &
-                                     DEVICE_MMIO_MASK) ==
-                                    (device_mmio_base & DEVICE_MMIO_MASK));
-
 wire [31:0] dcache_cpu_dout;
-wire        dcache_vipt_resolve_hit_cache;
-wire        dcache_cpu_ready;
-wire        dcache_cpu_resp_valid;
-wire        dcache_stores_drained;
-wire [31:0] dcache_store_patch_addr;
-wire [31:0] dcache_store_patch_data;
-wire  [3:0] dcache_store_patch_be;
-wire        dcache_store_patch_valid;
+wire dcache_cpu_ready;
+wire dcache_cpu_resp_valid;
 wire [31:0] dcache_mem_addr;
+wire [3:0] dcache_mem_be;
+wire [7:0] dcache_mem_burstcount;
 wire [31:0] dcache_mem_din;
-wire  [3:0] dcache_mem_be;
-wire  [7:0] dcache_mem_burstcount;
-wire        dcache_mem_valid;
-wire        dcache_mem_write;
-wire        dcache_mem_ready;
-wire        dcache_mem_resp_valid;
-wire        dcache_mem_line_resp_valid;
-
-wire [127:0] icache_cpu_line;
-wire         icache_cpu_ready;
-wire         icache_cpu_resp_valid;
-wire [31:0]  icache_mem_addr;
-wire  [3:0]  icache_mem_be;
-wire  [7:0]  icache_mem_burstcount;
-wire         icache_mem_valid;
-wire         icache_mem_ready;
-wire         icache_mem_resp_valid;
-wire         icache_mem_line_resp_valid;
-
-assign dcache_vipt_resolve_hit = dcache_vipt_resolve_hit_cache &&
-                                  !dcache_vipt_is_device_mmio;
-
-logic [7:0] dcache_rd_pending;
-logic [7:0] icache_rd_pending;
-logic       dcache_cpu_rd_pending;
-logic       icache_cpu_rd_pending;
-logic       direct_rd_pending;
-
-assign x87_req_selected = ENABLE_X87 && dcache_req_valid && dcache_req_is_x87;
-
-// VGA aperture accesses are device transactions. Bypass the posted L1 store
-// queue so an ET4000 bank-register write cannot overtake framebuffer writes.
-wire normal_cache_req = dcache_req_valid && !dcache_req_is_io &&
-                        !dcache_req_is_inta && !dcache_req_is_vga_mem &&
-                        !dcache_req_is_device_mmio &&
-                        !x87_req_selected;
-wire dcache_cpu_req = fast_store_valid || normal_cache_req;
-wire [31:0] dcache_cpu_addr = fast_store_valid ? fast_store_phys_addr
-                                              : dcache_req_phys_addr;
-wire [31:0] dcache_cpu_wdata = fast_store_valid ? fast_store_wdata
-                                               : dcache_req_wdata;
-wire [3:0] dcache_cpu_be = fast_store_valid ? fast_store_be : dcache_req_be;
-wire dcache_cpu_write = fast_store_valid || dcache_req_write;
-// WR_FAST already owns a translated physical address.  Its request must also
-// own the synchronous RAM preread; leaving the normal paging preread here
-// makes the following S_LOOKUP compare against an unrelated set.
-wire [11:0] dcache_cpu_preread_offset = fast_store_valid
-                                      ? fast_store_phys_addr[11:0]
-                                      : dcache_req_preread_offset;
-wire dcache_cpu_preread_priority = fast_store_valid ||
-                                   dcache_req_preread_priority;
-wire dcache_direct_req = dcache_req_valid && !x87_req_selected &&
-                         (dcache_req_is_io || dcache_req_is_inta ||
-                          dcache_req_is_vga_mem ||
-                          dcache_req_is_device_mmio);
-wire dcache_read_pending = (dcache_rd_pending != 8'd0);
-wire icache_read_pending = (icache_rd_pending != 8'd0);
-wire dcache_read_accept = normal_cache_req && !dcache_req_write && dcache_cpu_ready;
-wire icache_read_accept = icache_req_valid && icache_cpu_ready;
-wire dcache_read_done = dcache_cpu_resp_valid &&
-                        (dcache_cpu_rd_pending || dcache_read_accept);
-wire icache_read_done = icache_cpu_resp_valid &&
-                        (icache_cpu_rd_pending || icache_read_accept);
-// I/O and INTA transactions must not overtake older posted stores.  This is
-// what makes a CPU-filled Sound Blaster buffer visible before the following
-// DSP command lets DMA consume it.  VGA memory already bypasses the posted
-// queue, so direct VGA accesses remain mutually ordered without draining
-// unrelated normal-RAM stores first.
-wire direct_req_ordered = dcache_req_is_vga_mem || dcache_stores_drained;
-wire ext_direct_req = dcache_direct_req && direct_req_ordered &&
-                      !direct_rd_pending &&
-                      !dcache_read_pending && !icache_read_pending;
-wire ext_dcache_req = dcache_mem_valid && !ext_direct_req &&
-                      !direct_rd_pending && !icache_read_pending;
-wire ext_icache_req = icache_mem_valid && !ext_direct_req && !ext_dcache_req &&
-                      !direct_rd_pending && !dcache_read_pending;
-
-localparam [1:0] EXT_SRC_NONE   = 2'd0;
-localparam [1:0] EXT_SRC_DIRECT = 2'd1;
-localparam [1:0] EXT_SRC_DCACHE = 2'd2;
-localparam [1:0] EXT_SRC_ICACHE = 2'd3;
-
-logic        ext_valid_r;
-logic [1:0]  ext_src_r;
-logic [31:2] ext_addr_r;
-logic [3:0]  ext_be_r;
-logic [7:0]  ext_burstcount_r;
-logic [31:0] ext_direct_dout_r;
-logic [31:0] ext_dcache_dout_r;
-logic        ext_write_r;
-logic        ext_io_r;
-logic        ext_inta_r;
-
-wire ext_direct_accept = ext_valid_r && ready && (ext_src_r == EXT_SRC_DIRECT);
-wire ext_dcache_accept = ext_valid_r && ready && (ext_src_r == EXT_SRC_DCACHE);
-wire ext_icache_accept = ext_valid_r && ready && (ext_src_r == EXT_SRC_ICACHE);
-wire direct_rd_resp_now = resp_valid &&
-                          (direct_rd_pending || (ext_direct_accept && !ext_write_r));
-logic       icache_write_snoop_pending;
-logic [31:0] icache_write_snoop_addr_r;
-logic [31:0] icache_write_snoop_data_r;
-logic  [3:0] icache_write_snoop_be_r;
-// Normally the I-cache consumes the D-cache's registered S_LOOKUP store
-// directly.  The one-entry pending slot only resolves an external invalidate
-// collision (or holds the following store while an older pending patch is
-// consumed), preserving invalidate priority without returning to live paging
-// request signals.
-wire icache_write_patch_valid = !snoop_valid &&
-                                (icache_write_snoop_pending ||
-                                 dcache_store_patch_valid);
-wire [31:0] icache_write_patch_addr = icache_write_snoop_pending
-                                    ? icache_write_snoop_addr_r
-                                    : dcache_store_patch_addr;
-wire [31:0] icache_write_patch_data = icache_write_snoop_pending
-                                    ? icache_write_snoop_data_r
-                                    : dcache_store_patch_data;
-wire [3:0] icache_write_patch_be = icache_write_snoop_pending
-                                 ? icache_write_snoop_be_r
-                                 : dcache_store_patch_be;
-
-wire normal_req_accepted = normal_cache_req ? (dcache_cpu_ready && !fast_store_valid)
-                                            : ext_direct_accept;
-wire normal_req_complete = dcache_cpu_resp_valid ||
-                           (normal_cache_req && dcache_req_write &&
-                            dcache_cpu_ready && !fast_store_valid) ||
-                           direct_rd_resp_now ||
-                           (ext_direct_accept && ext_write_r);
-wire normal_read_complete = dcache_cpu_resp_valid || direct_rd_resp_now;
-wire [31:0] normal_rdata = dcache_cpu_resp_valid ? dcache_cpu_dout : din;
-
-assign dcache_req_accepted = x87_req_selected ? x87_req_accepted : normal_req_accepted;
-assign fast_store_accepted = fast_store_valid && dcache_cpu_ready;
-assign dcache_req_complete = normal_req_complete || x87_req_complete;
-assign dcache_read_complete = normal_read_complete || x87_read_complete;
-assign dcache_rdata = x87_read_complete ? x87_rdata : normal_rdata;
-assign icache_req_accepted = icache_cpu_ready;
-assign icache_req_complete = icache_cpu_resp_valid;
-assign icache_rdata = icache_cpu_line;
-
-assign addr       = ext_addr_r;
-assign be         = ext_be_r;
-assign burstcount = ext_burstcount_r;
-assign line_read  = ext_valid_r && !ext_write_r &&
-                    (ext_burstcount_r == 8'd4) &&
-                    ((ext_src_r == EXT_SRC_DCACHE) ||
-                     (ext_src_r == EXT_SRC_ICACHE));
-assign dout       = (ext_src_r == EXT_SRC_DIRECT) ? ext_direct_dout_r :
-                    (ext_src_r == EXT_SRC_DCACHE) ? ext_dcache_dout_r : 32'd0;
-assign valid      = ext_valid_r;
-assign write      = ext_valid_r && ext_write_r;
-assign io         = ext_valid_r && ext_io_r;
-assign inta       = ext_valid_r && ext_inta_r;
-
-assign dcache_mem_ready = ext_dcache_accept;
-assign icache_mem_ready = ext_icache_accept;
-assign dcache_mem_resp_valid = dcache_read_pending && resp_valid;
-assign icache_mem_resp_valid = icache_read_pending && resp_valid;
-assign dcache_mem_line_resp_valid = dcache_read_pending && line_resp_valid;
-assign icache_mem_line_resp_valid = icache_read_pending && line_resp_valid;
-
-always_ff @(posedge clk) begin
-    if (!reset_n) begin
-        ext_valid_r <= 1'b0;
-        ext_src_r <= EXT_SRC_NONE;
-        ext_addr_r <= 30'h0;
-        ext_be_r <= 4'h0;
-        ext_burstcount_r <= 8'h0;
-        ext_direct_dout_r <= 32'h0;
-        ext_dcache_dout_r <= 32'h0;
-        ext_write_r <= 1'b0;
-        ext_io_r <= 1'b0;
-        ext_inta_r <= 1'b0;
-        dcache_rd_pending <= 8'd0;
-        icache_rd_pending <= 8'd0;
-        dcache_cpu_rd_pending <= 1'b0;
-        icache_cpu_rd_pending <= 1'b0;
-        direct_rd_pending <= 1'b0;
-        icache_write_snoop_pending <= 1'b0;
-        icache_write_snoop_addr_r <= 32'h0;
-        icache_write_snoop_data_r <= 32'h0;
-        icache_write_snoop_be_r <= 4'h0;
-    end else begin
-        // Data is speculative until ext_src_r selects its registered owner.
-        // Capturing both sources unconditionally prevents request arbitration
-        // and live translation from becoming clock-enable muxes on dout.
-        ext_direct_dout_r <= dcache_direct_wdata;
-        ext_dcache_dout_r <= dcache_mem_din;
-
-        if (dcache_store_patch_valid &&
-            (snoop_valid || icache_write_snoop_pending)) begin
-            // The pending patch, when present, is consumed on this edge. Keep
-            // the newly accepted store for the following cycle.
-            icache_write_snoop_pending <= 1'b1;
-            icache_write_snoop_addr_r <= dcache_store_patch_addr;
-            icache_write_snoop_data_r <= dcache_store_patch_data;
-            icache_write_snoop_be_r <= dcache_store_patch_be;
-        end else if (icache_write_snoop_pending && !snoop_valid) begin
-            icache_write_snoop_pending <= 1'b0;
-        end
-
-        if (ext_valid_r) begin
-            if (ready) begin
-                ext_valid_r <= 1'b0;
-                ext_src_r <= EXT_SRC_NONE;
-            end
-        end else if (ext_direct_req) begin
-            ext_valid_r <= 1'b1;
-            ext_src_r <= EXT_SRC_DIRECT;
-            ext_addr_r <= dcache_req_phys_addr[31:2];
-            ext_be_r <= dcache_req_be;
-            ext_burstcount_r <= 8'd1;
-            ext_write_r <= dcache_req_write;
-            ext_io_r <= dcache_req_is_io;
-            ext_inta_r <= dcache_req_is_inta;
-        end else if (ext_dcache_req) begin
-            ext_valid_r <= 1'b1;
-            ext_src_r <= EXT_SRC_DCACHE;
-            ext_addr_r <= dcache_mem_addr[31:2];
-            ext_be_r <= dcache_mem_be;
-            ext_burstcount_r <= dcache_mem_burstcount;
-            ext_write_r <= dcache_mem_write;
-            ext_io_r <= 1'b0;
-            ext_inta_r <= 1'b0;
-        end else if (ext_icache_req) begin
-            ext_valid_r <= 1'b1;
-            ext_src_r <= EXT_SRC_ICACHE;
-            ext_addr_r <= icache_mem_addr[31:2];
-            ext_be_r <= icache_mem_be;
-            ext_burstcount_r <= icache_mem_burstcount;
-            ext_write_r <= 1'b0;
-            ext_io_r <= 1'b0;
-            ext_inta_r <= 1'b0;
-        end
-
-        if (ext_dcache_accept && !dcache_mem_write)
-            dcache_rd_pending <= dcache_mem_burstcount;
-        else if (dcache_read_pending && line_resp_valid)
-            dcache_rd_pending <= 8'd0;
-        else if (dcache_read_pending && resp_valid)
-            dcache_rd_pending <= dcache_rd_pending - 8'd1;
-
-        if (ext_icache_accept)
-            icache_rd_pending <= icache_mem_burstcount;
-        else if (icache_read_pending && line_resp_valid)
-            icache_rd_pending <= 8'd0;
-        else if (icache_read_pending && resp_valid)
-            icache_rd_pending <= icache_rd_pending - 8'd1;
-
-        if (dcache_read_accept && !dcache_read_done)
-            dcache_cpu_rd_pending <= 1'b1;
-        else if (dcache_read_done)
-            dcache_cpu_rd_pending <= 1'b0;
-
-        if (icache_read_accept && !icache_read_done)
-            icache_cpu_rd_pending <= 1'b1;
-        else if (icache_read_done)
-            icache_cpu_rd_pending <= 1'b0;
-
-        if (ext_direct_accept && !ext_write_r && !resp_valid)
-            direct_rd_pending <= 1'b1;
-        else if (direct_rd_pending && resp_valid)
-            direct_rd_pending <= 1'b0;
-    end
-end
-
-l1_cache #(
-    .PROTECT_UMA_ROM(PROTECT_UMA_ROM),
-    .SET_BITS(DCACHE_SET_BITS)
-) dcache_inst (
+wire dcache_mem_line_resp_valid;
+wire dcache_mem_ready;
+wire dcache_mem_resp_valid;
+wire dcache_mem_valid;
+wire dcache_mem_write;
+wire dcache_req_is_device_mmio;
+wire [31:0] dcache_req_phys_addr;
+wire dcache_stores_drained;
+wire [31:0] icache_mem_addr;
+wire [3:0] icache_mem_be;
+wire [7:0] icache_mem_burstcount;
+wire icache_mem_line_resp_valid;
+wire icache_mem_ready;
+wire icache_mem_resp_valid;
+wire icache_mem_valid;
+wire normal_cache_req;
+wire dcache_read_pending;
+wire direct_rd_pending;
+wire ext_valid_r;
+wire icache_read_pending;
+cache_unit #(.PROTECT_UMA_ROM(PROTECT_UMA_ROM), .DCACHE_SET_BITS(DCACHE_SET_BITS), .ICACHE_SET_BITS(ICACHE_SET_BITS), .ENABLE_DEVICE_MMIO(ENABLE_DEVICE_MMIO), .DEVICE_MMIO_MASK(DEVICE_MMIO_MASK)) cache_unit_inst (
+    // Clock, reset and board configuration
     .clk(clk),
-    .reset(!reset_n),
-    .cpu_addr(dcache_cpu_addr),
-    .cpu_preread_offset(dcache_cpu_preread_offset),
-    .cpu_preread_priority(dcache_cpu_preread_priority),
-    .cpu_din(dcache_cpu_wdata),
-    .cpu_dout(dcache_cpu_dout),
-    .cpu_be(dcache_cpu_be),
-    .cpu_valid(dcache_cpu_req),
-    .cpu_write(dcache_cpu_write),
-    // I/O, INTA, x87, and VGA/device transactions are routed around this
-    // cache above, so accepted D-cache requests need no physical-address
-    // aperture decode on their register inputs.
-    .cpu_uncacheable(1'b0),
-    .cpu_ready(dcache_cpu_ready),
-    .cpu_resp_valid(dcache_cpu_resp_valid),
-    .stores_drained(dcache_stores_drained),
-    .store_patch_addr(dcache_store_patch_addr),
-    .store_patch_data(dcache_store_patch_data),
-    .store_patch_be(dcache_store_patch_be),
-    .store_patch_valid(dcache_store_patch_valid),
-    .vipt_probe_offset(dcache_vipt_probe_offset),
-    .vipt_probe_valid(dcache_vipt_probe_valid),
-    .vipt_probe_ready(dcache_vipt_probe_ready),
-    .vipt_probe_accepted(dcache_vipt_probe_accepted),
-    .vipt_probe_direct_accepted(dcache_vipt_probe_direct_accepted),
-    .vipt_resolve_phys_addr(dcache_vipt_resolve_phys_addr),
-    .vipt_resolve_valid(dcache_vipt_resolve_valid),
-    .vipt_resolve_data(dcache_vipt_resolve_data),
-    .vipt_resolve_hit(dcache_vipt_resolve_hit_cache),
-    .mem_addr(dcache_mem_addr),
-    .mem_din(dcache_mem_din),
-    .mem_dout(din),
-    .mem_line_dout(line_din),
-    .mem_be(dcache_mem_be),
-    .mem_burstcount(dcache_mem_burstcount),
-    .mem_busy(ext_valid_r || direct_rd_pending || icache_read_pending),
-    .mem_valid(dcache_mem_valid),
-    .mem_write(dcache_mem_write),
-    .mem_ready(dcache_mem_ready),
-    .mem_resp_valid(dcache_mem_resp_valid),
-    .mem_line_resp_valid(dcache_mem_line_resp_valid),
+    .reset_n(reset_n),
+    .a20_enable(a20_enable),
+    .device_mmio_enable(device_mmio_enable),
+    .device_mmio_base(device_mmio_base),
+    // Paging unit: demand data request (physical address, before A20 masking)
+    .dcache_req_valid(dcache_req_valid),
+    .dcache_req_phys_addr_raw(dcache_req_phys_addr_raw),
+    .dcache_req_preread_offset(dcache_req_preread_offset),
+    .dcache_req_preread_priority(dcache_req_preread_priority),
+    .dcache_req_write(dcache_req_write),
+    .dcache_req_be(dcache_req_be),
+    .dcache_req_wdata(dcache_req_wdata),
+    .dcache_req_is_io(dcache_req_is_io),
+    .dcache_req_is_inta(dcache_req_is_inta),
+    .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
+    // Execution core: WR_FAST store and VIPT load/RMW preread
+    .fast_store_valid(fast_store_valid),
+    .fast_store_phys_addr_raw(fast_store_phys_addr_raw),
+    .fast_store_be(fast_store_be),
+    .fast_store_wdata(fast_store_wdata),
+    .fast_store_accepted(fast_store_accepted),
+    .dcache_vipt_probe_valid(dcache_vipt_probe_valid),
+    .dcache_vipt_probe_offset(dcache_vipt_probe_offset),
+    .dcache_vipt_probe_ready(dcache_vipt_probe_ready),
+    .dcache_vipt_probe_accepted(dcache_vipt_probe_accepted),
+    .dcache_vipt_probe_direct_accepted(dcache_vipt_probe_direct_accepted),
+    .dcache_vipt_resolve_valid(dcache_vipt_resolve_valid),
+    .dcache_vipt_resolve_phys_addr_raw(dcache_vipt_resolve_phys_addr_raw),
+    .dcache_vipt_resolve_hit(dcache_vipt_resolve_hit),
+    .dcache_vipt_resolve_data(dcache_vipt_resolve_data),
+    // Paging unit: instruction line request (prefetch)
+    .icache_req_valid(icache_req_valid),
+    .icache_req_phys_addr_raw(icache_req_phys_addr_raw),
+    .icache_req_accepted(icache_req_accepted),
+    .icache_req_complete(icache_req_complete),
+    .icache_rdata(icache_rdata),
+    // Bus interface unit: request routing and D-cache CPU response
+    .x87_req_selected(x87_req_selected),
+    .normal_cache_req(normal_cache_req),
+    .dcache_req_is_device_mmio(dcache_req_is_device_mmio),
+    .dcache_req_phys_addr(dcache_req_phys_addr),
+    .dcache_cpu_ready(dcache_cpu_ready),
+    .dcache_cpu_resp_valid(dcache_cpu_resp_valid),
+    .dcache_cpu_dout(dcache_cpu_dout),
+    .dcache_stores_drained(dcache_stores_drained),
+    // Bus interface unit: line fills and write-buffer drain (KBA/KBWR/KBRD)
+    .dcache_mem_valid(dcache_mem_valid),
+    .dcache_mem_addr(dcache_mem_addr),
+    .dcache_mem_write(dcache_mem_write),
+    .dcache_mem_be(dcache_mem_be),
+    .dcache_mem_burstcount(dcache_mem_burstcount),
+    .dcache_mem_din(dcache_mem_din),
+    .dcache_mem_ready(dcache_mem_ready),
+    .dcache_mem_resp_valid(dcache_mem_resp_valid),
+    .dcache_mem_line_resp_valid(dcache_mem_line_resp_valid),
+    .icache_mem_valid(icache_mem_valid),
+    .icache_mem_addr(icache_mem_addr),
+    .icache_mem_be(icache_mem_be),
+    .icache_mem_burstcount(icache_mem_burstcount),
+    .icache_mem_ready(icache_mem_ready),
+    .icache_mem_resp_valid(icache_mem_resp_valid),
+    .icache_mem_line_resp_valid(icache_mem_line_resp_valid),
+    .ext_valid_r(ext_valid_r),
+    .direct_rd_pending(direct_rd_pending),
+    .dcache_read_pending(dcache_read_pending),
+    .icache_read_pending(icache_read_pending),
+    .din(din),
+    .line_din(line_din),
+    // External coherence (snoop invalidation)
     .snoop_addr(snoop_addr),
-    .snoop_valid(snoop_valid),
-    .cache_enable(1'b1)
+    .snoop_valid(snoop_valid)
 );
 
-l1_icache #(
-    .SET_BITS(ICACHE_SET_BITS)
-) icache_inst (
+bus_unit #(.ENABLE_X87(ENABLE_X87)) bus_unit_inst (
+    // Clock and reset
     .clk(clk),
-    .reset(!reset_n),
-    .cpu_addr(icache_req_phys_addr),
-    .cpu_line(icache_cpu_line),
-    .cpu_valid(icache_req_valid),
-    .cpu_ready(icache_cpu_ready),
-    .cpu_resp_valid(icache_cpu_resp_valid),
-    .mem_addr(icache_mem_addr),
-    .mem_dout(din),
-    .mem_line_dout(line_din),
-    .mem_be(icache_mem_be),
-    .mem_burstcount(icache_mem_burstcount),
-    .mem_busy(ext_valid_r || direct_rd_pending || dcache_read_pending ||
-              dcache_mem_valid),
-    .mem_valid(icache_mem_valid),
-    .mem_ready(icache_mem_ready),
-    .mem_resp_valid(icache_mem_resp_valid),
-    .mem_line_resp_valid(icache_mem_line_resp_valid),
-    .patch_addr(icache_write_patch_addr),
-    .patch_data(icache_write_patch_data),
-    .patch_be(icache_write_patch_be),
-    .patch_valid(icache_write_patch_valid),
-    .invalidate_addr(snoop_addr),
-    .invalidate_valid(snoop_valid),
-    .cache_enable(1'b1)
+    .reset_n(reset_n),
+    // Paging unit: demand request, cycle type and completion
+    .dcache_req_valid(dcache_req_valid),
+    .dcache_req_write(dcache_req_write),
+    .dcache_req_be(dcache_req_be),
+    .dcache_direct_wdata(dcache_direct_wdata),
+    .dcache_req_is_io(dcache_req_is_io),
+    .dcache_req_is_inta(dcache_req_is_inta),
+    .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
+    .dcache_req_is_x87(dcache_req_is_x87),
+    .dcache_req_accepted(dcache_req_accepted),
+    .dcache_req_complete(dcache_req_complete),
+    .dcache_read_complete(dcache_read_complete),
+    .dcache_rdata(dcache_rdata),
+    // Execution core: WR_FAST store in flight
+    .fast_store_valid(fast_store_valid),
+    // FPU: coprocessor data-port cycles
+    .x87_req_selected(x87_req_selected),
+    .x87_req_accepted(x87_req_accepted),
+    .x87_req_complete(x87_req_complete),
+    .x87_read_complete(x87_read_complete),
+    .x87_rdata(x87_rdata),
+    // Cache unit: request routing and D-cache CPU response
+    .normal_cache_req(normal_cache_req),
+    .dcache_req_is_device_mmio(dcache_req_is_device_mmio),
+    .dcache_req_phys_addr(dcache_req_phys_addr),
+    .dcache_cpu_ready(dcache_cpu_ready),
+    .dcache_cpu_resp_valid(dcache_cpu_resp_valid),
+    .dcache_cpu_dout(dcache_cpu_dout),
+    .dcache_stores_drained(dcache_stores_drained),
+    // Cache unit: line fills and write-buffer drain
+    .dcache_mem_valid(dcache_mem_valid),
+    .dcache_mem_addr(dcache_mem_addr),
+    .dcache_mem_write(dcache_mem_write),
+    .dcache_mem_be(dcache_mem_be),
+    .dcache_mem_burstcount(dcache_mem_burstcount),
+    .dcache_mem_din(dcache_mem_din),
+    .dcache_mem_ready(dcache_mem_ready),
+    .dcache_mem_resp_valid(dcache_mem_resp_valid),
+    .dcache_mem_line_resp_valid(dcache_mem_line_resp_valid),
+    .icache_mem_valid(icache_mem_valid),
+    .icache_mem_addr(icache_mem_addr),
+    .icache_mem_be(icache_mem_be),
+    .icache_mem_burstcount(icache_mem_burstcount),
+    .icache_mem_ready(icache_mem_ready),
+    .icache_mem_resp_valid(icache_mem_resp_valid),
+    .icache_mem_line_resp_valid(icache_mem_line_resp_valid),
+    .ext_valid_r(ext_valid_r),
+    .direct_rd_pending(direct_rd_pending),
+    .dcache_read_pending(dcache_read_pending),
+    .icache_read_pending(icache_read_pending),
+    // External bus (XA/XD)
+    .valid(valid),
+    .ready(ready),
+    .addr(addr),
+    .be(be),
+    .burstcount(burstcount),
+    .line_read(line_read),
+    .write(write),
+    .io(io),
+    .inta(inta),
+    .dout(dout),
+    .din(din),
+    .resp_valid(resp_valid),
+    .line_resp_valid(line_resp_valid)
 );
-
 endmodule

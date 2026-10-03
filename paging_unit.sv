@@ -1,4 +1,27 @@
-// Paging Unit for 80386 Processor Integrates TLB and Page Walker for address translation. Also handles DWORD-crossing splits: receives...
+// Paging unit
+//
+// US5255377 Figs. 1-3: the paging unit arbitrates the linear-address (LA) bus
+// among three requesters in fixed priority - paging itself (page-directory
+// and page-table walks), then segmentation (data references formed in D2),
+// then the prefetcher. It receives a linear address in PH2 and looks it up in
+// the TLB in the following PH1 (E.1); the page-frame bits leave on the PA bus
+// to the cache, and the low 12 bits bypass paging. The data sheet gives a
+// 32-entry four-way TLB with pseudo-LRU.
+//
+// Signal map (i486 -> RTL):
+//   requester 1: paging (walker)             paging_walker walker_inst, walk_request (internal)
+//   requester 2: segmentation (demand)       mem_req, linear_addr, mem_* ; VIPT preread vipt_*
+//   requester 3: prefetcher                  pf_req_toggle, pf_linear_addr, pf_ack_toggle, pf_rdata
+//   arbitration                              walk in progress owns the port; in PG_IDLE a demand
+//                                            request is taken before a pending prefetch (idle_pf_req)
+//   TLB (E.1)                                paging_tlb tlb_inst; sidecar VIPT TLB for D2 prereads
+//   PA bus (+ page offset) to the cache      dcache_req_* / icache_req_*
+//   page fault to control                    page_fault, fault_code, cr2_out
+//
+// FPGA deviations: a D2 VIPT preread of a sidecar TLB lets one-clock loads
+// start before the authoritative lookup; prefetch uses a toggle handshake;
+// the unit also splits DWORD-crossing accesses. There is no registered
+// LA-bus replay slot (doc/z486/i486_lessons.md item 5).
 // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-1
 
 `include "z486_platform.svh"
@@ -20,7 +43,7 @@ module paging_unit
     output              invlpg_ack,
 
     //=========================================================================
-    // Memory/IO request from z486.sv
+    // LA bus, requester 2 (segmentation, E stage): demand memory/IO request
     //=========================================================================
     input               mem_req,           // Valid: memory/IO request pending
     input               mem_inta_req,      // INTA request; kept out of the demand TLB/cache cone
@@ -77,7 +100,7 @@ module paging_unit
     input        [31:0] fast_opr_data,
 
     //=========================================================================
-    // Prefetch request (toggle protocol)
+    // LA bus, requester 3 (prefetcher, lowest priority): line request (toggle protocol)
     //=========================================================================
     input               pf_req_toggle,
     output              pf_ack_toggle,
@@ -89,7 +112,7 @@ module paging_unit
     output reg   [31:0] pf_fault_addr,     // Linear address of faulted prefetch
 
     //=========================================================================
-    // Demand-side physical request interface
+    // PA bus to the cache unit: demand side (and walker PDE/PTE traffic)
     //=========================================================================
     output logic        dcache_req_valid,     // Demand/page-walk/IO request valid
     `Z486_REPLICATE
@@ -114,7 +137,7 @@ module paging_unit
     input        [31:0] dcache_rdata,         // Demand-side read data
 
     //=========================================================================
-    // Instruction-prefetch physical request interface
+    // PA bus to the cache unit: prefetch side
     //=========================================================================
     output logic        icache_req_valid,     // Prefetch request valid
     output logic [31:0] icache_req_phys_addr, // Prefetch physical address
@@ -141,11 +164,14 @@ localparam bit TRACE_MEM_EN    = 1'b0;
 localparam bit TRACE_PAGING_EN = 1'b0;
 
 reg pf_ack_toggle_r;
-reg [127:0] pf_rdata_r;       // Registered read line for prefetch
 reg         pf_fast_pending;  // TLB-hit icache request, independent of demand FSM
 wire pf_ack_bypass;
 assign pf_ack_toggle = pf_ack_toggle_r ^ pf_ack_bypass;
-assign pf_rdata = pf_ack_bypass ? icache_rdata : pf_rdata_r;
+// Every line response acknowledges through the bypass in its completion
+// cycle, and the prefetcher samples pf_rdata only on an ack edge; the other
+// acks (queued redirects, faults) carry no data. So the live icache line is
+// the only value ever consumed, and no registered copy is kept.
+assign pf_rdata = icache_rdata;
 
 wire pf_pending  = (pf_req_toggle != pf_ack_toggle_r);
 
@@ -660,7 +686,6 @@ always_ff @(posedge clk or negedge reset_n) begin
         mem_servicing <= 1'b0;
         mem_accepted_r <= 1'b0;
         pf_ack_toggle_r <= 1'b0;
-        pf_rdata_r <= 128'h0;
         pf_fast_pending <= 1'b0;
         dcache_req_valid_r <= 1'b0;
         dcache_req_is_io_r <= 1'b0;
@@ -735,7 +760,6 @@ always_ff @(posedge clk or negedge reset_n) begin
         if (fast_pf_candidate && icache_req_accepted)
             pf_fast_pending <= 1'b1;
         if (pf_fast_pending && icache_req_complete) begin
-            pf_rdata_r <= icache_rdata;
             pf_ack_toggle_r <= ~pf_ack_toggle_r;
             pf_fast_pending <= 1'b0;
         end
@@ -1069,7 +1093,6 @@ always_ff @(posedge clk or negedge reset_n) begin
 
             PG_PF_BIU_WAIT: begin
                 if (icache_req_complete) begin
-                    pf_rdata_r <= icache_rdata;           // latch read data
                     pf_ack_toggle_r <= ~pf_ack_toggle_r; // registered ack
                     state <= PG_IDLE;
                 end

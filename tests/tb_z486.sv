@@ -212,12 +212,12 @@ module tb_z486 #(
             #1;
             k = 0;
             while (k < 64 &&
-                   (dut.memory_inst.dcache_inst.storeq_count != 0 ||
-                    dut.memory_inst.dcache_inst.storeq_draining ||
-                    dut.memory_inst.dcache_inst.mem_valid_r ||
-                    dut.memory_inst.dcache_direct_req ||
+                   (dut.memory_inst.cache_unit_inst.dcache_inst.storeq_count != 0 ||
+                    dut.memory_inst.cache_unit_inst.dcache_inst.storeq_draining ||
+                    dut.memory_inst.cache_unit_inst.dcache_inst.mem_valid_r ||
+                    dut.memory_inst.bus_unit_inst.dcache_direct_req ||
                     (dut.memory_inst.ext_valid_r &&
-                     dut.memory_inst.ext_write_r))) begin
+                     dut.memory_inst.bus_unit_inst.ext_write_r))) begin
                 @(posedge clk);
                 #1;
                 k++;

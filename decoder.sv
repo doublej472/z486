@@ -1,4 +1,27 @@
-// Z486 Instruction Decoder
+// Instruction decoder: D1 decode and D2 execution set-up.
+//
+// US5293592 Figs. 2, 5, 6: decoder 31 (a PLA) always receives three bytes on
+// K1Q; code control 36 steps K1P past the whole instruction and sets K2P to
+// its literal; latches 35 hold the first microinstruction's controls and the
+// ROM entry point; execution set-up stage 34 (the D2 controller) works on the
+// preceding instruction while D1 decodes this one. Pipeline control 37 adds
+// one D1 clock per prefix and for 0F. US5390311 gives the entry-point PLA.
+//
+// Signal map (patent -> RTL):
+//   decoder 31 (D1 PLA) on K1Q            build_struct_work(), struct_len on k1q
+//   code control 36: K1P / K2P            k1p_adv, k1p_preread_adv / k2p_off, pop_now, pop_len
+//   entry-point PLA (US5390311)           entry_rom (preread on k1q_early), d1_issue_entry_point
+//   latches 35 (D1 -> D2 boundary)        the skeleton register (skel_*)
+//   execution set-up stage 34 (D2)        literal capture phases A/B -> d2_entry, d2_push
+//   prefix / 0F extra D1 clocks           prefix state before the skeleton
+//   IWORD to control                      i_bus (D2 entry), i_bus2 (skid successor)
+//
+// Stages: banners below mark D1 (structural decode), the D1->D2 skeleton
+// register, and D2 (literal capture and entry resolution). The hardwired
+// first microinstructions (the patent's decoder-supplied first lines) are in
+// hardwired_control.sv. Deviations: K1Q is an 8-byte window so D1 finds the
+// full structural length in one clock; the entry ROM is an M10K read one
+// cycle ahead on k1q_early; a one-entry skid (i_bus2) decouples D1 from D2.
 
 `include "z486_platform.svh"
 module decoder
@@ -8,16 +31,16 @@ module decoder
     input               reset_n,
 
     // Prefetch queue interface (two-cursor protocol)
-    input        [63:0] win_d1,         // registered raw window at the D1 cursor
-    input        [63:0] win_d1_early,   // speculative next window for entry-ROM preread
-    input        [5:0]  d1_avail,       // bytes fetched beyond the D1 cursor
-    output       [3:0]  d1_adv,         // D1 cursor advance (0-11 bytes: a prefix,
+    input        [63:0] k1q,            // registered raw window at the D1 cursor
+    input        [63:0] k1q_early,      // speculative next window for entry-ROM preread
+    input        [5:0]  k1q_avail,      // bytes fetched beyond the D1 cursor
+    output       [3:0]  k1p_adv,        // D1 cursor advance (0-11 bytes: a prefix,
                                         //   or the whole rest of the instruction
                                         //   at handoff - struct AND literal bytes)
-    output       [3:0]  d1_preread_adv, // structural advance without D2 backpressure
-    input        [31:0] win_lit,        // 4 bytes at pop_cursor + lit_off
-    input        [5:0]  lit_avail,      // bytes fetched beyond that point
-    output       [4:0]  lit_off,        // literal offset from the pop cursor
+    output       [3:0]  k1p_preread_adv,// structural advance without D2 backpressure
+    input        [31:0] k2q,            // 4 bytes at pop_cursor + k2p_off
+    input        [5:0]  k2q_avail,      // bytes fetched beyond that point
+    output       [4:0]  k2p_off,        // literal offset from the pop cursor
     output              pop_now,        // instruction completed D2: pop its bytes
     output       [4:0]  pop_len,        //   (registered length from the skeleton)
 
@@ -100,17 +123,17 @@ reg            skid_raw_valid_r;
 
 // Byte aliases at the D1 cursor.  The cursor does not advance until the
 // skeleton handoff, so during the SIB sub-cycle the sib byte is byte 2.
-wire [7:0] opcode = win_d1[7:0];
-wire [7:0] modrm  = win_d1[15:8];
-wire [7:0] sib_b  = win_d1[23:16];
+wire [7:0] opcode = k1q[7:0];
+wire [7:0] modrm  = k1q[15:8];
+wire [7:0] sib_b  = k1q[23:16];
 wire       data32 = code32_r ^ prefix_66;
 wire       addr32 = code32_r ^ prefix_67;
 wire [15:0] entry_rom_sel;
 
 wire consume_prefix = !d1_sib && !prefix_0f && is_prefix(opcode) &&
-                      (d1_avail >= 6'd1);
+                      (k1q_avail >= 6'd1);
 wire consume_0f     = !d1_sib && !prefix_0f && (opcode == 8'h0f) &&
-                      (d1_avail >= 6'd1);
+                      (k1q_avail >= 6'd1);
 
 decoder_work_t struct_work;
 logic [2:0]    struct_len;
@@ -123,10 +146,10 @@ wire [45:0] struct_work_inputs = {
 };
 always_comb build_struct_work(struct_work_inputs, struct_work, struct_len);
 
-wire struct_bytes_ok = !d1_sib && (d1_avail >= {3'b000, struct_len});
-wire sib_bytes_ok    = d1_sib && (d1_avail >= 6'd3);   // opcode+modrm+sib in view
+wire struct_bytes_ok = !d1_sib && (k1q_avail >= {3'b000, struct_len});
+wire sib_bytes_ok    = d1_sib && (k1q_avail >= 6'd3);   // opcode+modrm+sib in view
 
-// skel_free: d2_done's terms are lit_avail / out_full / phase - all
+// skel_free: d2_done's terms are k2q_avail / out_full / phase - all
 // register-derived, never i_issue (L1) - so the same-edge free is legal.
 wire d2_done;
 wire d1_slot_ready = !skid_v || i_issue;
@@ -161,7 +184,7 @@ always_comb begin
     end
 end
 
-wire [9:0] entry_rom_addr = {win_d1_early[7:0],
+wire [9:0] entry_rom_addr = {k1q_early[7:0],
                              prefix_rep_early, prefix_0f_early};
 `Z486_BLOCK_RAM reg [63:0] entry_rom [0:1023];
 initial $readmemh("pla_entry_rom.hex", entry_rom);
@@ -178,7 +201,7 @@ always_ff @(posedge clk or negedge reset_n) begin
     end else begin
         if (entry_rom_use_q_r)
             entry_rom_hold_r <= entry_rom_q;
-        entry_rom_use_q_r <= q_flush || (d1_adv == d1_preread_adv);
+        entry_rom_use_q_r <= q_flush || (k1p_adv == k1p_preread_adv);
     end
 end
 wire [63:0] entry_rom_current = entry_rom_use_q_r
@@ -247,7 +270,7 @@ wire [4:0] handoff_lit_off = handoff_work.entry.length -
 // D1 cursor advance at handoff: the whole REST of the instruction (struct
 // bytes AND the literal bytes D2 will capture), so the cursor lands on the
 // next instruction's first byte.  It may pass not-yet-fetched literal
-// bytes; d1_avail clamps to 0 in that case and D1 waits for the fill.
+// bytes; k1q_avail clamps to 0 in that case and D1 waits for the fill.
 wire [4:0] handoff_adv = handoff_work.entry.length -
                          {1'b0, prefix_count} - (prefix_0f ? 5'd1 : 5'd0);
 // Prefix and 0F bytes have already advanced the D1 cursor. Relative to the
@@ -263,14 +286,14 @@ wire [3:0] handoff_lit_size = {1'b0, handoff_work.lit1_size} +
                               {1'b0, handoff_work.lit2_size};
 wire handoff_one_d2 = (handoff_work.lit2_kind == LIT_NONE ||
                        handoff_lit_size <= 4'd4) &&
-                      (d1_avail >= {1'b0, handoff_adv});
+                      (k1q_avail >= {1'b0, handoff_adv});
 wire [3:0] handoff_raw_need = (handoff_work.lit2_kind == LIT_NONE ||
                                handoff_lit_size <= 4'd4)
                             ? handoff_lit_size
                             : {1'b0, handoff_work.lit1_size};
 wire [5:0] handoff_raw_end = {1'b0, handoff_raw_lit_off_w} +
                              {2'b00, handoff_raw_need};
-wire handoff_raw_valid = (d1_avail >= handoff_raw_end);
+wire handoff_raw_valid = (k1q_avail >= handoff_raw_end);
 // Launch the synchronous ROM as soon as structural decode owns an empty D2.
 // D2 holds the returned word while late or second literals are captured.
 assign d1_issue_direct = d1_handoff && !skel_v;
@@ -280,10 +303,10 @@ always_comb begin
 end
 
 // TIMING: no !q_flush in the advance/pop legs. q_flush carries the deep uc_exec/mem-block cone
-assign d1_adv = (consume_prefix || consume_0f) ? 4'd1 :
+assign k1p_adv = (consume_prefix || consume_0f) ? 4'd1 :
                 d1_handoff ? handoff_adv[3:0] :
                 4'd0;
-assign d1_preread_adv = (consume_prefix || consume_0f) ? 4'd1 :
+assign k1p_preread_adv = (consume_prefix || consume_0f) ? 4'd1 :
                         d1_preread_handoff ? handoff_adv[3:0] :
                         4'd0;
 
@@ -370,8 +393,8 @@ always_ff @(posedge clk or negedge reset_n) begin
 
         if (d1_handoff) begin
             d1_sib <= 1'b0;
-            skid_raw_lo_r <= win_d1[31:0];
-            skid_raw_hi_r <= win_d1[63:32];
+            skid_raw_lo_r <= k1q[31:0];
+            skid_raw_hi_r <= k1q[63:32];
             skid_raw_lit_off_r <= handoff_raw_lit_off;
             skid_raw_valid_r <= handoff_raw_valid;
             // The skeleton carries the prefix state; clear for the next one.
@@ -445,7 +468,7 @@ wire prefetch_fieldB = skel_v && d2_window_valid && !d2_phaseB &&
 wire [4:0] resident_lit_off = skel_lit_off +
                               ((d2_phaseB || prefetch_fieldB)
                                   ? {2'b00, sizeA} : 5'd0);
-assign lit_off = resident_lit_off;
+assign k2p_off = resident_lit_off;
 
 // D1 carries raw bytes, not parsed literals. D2 selects the literal start from
 // the registered window; the second field uses the live literal port only when
@@ -477,7 +500,7 @@ wire       finishing = d2_phaseB || skel.fields_fit;
 wire [3:0] need_now  = d2_phaseB ? {1'b0, sizeB} :
                        !has_litA ? 4'd0 :
                        skel.fields_fit ? sizeAB : {1'b0, sizeA};
-wire       bytes_ok  = (lit_avail >= {2'b00, need_now});
+wire       bytes_ok  = (k2q_avail >= {2'b00, need_now});
 wire       d2_can    = skel_v && d2_window_valid;
 wire       d2_complete = d2_can && finishing;
 assign     d2_done   = i_issue;
@@ -533,17 +556,17 @@ always_ff @(posedge clk or negedge reset_n) begin
         skel_window_valid_r <= skid_raw_valid_r;
         skel_window_raw_r <= 1'b1;
     end else if (promote_handoff_capture) begin
-        skel_lit_r <= win_d1[31:0];
-        skel_raw_hi_r <= win_d1[63:32];
+        skel_lit_r <= k1q[31:0];
+        skel_raw_hi_r <= k1q[63:32];
         skel_raw_lit_off_r <= handoff_raw_lit_off;
         skel_window_valid_r <= handoff_raw_valid;
         skel_window_raw_r <= 1'b1;
     end else if (d2_stepA) begin
-        skel_lit_r <= win_lit;
-        skel_window_valid_r <= (lit_avail >= {3'b000, sizeB});
+        skel_lit_r <= k2q;
+        skel_window_valid_r <= (k2q_avail >= {3'b000, sizeB});
         skel_window_raw_r <= 1'b0;
     end else if (d2_late_capture) begin
-        skel_lit_r <= win_lit;
+        skel_lit_r <= k2q;
         skel_window_valid_r <= 1'b1;
         skel_window_raw_r <= 1'b0;
     end else if (d2_done) begin
@@ -627,7 +650,7 @@ always @(posedge clk) begin
     if (D1_EVT && d1_handoff)
         $display("%0t D1HO op=%02x modrm=%02x len=%0d adv=%0d(sib=%b slen=%0d) litoff=%0d A=%0d/%0d B=%0d/%0d pcnt=%0d 0f=%b",
                  $time, handoff_work.entry.opcode, handoff_work.entry.modrm,
-                 handoff_work.entry.length, d1_adv, d1_sib, struct_len,
+                 handoff_work.entry.length, k1p_adv, d1_sib, struct_len,
                  handoff_lit_off, handoff_work.lit1_kind, handoff_work.lit1_size,
                  handoff_work.lit2_kind, handoff_work.lit2_size,
                  prefix_count, prefix_0f);
@@ -641,11 +664,11 @@ always @(posedge clk) begin
         $fatal(1, "D1: raw literal offset exceeds opcode window: off=%0d op=%02x",
                handoff_raw_lit_off_w, handoff_work.entry.opcode);
     // The literal plan must tile the instruction exactly: pop_len bytes =
-    // struct bytes (lit_off) + literal bytes.
+    // struct bytes (k2p_off) + literal bytes.
     if (reset_n && skel_v &&
         ({1'b0, skel.entry.length} !==
          {1'b0, skel_lit_off} + {3'b000, skel.lit1_size} + {3'b000, skel.lit2_size}))
-        $fatal(1, "D2: literal plan does not tile: len=%0d lit_off=%0d A=%0d B=%0d",
+        $fatal(1, "D2: literal plan does not tile: len=%0d k2p_off=%0d A=%0d B=%0d",
                skel.entry.length, skel_lit_off, skel.lit1_size, skel.lit2_size);
     if (reset_n && d2_phaseB && !skel_v)
         $fatal(1, "D2: phase B with no skeleton");

@@ -1,32 +1,97 @@
-// Integer Data Unit. Owns integer register state, source/destination selection,
-// arithmetic engines, and architectural/microcode flags.
+// Main datapath
+//
+// Fu/Saini/Gelsinger Fig. 1: the register file, ALU, barrel shifter and
+// flags, joined to the cache by the two 32-bit data buses and to
+// segmentation by the base/index bus. US5142635 Figs. 2-5 detail it: the
+// register file reads base/index onto the I bus in D2 (one clock ahead of
+// E data reads), results write back in WB, and "shorters" bypass a result to
+// E or D2 before it is written. The same patent's stack engine keeps ESP, an
+// advanced ASP and a shadow SSP with a dedicated stack-pointer adder on the J
+// bus.
+//
+// Signal map (i486 -> RTL):
+//   register file (DREG), 3 read / 1 write     eax..edi, read_gpr_value(), write_gpr
+//   I bus base/index read (D2)                 ea_base/ea_index -> ea_base_value/ea_index_value
+//   ALU / barrel shifter / multiply-divide     alu_inst / shifter_inst / mul_div_inst
+//   ALU latch, write-back value                sigma, alu_result, shift_result
+//   R bus memory operand, write data           opr_r / opr_w, memory_write_source_value
+//   shorters: WB -> E / D2 bypass              dly_gpr_forward (RNI delay slot), load_wb_* (VIPT load),
+//                                              eflags_fwd (flags), branch_condition_true (Jcc)
+//   stack engine (ispval, SPADD)               stack_op/stack_dir -> sigma = ESP +/- 2/4 at instr_start
+//   flags                                      eflags, uc_flags, flags_backup (386 microcode FLAGSB)
+//
+// Stages: operand reads and ALU/shift in E; results commit on the E commit
+// edge (z486 has no general WB stage) except deferred load/shift commits
+// (recipe_memory_write / recipe_shift_write). Deviation: ESP is ordinary
+// register-file state, without the i486's ASP/SSP stack engine.
 `include "z486_platform.svh"
 module data_unit
     import z486_pkg::*;
 (
+    // Clock and reset
     input  logic        clk,
     input  logic        reset_n,
 
+    // Microsequencer: current microword fields and E-stage enables
     input  logic        exec,                   // Execute the current micro-op
     input  logic        shift_exec,             // Execute registered shift control
+    input  logic        pipeline_advance,        // Advance deferred flag state
+    input  logic        repeat_active,
+    input  logic [6:0]  aluop,
+    input  logic [4:0]  alu_operation,
+    input  logic        update_arch_flags,
+    input  logic        update_carry,
+    input  logic [6:0]  dest,
+    input  logic [5:0]  source_field,
+    input  logic [5:0]  source_live,             // Timing-selected live source field
+    input  logic [5:0]  alu_source,
+    input  logic [5:0]  alu_source_live,          // Timing-selected live ALU source
+    input  logic        fpu_f8,
+    input  logic [6:0]  shift_aluop,             // ROM-early ALU/jump field for shifter
+    input  logic [1:0]  shift_sigma_sel,         // Registered barrel SIGMA selector
+    input  logic [3:0]  shift_source_class,      // Predecoded shifter source class
+    input  logic [1:0]  shift2_source,           // Predecoded SHIFT2 source
+    input  logic        shift_is_shift2,         // Registered ROM SHIFT2 decode
+    input  logic        shift2_capture_ce,       // Advance q_mem -> q operand capture
+    input  logic        shift2_next_valid,       // q_mem word is SHIFT2
+    input  logic [1:0]  shift2_next_source,      // q_mem SHIFT2 source class
+    input  logic        shift_uc_carry,          // BSR loop needs carry immediately
+
+    // Event control: instruction lifecycle, faults and interrupt delivery
     input  logic        instr_start,            // First cycle of a new instruction
+    input  logic        uc_active,
     input  logic        halted,
     input  logic        ifetch_page_fault,
     input  logic        interrupt_entry,
-    input  logic        repeat_active,
+    input  logic        any_fault,
     input  logic        clear_rf,
-    input  logic        pipeline_advance,        // Advance deferred flag state
+    input  logic        gate_detect,
+    output logic        flags_backup_active,
+
+    // Decoder: EX and D2 instruction, operand sizes, stack-operation class (ispval)
+    input  dec_entry_t  instr,
+    input  dec_entry_t  next_instr,              // D2 instruction for setup lookahead
+    input  logic [1:0]  op_size,
+    input  logic [1:0]  srcreg_size,
+    input  logic [1:0]  op_size_src,             // Source-mux operand size
+    input  logic [1:0]  srcreg_size_src,          // Source-mux register size
+    input  logic        is_dword,
+    input  logic        is_signed_mul,
     input  logic        stack_op,
     input  logic        stack_dir,
     input  logic        stack_data32,
     input  logic        stack32,
-    input  logic        gate_detect,
-    input  logic        any_fault,
-    input  logic        uc_active,
+
+    // Hardwired control: recipe state and deferred recipe commits
     input  logic        recipe_rni,               // Current recipe uStep contains RNI
     input  recipe_state_t recipe_state,           // Latched hardwired recipe
     input  logic        hardwired_off,
     input  logic        recipe_commit_cancel,     // Cancel deferred recipe commit
+    output recipe_pending_write_t recipe_shift_write, // Deferred shift GPR commit
+    output logic [31:0] recipe_shift_data,          // Deferred shift result
+    output recipe_pending_write_t recipe_memory_write, // Deferred load GPR commit
+
+    // Load pipeline: registered VIPT load write-back into the register file
     input  logic        load_wb_valid,             // Registered VIPT load WB
     input  logic [2:0]  load_wb_dst,
     input  logic [1:0]  load_wb_size,
@@ -38,47 +103,21 @@ module data_unit
     input  logic [1:0]  load_alu_dst_capture_size,
     input  logic [31:0] load_alu_dst_capture_data,
 
-    input  logic [6:0]  aluop,
-    input  logic [4:0]  alu_operation,
-    input  logic [6:0]  shift_aluop,             // ROM-early ALU/jump field for shifter
-    input  logic [1:0]  shift_sigma_sel,         // Registered barrel SIGMA selector
-    input  logic [6:0]  dest,
-    input  logic [5:0]  source_field,
-    input  logic [5:0]  source_live,             // Timing-selected live source field
-    input  logic [5:0]  alu_source,
-    input  logic [5:0]  alu_source_live,          // Timing-selected live ALU source
-    input  logic        fpu_f8,
-    input  logic [3:0]  shift_source_class,      // Predecoded shifter source class
-    input  logic [1:0]  shift2_source,           // Predecoded SHIFT2 source
-    input  logic        shift_is_shift2,         // Registered ROM SHIFT2 decode
-    input  logic        shift2_capture_ce,       // Advance q_mem -> q operand capture
-    input  logic        shift2_next_valid,       // q_mem word is SHIFT2
-    input  logic [1:0]  shift2_next_source,      // q_mem SHIFT2 source class
-    input  logic        shift_uc_carry,          // BSR loop needs carry immediately
-    input  logic [1:0]  op_size,
-    input  logic [1:0]  srcreg_size,
-    input  logic [1:0]  op_size_src,             // Source-mux operand size
-    input  logic [1:0]  srcreg_size_src,          // Source-mux register size
-    input  logic        update_arch_flags,
-    input  logic        update_carry,
+    // Shorters (US5142635): bypasses around the register file
+    input  gpr_forward_t dly_gpr_forward,        // RNI-delay GPR bypass
+    output logic [31:0] eflags_fwd,               // Current-cycle flag forwarding
+    output logic        branch_condition_true,    // Selected forwarded Jcc condition
 
-    input  dec_entry_t  instr,
-    input  dec_entry_t  next_instr,              // D2 instruction for setup lookahead
-    input  logic        pe,
-    input  logic [1:0]  cpl,
-    input  logic        is_dword,
-    input  logic        is_signed_mul,
-    input  logic [31:0] eip,
-    input  logic [31:0] cr0,
-    input  logic [31:0] cr2,
-    input  logic [31:0] tmpeip,
-    input  logic [31:0] tmpesp,
-    input  logic [31:0] dr6,
-    input  logic [31:0] dr7,
-    input  logic [31:0] slctr,
-    input  logic [31:0] protun,
+    // Segmentation: I-bus base/index reads and address registers
+    input  gpr_ref_t    ea_base,                 // Address-unit base GPR reference
+    input  gpr_ref_t    ea_index,                // Address-unit index GPR reference
+    output logic [31:0] ea_base_value,            // Base GPR value for address unit
+    output logic [31:0] ea_index_value,           // Index GPR value for address unit
+    input  logic [31:0] forwarded_esp,           // ESP including pending stack update
     input  logic [31:0] ind,
     input  logic [31:0] ea,
+
+    // Segmentation and protection: selectors, descriptor and protection sources
     input  logic [15:0] es,
     input  logic [15:0] cs,
     input  logic [15:0] ss,
@@ -88,20 +127,30 @@ module data_unit
     input  logic [15:0] ldtr,
     input  logic [15:0] tr,
     input  logic [2:0]  seg_reg_sel,
-    input  logic [31:0] forwarded_esp,           // ESP including pending stack update
     input  logic [31:0] desc_raw_hi,
+    input  logic [31:0] slctr,
+    input  logic [31:0] protun,
+    input  logic        pe,
+    input  logic [1:0]  cpl,
+    output logic [31:0] protection_source_value, // Source value for protection unit
+    output logic        protection_source_low16_nonzero,
+    output logic [15:0] cs_source_value,          // Source value for CS updates
+
+    // Cache and bus unit: memory operand in (R bus) and write data out
     input  logic [31:0] opr_r,
-    input  gpr_ref_t    ea_base,                 // Address-unit base GPR reference
-    input  gpr_ref_t    ea_index,                // Address-unit index GPR reference
-    input  gpr_forward_t dly_gpr_forward,        // RNI-delay GPR bypass
-    output logic [31:0] sigma,
-    output logic [31:0] countr,
-    output logic [31:0] alu_src_hold,             // Registered ALU source operand
-    output logic [31:0] source_value_live,        // Selected microcode source value
-    output logic [31:0] memory_write_source_value,// Narrow source mux for WR W
-    output logic [31:0] alu_source_value_live,    // Selected ALU-source value
-    output logic [31:0] dest_value,
-    output logic [31:0] alu_src,
+    output logic [31:0] opr_w,
+    output logic [31:0] memory_write_source_value, // Narrow source mux for WR W
+
+    // Control registers and restart state read as microcode sources
+    input  logic [31:0] eip,
+    input  logic [31:0] cr0,
+    input  logic [31:0] cr2,
+    input  logic [31:0] dr6,
+    input  logic [31:0] dr7,
+    input  logic [31:0] tmpeip,
+    input  logic [31:0] tmpesp,
+
+    // Register file, internal registers and flags (datapath state)
     output logic [31:0] eax,
     output logic [31:0] ecx,
     output logic [31:0] edx,
@@ -112,27 +161,22 @@ module data_unit
     output logic [31:0] edi,
     output logic [31:0] tmpc,
     output logic [31:0] tmpg,
-    output logic [31:0] opr_w,
-    output logic [31:0] protection_source_value, // Source value for protection unit
-    output logic        protection_source_low16_nonzero,
-    output logic [15:0] cs_source_value,          // Source value for CS updates
-    output logic [31:0] ea_base_value,            // Base GPR value for address unit
-    output logic [31:0] ea_index_value,           // Index GPR value for address unit
+    output logic [31:0] countr,
     output logic [31:0] eflags,
     output logic [31:0] uc_flags,
     output logic [31:0] flags_backup,
-    output logic        flags_backup_active,
-    output logic [31:0] eflags_fwd,               // Current-cycle flag forwarding
-    output logic        branch_condition_true,    // Selected forwarded Jcc condition
 
-    output recipe_pending_write_t recipe_shift_write, // Deferred shift GPR commit
-    output logic [31:0] recipe_shift_data,          // Deferred shift result
-    output recipe_pending_write_t recipe_memory_write, // Deferred load GPR commit
-
+    // E-stage results
+    output logic [31:0] sigma,
+    output logic [31:0] alu_result,
+    output logic [31:0] shift_result,
     output logic [31:0] muldiv_result,
     output logic        div_overflow,
-    output logic [31:0] alu_result,
-    output logic [31:0] shift_result
+    output logic [31:0] alu_src,
+    output logic [31:0] alu_src_hold,             // Registered ALU source operand
+    output logic [31:0] source_value_live,        // Selected microcode source value
+    output logic [31:0] alu_source_value_live,    // Selected ALU-source value
+    output logic [31:0] dest_value
 );
 
 logic [31:0] alu_dst;
@@ -648,12 +692,13 @@ always_comb begin
                       : read_source(source_live);
     memory_write_source_value = read_memory_write_source(source_live);
     alu_source_value_live = read_alu_source(alu_source_live);
-    alu_dst = source_field == SRC_MDTMP ? muldiv_result :
-              source_is_factored_gpr(source_field)
-            ? read_factored_gpr_source(source_field)
-            : read_source(source_field);
+    // source_field is a timing replica of source_live (both load from the
+    // same ROM word on the same enable), so one source tree serves both.
+    alu_dst = source_value_live;
     dest_value = alu_dst;
-    alu_src = fpu_f8 ? 32'h8000_00f8 : read_alu_source(alu_source);
+    // alu_source is a timing replica of alu_source_live (same ROM field,
+    // same load enable), so the ALU source shares the live tree.
+    alu_src = fpu_f8 ? 32'h8000_00f8 : alu_source_value_live;
     protection_source_value = read_protection_source(source_live,
                                                      source_value_live);
     protection_source_low16_nonzero = |protection_source_value[15:0];

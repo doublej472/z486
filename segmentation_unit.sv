@@ -1,4 +1,28 @@
-// Segmentation Unit for z486 This contains: - Descriptor Cache array (ES/CS/SS/DS/FS/GS/IDT/TR/LDT/GDT) - Segment selection and address...
+// Segmentation unit (i486 "S" unit).
+//
+// Fu/Saini/Gelsinger Fig. 1 places the descriptor registers, the "limit and
+// attribute PLA" and address formation in one segmentation unit.
+// US5204953 Figs. 1-2 put both adders there: a two-input effective-address
+// adder (latches 15 + 16) and a three-input linear-address adder (15 + 16 +
+// segment base 17) working in parallel in D2.2; E checks the effective
+// address for limit and access rights. US5201043 adds alignment checking.
+//
+// Signal map (patent -> RTL):
+//   descriptor registers, segment base 17      desc_cache[], seg_base_for()
+//   limit and attribute PLA (E check)          seg_limit_r, base_diff, seg_fault
+//   ISLA / IESSEG (D1.2 early-start controls)  address_unit d2_start / d2_ea, init_* (INIT_SEG)
+//   latches 15/16, EA adder 14                 address_unit_inst: ea_base/ea_index/displacement -> issue_ea
+//   three-input LA adder 12, LA bus (D2.2)     address_unit_inst: issue_linear (issue_seg_base + EA)
+//   CSLA/DCIMD multi-address sequencing (E)    address_unit_inst: IND, ind_delta, ind_linear
+//   GSBR bus-cycle spec                        seg_sel, is_dtable, descsw_mode
+//   SINTR alignment fault                      (not implemented; 386 microcode has no #AC)
+//
+// Stages: D2 forms the EA and LA for the issuing instruction (address_unit
+// issue_* ports); E runs the microcode IND sequence and the limit check. There
+// is no general WB stage; descriptor loads commit in the E commit edge.
+// FPGA deviations: the E-stage relocation is registered (ind_linear) rather
+// than re-added per access, and the limit check subtracts from the registered
+// limit to keep access_size off the 32-bit path.
 // Details: doc/z486/implementation_notes.md#src-24-z486-segmentation-unit-sv-1
 module segmentation_unit
     import z486_pkg::*;
@@ -56,7 +80,56 @@ module segmentation_unit
     output     [31:0]  seg_base_exec,      // Pending base excluding issue-only INIT_SEG
     output             eff_mask_exec,      // Pending mask excluding issue-only INIT_SEG
     output             seg_fault,          // Segment limit/protection fault
-    output             is_stack_fault      // Fault is on SS (→ #SS not #GP)
+    output             is_stack_fault,     // Fault is on SS (→ #SS not #GP)
+
+    // Decoder D2: issuing instruction, EA recipe, displacement and D2 segment base (ISLA/IESSEG, K2Q)
+    input  logic au_instr_issue,
+    input  dec_entry_t au_instr,
+    input  logic au_d2_start,
+    input  ea_dec_t au_d2_ea,
+    input  logic au_split_ea_prepare,
+    input  logic au_split_ea_use,
+    input  logic [2:0] au_split_ea_adjust,
+    input  logic [31:0] au_displacement,
+    input  logic au_branch_relative,
+    input  logic [31:0] au_branch_target_eip,
+    input  logic [31:0] au_issue_seg_base,
+    input  logic au_issue_eff_mask,
+
+    // Datapath: I-bus base/index reads and E-stage operands
+    output gpr_ref_t au_ea_base,
+    output gpr_ref_t au_ea_index,
+    input  logic [31:0] au_ea_base_value,
+    input  logic [31:0] au_ea_index_value,
+    input  logic [31:0] au_forwarded_esp,
+    input  logic [31:0] au_source_value,
+    input  logic [31:0] au_alu_value,
+    input  logic [31:0] au_alu_value_hold,
+    input  logic au_is_dword,
+
+    // Microsequencer: E-stage IND control
+    input  logic au_exec,
+    input  logic au_exec_addr32,
+    input  logic [5:0] au_alu_source,
+    input  logic [8:0] au_ind_ctrl,
+    input  logic au_instr_jcc,
+
+    // Paging and control registers: fault readback
+    input  logic [2:0] au_fault_code,
+    input  logic [31:0] au_fault_addr,
+    input  logic [31:0] au_cr3,
+
+    // LA bus to paging and cache
+    output logic [31:0] au_issue_linear,
+    output logic [1:0] au_issue_linear_low,
+    output logic [31:0] au_ind_linear,
+    output logic au_ind_linear_valid,
+
+    // EA bus and IND to control and datapath
+    output logic [31:0] au_issue_ea,
+    output logic [31:0] au_ea,
+    output logic [31:0] au_ind,
+    output logic [31:0] au_ind_delta
 );
 
 reg [3:0]   desc_write_seg;     // Tracks target segment for SDES/SDEL
@@ -569,5 +642,58 @@ always_ff @(posedge clk) begin
         endcase
     end
 end
+
+address_unit address_unit_inst (
+    .clk(clk),
+    .reset_n(reset_n),
+    .instr_issue(au_instr_issue),
+    .instr(au_instr),
+    .d2_start(au_d2_start),
+    .d2_ea(au_d2_ea),
+    .split_ea_prepare(au_split_ea_prepare),
+    .split_ea_use(au_split_ea_use),
+    .split_ea_adjust(au_split_ea_adjust),
+    .displacement(au_displacement),
+    .ea_base(au_ea_base),
+    .ea_index(au_ea_index),
+    .ea_base_value(au_ea_base_value),
+    .ea_index_value(au_ea_index_value),
+    .branch_relative(au_branch_relative),
+    .branch_target_eip(au_branch_target_eip),
+    .forwarded_esp(au_forwarded_esp),
+    .ss_stack32(desc_cache[SEG_SS].D_B),
+    .issue_seg_base(au_issue_seg_base),
+    .issue_eff_mask(au_issue_eff_mask),
+    .exec(au_exec),
+    .exec_addr32(au_exec_addr32),
+    .alu_source(au_alu_source),
+    .ind_ctrl(au_ind_ctrl),
+    .source_value(au_source_value),
+    .alu_value(au_alu_value),
+    .alu_value_hold(au_alu_value_hold),
+    .instr_jcc(au_instr_jcc),
+    .pe(pe),
+    .is_dword(au_is_dword),
+    .descsw_mode(descsw_mode),
+    .cs_stack32(desc_cache[SEG_CS].D_B),
+    .seg_cmd(exec_seg_cmd),
+    .seg_sel(seg_sel),
+    .seg_base_pending(seg_base_exec),
+    .eff_mask_pending(eff_mask_exec),
+    .lar_result(lar_result),
+    .llim_result(llim_result),
+    .lbas_result(lbas_result),
+    .fault_code(au_fault_code),
+    .fault_addr(au_fault_addr),
+    .cr3(au_cr3),
+    .ind(au_ind),
+    .ind_delta(au_ind_delta),
+    .ind_linear(au_ind_linear),
+    .ind_linear_valid(au_ind_linear_valid),
+    .ea(au_ea),
+    .issue_ea(au_issue_ea),
+    .issue_linear(au_issue_linear),
+    .issue_linear_low(au_issue_linear_low)
+);
 
 endmodule

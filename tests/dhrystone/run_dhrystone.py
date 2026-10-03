@@ -198,6 +198,7 @@ def rtl_sources(core: str, core_dir: Path) -> list[Path]:
         "cpu_throttle.sv",
         "interrupt_controller.sv",
         "microsequencer.sv",
+        "event_control.sv",
         "hardwired_control.sv",
         "data_unit.sv",
         "address_unit.sv",
@@ -228,7 +229,7 @@ def rtl_sources(core: str, core_dir: Path) -> list[Path]:
             optional_src = core_dir / optional_name
             if optional_src.exists():
                 sources.append(optional_src)
-    for optional_name in ("memory.sv", "l1_cache.sv", "l1_icache.sv"):
+    for optional_name in ("memory.sv", "bus_unit.sv", "cache_unit.sv", "l1_cache.sv", "l1_icache.sv"):
         optional_src = core_dir / optional_name
         if optional_src.exists():
             sources.append(optional_src)

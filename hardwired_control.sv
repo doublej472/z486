@@ -1,3 +1,18 @@
+// Hardwired control: the decoder-supplied microinstructions of D2 set-up.
+//
+// US5293592: the decoder latches the controls for the first line of microcode
+// (latches 35), so "the decoder in effect provides the first two lines of
+// microcode" while the control ROM is accessed; Fu/Saini call these the
+// hardwired microinstructions issued in D1 and D2. In z486 they are generated
+// recipes of one to three native uSteps for the common instructions, and a
+// successor may start early in a reclaimed RNI slot (chaining).
+//
+// Signal map (i486 -> RTL):
+//   first microcode lines from latches 35     recipe_state, recipe uSteps
+//   D2 set-up hazard checks (load-use rule)   predecessor/successor dependency checks
+//   early start of the next instruction       chain_start, shift_alu_prestart
+//   Jcc resolved in the first E clock         Jcc folding, branch_ustep_*
+//
 // Hardwired common-instruction control. Terminology:
 //   hardwired instruction - architectural instruction selected for this control;
 //   recipe                - its generated sequence of one to three uSteps;

@@ -66,9 +66,17 @@ module paging_tlb
     input        [19:0] invalidate_vpn
 );
 
-// 8 sets × 4 ways
-tlb_entry_t tlb [7:0][3:0];
-reg vga_mem [7:0][3:0];
+// 8 sets x 4 ways. Tags and PFNs live in MLAB, one copy per read port (the
+// registered lookup, the live demand lookup, and INVLPG's tag compare); the
+// small per-entry flags, valid bits and PLRU state stay in registers.
+// MLABs have one write port and asynchronous reads, so each copy costs about
+// 20 ALMs where the register array cost a flip-flop per bit plus an 8:1 read
+// mux per bit and port.
+reg valid_q    [7:0][3:0];
+reg writable_q [7:0][3:0];
+reg user_q     [7:0][3:0];
+reg dirty_q    [7:0][3:0];
+reg vga_mem    [7:0][3:0];
 
 // PLRU bits per set: 3 bits each for 4-way replacement [B0] B0: 0=left subtree, 1=right subtree / \ [B1] [B2] B1: 0=way0, 1=way1 / \ / \...
 // Details: doc/z486/implementation_notes.md#src-24-z486-paging-tlb-sv-50
@@ -81,11 +89,88 @@ wire [19:0] lookup_vpn = linear_addr[31:12];
 wire [2:0]  lookup_set = lookup_vpn[2:0];       // Set index: VPN[2:0]
 wire [16:0] lookup_tag = lookup_vpn[19:3];       // Tag: VPN[19:3]
 
+// Live demand lookup address decomposition. linear_addr_live (z486 paging_live_linear) is a very high-fanout net: its set bits drive the...
+// Details: doc/z486/implementation_notes.md#src-24-z486-paging-tlb-sv-77
+`Z486_KEEP wire [31:0] lal_w0 = linear_addr_live;
+`Z486_KEEP wire [31:0] lal_w1 = linear_addr_live;
+`Z486_KEEP wire [31:0] lal_w2 = linear_addr_live;
+`Z486_KEEP wire [31:0] lal_w3 = linear_addr_live;
+
+wire [2:0] live_set0 = lal_w0[14:12];  wire [16:0] live_tag0 = lal_w0[31:15];
+wire [2:0] live_set1 = lal_w1[14:12];  wire [16:0] live_tag1 = lal_w1[31:15];
+wire [2:0] live_set2 = lal_w2[14:12];  wire [16:0] live_tag2 = lal_w2[31:15];
+wire [2:0] live_set3 = lal_w3[14:12];  wire [16:0] live_tag3 = lal_w3[31:15];
+
+// Walker refills always target the registered lookup address
+// (paging_unit drives update_vpn from tlb_lookup_addr), so the lookup port's
+// hit vector doubles as the refill's existing-entry match.
+wire [2:0]  update_set = update_vpn[2:0];
+wire [16:0] update_tag = update_vpn[19:3];
+wire [2:0]  invalidate_set = invalidate_vpn[2:0];
+wire [16:0] invalidate_tag = invalidate_vpn[19:3];
+wire        tlb_write = reset_n && !invalidate_all && !invalidate_page && update_valid;
+wire [1:0]  victim_way;
+
+logic [16:0] lookup_tag_q [4];
+logic [19:0] lookup_pfn_q [4];
+logic [16:0] live_tag_q   [4];
+logic [19:0] live_pfn_q   [4];
+logic [16:0] inval_tag_q  [4];
+
+// Quartus 17 does not apply ramstyle to memories declared inside a generate
+// block (they stay as registers), so the twelve copies are written out flat.
+`Z486_DISTRIBUTED_RAM reg [36:0] lookup_copy0 [0:7];
+`Z486_DISTRIBUTED_RAM reg [36:0] live_copy0   [0:7];
+`Z486_DISTRIBUTED_RAM reg [16:0] inval_copy0  [0:7];
+`Z486_DISTRIBUTED_RAM reg [36:0] lookup_copy1 [0:7];
+`Z486_DISTRIBUTED_RAM reg [36:0] live_copy1   [0:7];
+`Z486_DISTRIBUTED_RAM reg [16:0] inval_copy1  [0:7];
+`Z486_DISTRIBUTED_RAM reg [36:0] lookup_copy2 [0:7];
+`Z486_DISTRIBUTED_RAM reg [36:0] live_copy2   [0:7];
+`Z486_DISTRIBUTED_RAM reg [16:0] inval_copy2  [0:7];
+`Z486_DISTRIBUTED_RAM reg [36:0] lookup_copy3 [0:7];
+`Z486_DISTRIBUTED_RAM reg [36:0] live_copy3   [0:7];
+`Z486_DISTRIBUTED_RAM reg [16:0] inval_copy3  [0:7];
+always_ff @(posedge clk) begin
+    if (tlb_write && victim_way == 2'd0) begin
+        lookup_copy0[update_set] <= {update_tag, update_pfn};
+        live_copy0[update_set]   <= {update_tag, update_pfn};
+        inval_copy0[update_set]  <= update_tag;
+    end
+    if (tlb_write && victim_way == 2'd1) begin
+        lookup_copy1[update_set] <= {update_tag, update_pfn};
+        live_copy1[update_set]   <= {update_tag, update_pfn};
+        inval_copy1[update_set]  <= update_tag;
+    end
+    if (tlb_write && victim_way == 2'd2) begin
+        lookup_copy2[update_set] <= {update_tag, update_pfn};
+        live_copy2[update_set]   <= {update_tag, update_pfn};
+        inval_copy2[update_set]  <= update_tag;
+    end
+    if (tlb_write && victim_way == 2'd3) begin
+        lookup_copy3[update_set] <= {update_tag, update_pfn};
+        live_copy3[update_set]   <= {update_tag, update_pfn};
+        inval_copy3[update_set]  <= update_tag;
+    end
+end
+assign {lookup_tag_q[0], lookup_pfn_q[0]} = lookup_copy0[lookup_set];
+assign {live_tag_q[0], live_pfn_q[0]}     = live_copy0[live_set0];
+assign inval_tag_q[0]                      = inval_copy0[invalidate_set];
+assign {lookup_tag_q[1], lookup_pfn_q[1]} = lookup_copy1[lookup_set];
+assign {live_tag_q[1], live_pfn_q[1]}     = live_copy1[live_set1];
+assign inval_tag_q[1]                      = inval_copy1[invalidate_set];
+assign {lookup_tag_q[2], lookup_pfn_q[2]} = lookup_copy2[lookup_set];
+assign {live_tag_q[2], live_pfn_q[2]}     = live_copy2[live_set2];
+assign inval_tag_q[2]                      = inval_copy2[invalidate_set];
+assign {lookup_tag_q[3], lookup_pfn_q[3]} = lookup_copy3[lookup_set];
+assign {live_tag_q[3], live_pfn_q[3]}     = live_copy3[live_set3];
+assign inval_tag_q[3]                      = inval_copy3[invalidate_set];
+
 // Hit detection - combinational, parallel comparison within selected set
-wire hit0 = tlb[lookup_set][0].valid && (tlb[lookup_set][0].tag == lookup_tag);
-wire hit1 = tlb[lookup_set][1].valid && (tlb[lookup_set][1].tag == lookup_tag);
-wire hit2 = tlb[lookup_set][2].valid && (tlb[lookup_set][2].tag == lookup_tag);
-wire hit3 = tlb[lookup_set][3].valid && (tlb[lookup_set][3].tag == lookup_tag);
+wire hit0 = valid_q[lookup_set][0] && (lookup_tag_q[0] == lookup_tag);
+wire hit1 = valid_q[lookup_set][1] && (lookup_tag_q[1] == lookup_tag);
+wire hit2 = valid_q[lookup_set][2] && (lookup_tag_q[2] == lookup_tag);
+wire hit3 = valid_q[lookup_set][3] && (lookup_tag_q[3] == lookup_tag);
 
 // Compute device classification per way, in parallel with hit detection. This
 // avoids putting the selected-PFN mux on cache request routing controls.
@@ -100,22 +185,10 @@ wire [1:0] hit_way = hit0 ? 2'd0 :
                      hit2 ? 2'd2 :
                      hit3 ? 2'd3 : 2'd0;
 
-// Live demand lookup address decomposition. linear_addr_live (z486 paging_live_linear) is a very high-fanout net: its set bits drive the...
-// Details: doc/z486/implementation_notes.md#src-24-z486-paging-tlb-sv-77
-`Z486_KEEP wire [31:0] lal_w0 = linear_addr_live;
-`Z486_KEEP wire [31:0] lal_w1 = linear_addr_live;
-`Z486_KEEP wire [31:0] lal_w2 = linear_addr_live;
-`Z486_KEEP wire [31:0] lal_w3 = linear_addr_live;
-
-wire [2:0] live_set0 = lal_w0[14:12];  wire [16:0] live_tag0 = lal_w0[31:15];
-wire [2:0] live_set1 = lal_w1[14:12];  wire [16:0] live_tag1 = lal_w1[31:15];
-wire [2:0] live_set2 = lal_w2[14:12];  wire [16:0] live_tag2 = lal_w2[31:15];
-wire [2:0] live_set3 = lal_w3[14:12];  wire [16:0] live_tag3 = lal_w3[31:15];
-
-wire live_hit0 = tlb[live_set0][0].valid && (tlb[live_set0][0].tag == live_tag0);
-wire live_hit1 = tlb[live_set1][1].valid && (tlb[live_set1][1].tag == live_tag1);
-wire live_hit2 = tlb[live_set2][2].valid && (tlb[live_set2][2].tag == live_tag2);
-wire live_hit3 = tlb[live_set3][3].valid && (tlb[live_set3][3].tag == live_tag3);
+wire live_hit0 = valid_q[live_set0][0] && (live_tag_q[0] == live_tag0);
+wire live_hit1 = valid_q[live_set1][1] && (live_tag_q[1] == live_tag1);
+wire live_hit2 = valid_q[live_set2][2] && (live_tag_q[2] == live_tag2);
+wire live_hit3 = valid_q[live_set3][3] && (live_tag_q[3] == live_tag3);
 
 assign live_is_vga_mem =
     (live_hit0 && vga_mem[live_set0][0]) ||
@@ -205,32 +278,10 @@ always_comb begin
     hit = hit0 | hit1 | hit2 | hit3;
 
     // Select physical address from matching entry
-    case (hit_way)
-        2'd0: begin
-            physical_addr = {tlb[lookup_set][0].pfn, linear_addr[11:0]};
-            writable = tlb[lookup_set][0].writable;
-            user = tlb[lookup_set][0].user;
-            dirty = tlb[lookup_set][0].dirty;
-        end
-        2'd1: begin
-            physical_addr = {tlb[lookup_set][1].pfn, linear_addr[11:0]};
-            writable = tlb[lookup_set][1].writable;
-            user = tlb[lookup_set][1].user;
-            dirty = tlb[lookup_set][1].dirty;
-        end
-        2'd2: begin
-            physical_addr = {tlb[lookup_set][2].pfn, linear_addr[11:0]};
-            writable = tlb[lookup_set][2].writable;
-            user = tlb[lookup_set][2].user;
-            dirty = tlb[lookup_set][2].dirty;
-        end
-        2'd3: begin
-            physical_addr = {tlb[lookup_set][3].pfn, linear_addr[11:0]};
-            writable = tlb[lookup_set][3].writable;
-            user = tlb[lookup_set][3].user;
-            dirty = tlb[lookup_set][3].dirty;
-        end
-    endcase
+    physical_addr = {lookup_pfn_q[hit_way], linear_addr[11:0]};
+    writable = writable_q[lookup_set][hit_way];
+    user = user_q[lookup_set][hit_way];
+    dirty = dirty_q[lookup_set][hit_way];
 
     // If no hit, output linear address (will be overridden by page walker result)
     if (!hit) begin
@@ -247,86 +298,77 @@ always_comb begin
     // one-hot hit vector instead of priority-encoding a way and then muxing;
     // this shortens the live address -> paging/cache finalize cone.
     live_physical_addr = {
-        ({20{live_hit0}} & tlb[live_set0][0].pfn) |
-        ({20{live_hit1}} & tlb[live_set1][1].pfn) |
-        ({20{live_hit2}} & tlb[live_set2][2].pfn) |
-        ({20{live_hit3}} & tlb[live_set3][3].pfn),
+        ({20{live_hit0}} & live_pfn_q[0]) |
+        ({20{live_hit1}} & live_pfn_q[1]) |
+        ({20{live_hit2}} & live_pfn_q[2]) |
+        ({20{live_hit3}} & live_pfn_q[3]),
         linear_addr_live[11:0]
     };
     live_writable = !live_hit |
-                    (live_hit0 & tlb[live_set0][0].writable) |
-                    (live_hit1 & tlb[live_set1][1].writable) |
-                    (live_hit2 & tlb[live_set2][2].writable) |
-                    (live_hit3 & tlb[live_set3][3].writable);
-    live_user = (live_hit0 & tlb[live_set0][0].user) |
-                (live_hit1 & tlb[live_set1][1].user) |
-                (live_hit2 & tlb[live_set2][2].user) |
-                (live_hit3 & tlb[live_set3][3].user);
-    live_dirty = (live_hit0 & tlb[live_set0][0].dirty) |
-                 (live_hit1 & tlb[live_set1][1].dirty) |
-                 (live_hit2 & tlb[live_set2][2].dirty) |
-                 (live_hit3 & tlb[live_set3][3].dirty);
+                    (live_hit0 & writable_q[live_set0][0]) |
+                    (live_hit1 & writable_q[live_set1][1]) |
+                    (live_hit2 & writable_q[live_set2][2]) |
+                    (live_hit3 & writable_q[live_set3][3]);
+    live_user = (live_hit0 & user_q[live_set0][0]) |
+                (live_hit1 & user_q[live_set1][1]) |
+                (live_hit2 & user_q[live_set2][2]) |
+                (live_hit3 & user_q[live_set3][3]);
+    live_dirty = (live_hit0 & dirty_q[live_set0][0]) |
+                 (live_hit1 & dirty_q[live_set1][1]) |
+                 (live_hit2 & dirty_q[live_set2][2]) |
+                 (live_hit3 & dirty_q[live_set3][3]);
 end
 
-// Update address decomposition
-wire [2:0]  update_set = update_vpn[2:0];
-wire [2:0]  update_plru = plru[update_set];
+// PLRU victim selection for the update set (existing entry wins). The
+// existing-entry match is the lookup port's hit vector (see update_set above).
+assign victim_way = hit0 ? 2'd0 :
+                    hit1 ? 2'd1 :
+                    hit2 ? 2'd2 :
+                    hit3 ? 2'd3 :
+                    plru[update_set][0] ? (plru[update_set][2] ? 2'd3 : 2'd2) :
+                                          (plru[update_set][1] ? 2'd1 : 2'd0);
 
-// If the VPN is already present in the set, update that way in place. Blind PLRU allocation creates duplicate entries, and the hit...
-// Details: doc/z486/implementation_notes.md#src-24-z486-paging-tlb-sv-187
-wire [16:0] update_tag = update_vpn[19:3];
-wire match0 = tlb[update_set][0].valid && (tlb[update_set][0].tag == update_tag);
-wire match1 = tlb[update_set][1].valid && (tlb[update_set][1].tag == update_tag);
-wire match2 = tlb[update_set][2].valid && (tlb[update_set][2].tag == update_tag);
-wire match3 = tlb[update_set][3].valid && (tlb[update_set][3].tag == update_tag);
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && update_valid && update_vpn != lookup_vpn)
+        $fatal(1, "TLB refill vpn %05x differs from the registered lookup %05x",
+               update_vpn, lookup_vpn);
+// synthesis translate_on
 
-wire [2:0] invalidate_set = invalidate_vpn[2:0];
-wire [16:0] invalidate_tag = invalidate_vpn[19:3];
+wire inval_match0 = valid_q[invalidate_set][0] && inval_tag_q[0] == invalidate_tag;
+wire inval_match1 = valid_q[invalidate_set][1] && inval_tag_q[1] == invalidate_tag;
+wire inval_match2 = valid_q[invalidate_set][2] && inval_tag_q[2] == invalidate_tag;
+wire inval_match3 = valid_q[invalidate_set][3] && inval_tag_q[3] == invalidate_tag;
 
-// PLRU victim selection for the update set (existing entry wins)
-wire [1:0] victim_way = match0 ? 2'd0 :
-                        match1 ? 2'd1 :
-                        match2 ? 2'd2 :
-                        match3 ? 2'd3 :
-                        update_plru[0] ? (update_plru[2] ? 2'd3 : 2'd2) :
-                                          (update_plru[1] ? 2'd1 : 2'd0);
-
-// TLB update and PLRU management
+// TLB state update and PLRU management. Tag/PFN writes are in the MLAB
+// copies above, enabled by tlb_write and victim_way.
 integer s;
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
         // Invalidate all entries on reset
         for (s = 0; s < 8; s = s + 1) begin
-            tlb[s][0].valid <= 1'b0;
-            tlb[s][1].valid <= 1'b0;
-            tlb[s][2].valid <= 1'b0;
-            tlb[s][3].valid <= 1'b0;
+            valid_q[s][0] <= 1'b0;
+            valid_q[s][1] <= 1'b0;
+            valid_q[s][2] <= 1'b0;
+            valid_q[s][3] <= 1'b0;
             plru[s] <= 3'b000;
         end
     end else if (invalidate_all) begin
         // CR3 write - flush entire TLB
         for (s = 0; s < 8; s = s + 1) begin
-            tlb[s][0].valid <= 1'b0;
-            tlb[s][1].valid <= 1'b0;
-            tlb[s][2].valid <= 1'b0;
-            tlb[s][3].valid <= 1'b0;
+            valid_q[s][0] <= 1'b0;
+            valid_q[s][1] <= 1'b0;
+            valid_q[s][2] <= 1'b0;
+            valid_q[s][3] <= 1'b0;
             plru[s] <= 3'b000;
         end
     end else if (invalidate_page) begin
         // Multiple matching ways are not expected, but clear every match so
         // INVLPG also repairs any duplicate left by an earlier implementation.
-        if (tlb[invalidate_set][0].valid &&
-            tlb[invalidate_set][0].tag == invalidate_tag)
-            tlb[invalidate_set][0].valid <= 1'b0;
-        if (tlb[invalidate_set][1].valid &&
-            tlb[invalidate_set][1].tag == invalidate_tag)
-            tlb[invalidate_set][1].valid <= 1'b0;
-        if (tlb[invalidate_set][2].valid &&
-            tlb[invalidate_set][2].tag == invalidate_tag)
-            tlb[invalidate_set][2].valid <= 1'b0;
-        if (tlb[invalidate_set][3].valid &&
-            tlb[invalidate_set][3].tag == invalidate_tag)
-            tlb[invalidate_set][3].valid <= 1'b0;
+        if (inval_match0) valid_q[invalidate_set][0] <= 1'b0;
+        if (inval_match1) valid_q[invalidate_set][1] <= 1'b0;
+        if (inval_match2) valid_q[invalidate_set][2] <= 1'b0;
+        if (inval_match3) valid_q[invalidate_set][3] <= 1'b0;
     end else begin
         // Update PLRU on hit (point away from accessed way in the hit set)
         if (hit) begin
@@ -340,47 +382,16 @@ always_ff @(posedge clk or negedge reset_n) begin
 
         // Insert new entry from page walker
         if (update_valid) begin
+            valid_q[update_set][victim_way]    <= 1'b1;
+            writable_q[update_set][victim_way] <= update_writable;
+            user_q[update_set][victim_way]     <= update_user;
+            dirty_q[update_set][victim_way]    <= update_dirty;
+            vga_mem[update_set][victim_way]    <= (update_pfn[19:5] == 15'h5);
             case (victim_way)
-                2'd0: begin
-                    tlb[update_set][0].valid <= 1'b1;
-                    tlb[update_set][0].tag <= update_tag;
-                    tlb[update_set][0].pfn <= update_pfn;
-                    tlb[update_set][0].writable <= update_writable;
-                    tlb[update_set][0].user <= update_user;
-                    tlb[update_set][0].dirty <= update_dirty;
-                    vga_mem[update_set][0] <= (update_pfn[19:5] == 15'h5);
-                    plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b1;
-                end
-                2'd1: begin
-                    tlb[update_set][1].valid <= 1'b1;
-                    tlb[update_set][1].tag <= update_tag;
-                    tlb[update_set][1].pfn <= update_pfn;
-                    tlb[update_set][1].writable <= update_writable;
-                    tlb[update_set][1].user <= update_user;
-                    tlb[update_set][1].dirty <= update_dirty;
-                    vga_mem[update_set][1] <= (update_pfn[19:5] == 15'h5);
-                    plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b0;
-                end
-                2'd2: begin
-                    tlb[update_set][2].valid <= 1'b1;
-                    tlb[update_set][2].tag <= update_tag;
-                    tlb[update_set][2].pfn <= update_pfn;
-                    tlb[update_set][2].writable <= update_writable;
-                    tlb[update_set][2].user <= update_user;
-                    tlb[update_set][2].dirty <= update_dirty;
-                    vga_mem[update_set][2] <= (update_pfn[19:5] == 15'h5);
-                    plru[update_set][0] <= 1'b0; plru[update_set][2] <= 1'b1;
-                end
-                2'd3: begin
-                    tlb[update_set][3].valid <= 1'b1;
-                    tlb[update_set][3].tag <= update_tag;
-                    tlb[update_set][3].pfn <= update_pfn;
-                    tlb[update_set][3].writable <= update_writable;
-                    tlb[update_set][3].user <= update_user;
-                    tlb[update_set][3].dirty <= update_dirty;
-                    vga_mem[update_set][3] <= (update_pfn[19:5] == 15'h5);
-                    plru[update_set][0] <= 1'b0; plru[update_set][2] <= 1'b0;
-                end
+                2'd0: begin plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b1; end
+                2'd1: begin plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b0; end
+                2'd2: begin plru[update_set][0] <= 1'b0; plru[update_set][2] <= 1'b1; end
+                2'd3: begin plru[update_set][0] <= 1'b0; plru[update_set][2] <= 1'b0; end
             endcase
 
             // synthesis translate_off

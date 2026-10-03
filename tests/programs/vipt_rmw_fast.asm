@@ -167,7 +167,7 @@ pass:
     out STATUS_PORT, al
     hlt
 
-fail1: mov eax, 1
+fail1: mov eax, 7        ; status 1 means pass
     jmp fail
 fail2: mov eax, 2
     jmp fail

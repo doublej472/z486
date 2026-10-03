@@ -6,6 +6,7 @@ cpu_throttle.sv
 interrupt_controller.sv
 ucode_rom.sv
 microsequencer.sv
+event_control.sv
 hardwired_control.sv
 data_unit.sv
 address_unit.sv
@@ -19,6 +20,8 @@ paging_unit.sv
 paging_tlb.sv
 paging_walker.sv
 memory.sv
+bus_unit.sv
+cache_unit.sv
 l1_cache.sv
 l1_icache.sv
 x87/x87_bridge.sv

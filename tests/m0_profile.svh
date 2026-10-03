@@ -219,11 +219,11 @@ always @(posedge clk) begin : m0_profile_sample
         // included.  Causes are mutually exclusive and ordered by ownership.
         if (m0_instruction_supply_blocked) begin
             m0_supply_block[0] += 1;
-            if ((m0_pf_bytes != 0) || (dut.d1_avail != 0))
+            if ((m0_pf_bytes != 0) || (dut.k1q_avail != 0))
                 supply_reason = 7;
             else if (dut.q_flush || m0_after_flush)
                 supply_reason = 3;
-            else if (dut.memory_inst.icache_inst.state == 3'd3)
+            else if (dut.memory_inst.cache_unit_inst.icache_inst.state == 3'd3)
                 supply_reason = 1;
             else if (dut.mem_servicing || dut.mem_req_upcoming ||
                      dut.memory_inst.dcache_mem_valid)
@@ -264,7 +264,7 @@ always @(posedge clk) begin : m0_profile_sample
         if (dut.icache_req_accepted)     m0_record_frontend_event(1);
         if (dut.icache_req_complete)     m0_record_frontend_event(2);
         if (dut.prefetch_inst.fill_commit) m0_record_frontend_event(3);
-        if (dut.d1_adv != 0)             m0_record_frontend_event(4);
+        if (dut.k1p_adv != 0)             m0_record_frontend_event(4);
         if (dut.d2_push)                 m0_record_frontend_event(5);
     end
 end
