@@ -200,19 +200,23 @@ assign live_is_vga_mem =
 // It is maintained as an independent TLB: retaining a translation after the
 // four-way TLB replaces it is valid until software executes INVLPG or reloads
 // CR3, just as retaining it in any other TLB entry would be.
-localparam integer VIPT_TLB_INDEX_BITS = 5;
+// 256 entries, direct-mapped on VPN[19:12]: one M10K, and no way select on
+// the hit path (it feeds D2 issue through a direct load's hit). Fewer
+// entries let a program's read and write pages collide (Quake: 32 entries
+// cost 1.9%).
+localparam integer VIPT_TLB_INDEX_BITS = 8;
 localparam integer VIPT_TLB_ENTRIES = 1 << VIPT_TLB_INDEX_BITS;
 wire [VIPT_TLB_INDEX_BITS-1:0] vipt_preread_index =
-    vipt_linear_addr[16:12];
+    vipt_linear_addr[19:12];
 wire [VIPT_TLB_INDEX_BITS-1:0] vipt_refill_index =
-    vipt_refill_linear[16:12];
+    vipt_refill_linear[19:12];
 wire vipt_refill_write = vipt_refill_valid && !update_valid;
 reg [31:0] vipt_linear_r;
 reg        vipt_hazard_r;
 reg [VIPT_TLB_ENTRIES-1:0] vipt_valid;
-// {VPN tag[19:5], PFN[19:0], writable, user, dirty, VGA}
-`Z486_BLOCK_RAM_NO_RW_CHECK reg [38:0] vipt_tlb [0:VIPT_TLB_ENTRIES-1];
-reg [38:0] vipt_tlb_q;
+// {VPN tag[19:8], PFN[19:0], writable, user, dirty, VGA}
+`Z486_BLOCK_RAM_NO_RW_CHECK reg [35:0] vipt_tlb [0:VIPT_TLB_ENTRIES-1];
+reg [35:0] vipt_tlb_q;
 
 always_ff @(posedge clk) begin
     if (vipt_preread) begin
@@ -227,8 +231,8 @@ always_ff @(posedge clk) begin
     end
 end
 
-wire vipt_match = vipt_valid[vipt_linear_r[16:12]] && !vipt_hazard_r &&
-                  (vipt_tlb_q[38:24] == vipt_linear_r[31:17]);
+wire vipt_match = vipt_valid[vipt_linear_r[19:12]] && !vipt_hazard_r &&
+                  (vipt_tlb_q[35:24] == vipt_linear_r[31:20]);
 assign vipt_is_vga_mem = vipt_match && vipt_tlb_q[0];
 
 always_comb begin
@@ -247,12 +251,12 @@ end
 
 always_ff @(posedge clk) begin
     if (update_valid)
-        vipt_tlb[update_vpn[4:0]] <= {update_vpn[19:5], update_pfn,
+        vipt_tlb[update_vpn[7:0]] <= {update_vpn[19:8], update_pfn,
                                       update_writable, update_user,
                                       update_dirty,
                                       update_pfn[19:5] == 15'h5};
     else if (vipt_refill_write)
-        vipt_tlb[vipt_refill_index] <= {vipt_refill_linear[31:17],
+        vipt_tlb[vipt_refill_index] <= {vipt_refill_linear[31:20],
                                         vipt_refill_pfn,
                                         vipt_refill_writable,
                                         vipt_refill_user,
@@ -266,9 +270,9 @@ always_ff @(posedge clk or negedge reset_n) begin
     else if (invalidate_all)
         vipt_valid <= '0;
     else if (invalidate_page)
-        vipt_valid[invalidate_vpn[4:0]] <= 1'b0;
+        vipt_valid[invalidate_vpn[7:0]] <= 1'b0;
     else if (update_valid)
-        vipt_valid[update_vpn[4:0]] <= 1'b1;
+        vipt_valid[update_vpn[7:0]] <= 1'b1;
     else if (vipt_refill_write)
         vipt_valid[vipt_refill_index] <= 1'b1;
 end

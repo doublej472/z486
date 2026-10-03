@@ -15,7 +15,8 @@
 //   ALU / barrel shifter / multiply-divide     alu_inst / shifter_inst / mul_div_inst
 //   ALU latch, write-back value                sigma, alu_result, shift_result
 //   R bus memory operand, write data           opr_r / opr_w, memory_write_source_value
-//   shorters: WB -> E / D2 bypass              dly_gpr_forward (RNI delay slot), load_wb_* (VIPT load),
+//   shorters: WB -> E / D2 bypass              pending-write table (pend_*_mask: delay slot, deferred
+//                                              shift, load WB, ROM load) -> gpr_ex_view / gpr_ea_view;
 //                                              eflags_fwd (flags), branch_condition_true (Jcc)
 //   stack engine (ispval, SPADD)               stack_op/stack_dir -> sigma = ESP +/- 2/4 at instr_start
 //   flags                                      eflags, uc_flags, flags_backup (386 microcode FLAGSB)
@@ -113,7 +114,8 @@ module data_unit
     input  gpr_ref_t    ea_index,                // Address-unit index GPR reference
     output logic [31:0] ea_base_value,            // Base GPR value for address unit
     output logic [31:0] ea_index_value,           // Index GPR value for address unit
-    input  logic [31:0] forwarded_esp,           // ESP including pending stack update
+    input  logic [31:0] forwarded_esp,            // ESP including pending stack update
+    output logic [7:0]  pend_write_mask,          // GPRs a late producer writes on this edge
     input  logic [31:0] ind,
     input  logic [31:0] ea,
 
@@ -319,45 +321,68 @@ wire [31:0] load_wb_forward_data = load_wb_forward_data_r;
 wire [2:0] load_wb_widx = (load_wb_size == 2'd0)
                          ? {1'b0, load_wb_dst[1:0]} : load_wb_dst;
 
-// WB-to-EX bypass for a hardwired load's immediate successor.  Cache data is
-// already registered in load_wb_data; this mux therefore starts at the WB
-// boundary and does not extend the cache finalize path into the ALU.
+// Pending GPR writes: the i486's single writeback path with its E->D2 and
+// WB->E bypasses. Every late producer names its byte-normalized destination
+// as a one-hot; two forwarded register views are formed once from them and
+// every reader indexes a view, instead of each read comparing every producer.
+//   EX view  (operand reads)  plain-load WB data, then the ROM load commit
+//   EA view  (D2 base/index)  delay-slot write, else deferred shift, else
+//                             plain-load WB data
+// A plain load's WB value is already merged with its destination's prior
+// value; an M3 ALU result is not forwarded (its readers are interlocked).
+wire [7:0] pend_load_mask  = (load_wb_valid && !load_wb_is_alu) ? (8'h01 << load_wb_widx) : 8'h00;
+wire [7:0] pend_mem_mask   = recipe_memory_write.valid ? recipe_memory_dst_onehot : 8'h00;
+wire [7:0] pend_shift_mask = recipe_shift_write.valid ? (8'h01 << recipe_shift_widx) : 8'h00;
+wire [7:0] pend_dly_mask   = dly_gpr_forward.valid ? (8'h01 << dly_gpr_forward.dst) : 8'h00;
+
+logic [31:0] gpr_ex_view [0:7];
+logic [31:0] gpr_ea_view [0:7];
+always_comb begin
+    logic [31:0] current, merged, dly_value, shift_value;
+    for (int r = 0; r < 8; r++) begin
+        current = read_gpr_value(3'(r), 2'd2);
+
+        merged = pend_load_mask[r] ? load_wb_forward_data : current;
+        if (pend_mem_mask[r])
+            case (recipe_memory_mode)
+                EA_FWD_BLO: merged = {merged[31:8], opr_r[7:0]};
+                EA_FWD_BHI: merged = {merged[31:16], opr_r[7:0], merged[7:0]};
+                EA_FWD_W:   merged = {merged[31:16], opr_r[15:0]};
+                default:    merged = opr_r;
+            endcase
+        gpr_ex_view[r] = merged;
+
+        case (dly_gpr_forward.mode)
+            EA_FWD_BLO: dly_value = {current[31:8], dly_gpr_forward.data[7:0]};
+            EA_FWD_BHI: dly_value = {current[31:16], dly_gpr_forward.data[7:0], current[7:0]};
+            EA_FWD_W:   dly_value = {current[31:16], dly_gpr_forward.data[15:0]};
+            default:    dly_value = dly_gpr_forward.data;
+        endcase
+        if (recipe_shift_write.size == 2'd0)
+            shift_value = recipe_shift_write.dst[2]
+                ? {current[31:16], recipe_shift_data[7:0], current[7:0]}
+                : {current[31:8], recipe_shift_data[7:0]};
+        else if (recipe_shift_write.size == 2'd1)
+            shift_value = {current[31:16], recipe_shift_data[15:0]};
+        else
+            shift_value = recipe_shift_data;
+        gpr_ea_view[r] = pend_dly_mask[r]   ? dly_value :
+                         pend_shift_mask[r] ? shift_value :
+                         pend_load_mask[r]  ? load_wb_forward_data : current;
+    end
+end
+
+// An EX operand read, formatted to its size.
 function automatic logic [31:0] read_gpr_load_forwarded(
     input logic [2:0] reg_sel,
     input logic [1:0] size
 );
-    logic [2:0] read_widx;
     logic [31:0] merged;
     begin
-        read_widx = (size == 2'd0) ? {1'b0, reg_sel[1:0]} : reg_sel;
-        merged = read_gpr_value(read_widx, 2'd2);
-
-        // Plain loads may feed a successor directly from registered cache
-        // data.  M3's value is the output of another combinational ALU, so it
-        // is interlocked until architectural commit instead of creating a
-        // private-ALU -> successor-ALU/EA path in one cycle.
-        if (load_wb_valid && !load_wb_is_alu &&
-            (load_wb_widx == read_widx))
-            merged = load_wb_forward_data;
-
-        // The legacy ROM load path reaches the same registered-WB boundary
-        // through recipe_memory_write.  Forward it as well so address-size 16
-        // and other non-VIPT loads obey the same no-bubble data-use rule.
-        if (recipe_memory_write.valid &&
-            recipe_memory_dst_onehot[read_widx]) begin
-            case (recipe_memory_mode)
-                EA_FWD_BLO: merged = {merged[31:8], opr_r[7:0]};
-                EA_FWD_BHI: merged = {merged[31:16], opr_r[7:0],
-                                      merged[7:0]};
-                EA_FWD_W:   merged = {merged[31:16], opr_r[15:0]};
-                default:    merged = opr_r;
-            endcase
-        end
-
+        merged = gpr_ex_view[(size == 2'd0) ? {1'b0, reg_sel[1:0]} : reg_sel];
         if (size == 2'd0)
-            read_gpr_load_forwarded = reg_sel[2]
-                                    ? {24'd0, merged[15:8]}
-                                    : {24'd0, merged[7:0]};
+            read_gpr_load_forwarded = reg_sel[2] ? {24'd0, merged[15:8]}
+                                                 : {24'd0, merged[7:0]};
         else if (size == 2'd1)
             read_gpr_load_forwarded = {16'd0, merged[15:0]};
         else
@@ -365,51 +390,16 @@ function automatic logic [31:0] read_gpr_load_forwarded(
     end
 endfunction
 
-// D2 reads the architectural GPR bank with delay-slot and deferred-shift
-// forwarding. Delay-slot data wins if both producers name the same register.
+// Every late GPR write landing on this edge (any direct-load WB included).
+assign pend_write_mask = pend_dly_mask | pend_shift_mask |
+                         (load_wb_valid ? (8'h01 << load_wb_widx) : 8'h00);
+
+// A D2 base/index read.
 function automatic logic [31:0] read_ea_gpr(
     input logic       valid,
     input logic [2:0] idx
 );
-    logic [31:0] current_value, dly_value, shift_value, load_value;
-    logic        dly_hit, shift_hit, load_hit;
-    begin
-        current_value = valid ? read_gpr_value(idx, 2'd2) : 32'd0;
-        dly_hit = dly_gpr_forward.valid && valid &&
-                  (dly_gpr_forward.dst == idx);
-        shift_hit = recipe_shift_write.valid && valid &&
-                    (recipe_shift_widx == idx);
-        load_hit = load_wb_valid && !load_wb_is_alu && valid &&
-                   (load_wb_widx == idx);
-
-        // Format each producer before the priority mux. This keeps delay-slot
-        // data out of the shift/load mode selection on the D2 EA path.
-        case (dly_gpr_forward.mode)
-            EA_FWD_BLO: dly_value =
-                {current_value[31:8], dly_gpr_forward.data[7:0]};
-            EA_FWD_BHI: dly_value =
-                {current_value[31:16], dly_gpr_forward.data[7:0],
-                 current_value[7:0]};
-            EA_FWD_W: dly_value =
-                {current_value[31:16], dly_gpr_forward.data[15:0]};
-            default: dly_value = dly_gpr_forward.data;
-        endcase
-        if (recipe_shift_write.size == 2'd0)
-            shift_value = recipe_shift_write.dst[2]
-                ? {current_value[31:16], recipe_shift_data[7:0],
-                   current_value[7:0]}
-                : {current_value[31:8], recipe_shift_data[7:0]};
-        else if (recipe_shift_write.size == 2'd1)
-            shift_value = {current_value[31:16], recipe_shift_data[15:0]};
-        else
-            shift_value = recipe_shift_data;
-
-        load_value = load_wb_forward_data;
-
-        read_ea_gpr = dly_hit   ? dly_value :
-                      shift_hit ? shift_value :
-                      load_hit  ? load_value : current_value;
-    end
+    read_ea_gpr = valid ? gpr_ea_view[idx] : 32'd0;
 endfunction
 
 // Every direct load reads its destination after older architectural writes

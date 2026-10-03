@@ -71,7 +71,8 @@ module address_unit
     output logic [31:0] ea,
     output logic [31:0] issue_ea,              // Combinational D2 effective address
     output logic [31:0] issue_linear,          // Combinational D2 relocated address
-    output logic [1:0]  issue_linear_low       // Low address bits without full relocation
+    output logic [1:0]  issue_linear_low,      // Low address bits without full relocation
+    output logic [31:0] issue_mem_linear       // The issuing instruction's memory address (stack, moffs or ModR/M)
 );
 
 logic [1:0] ea_scale_r;
@@ -369,6 +370,17 @@ always_ff @(posedge clk) begin
     end
 end
 
+// The address an issuing instruction's first memory access uses: the
+// forwarded ESP for a stack operation, the immediate for moffs, else the
+// ModR/M effective address. The issue edge captures exactly this value.
+wire [31:0] issue_stack_offset = instr.stack_dir
+    ? (ss_stack32 ? forwarded_esp : {16'd0, forwarded_esp[15:0]})
+    : (ss_stack32 ? forwarded_esp - (instr.data32 ? 32'd4 : 32'd2)
+                  : {16'd0, forwarded_esp[15:0] - (instr.data32 ? 16'd4 : 16'd2)});
+assign issue_mem_linear = instr.stack_op ? relocate_issue(issue_stack_offset)
+                        : instr.has_moffs ? relocate_issue(instr.immediate)
+                        : effective_linear;
+
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         issue_ind_r <= 32'd0;
@@ -383,32 +395,21 @@ always_ff @(posedge clk) begin
         ind_delta <= !instr.stack_op ? 32'd2 :
                      !instr.stack_dir ? (instr.data32 ? -32'd4 : -32'd2) :
                                         (instr.data32 ? 32'd4 : 32'd2);
-        if (instr.stack_op && instr.stack_dir) begin
-            automatic logic [31:0] stack_offset =
-                ss_stack32 ? forwarded_esp : {16'd0, forwarded_esp[15:0]};
-            issue_ind_r <= stack_offset;
+        if (instr.stack_op) begin
+            issue_ind_r <= issue_stack_offset;
             ind_owner_issue_r <= 1'b1;
-            issue_linear_r <= relocate_issue(stack_offset);
-            ind_linear_valid <= 1'b1;
-        end else if (instr.stack_op && !instr.stack_dir) begin
-            automatic logic [31:0] stack_offset = ss_stack32
-                ? forwarded_esp - (instr.data32 ? 32'd4 : 32'd2)
-                : {16'd0, forwarded_esp[15:0] -
-                          (instr.data32 ? 16'd4 : 16'd2)};
-            issue_ind_r <= stack_offset;
-            ind_owner_issue_r <= 1'b1;
-            issue_linear_r <= relocate_issue(stack_offset);
+            issue_linear_r <= issue_mem_linear;
             ind_linear_valid <= 1'b1;
         end else if (instr.has_moffs) begin
             issue_ind_r <= instr.addr32 ? instr.immediate
                                         : {16'd0, instr.immediate[15:0]};
             ind_owner_issue_r <= 1'b1;
-            issue_linear_r <= relocate_issue(instr.immediate);
+            issue_linear_r <= issue_mem_linear;
             ind_linear_valid <= 1'b1;
         end else if (instr.has_modrm) begin
             issue_ind_r <= effective_addr;
             ind_owner_issue_r <= 1'b1;
-            issue_linear_r <= effective_linear;
+            issue_linear_r <= issue_mem_linear;
             ind_linear_valid <= 1'b1;
         end
     end else if (exec) begin

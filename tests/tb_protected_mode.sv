@@ -264,18 +264,18 @@ module tb_protected_mode #(
                         cpu_load_issue[5] += 1;
                     if (dut.d2_vipt_candidate && !dut.dcache_vipt_probe_ready)
                         cpu_load_issue[6] += 1;
-                    if (dut.d2_vipt_candidate && dut.d2_vipt_older_store)
+                    if (dut.d2_vipt_candidate && dut.data_access_inst.d2_vipt_older_store)
                         cpu_load_issue[7] += 1;
                     cpu_current_load_path = dut.d2_vipt_load ? 2'd0 :
                         dut.d2_recipe.hardwired ? 2'd1 : 2'd2;
                     cpu_current_load_addr32 = dut.i_bus.addr32;
-                    cpu_current_load_size = dut.d2_vipt_mem_size;
+                    cpu_current_load_size = dut.data_access_inst.d2_vipt_mem_size;
                     load_terms = (|dut.i_bus.ea_base_onehot) +
                                  (|dut.i_bus.ea_index_onehot) +
                                  (dut.i_bus.displacement != 32'd0);
                     cpu_current_load_ea_class = dut.i_bus.ea_complex ? 2'd2 :
                                                 (load_terms >= 2) ? 2'd1 : 2'd0;
-                    load_bytes = 1 << dut.d2_vipt_mem_size;
+                    load_bytes = 1 << dut.data_access_inst.d2_vipt_mem_size;
                     if (({1'b0, dut.issue_ind_linear[11:0]} + load_bytes) > 4096)
                         cpu_current_load_alignment = 2'd3;
                     else if (({1'b0, dut.issue_ind_linear[3:0]} + load_bytes) > 16)
@@ -295,11 +295,11 @@ module tb_protected_mode #(
 
             if (dut.vipt_load_ex_r.valid && dut.vipt_load_ex_probed_r) begin
                 cpu_load_result[0] += 1;
-                if (dut.vipt_load_ex_hit)
+                if (dut.data_access_inst.vipt_load_ex_hit)
                     cpu_load_result[1] += 1;
-                else if (!dut.vipt_load_ex_contained)
+                else if (!dut.data_access_inst.vipt_load_ex_contained)
                     cpu_load_result[2] += 1;
-                else if (!dut.vipt_translation_ok)
+                else if (!dut.data_access_inst.vipt_translation_ok)
                     cpu_load_result[3] += 1;
                 else if (dut.vipt_tlb_is_vga_mem)
                     cpu_load_result[4] += 1;
@@ -308,7 +308,7 @@ module tb_protected_mode #(
                 else
                     cpu_load_result[6] += 1;
             end
-            if (dut.vipt_load_slow_req_r && dut.mem_accepted)
+            if (dut.data_access_inst.vipt_load_slow_req_r && dut.mem_accepted)
                 cpu_load_result[7] += 1;
 
             if (dut.jcc_fold_active && dut.uc_exec)
@@ -589,10 +589,10 @@ module tb_protected_mode #(
             $fatal(1, "VIPT load-to-EA consumer issued before writeback");
         if (!reset_n || dut.q_flush || dut.any_fault) begin
             vipt_store_replay_pending <= 1'b0;
-        end else if (dut.vipt_issue_store_wait) begin
+        end else if (dut.data_access_inst.vipt_issue_store_wait) begin
             vipt_store_wait_issues <= vipt_store_wait_issues + 1;
             vipt_store_replay_pending <= 1'b1;
-        end else if (vipt_store_replay_pending && dut.vipt_replay_try &&
+        end else if (vipt_store_replay_pending && dut.data_access_inst.vipt_replay_try &&
                      dut.dcache_vipt_probe_accepted) begin
             vipt_store_replays <= vipt_store_replays + 1;
             vipt_store_replay_pending <= 1'b0;
@@ -1556,7 +1556,9 @@ module tb_protected_mode #(
             end
 
             // Hardware interrupt signal generation
-            if (intr_hardwired_load_arm && dut.uc_exec &&
+            // The load's first cycle, executed from the ROM or as a direct load
+            // (whose ROM word does not execute).
+            if (intr_hardwired_load_arm && dut.i_first && !dut.stall &&
                 (dut.uc_addr == 12'h019) && dut.recipe_state.hardwired &&
                 (dut.recipe_state.commit_sel == z486_pkg::RECIPE_COMMIT_MEM) &&
                 dut.d2_vipt_candidate) begin

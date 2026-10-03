@@ -122,6 +122,7 @@ module segmentation_unit
     // LA bus to paging and cache
     output logic [31:0] au_issue_linear,
     output logic [1:0] au_issue_linear_low,
+    output logic [31:0] au_issue_mem_linear,
     output logic [31:0] au_ind_linear,
     output logic au_ind_linear_valid,
 
@@ -693,7 +694,8 @@ address_unit address_unit_inst (
     .ea(au_ea),
     .issue_ea(au_issue_ea),
     .issue_linear(au_issue_linear),
-    .issue_linear_low(au_issue_linear_low)
+    .issue_linear_low(au_issue_linear_low),
+    .issue_mem_linear(au_issue_mem_linear)
 );
 
 endmodule

@@ -44,6 +44,7 @@ module memory #(
     input       [3:0]  fast_store_be,
     input      [31:0]  fast_store_wdata,
     output             fast_store_accepted,
+    output             dcache_wr_ready,      // the L1 takes a direct store this cycle (registered)
 
     // Non-owning hardwired-load preread. A miss is retried through the demand
     // request interface above; this port never starts a fill by itself.
@@ -95,6 +96,7 @@ module memory #(
 wire [31:0] dcache_cpu_dout;
 wire dcache_cpu_ready;
 wire dcache_cpu_wr_ready;
+assign dcache_wr_ready = dcache_cpu_wr_ready;
 wire dcache_cpu_resp_valid;
 wire [31:0] dcache_mem_addr;
 wire [3:0] dcache_mem_be;

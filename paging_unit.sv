@@ -48,12 +48,12 @@ module paging_unit
     input               mem_req,           // Valid: memory/IO request pending
     input               mem_inta_req,      // INTA request; kept out of the demand TLB/cache cone
     input        [31:0] mem_inta_addr,
-    input               mem_ea_read,       // This demand read uses the early-start EA (SET-read eligible)
     input               mem_req_precheck,  // mem_req before the GP/segment-fault gate; drives
                                            // speculative address capture + TLB-lookup-addr load
     input               mem_req_upcoming,  // Combinational early hint: suppresses prefetch start
     output logic        mem_accepted,      // Ready: demand request may be handed off this cycle
     output reg          mem_servicing,     // High while accepted request is in flight
+    output              demand_idle,       // A demand request would be captured this cycle
     output              mem_complete_now,  // Completion shortcut (disabled: use registered mem_servicing clear)
     output              mem_read_complete, // Demand operand read, excluding walker traffic
     output reg          mem_dly_grace,     // Pulse: dcache lookup cycle of an optimistic demand read;
@@ -78,6 +78,8 @@ module paging_unit
     input               mem_rd_ind,        // BUSOP_RD_IND flag
     input               is_write_access,   // Is this a write (for permission check)
     input               mem_check_only,    // CW: check write permission only, no actual bus write
+    input               pretrans_valid,    // this read is already translated (cache-only miss)
+    input        [31:0] pretrans_phys,     //   at this physical address
     input        [1:0]  cpl,               // Current privilege level
     input               mem_is_io,         // This request is IO (skip translation)
     input        [3:0]  mem_be,            // Pre-computed byte enables (for IO and non-crossing mem)
@@ -434,6 +436,7 @@ wire idle_x87_io_req = mem_is_io &&
                        (idle_request_linear[1:0] == 2'b00);
 wire cache_lookup_granted = 1'b1;
 wire idle_mem_ready = s_idle && !mem_servicing;
+assign demand_idle = idle_mem_ready;
 wire req_tlb_dirty_ok = !req_is_write || tlb_dirty;
 wire req_can_translate = !pg_enable || (tlb_hit && slow_tlb_access_ok && req_tlb_dirty_ok);
 wire req_perm_fault = pg_enable && tlb_hit && !slow_tlb_access_ok;
@@ -487,11 +490,6 @@ wire [31:0] fast_pf_phys = pg_enable ? {tlb_physical_addr[31:12], pf_linear_addr
 assign mem_accepted = mem_accepted_r || idle_mem_ready;
 wire        req_mem_present    = (state == PG_MEM_TLB);
 
-// Early read drives dcache at PG_IDLE / RD microcode time
-wire        early_rd_idx_drive = idle_data_req && !mem_write && !mem_is_io;
-wire        early_rd_tlb_ok    = !pg_enable || (live_tlb_hit && live_user_ok);
-wire        early_rd_present   = early_rd_idx_drive && mem_ea_read && !idle_mem_crossing &&
-                                 !mem_rd_ind && early_rd_tlb_ok;
 // Early write: post a cacheable, non-crossing, non-check-only write at PG_IDLE from the live TLB. Validated (zero EARLY-WRITE mismatches...
 // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-415
 wire        early_wr_idx_drive = idle_data_req && mem_write && !mem_is_io;
@@ -501,7 +499,7 @@ wire        early_wr_present   = early_wr_idx_drive && !idle_mem_crossing &&
 // mere request intent out of this select prevents a faulting/missing live
 // translation from coupling into an older registered direct request.
 wire        early_wr_data_drive = early_wr_present && !dcache_req_valid_r;
-wire        early_idx_drive    = early_rd_idx_drive || early_wr_idx_drive;
+wire        early_idx_drive    = early_wr_idx_drive;
 // The live physical frame is consumed only after live_tlb_hit qualifies an
 // early request.  The TLB therefore need not synthesize a linear-address
 // fallback into this already-deep cache-finalize path.
@@ -511,17 +509,23 @@ wire        early_is_vga_mem   = pg_enable ? live_tlb_is_vga_mem
                                            : (linear_addr[31:17] == 15'h5);
 wire        req_is_vga_mem     = pg_enable ? tlb_is_vga_mem
                                            : (req_linear[31:17] == 15'h5);
-wire        early_rd_accept    = early_rd_present && dcache_req_accepted;
 wire        early_wr_accept    = early_wr_present && dcache_req_accepted;
-wire        early_present      = early_rd_present || early_wr_present;
+// A read whose probe-path resolve found a TLB hit but no line presents its
+// registered physical address directly: no translation cycle.
+wire        pretrans_present   = idle_data_req && pretrans_valid && !mem_write &&
+                                 !mem_is_io && !idle_mem_crossing;
+wire        pretrans_accept    = pretrans_present && dcache_req_accepted;
+wire        early_present      = early_wr_present || pretrans_present;
 
 assign dcache_req_valid = dcache_req_valid_r || req_mem_dcache_candidate || early_present;
 // PIPT cache request: drive the cache off the physical address only -- no separate early-index port. Page frame [31:12] uses the...
 // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-433
-wire [19:0] dcache_req_frame  = early_present   ? early_phys[31:12] :
+wire [19:0] dcache_req_frame  = pretrans_present ? pretrans_phys[31:12] :
+                                early_present   ? early_phys[31:12] :
                                 req_mem_present  ? req_mem_phys[31:12] :
                                                    dcache_req_phys_addr_r[31:12];
-wire [11:0] dcache_req_offset = early_idx_drive  ? linear_addr[11:0] :
+wire [11:0] dcache_req_offset = pretrans_present ? pretrans_phys[11:0] :
+                                early_idx_drive  ? linear_addr[11:0] :
                                 req_mem_present   ? req_linear[11:0] :
                                                     dcache_req_phys_addr_r[11:0];
 assign dcache_req_phys_addr = {dcache_req_frame, dcache_req_offset};
@@ -529,10 +533,10 @@ assign dcache_req_preread_offset = dcache_req_offset;
 // Conservatively reserve the preread port for any registered demand request.
 // IO-like requests do not consume the cache, but retaining that distinction
 // here only lengthens the arbitration cone and cannot improve demand latency.
-assign dcache_req_preread_priority = early_idx_drive || req_mem_present ||
+assign dcache_req_preread_priority = early_idx_drive || pretrans_present || req_mem_present ||
                                      dcache_req_valid_r;
-assign dcache_req_write = early_wr_present ? 1'b1 :
-                          early_rd_present ? 1'b0 :
+assign dcache_req_write = pretrans_present ? 1'b0 :
+                          early_wr_present ? 1'b1 :
                           req_mem_present  ? req_is_write : dcache_req_write_r;
 assign dcache_req_be = early_present ? mem_be :
                        req_mem_present ?
@@ -885,13 +889,10 @@ always_ff @(posedge clk or negedge reset_n) begin
                             dcache_req_is_inta_r <= 1'b0;
                             state <= PG_CROSS_WAIT1;
                         end
-                    end else if (early_rd_accept) begin
-                        // SET-read-at-019: the dcache accepted the early read (presented this cycle with the live physical), so the SET preread already ran at...
-                        // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-753
+                    end else if (pretrans_accept) begin
                         latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size),
                                        linear_addr[1:0], 1'b0, 1'b0);
                         fast_path_pending <= 1'b1;
-                        mem_dly_grace <= 1'b1;   // optimistic release for the finalize cycle
                     end else if (early_wr_accept) begin
                         // Early posted write: the store-queue write was enqueued this cycle from the live physical (accept => post), so the access is done. Clear...
                         // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-764

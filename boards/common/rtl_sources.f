@@ -8,6 +8,7 @@ ucode_rom.sv
 microsequencer.sv
 event_control.sv
 hardwired_control.sv
+data_access.sv
 data_unit.sv
 address_unit.sv
 shifter.sv

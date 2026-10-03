@@ -203,7 +203,12 @@ wire spec_b_match = spec_req && !spec_match_now && spec_b_valid &&
                     !spec_inflight && !spec_pend &&
                     !spec_store_valid && !spec_global_kill &&
                     (spec_b_addr == spec_linear[31:4]);
-wire spec_want   = ((spec_req && !spec_match_now && !spec_b_match) || spec_pend);
+// A request for the line already in flight (an older branch's target in the
+// same line) re-owns that fetch, as spec_match_now re-owns a buffered line.
+wire spec_inflight_match = spec_req && spec_inflight && !spec_poison && !spec_pend &&
+                           (spec_addr == spec_linear[31:4]);
+wire spec_want   = ((spec_req && !spec_match_now && !spec_b_match && !spec_inflight_match) ||
+                    spec_pend);
 // !pf_redirect_queued/!pf_drop_inflight: the queued-redirect handshake makes pf_inflight look idle (req toggled back to ack) while the...
 // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-178
 wire spec_launch = spec_want && !pf_inflight && !q_flush && !pf_suspend &&
@@ -215,6 +220,14 @@ wire spec_adopt        = spec_inflight && !spec_poison && !pf_ack_edge && spec_o
 wire spec_data_now     = spec_inflight && !spec_poison && pf_ack_edge && !pf_fault &&
                          spec_owner;
 wire spec_flush_hit    = q_flush && (spec_line_match || spec_data_now);
+// synthesis translate_off
+// Ownership stands in for an address compare: prove it on every adopted flush.
+always @(posedge clk)
+    if (reset_n && q_flush && (spec_flush_hit || spec_adopt) &&
+        ((spec_addr != pf_flush_addr[31:4]) || (spec_off != pf_flush_addr[3:0])))
+        $fatal(1, "SPEC OWNER MISMATCH: line %07x off %x flush %08x",
+               spec_addr, spec_off, pf_flush_addr);
+// synthesis translate_on
 // K1PJ (US5293592): the byte where code begins after a jump, returned with
 // the refilled line. The buffered target line supplies its latched offset.
 wire [1:0] k1pj_boff = spec_flush_hit ? spec_off[1:0] : pf_flush_addr[1:0];
@@ -567,8 +580,8 @@ always_ff @(posedge clk or negedge reset_n) begin
         // Latch a spec request; a newer request replaces an older PENDING one but never the address of a fetch already in flight. Ownership-based...
         // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-489
         if (spec_req && !q_flush) begin
-            if (spec_match_now) begin
-                // Buffered line already holds this target: re-own, no refetch.
+            if (spec_match_now || spec_inflight_match) begin
+                // Buffered or in-flight line holds this target: re-own, no refetch.
                 spec_off <= spec_linear[3:0];
             end else if (spec_b_match) begin
                 // The victim holds this target: swap the two entries.

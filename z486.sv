@@ -150,7 +150,6 @@ wire [31:0] dest_value;
 wire        uc_pref_suppress_prev;
 wire        stall;
 wire        decq_empty;
-wire        vipt_load_ex_hit;
 wire        uc_busreq;
 wire        mem_req_current;
 wire        uc_is_wio;
@@ -160,12 +159,88 @@ wire [1:0]  pg_cpl;
 wire        seg_gp_fault;
 wire [31:0] issue_ind_linear;
 wire [1:0]  issue_ind_linear_low;
+wire [31:0] issue_mem_linear;          // issuing instruction's memory address (stack, moffs, ModR/M)
+wire [31:0] forwarded_esp;             // ESP including a pending stack update
+wire [7:0]  pend_write_mask;           // GPRs a late producer writes on this edge
+// Data-access pipeline (data_access.sv) connections
+// L1 data cache: probe/resolve port and direct store port
+wire         dcache_wr_ready;
+wire         fast_store_accepted;
+wire [3:0]   fast_store_be;
+wire         fast_store_valid;
+wire [31:0]  fast_store_wdata;
+wire [31:0]  rmw_fast_phys_r;
+wire [31:0]  st_phys;
+wire         st_route;
+wire         st_take;
+// Paging unit and sidecar TLB
+wire         paging_demand_idle;
+wire         sidecar_bg_pre;
+wire         st_tlb_pre;
+wire [1:0]   ucrd_cpl_r;
+wire         ucrd_hit;
+wire [31:0]  ucrd_linear_r;
+wire         ucrd_phys_ok_r;
+wire [31:0]  ucrd_phys_r;
+wire         ucrd_route_pre;
+wire [1:0]   ucrd_size_r;
+wire         ucrd_slow_req_r;
+wire         ucrd_slow_submit;
+wire         ucrd_x87_r;
+hardwired_load_payload_t vipt_load_slow_r;
+wire [31:0]  vipt_probe_linear;
+wire         vipt_slow_addr_owned;
+wire         vipt_slow_phys_ok_r;
+wire [31:0]  vipt_slow_phys_r;
+wire         vipt_slow_submit;
+// Data unit: load writeback and operands
+wire         direct_wb_retire;
+wire         fast_opr_commit;
+wire [31:0]  fast_opr_data;
+wire         vipt_load_alu_dst_capture;
+wire [31:0]  vipt_load_alu_dst_capture_data;
+wire [2:0]   vipt_load_alu_dst_capture_dst;
+wire [1:0]   vipt_load_alu_dst_capture_size;
+wire [4:0]   vipt_load_wb_alu_op_r;
+wire [31:0]  vipt_load_wb_data;
+wire [7:0]   vipt_load_wb_dst_onehot_r;
+wire [2:0]   vipt_load_wb_dst_r;
+wire         vipt_load_wb_is_alu_r;
+wire [1:0]   vipt_load_wb_size_r;
+wire [31:0]  vipt_load_wb_target_r;
+wire         vipt_load_wb_valid_r;
+// D2 instruction and issue
+wire         d2_vipt_ea_hazard;
+wire         d2_plain_load_overlap_ready;
+wire         d2_vipt_candidate;
+wire         d2_vipt_load;
+wire         d2_vipt_pipe_ready;
+wire         d2_vipt_pop;
+wire         d2_vipt_ret;
+wire         d2_vipt_rmw;
+wire         d2_vipt_rmw_candidate;
+wire         vipt_issue_load;
+// Microsequencer and core control
+wire         pop_direct_r;
+wire         rd_fast_finish;
+wire         rd_fast_valid_r;
+wire         ret_redirect;
+wire         rmw_fallback_delay_r;
+wire         rmw_fast_active_r;
+wire         stall_fast_store;
+wire         stall_rmw_probe;
+wire         stall_ucrd;
+wire         vipt_load_ex_probed_r;
+hardwired_load_token_t vipt_load_ex_r;
+wire         vipt_load_exec_block;
+hardwired_load_token_t vipt_load_replay_r;
+wire         vipt_load_slow_busy;
+wire         vipt_load_slow_wait_r;
 wire        dly_gpr_we;
 wire        eff_mask_pending;
 reg  [3:0]  seg_cmd;
 wire gate_detect_cond;
 wire [31:0] br_target;
-reg         rmw_fallback_delay_r;
 reg         early_redirected;
 
 // Segmentation and protection state shared across the address pipeline.
@@ -191,6 +266,12 @@ wire [19:0] idt_limit;
 wire [31:0] gdt_base;
 wire [19:0] gdt_limit;
 wire [31:0] CS_base = desc_cache[SEG_CS].base;
+// Flat segments (page-granular, 4 GB limit, not expand-down): no contained
+// access can violate their limit, so direct loads skip the limit check.
+wire ds_flat   = desc_cache[SEG_DS].G && (&desc_cache[SEG_DS].limit) &&
+                 (desc_cache[SEG_DS].seg_type[3] || !desc_cache[SEG_DS].seg_type[2]);
+wire ss_flat32 = desc_cache[SEG_SS].G && desc_cache[SEG_SS].D_B && (&desc_cache[SEG_SS].limit) &&
+                 (desc_cache[SEG_SS].seg_type[3] || !desc_cache[SEG_SS].seg_type[2]);
 
 wire       pe = CR0[0];             // Protected mode enable
 wire       vm = EFLAGS[17];         // Virtual 8086 mode
@@ -419,20 +500,6 @@ wire       x87_direct_candidate;              // D2 entry is the direct x87 over
 wire       flags_backup_active;     // Set at i_issue/FLGSBA, cleared on interrupt_entry - guards FLAGSB writes
 wire       d2_hardwired;             // D2 entry is a bounded hardwired recipe
 wire       jcc_fold_active;            // not-taken Jcc occupies reclaimed slot
-wire       d2_vipt_candidate;          // Hardwired MOV/MOVX register load
-wire       d2_vipt_load;               // Candidate accepted by the VIPT probe
-wire       d2_vipt_alu;                // ALU register,memory via registered VIPT data
-wire       d2_vipt_rmw_candidate;      // Qualified RD_FAST RMW overlay
-wire       d2_vipt_rmw;                // Candidate accepted for a D2 preread
-wire       d2_vipt_ea_hazard;          // Pending direct load owns a D2 EA input
-wire       d2_vipt_older_store;         // Current EX uop must enter paging before a younger load
-wire [2:0] d2_vipt_dst;
-wire [7:0] d2_vipt_dst_onehot;
-wire [1:0] d2_vipt_mem_size;
-wire [1:0] d2_vipt_write_size;
-hardwired_load_result_t d2_vipt_result_kind;
-hardwired_load_token_t vipt_load_ex_r; // D2-owned preread resolves in EX
-hardwired_load_token_t vipt_load_replay_r; // Younger probe saved behind a miss
 // These nets feed module ports before their generating logic appears below.
 // Declare them here so XSim cannot create disconnected implicit one-bit nets.
 wire [31:0] spec_target_lin;
@@ -441,79 +508,8 @@ reg         pf_spec_owner_r;
 wire        pf_spec_store;
 wire [31:0] pf_spec_store_linear;
 wire        pf_spec_global_kill;
-wire        vipt_issue_load;
 wire        prot_redirect_prev;
 wire        prot_redirect_taken;
-hardwired_load_payload_t vipt_load_slow_r; // Miss owned by normal paging
-reg        vipt_load_slow_req_r;
-reg        vipt_load_slow_wait_r;
-reg        vipt_load_wb_valid_r;       // Registered load retires in WB
-reg        vipt_load_ex_probed_r;      // EX token owns valid cache/TLB prereads
-reg [31:0] vipt_load_wb_data_r;
-reg [2:0]  vipt_load_wb_dst_r;
-reg [7:0]  vipt_load_wb_dst_onehot_r;
-reg [1:0]  vipt_load_wb_size_r;
-reg        vipt_load_wb_is_alu_r;
-reg [4:0]  vipt_load_wb_alu_op_r;
-reg        vipt_load_overlap_r;        // Plain-load successor owns EX while load completes
-wire       vipt_load_slow_busy = vipt_load_slow_req_r || vipt_load_slow_wait_r;
-wire       vipt_load_busy = vipt_load_ex_r.valid || vipt_load_replay_r.valid ||
-                            vipt_load_slow_busy || vipt_load_wb_valid_r;
-wire       vipt_load_retire;
-
-reg        rd_fast_valid_r;             // Issued overlay awaiting VIPT finalize
-reg        rd_fast_probed_r;            // D2 preread was accepted
-reg [31:0] rd_fast_linear_r;
-reg [1:0]  rd_fast_size_r;
-reg [1:0]  rd_fast_lane_r;
-reg        rmw_fast_active_r;           // Qualified address owned through WR_FAST
-reg [31:0] rmw_fast_phys_r;
-reg [1:0]  rmw_fast_size_r;
-reg [1:0]  rmw_fast_lane_r;
-wire       fast_store_accepted;
-wire       fast_store_valid = rmw_fast_active_r && i_rni_delay;
-wire [3:0] fast_store_be = calc_be(rmw_fast_size_r, rmw_fast_lane_r);
-wire [31:0] fast_store_wdata = SIGMA << {rmw_fast_lane_r, 3'b000};
-wire       stall_fast_store = fast_store_valid && !fast_store_accepted;
-// A qualified RMW whose D2 preread was denied (for example by an older store
-// still in L1 lookup in the same set) holds its overlay entry uStep and
-// replays the preread from the registered linear address, instead of taking
-// the full original-routine fallback. The select terms are registered.
-wire       stall_rmw_probe = rd_fast_valid_r && !rd_fast_probed_r && i_first;
-wire       direct_wb_retire = vipt_load_retire;
-
-function automatic [31:0] format_hardwired_load(
-    input [31:0] raw,
-    input [1:0] lane,
-    input [1:0] mem_size,
-    input hardwired_load_result_t result_kind
-);
-    logic [31:0] shifted;
-    begin
-        shifted = raw >> {lane, 3'b000};
-        case (mem_size)
-            2'd0: begin
-                case (result_kind)
-                    LOAD_RESULT_SIGN_EXTEND:
-                        format_hardwired_load = {{24{shifted[7]}}, shifted[7:0]};
-                    default:
-                        format_hardwired_load = {24'd0, shifted[7:0]};
-                endcase
-            end
-            2'd1: begin
-                case (result_kind)
-                    LOAD_RESULT_SIGN_EXTEND:
-                        format_hardwired_load = {{16{shifted[15]}}, shifted[15:0]};
-                    default:
-                        format_hardwired_load = {16'd0, shifted[15:0]};
-                endcase
-            end
-            default: format_hardwired_load = shifted;
-        endcase
-    end
-endfunction
-
-wire [31:0] vipt_load_wb_data = vipt_load_wb_data_r;
 
 // Empty D2 may launch directly from D1. Otherwise the resident D2 skeleton
 // supplies a registered entry address when the current instruction ends.
@@ -565,25 +561,6 @@ wire       d2_ready_base = d2_payload_ready && !stall &&
                       !(i_rni && tf_trap_pending && !single_step) &&
                       !interrupt_at_boundary && !q_flush &&
                       !d2_vipt_ea_hazard;
-// An occupied EX stage may accept only another direct load. If the older load
-// misses, the accepted younger token moves to the replay slot on this edge.
-wire       d2_vipt_pipe_ready = d2_vipt_candidate &&
-                                dcache_vipt_probe_ready &&
-                                vipt_load_ex_probed_r &&
-                                !vipt_load_replay_r.valid &&
-                                !vipt_load_slow_busy && !single_step;
-// Once a plain load has finalized as a hit, its successor may enter EX on the
-// same edge. Data operands consume the following WB value through forwarding;
-// an EA dependency is held by d2_vipt_ea_hazard for exactly one hit cycle.
-// Misses retain the precise slow-path interlock.
-wire       d2_plain_load_overlap_ready = vipt_load_ex_r.valid &&
-                                vipt_load_ex_probed_r &&
-                                vipt_load_ex_hit &&
-                                !vipt_load_ex_r.is_alu &&
-                                !d2_vipt_candidate &&
-                                !d2_vipt_ea_hazard &&
-                                !vipt_load_replay_r.valid &&
-                                !vipt_load_slow_busy && !single_step;
 assign     d2_ready = d2_ready_base &&
                       !vipt_load_replay_r.valid && !vipt_load_slow_busy &&
                       (!d2_vipt_candidate || d2_vipt_load) &&
@@ -603,9 +580,6 @@ assign     i_issue = (pb_issue_b23 || pb_issue) &&
                      (d2_vipt_load ? d2_vipt_issue_ready : d2_ready);
 
 // synthesis translate_off
-wire [2:0] vipt_load_wb_norm_dst = (vipt_load_wb_size_r == 2'd0)
-                                  ? {1'b0, vipt_load_wb_dst_r[1:0]}
-                                  : vipt_load_wb_dst_r;
 always_ff @(posedge clk) begin
     if (reset_n && (i_issue !== i_issue_reference))
         $fatal(1, "VIPT ISSUE READY MISMATCH: direct=%b generic=%b",
@@ -616,10 +590,14 @@ end
 wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
 wire       dly_grace_now = mem_dly_grace && uc_p_pure_dly;
 wire       posted_write_release = mem_write_dly_grace && !uc_busreq;    // release non-busop writes after one cycle
-wire       mem_block_busy = (uc_bus_or_dly && !dly_grace_now && !posted_write_release) ||
+// A word whose bus operation the direct load suppresses (its ROM word while
+// the token owns the access) does not wait for paging.
+wire       uc_bus_or_dly_live = uc_bus_or_dly && !vipt_load_exec_block;
+wire       mem_block_busy = (uc_bus_or_dly_live && !dly_grace_now && !posted_write_release) ||
                             mem_opt_wait || mem_write_wait; // demand op in flight
-wire       mem_block_idle = (uc_busreq && !mem_accepted);  // uop wants the bus, paging not ready
-wire       stall_mem = mem_servicing ? mem_block_busy : (mem_req_current && !mem_accepted);
+wire       mem_block_idle = (uc_busreq && !vipt_load_exec_block && !mem_accepted);  // uop wants the bus, paging not ready
+wire       stall_mem = (mem_servicing ? mem_block_busy : (mem_req_current && !mem_accepted)) ||
+                       stall_ucrd;
 wire       stall_wio = uc_active && uc_is_wio &&
                        !interrupt_pending && !single_step;
 wire       stall_x87_direct;
@@ -633,23 +611,27 @@ wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight)
                            && !(uc_is_wio && interrupt_pending);
 
 // uc_exec: master enable for microcode execution
-wire       vipt_load_overlap_wb = vipt_load_overlap_r &&
-                     vipt_load_wb_valid_r && !vipt_load_ex_r.valid &&
-                     !vipt_load_replay_r.valid && !vipt_load_slow_busy;
-wire       vipt_load_exec_block = vipt_load_busy && !vipt_load_overlap_wb;
 // uc_slot_live: every hold on the executing word except a direct load's own
 // ROM words, which the data pipeline completes. A dead slot issues on it.
 wire       uc_slot_live = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) &&
+                 !stall_ucrd &&
                  !stall_wio && !stall_x87_direct && !stall_invlpg &&
                  !stall_fast_store && !stall_rmw_probe &&
                  !throttle_parked_r && !recipe_slot_stale && !rmw_fallback_delay_r;
-assign uc_exec = uc_slot_live && !vipt_load_exec_block;
+// A direct POP's first ROM word executes for its ESP write while the data
+// pipeline completes the load (the word's read is suppressed).
+assign uc_exec = uc_slot_live && (!vipt_load_exec_block || (pop_direct_r && i_first));
 wire       uc_exec_writeback = uc_exec;  // local copies for reducing fanout
 wire       uc_exec_shift = uc_exec;
 
 assign     seg_cmd_valid = i_issue || uc_exec;
 
 dec_entry_t i_bus;            // Instruction resident in unified D2
+// A direct load's address and byte lane: the ModR/M lane comes from the fast
+// low-bit adders; a moffs lane from the relocated immediate.
+wire [31:0] issue_load_linear = issue_mem_linear;
+wire [1:0]  issue_load_low = (i_bus.has_moffs || i_bus.stack_op) ? issue_mem_linear[1:0]
+                                                                : issue_ind_linear_low;
 wire       decq_has_jmp_call; // D1/D2 holds a JMP/CALL rel (halt speculative prefetch)
 dec_entry_t pb_next_instr;    // Instruction entering the D2 skeleton from D1
 ea_dec_t    skel_load_ea_dec; // Its EA decode, latched by the Address Unit
@@ -690,7 +672,8 @@ wire       pb_load_ready = !x87_direct_candidate && !d2_vipt_ea_hazard &&
     (!d2_vipt_rmw_candidate ||
      (dcache_vipt_probe_ready && !vipt_load_replay_r.valid && !vipt_load_slow_busy &&
       !rmw_fast_active_r && !mem_servicing)) &&
-    (z486_pkg::recipe_early_kind(i_bus.entry_point) != RECIPE_EARLY_LOAD ||
+    ((z486_pkg::recipe_early_kind(i_bus.entry_point) != RECIPE_EARLY_LOAD &&
+      !d2_vipt_candidate) ||
      ((d2_vipt_candidate ? (d2_vipt_load &&
                             (!vipt_load_ex_r.valid || vipt_load_ex_probed_r))
                          : !vipt_load_ex_r.valid) &&
@@ -789,10 +772,11 @@ memory #(
     .dcache_read_complete(dcache_read_complete),
     .dcache_rdata(dcache_rdata),
     .fast_store_valid(fast_store_valid),
-    .fast_store_phys_addr_raw(rmw_fast_phys_r),
+    .fast_store_phys_addr_raw(st_take ? st_phys : rmw_fast_phys_r),
     .fast_store_be(fast_store_be),
     .fast_store_wdata(fast_store_wdata),
     .fast_store_accepted(fast_store_accepted),
+    .dcache_wr_ready(dcache_wr_ready),
     .dcache_vipt_probe_valid(dcache_vipt_probe_valid),
     .dcache_vipt_probe_offset(dcache_vipt_probe_offset),
     .dcache_vipt_probe_ready(dcache_vipt_probe_ready),
@@ -886,25 +870,99 @@ prefetch prefetch_inst (
 // z486 speculative branch-target fetch
 wire [31:0] spec_disp      = i_bus.branch_rel8 ? {{24{i_bus.displacement[7]}}, i_bus.displacement[7:0]}
                                           : i_bus.displacement;
-// Stale-EIP pop guard: a pop CHAINED into a control transfer's
-wire        spec_eip_stale = uc_exec && recipe_rni && (uc_dest == DEST_eIP);
 // A 16-bit operand size truncates the new EIP to 16 bits.
 wire [31:0] spec_target_sum = EIP + ({27'd0, i_bus.length} + spec_disp);
 wire [31:0] spec_target_eip = i_bus.data32 ? spec_target_sum : {16'h0, spec_target_sum[15:0]};
-assign spec_target_lin = CS_base + spec_target_eip;
-assign pf_spec_req = i_issue && (i_bus.rel_branch_kind != REL_BRANCH_NONE) &&
-                     !hardwired_off && !spec_eip_stale;
-// Ownership: set when an instruction's i_issue requests a spec fetch, cleared
-// by any later pop, flush, or interrupt entry - so it is only up while the
+
+// Return-address stack: a near CALL pushes its return address at issue and a
+// direct-load RET pops it. A RET in D2 requests the line of the predicted
+// target as a branch requests its target; the prediction is checked against
+// the stack word the RET resolves in EX, and a RET keeps the line only if it
+// matched (a wrong prediction costs only the line).
+localparam integer RSB_DEPTH = 4;
+reg  [31:0] rsb [0:RSB_DEPTH-1];
+reg  [RSB_DEPTH-1:0] rsb_valid;
+reg  [1:0]  rsb_top_r;
+reg  [31:0] ret_pred_r;                // the issued RET's predicted target
+wire        d2_is_call = !i_bus.has_0f &&
+                         ((i_bus.rel_branch_kind == REL_BRANCH_CALL) ||
+                          ((i_bus.opcode == 8'hFF) && (i_bus.modrm[5:3] == 3'd2)));
+wire [31:0] call_return_sum = EIP + {27'd0, i_bus.length};
+wire [31:0] call_return = i_bus.data32 ? call_return_sum : {16'h0, call_return_sum[15:0]};
+wire        d2_ret_pred = d2_vipt_ret && rsb_valid[rsb_top_r];
+wire        ret_issue = vipt_issue_load && d2_vipt_ret;
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        rsb_valid <= '0;
+        rsb_top_r <= 2'd0;
+    end else if (i_issue && d2_is_call) begin
+        rsb_top_r <= rsb_top_r + 2'd1;
+        rsb[rsb_top_r + 2'd1] <= call_return;
+        rsb_valid[rsb_top_r + 2'd1] <= 1'b1;
+    end else if (ret_issue) begin
+        rsb_top_r <= rsb_top_r - 2'd1;
+        rsb_valid[rsb_top_r] <= 1'b0;
+    end
+    if (ret_issue)
+        ret_pred_r <= rsb[rsb_top_r];
+end
+assign spec_target_lin = CS_base + (d2_ret_pred ? rsb[rsb_top_r] : spec_target_eip);
+// A relative branch requests its target line as soon as it is resident in
+// D2, while its predecessor executes: EIP then already holds the branch's
+// own address. The target is right only if EIP is not written between the
+// request and the issue, so an EIP write cancels a sent request (the next
+// cycle requests again from the new EIP). The request is registered D2 state,
+// off i_issue. It waits while the executing instruction owns the spec line
+// (a microcode branch flushes late).
+wire        eip_write_now = branch_ustep_redirect || ret_redirect ||
+                            (uc_exec && ((uc_dest == DEST_EIP) || (uc_dest == DEST_eIP) ||
+                                         (uc_dest == DEST_IP) ||
+                                         (uc_dest == DEST_USTEP_RPTI_EIP)));
+reg         d2_spec_sent_r;            // the D2 branch's target line is requested
+// A hardwired branch uStep that executes not taken no longer needs its line.
+wire        spec_owner_release = branch_ustep_exec && !branch_ustep_redirect;
+assign pf_spec_req = d2_resident && d2_push &&
+                     ((i_bus.rel_branch_kind != REL_BRANCH_NONE) || d2_ret_pred) &&
+                     !hardwired_off && !d2_spec_sent_r && !eip_write_now &&
+                     !(pf_spec_owner_r && !spec_owner_release);
+// A RET checks its prediction when its probe resolves in EX.
+wire        ret_pred_wrong = vipt_load_ex_r.valid && vipt_load_ex_probed_r &&
+                             vipt_load_ex_r.is_ret &&
+                             (dcache_vipt_resolve_data != ret_pred_r);
+always_ff @(posedge clk) begin
+    if (!reset_n || q_flush || i_issue || interrupt_entry || any_fault || eip_write_now)
+        d2_spec_sent_r <= 1'b0;
+    else if (pf_spec_req)
+        d2_spec_sent_r <= 1'b1;
+end
+// synthesis translate_off
+logic [31:0] d2_spec_sent_lin_r;
+always_ff @(posedge clk) begin
+    if (pf_spec_req) d2_spec_sent_lin_r <= spec_target_lin;
+    if (reset_n && i_issue && d2_spec_sent_r && !eip_write_now &&
+        (d2_spec_sent_lin_r !== spec_target_lin))
+        $fatal(1, "D2 SPEC TARGET STALE: sent %08x issue %08x EIP %08x op %02x uc %03x",
+               d2_spec_sent_lin_r, spec_target_lin, EIP, i_bus.opcode, uc_addr);
+end
+// synthesis translate_on
+// Ownership: taken at issue by a branch whose request stands, cleared by any
+// later issue, flush, or interrupt entry - so it is only up while the
 // requesting branch itself is the current instruction, which is exactly when
 // its taken-flush address provably equals the spec target.
 always_ff @(posedge clk) begin
     if (!reset_n)
         pf_spec_owner_r <= 1'b0;
     else begin
+        if (spec_owner_release)
+            pf_spec_owner_r <= 1'b0;
+        // A RET owns its predicted line only as a direct load (a ROM-path RET
+        // redirects from microcode, unchecked against the prediction).
         if (i_issue)
-            pf_spec_owner_r <= pf_spec_req;
-        if (q_flush || interrupt_entry || any_fault)
+            pf_spec_owner_r <= ((d2_spec_sent_r && !eip_write_now) || pf_spec_req) &&
+                               (!d2_vipt_ret || d2_vipt_load);
+        // A RET whose prediction was wrong, or whose probe missed (its
+        // redirect waits for paging), gives up the line.
+        if (q_flush || interrupt_entry || any_fault || vipt_load_slow_busy || ret_pred_wrong)
             pf_spec_owner_r <= 1'b0;
     end
 end
@@ -1062,6 +1120,8 @@ hardwired_control hardwired_control_inst (
     .throttle_hold(throttle_hold),
     .stall(stall),
     .load_pipe_issue(vipt_issue_load),
+    .load_pipe_pop(vipt_issue_load && d2_vipt_pop),
+    .load_pipe_ret(vipt_issue_load && d2_vipt_ret),
     .load_wb_retire(direct_wb_retire),
     .load_probe_wait(d2_resident && d2_vipt_candidate && !d2_vipt_load),
     .pb_valid(pb_valid),
@@ -1126,305 +1186,6 @@ always_ff @(posedge clk) begin
     end
 end
 
-// The direct load pipeline admits a younger D2 probe while the older token
-// resolves in EX. A miss transfers the older token to normal paging and saves
-// the already-consumed younger token in one replay slot.
-wire vipt_page_enabled = CR0[31];
-wire vipt_user_ok = (pg_cpl != 2'd3) || vipt_tlb_user;
-wire vipt_translation_ok = !vipt_page_enabled ||
-                           (vipt_tlb_hit && vipt_user_ok);
-wire [31:0] vipt_resolve_linear = rd_fast_valid_r
-                                ? rd_fast_linear_r
-                                : vipt_load_ex_r.linear_addr;
-wire [31:0] vipt_resolve_phys = vipt_page_enabled
-                              ? vipt_tlb_phys_addr : vipt_resolve_linear;
-wire vipt_load_ex_contained =
-    (vipt_load_ex_r.mem_size == 2'd0) ||
-    ((vipt_load_ex_r.mem_size == 2'd1) &&
-     (vipt_load_ex_r.lane != 2'd3)) ||
-    ((vipt_load_ex_r.mem_size == 2'd2) &&
-     (vipt_load_ex_r.lane == 2'd0));
-assign vipt_load_ex_hit = vipt_load_ex_r.valid && vipt_load_ex_probed_r &&
-                          vipt_load_ex_contained &&
-                          vipt_translation_ok &&
-                          !vipt_tlb_is_vga_mem && !seg_gp_fault &&
-                          dcache_vipt_resolve_hit;
-// Capture the destination operand from every registered EX token,
-// independently of translation, segmentation, and cache outcome. Plain loads
-// use it for byte/word merge forwarding; M3 uses it as the private ALU
-// destination. This speculative state has no architectural side effect;
-// fault/miss handling gates the later valid/commit token.
-wire vipt_load_alu_dst_capture_fast = vipt_load_ex_r.valid &&
-                                      vipt_load_ex_probed_r;
-wire vipt_load_alu_dst_capture_slow = vipt_load_slow_wait_r &&
-                                      !mem_servicing;
-wire vipt_load_alu_dst_capture = vipt_load_alu_dst_capture_fast ||
-                                 vipt_load_alu_dst_capture_slow;
-wire [2:0] vipt_load_alu_dst_capture_dst =
-    vipt_load_alu_dst_capture_fast ? vipt_load_ex_r.dst
-                                   : vipt_load_slow_r.dst;
-wire [1:0] vipt_load_alu_dst_capture_size =
-    vipt_load_alu_dst_capture_fast ? vipt_load_ex_r.write_size
-                                   : vipt_load_slow_r.write_size;
-wire [31:0] vipt_load_alu_dst_capture_data =
-    vipt_load_alu_dst_capture_fast
-        ? format_hardwired_load(dcache_vipt_resolve_data,
-                               vipt_load_ex_r.lane,
-                               vipt_load_ex_r.mem_size,
-                               vipt_load_ex_r.result_kind)
-        : format_hardwired_load(OPR_R, 2'd0,
-                               vipt_load_slow_r.mem_size,
-                               vipt_load_slow_r.result_kind);
-wire vipt_replay_try = vipt_load_replay_r.valid &&
-                       !vipt_load_ex_r.valid && !vipt_load_slow_busy &&
-                       !mem_servicing &&
-                       dcache_vipt_probe_ready;
-assign vipt_issue_load = i_issue && d2_vipt_load;
-wire rd_fast_issue = i_issue &&
-                     (i_bus.ucode_action == RECIPE_ACTION_RMW_FAST);
-wire vipt_issue_rmw = rd_fast_issue && d2_vipt_rmw;
-wire vipt_issue_store_wait = vipt_issue_load && d2_vipt_older_store;
-// The older load replay has priority; neither replay can coincide with a D2
-// issue probe because the replaying instruction still owns EX.
-wire rmw_replay_try = stall_rmw_probe && !vipt_replay_try &&
-                      !vipt_load_ex_r.valid && !vipt_load_slow_busy &&
-                      !mem_servicing && dcache_vipt_probe_ready;
-wire [31:0] vipt_probe_linear = vipt_replay_try
-                              ? vipt_load_replay_r.linear_addr
-                              : stall_rmw_probe
-                              ? rd_fast_linear_r
-                              : issue_ind_linear;
-
-assign dcache_vipt_probe_valid = vipt_issue_load || vipt_issue_rmw ||
-                                 vipt_replay_try || rmw_replay_try;
-assign dcache_vipt_probe_offset = vipt_probe_linear[11:0];
-assign dcache_vipt_resolve_valid = ((vipt_load_ex_r.valid &&
-                                     vipt_load_ex_probed_r) ||
-                                    (rd_fast_valid_r &&
-                                     rd_fast_probed_r)) &&
-                                   vipt_translation_ok &&
-                                   !vipt_tlb_is_vga_mem && !seg_gp_fault;
-assign dcache_vipt_resolve_phys_addr = vipt_resolve_phys;
-
-// A synthetic RNI is required only when the direct pipeline drains. Interior
-// load boundaries are represented by their D2 issue and WB commit tokens.
-assign vipt_load_retire = vipt_load_wb_valid_r && !vipt_load_overlap_r &&
-                          !vipt_load_ex_r.valid &&
-                          !vipt_load_replay_r.valid &&
-                          !vipt_load_slow_busy;
-
-always_ff @(posedge clk) begin
-    if (!reset_n) begin
-        vipt_load_ex_r <= '0;
-        vipt_load_replay_r <= '0;
-        vipt_load_slow_r <= '0;
-        vipt_load_slow_req_r <= 1'b0;
-        vipt_load_slow_wait_r <= 1'b0;
-        vipt_load_wb_valid_r <= 1'b0;
-        vipt_load_ex_probed_r <= 1'b0;
-        vipt_load_wb_data_r <= 32'd0;
-        vipt_load_wb_dst_r <= 3'd0;
-        vipt_load_wb_dst_onehot_r <= 8'd0;
-        vipt_load_wb_size_r <= 2'd2;
-        vipt_load_wb_is_alu_r <= 1'b0;
-        vipt_load_wb_alu_op_r <= 5'd0;
-        vipt_load_overlap_r <= 1'b0;
-    end else begin
-        vipt_load_wb_valid_r <= 1'b0;
-
-        if (vipt_load_wb_valid_r)
-            vipt_load_overlap_r <= 1'b0;
-        if (i_issue && d2_plain_load_overlap_ready)
-            vipt_load_overlap_r <= 1'b1;
-
-        // The EX slot normally advances or empties every cycle.
-        vipt_load_ex_r.valid <= 1'b0;
-        vipt_load_ex_probed_r <= 1'b0;
-
-        if (vipt_replay_try && dcache_vipt_probe_direct_accepted) begin
-            vipt_load_ex_r <= vipt_load_replay_r;
-            vipt_load_ex_probed_r <= 1'b1;
-            vipt_load_replay_r.valid <= 1'b0;
-        end
-
-        if (vipt_load_ex_r.valid) begin
-            if (!vipt_load_ex_probed_r) begin
-                vipt_load_replay_r <= vipt_load_ex_r;
-            end else if (vipt_load_ex_hit && !any_fault) begin
-                vipt_load_wb_valid_r <= 1'b1;
-                vipt_load_wb_data_r <= format_hardwired_load(
-                    dcache_vipt_resolve_data, vipt_load_ex_r.lane,
-                    vipt_load_ex_r.mem_size, vipt_load_ex_r.result_kind);
-                vipt_load_wb_dst_r <= vipt_load_ex_r.dst;
-                vipt_load_wb_dst_onehot_r <= vipt_load_ex_r.dst_onehot;
-                vipt_load_wb_size_r <= vipt_load_ex_r.write_size;
-                vipt_load_wb_is_alu_r <= vipt_load_ex_r.is_alu;
-                vipt_load_wb_alu_op_r <= vipt_load_ex_r.alu_op;
-            end else if (!any_fault) begin
-                vipt_load_slow_r.linear_addr <= vipt_load_ex_r.linear_addr;
-                vipt_load_slow_r.restart_eip <= vipt_load_ex_r.restart_eip;
-                vipt_load_slow_r.dst <= vipt_load_ex_r.dst;
-                vipt_load_slow_r.dst_onehot <= vipt_load_ex_r.dst_onehot;
-                vipt_load_slow_r.mem_size <= vipt_load_ex_r.mem_size;
-                vipt_load_slow_r.lane <= vipt_load_ex_r.lane;
-                vipt_load_slow_r.write_size <= vipt_load_ex_r.write_size;
-                vipt_load_slow_r.result_kind <= vipt_load_ex_r.result_kind;
-                vipt_load_slow_r.is_alu <= vipt_load_ex_r.is_alu;
-                vipt_load_slow_r.alu_op <= vipt_load_ex_r.alu_op;
-                vipt_load_slow_req_r <= 1'b1;
-            end
-        end
-
-        if (vipt_issue_load) begin
-            if (vipt_load_ex_r.valid && !vipt_load_ex_hit) begin
-                vipt_load_replay_r.valid <= 1'b1;
-                vipt_load_replay_r.linear_addr <= issue_ind_linear;
-                vipt_load_replay_r.restart_eip <= EIP;
-                vipt_load_replay_r.dst <= d2_vipt_dst;
-                vipt_load_replay_r.dst_onehot <= d2_vipt_dst_onehot;
-                vipt_load_replay_r.mem_size <= d2_vipt_mem_size;
-                vipt_load_replay_r.lane <= issue_ind_linear_low;
-                vipt_load_replay_r.write_size <= d2_vipt_write_size;
-                vipt_load_replay_r.result_kind <= d2_vipt_result_kind;
-                vipt_load_replay_r.is_alu <= d2_vipt_alu;
-                vipt_load_replay_r.alu_op <= i_bus.decoded_alu_op;
-            end else begin
-                vipt_load_ex_r.valid <= 1'b1;
-                vipt_load_ex_probed_r <= dcache_vipt_probe_accepted &&
-                                          !vipt_issue_store_wait;
-                vipt_load_ex_r.linear_addr <= issue_ind_linear;
-                vipt_load_ex_r.restart_eip <= EIP;
-                vipt_load_ex_r.dst <= d2_vipt_dst;
-                vipt_load_ex_r.dst_onehot <= d2_vipt_dst_onehot;
-                vipt_load_ex_r.mem_size <= d2_vipt_mem_size;
-                vipt_load_ex_r.lane <= issue_ind_linear_low;
-                vipt_load_ex_r.write_size <= d2_vipt_write_size;
-                vipt_load_ex_r.result_kind <= d2_vipt_result_kind;
-                vipt_load_ex_r.is_alu <= d2_vipt_alu;
-                vipt_load_ex_r.alu_op <= i_bus.decoded_alu_op;
-            end
-        end
-
-        if (vipt_load_slow_req_r && mem_accepted) begin
-            vipt_load_slow_req_r <= 1'b0;
-            vipt_load_slow_wait_r <= 1'b1;
-        end
-        // Paging assembles crossing reads in OPR_R.  Wait until its ownership
-        // drops rather than treating the first fragment as a completed load.
-        if (vipt_load_slow_wait_r && !mem_servicing) begin
-            vipt_load_slow_wait_r <= 1'b0;
-            vipt_load_wb_valid_r <= 1'b1;
-            vipt_load_wb_data_r <= format_hardwired_load(
-                OPR_R, 2'd0, vipt_load_slow_r.mem_size,
-                vipt_load_slow_r.result_kind);
-            vipt_load_wb_dst_r <= vipt_load_slow_r.dst;
-            vipt_load_wb_dst_onehot_r <= vipt_load_slow_r.dst_onehot;
-            vipt_load_wb_size_r <= vipt_load_slow_r.write_size;
-            vipt_load_wb_is_alu_r <= vipt_load_slow_r.is_alu;
-            vipt_load_wb_alu_op_r <= vipt_load_slow_r.alu_op;
-        end
-
-        if (q_flush || any_fault || interrupt_entry) begin
-            vipt_load_ex_r.valid <= 1'b0;
-            vipt_load_replay_r.valid <= 1'b0;
-            vipt_load_slow_req_r <= 1'b0;
-            vipt_load_slow_wait_r <= 1'b0;
-            vipt_load_wb_valid_r <= 1'b0;
-            vipt_load_ex_probed_r <= 1'b0;
-            vipt_load_overlap_r <= 1'b0;
-        end
-    end
-end
-
-// synthesis translate_off
-always_ff @(posedge clk) begin
-    if (reset_n && i_issue && d2_vipt_load && !dcache_vipt_probe_ready)
-        $fatal(1, "VIPT load issued without an accepted D2 preread");
-    if (reset_n && vipt_issue_load && vipt_load_ex_r.valid &&
-        !vipt_load_ex_hit && vipt_load_replay_r.valid)
-        $fatal(1, "VIPT replay token overflow");
-    if (reset_n && vipt_load_wb_valid_r &&
-        (vipt_load_wb_dst_onehot_r !== (8'h01 << vipt_load_wb_norm_dst)))
-        $fatal(1, "VIPT WB destination mask mismatch");
-end
-// synthesis translate_on
-
-// RD_FAST finalizes the D2 preread in the overlay entry uStep. A hit commits
-// the formatted operand to normal OPR_R and retains only the write-qualified
-// physical identity. A reject has no architectural side effect and redirects
-// to the untouched original routine.
-wire rd_fast_contained =
-    (rd_fast_size_r == 2'd0) ||
-    ((rd_fast_size_r == 2'd1) && (rd_fast_lane_r != 2'd3)) ||
-    ((rd_fast_size_r == 2'd2) && (rd_fast_lane_r == 2'd0));
-wire rd_fast_page_write_ok = !vipt_page_enabled ||
-    (vipt_tlb_hit && vipt_user_ok && vipt_tlb_dirty &&
-     (vipt_tlb_writable || ((pg_cpl != 2'd3) && !CR0[16])));
-wire rd_fast_hit = rd_fast_valid_r && rd_fast_probed_r &&
-                   rd_fast_contained && rd_fast_page_write_ok &&
-                   !vipt_tlb_is_vga_mem && !seg_gp_fault &&
-                   dcache_vipt_resolve_hit;
-wire rd_fast_finish = rd_fast_valid_r && i_first && uc_exec;
-wire fast_opr_commit = rd_fast_finish && rd_fast_hit;
-wire [31:0] fast_opr_data = format_hardwired_load(
-    dcache_vipt_resolve_data, rd_fast_lane_r,
-    rd_fast_size_r, LOAD_RESULT_COPY);
-always_ff @(posedge clk) begin
-    if (!reset_n) begin
-        rd_fast_valid_r <= 1'b0;
-        rd_fast_probed_r <= 1'b0;
-        rd_fast_linear_r <= 32'd0;
-        rd_fast_size_r <= 2'd0;
-        rd_fast_lane_r <= 2'd0;
-        rmw_fast_active_r <= 1'b0;
-        rmw_fast_phys_r <= 32'd0;
-        rmw_fast_size_r <= 2'd0;
-        rmw_fast_lane_r <= 2'd0;
-        rmw_fallback_delay_r <= 1'b0;
-    end else begin
-        if (rd_fast_issue) begin
-            rd_fast_valid_r <= 1'b1;
-            rd_fast_probed_r <= d2_vipt_rmw &&
-                                dcache_vipt_probe_accepted;
-            rd_fast_linear_r <= issue_ind_linear;
-            rd_fast_size_r <= i_bus.operand_size;
-            rd_fast_lane_r <= issue_ind_linear_low;
-        end
-        if (rmw_replay_try && dcache_vipt_probe_direct_accepted)
-            rd_fast_probed_r <= 1'b1;
-
-        if (rd_fast_finish) begin
-            rd_fast_valid_r <= 1'b0;
-            rd_fast_probed_r <= 1'b0;
-            if (rd_fast_hit) begin
-                rmw_fast_active_r <= 1'b1;
-                rmw_fast_phys_r <= vipt_resolve_phys;
-                rmw_fast_size_r <= rd_fast_size_r;
-                rmw_fast_lane_r <= rd_fast_lane_r;
-            end else begin
-                rmw_fallback_delay_r <= 1'b1;
-            end
-        end
-
-        // Keep the overlay inert while its registered rejection redirects the
-        // two-stage ROM pipeline. The target word is held for one cycle and
-        // executes normally after this token is cleared.
-        if (rmw_fallback_delay_r &&
-            (uc_addr == recipe_fallback_entry(i.entry_point)) &&
-            (uc_addr_mem_r == recipe_fallback_entry(i.entry_point)))
-            rmw_fallback_delay_r <= 1'b0;
-
-        if (fast_store_accepted)
-            rmw_fast_active_r <= 1'b0;
-
-        if (q_flush || any_fault || interrupt_entry) begin
-            rd_fast_valid_r <= 1'b0;
-            rd_fast_probed_r <= 1'b0;
-            rmw_fast_active_r <= 1'b0;
-            rmw_fallback_delay_r <= 1'b0;
-        end
-    end
-end
 
 // synthesis translate_off
 always_ff @(posedge clk) begin
@@ -1553,6 +1314,7 @@ assign dly_gpr_forward.dst = dly_gpr_sel;
 assign dly_gpr_forward.mode = dly_gpr_mode;
 assign dly_gpr_forward.data = dly_fwd_value;
 
+
 wire       dly_esp_fwd = dly_gpr_we && (dly_gpr_sel == 3'd4);
 wire       shc_esp_fwd = recipe_shift_write.valid && (recipe_shift_write.dst == 3'd4) &&
                          (recipe_shift_write.size != 2'd0);
@@ -1561,7 +1323,7 @@ wire       vipt_esp_fwd = vipt_load_wb_valid_r &&
 wire [31:0] vipt_esp_value = (vipt_load_wb_size_r == 2'd1)
                            ? {ESP[31:16], vipt_load_wb_data[15:0]}
                            : vipt_load_wb_data;
-wire [31:0] forwarded_esp = recipe_esp_fwd ? SIGMA :
+assign forwarded_esp = (recipe_esp_fwd || (pop_direct_r && i_first)) ? SIGMA :
                             dly_esp_fwd  ? dly_fwd_value :
                             shc_esp_fwd  ? (recipe_shift_write.size == 2'd1
                                             ? {ESP[31:16], recipe_shift_data[15:0]}
@@ -1662,10 +1424,7 @@ wire [7:0] ea_inval_gpr =
 // The VIPT token normalized byte-register destinations when it entered the
 // pipe. Reuse that registered one-hot here instead of putting WB size/dst
 // decode on the split-EA wait and macro-entry launch cone.
-wire [7:0] d2_split_commit_mask =
-    (dly_gpr_we ? (8'h01 << dly_gpr_sel) : 8'h00) |
-    (recipe_shift_write.valid ? gpr_wr_expand(recipe_shift_write.dst) : 8'h00) |
-    (vipt_load_wb_valid_r ? vipt_load_wb_dst_onehot_r : 8'h00);
+wire [7:0] d2_split_commit_mask = pend_write_mask;
 wire d2_ea_split_refresh = d2_ea_split_done_r &&
     (((d2_agu_dec.base_sel | d2_agu_dec.index_sel) & d2_split_commit_mask) != 8'h00);
 // D2 may capture the partial sum while its predecessor still executes. If the
@@ -1841,6 +1600,7 @@ segmentation_unit seg_unit (
     // LA bus to paging and cache
     .au_issue_linear(issue_ind_linear),
     .au_issue_linear_low(issue_ind_linear_low),
+    .au_issue_mem_linear(issue_mem_linear),
     .au_ind_linear(ind_linear),
     .au_ind_linear_valid(ind_linear_valid),
     // EA bus and IND to control and datapath
@@ -1970,6 +1730,14 @@ assign stall_invlpg = invlpg_active && !invlpg_priv_fault && !invlpg_ack;
 assign gp_fault_trigger = (seg_gp_fault && !rd_fast_valid_r) ||
                           invlpg_priv_fault;
 
+// Deferred GPR commits cancel on any_fault_issue only: a divide overflow fires
+// deep inside DIV's microcode, never while a load or hardwired recipe commits.
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && div_overflow &&
+        (vipt_load_wb_valid_r || recipe_mem_write.valid || recipe_rni))
+        $fatal(1, "divide overflow coincides with a deferred GPR commit");
+// synthesis translate_on
 // div_overflow fires only at the first DIV7/PREDIV word
 assign any_fault_issue = gp_fault_trigger || page_fault;
 assign any_fault = any_fault_issue || div_overflow;
@@ -1995,7 +1763,7 @@ wire io_busop_wr = uc_p_io_wr && mem_is_io;
 wire iack_busop = uc_p_iack;        // IACK bus operation (interrupt acknowledge)
 
 // A stale slot word (a dead slot that issued nothing) starts no bus cycle.
-assign mem_op_eligible = core_live && !mem_servicing && !recipe_slot_stale &&
+assign mem_op_eligible = core_live && !mem_servicing && !recipe_slot_stale && !stall_ucrd &&
                          !throttle_parked_r && !vipt_load_exec_block &&
                          !(i_rni_delay && d2_vipt_candidate);
 // A failed protection test redirects after its third architectural delay uop.
@@ -2019,110 +1787,178 @@ assign pg_cpl = implicit_supervisor ? 2'b00 : cpl;
 reg         gp_fault_r;
 reg         ss_fault_r;
 
-wire        vipt_slow_submit = vipt_load_slow_req_r && !mem_servicing;
-// A fallback token owns stable registered address metadata as soon as it is
-// pending.  Present that address to the live TLB while an older request drains;
-// submission remains idle-gated above.  This keeps mem_servicing out of the
-// live-TLB/cache-address cone without changing request ordering.
-wire        vipt_slow_addr_owned = vipt_load_slow_req_r;
 wire        mem_req_to_paging = (mem_op_eligible &&
                                  (uc_data_busreq || x87_direct_mem_req) &&
-                                 !gp_fault_trigger) || vipt_slow_submit;
+                                 !gp_fault_trigger && !ucrd_route_pre && !st_route) ||
+                                vipt_slow_submit || ucrd_slow_submit;
+
 wire        iack_req_to_paging = mem_op_eligible && iack_busop && !gp_fault_trigger;
-wire        mem_write_now = (x87_direct_mem_req || vipt_slow_submit) ? 1'b0 :
+wire        mem_write_now = (x87_direct_mem_req || vipt_slow_submit || ucrd_slow_submit) ? 1'b0 :
                             (uc_is_write || (io_busop_wr && mem_is_io));
 wire [1:0]  paging_mem_eff_size = vipt_slow_submit
                                 ? vipt_load_slow_r.mem_size
+                                : ucrd_slow_submit ? ucrd_size_r
                                 : x87_direct_mem_req ? 2'd2 : mem_eff_size;
 wire [31:0] paging_linear_addr = vipt_slow_addr_owned
-                               ? vipt_load_slow_r.linear_addr : ind_linear;
+                               ? vipt_load_slow_r.linear_addr
+                               : ucrd_slow_req_r ? ucrd_linear_r : ind_linear;
 wire [3:0]  mem_be_now = iack_busop ? 4'b1111 :
                           calc_be(paging_mem_eff_size,
                                   paging_linear_addr[1:0]);
-assign pf_spec_store = mem_req_to_paging && mem_write_now && mem_accepted;
+assign pf_spec_store = (mem_req_to_paging && mem_write_now && mem_accepted) || st_take;
 assign pf_spec_store_linear = paging_linear_addr;
-wire        paging_live_valid  = vipt_slow_submit ? 1'b1 : ind_linear_valid;
-wire        paging_mem_rd_ind = !x87_direct_mem_req && !vipt_slow_submit &&
+wire        paging_owned_submit = vipt_slow_submit || ucrd_slow_submit;
+wire        paging_live_valid  = paging_owned_submit ? 1'b1 : ind_linear_valid;
+wire        paging_mem_rd_ind = !x87_direct_mem_req && !paging_owned_submit &&
                                 (uc_buscode == BUSOP_RD_IND);
-wire        paging_is_write_access = !x87_direct_mem_req && !vipt_slow_submit &&
+wire        paging_is_write_access = !x87_direct_mem_req && !paging_owned_submit &&
                                       (uc_is_write || uc_is_check_write);
-wire        mem_ea_read = x87_direct_mem_req || vipt_slow_submit ||
-                          (i_first && i.ind_is_ea);
 
-// Direct register loads share one token after D2.  MOVZX/MOVSX use SRCREG as
-// their architectural destination in the original microcode; plain MOV uses
-// DSTREG and may name AH/CH/DH/BH.  Crossing operands are admitted here so EX
-// can transfer their registered address and metadata to normal paging.
-// Both address sizes are eligible: address_unit has already masked a16 offsets
-// and added the selected segment base before issue. Complex base+index+disp
-// forms retain their separate D2 partial-sum cycle.
-// A write uop and its D2 successor can overlap on the edge where paging first
-// captures the write.  The store may still need a dirty-bit page walk, so it
-// is not yet visible to the cache's store queue.  Accept the younger load token
-// but discard that edge's speculative preread, then replay it only after paging
-// releases the older request.  The load retains VIPT while cache/store-queue
-// ordering sees the accepted store before the replayed lookup.
-assign d2_vipt_older_store = uc_active && uc_is_write;
-wire d2_vipt_plain_mov = !i_bus.has_0f &&
-                         ((i_bus.opcode == 8'h8A) ||
-                          (i_bus.opcode == 8'h8B));
-wire d2_vipt_movx = i_bus.has_0f && i_bus.data32 &&
-                    ((i_bus.opcode == 8'hB6) ||
-                     (i_bus.opcode == 8'hB7) ||
-                     (i_bus.opcode == 8'hBE) ||
-                     (i_bus.opcode == 8'hBF));
-assign d2_vipt_alu = i_bus.vipt_alu;
-assign d2_vipt_dst = d2_vipt_movx ? i_bus.src_reg_sel
-                                  : i_bus.dst_reg_sel;
-assign d2_vipt_mem_size = d2_vipt_movx ? i_bus.source_size
-                                       : i_bus.operand_size;
-assign d2_vipt_write_size = d2_vipt_movx ? 2'd2
-                                         : i_bus.operand_size;
-wire [2:0] d2_vipt_dst_wide = (d2_vipt_write_size == 2'd0)
-                            ? {1'b0, d2_vipt_dst[1:0]} : d2_vipt_dst;
-assign d2_vipt_dst_onehot = 8'h01 << d2_vipt_dst_wide;
-assign d2_vipt_result_kind = !d2_vipt_movx ? LOAD_RESULT_COPY :
-    (i_bus.opcode[3] ? LOAD_RESULT_SIGN_EXTEND : LOAD_RESULT_ZERO_EXTEND);
-assign d2_vipt_candidate = !hardwired_off &&
-                           (i_bus.rep_lock == PREFIX_NOREPLOCK) &&
-                           (d2_vipt_plain_mov || d2_vipt_movx || d2_vipt_alu) &&
-                           i_bus.has_modrm &&
-                           (i_bus.modrm[7:6] != 2'b11) &&
-                           !i_bus.has_moffs && !i_bus.stack_op &&
-                           !single_step;
-assign d2_vipt_load = d2_vipt_candidate && dcache_vipt_probe_ready &&
-                      !vipt_load_replay_r.valid && !vipt_load_slow_busy &&
-                      !rmw_fast_active_r;
-wire d2_vipt_rmw_opcode = ((i_bus.opcode == 8'hF6) ||
-                            (i_bus.opcode == 8'hF7))
-                         ? ((i_bus.modrm[5:3] == 3'b010) ||
-                            (i_bus.modrm[5:3] == 3'b011))
-                         : (((i_bus.opcode == 8'hFE) ||
-                             (i_bus.opcode == 8'hFF)) &&
-                            ((i_bus.modrm[5:3] == 3'b000) ||
-                             (i_bus.modrm[5:3] == 3'b001)));
-assign d2_vipt_rmw_candidate = !hardwired_off &&
-                           (i_bus.ucode_action == RECIPE_ACTION_RMW_FAST) &&
-                           (((i_bus.opcode == 8'hF6) ||
-                             (i_bus.opcode == 8'hF7) ||
-                             (i_bus.opcode == 8'hFE) ||
-                             (i_bus.opcode == 8'hFF))
-                                ? d2_vipt_rmw_opcode : 1'b1) &&
-                           (i_bus.rep_lock == PREFIX_NOREPLOCK) &&
-                           i_bus.has_modrm &&
-                           (i_bus.modrm[7:6] != 2'b11) &&
-                           !i_bus.has_moffs && !i_bus.stack_op &&
-                           !single_step;
-assign d2_vipt_rmw = d2_vipt_rmw_candidate &&
-                     dcache_vipt_probe_ready &&
-                     !vipt_load_replay_r.valid && !vipt_load_slow_busy &&
-                     // The retiring WR_FAST owns the demand preread, but a
-                     // same-word successor can share it.  Admit the successor
-                     // on the acceptance edge so N/N+1/N+2 is truly a
-                     // three-cycle first-to-first sequence; backpressure still
-                     // keeps the younger instruction out of EX.
-                     (!rmw_fast_active_r || fast_store_accepted) &&
-                     !mem_servicing;
+
+data_access data_access_inst (
+    // Clock and reset
+    .clk(clk),
+    .reset_n(reset_n),
+    // L1 data cache: probe/resolve port and direct store port
+    .dcache_vipt_probe_accepted(dcache_vipt_probe_accepted),
+    .dcache_vipt_probe_direct_accepted(dcache_vipt_probe_direct_accepted),
+    .dcache_vipt_probe_ready(dcache_vipt_probe_ready),
+    .dcache_vipt_resolve_data(dcache_vipt_resolve_data),
+    .dcache_vipt_resolve_hit(dcache_vipt_resolve_hit),
+    .dcache_wr_ready(dcache_wr_ready),
+    .fast_store_accepted(fast_store_accepted),
+    .dcache_vipt_probe_offset(dcache_vipt_probe_offset),
+    .dcache_vipt_probe_valid(dcache_vipt_probe_valid),
+    .dcache_vipt_resolve_phys_addr(dcache_vipt_resolve_phys_addr),
+    .dcache_vipt_resolve_valid(dcache_vipt_resolve_valid),
+    .fast_store_be(fast_store_be),
+    .fast_store_valid(fast_store_valid),
+    .fast_store_wdata(fast_store_wdata),
+    .rmw_fast_phys_r(rmw_fast_phys_r),
+    .st_phys(st_phys),
+    .st_route(st_route),
+    .st_take(st_take),
+    // Paging unit and sidecar TLB
+    .CR0(CR0),
+    .mem_accepted(mem_accepted),
+    .mem_servicing(mem_servicing),
+    .paging_demand_idle(paging_demand_idle),
+    .pg_cpl(pg_cpl),
+    .vipt_tlb_dirty(vipt_tlb_dirty),
+    .vipt_tlb_hit(vipt_tlb_hit),
+    .vipt_tlb_is_vga_mem(vipt_tlb_is_vga_mem),
+    .vipt_tlb_phys_addr(vipt_tlb_phys_addr),
+    .vipt_tlb_user(vipt_tlb_user),
+    .vipt_tlb_writable(vipt_tlb_writable),
+    .sidecar_bg_pre(sidecar_bg_pre),
+    .st_tlb_pre(st_tlb_pre),
+    .ucrd_cpl_r(ucrd_cpl_r),
+    .ucrd_hit(ucrd_hit),
+    .ucrd_linear_r(ucrd_linear_r),
+    .ucrd_phys_ok_r(ucrd_phys_ok_r),
+    .ucrd_phys_r(ucrd_phys_r),
+    .ucrd_route_pre(ucrd_route_pre),
+    .ucrd_size_r(ucrd_size_r),
+    .ucrd_slow_req_r(ucrd_slow_req_r),
+    .ucrd_slow_submit(ucrd_slow_submit),
+    .ucrd_x87_r(ucrd_x87_r),
+    .vipt_load_slow_r(vipt_load_slow_r),
+    .vipt_probe_linear(vipt_probe_linear),
+    .vipt_slow_addr_owned(vipt_slow_addr_owned),
+    .vipt_slow_phys_ok_r(vipt_slow_phys_ok_r),
+    .vipt_slow_phys_r(vipt_slow_phys_r),
+    .vipt_slow_submit(vipt_slow_submit),
+    // Address and segmentation units
+    .ds_flat(ds_flat),
+    .ind_linear(ind_linear),
+    .ind_linear_valid(ind_linear_valid),
+    .issue_ind_linear(issue_ind_linear),
+    .issue_ind_linear_low(issue_ind_linear_low),
+    .issue_load_linear(issue_load_linear),
+    .issue_load_low(issue_load_low),
+    .issue_mem_linear(issue_mem_linear),
+    .pe(pe),
+    .seg_gp_fault(seg_gp_fault),
+    .ss_flat32(ss_flat32),
+    // Data unit: load writeback and operands
+    .forwarded_esp(forwarded_esp),
+    .mem_wdata(mem_wdata),
+    .OPR_R(OPR_R),
+    .SIGMA(SIGMA),
+    .direct_wb_retire(direct_wb_retire),
+    .fast_opr_commit(fast_opr_commit),
+    .fast_opr_data(fast_opr_data),
+    .vipt_load_alu_dst_capture(vipt_load_alu_dst_capture),
+    .vipt_load_alu_dst_capture_data(vipt_load_alu_dst_capture_data),
+    .vipt_load_alu_dst_capture_dst(vipt_load_alu_dst_capture_dst),
+    .vipt_load_alu_dst_capture_size(vipt_load_alu_dst_capture_size),
+    .vipt_load_wb_alu_op_r(vipt_load_wb_alu_op_r),
+    .vipt_load_wb_data(vipt_load_wb_data),
+    .vipt_load_wb_dst_onehot_r(vipt_load_wb_dst_onehot_r),
+    .vipt_load_wb_dst_r(vipt_load_wb_dst_r),
+    .vipt_load_wb_is_alu_r(vipt_load_wb_is_alu_r),
+    .vipt_load_wb_size_r(vipt_load_wb_size_r),
+    .vipt_load_wb_target_r(vipt_load_wb_target_r),
+    .vipt_load_wb_valid_r(vipt_load_wb_valid_r),
+    // D2 instruction and issue
+    .d2_vipt_ea_hazard(d2_vipt_ea_hazard),
+    .EIP(EIP),
+    .hardwired_off(hardwired_off),
+    .i_bus(i_bus),
+    .i_issue(i_issue),
+    .single_step(single_step),
+    .d2_plain_load_overlap_ready(d2_plain_load_overlap_ready),
+    .d2_vipt_candidate(d2_vipt_candidate),
+    .d2_vipt_load(d2_vipt_load),
+    .d2_vipt_pipe_ready(d2_vipt_pipe_ready),
+    .d2_vipt_pop(d2_vipt_pop),
+    .d2_vipt_ret(d2_vipt_ret),
+    .d2_vipt_rmw(d2_vipt_rmw),
+    .d2_vipt_rmw_candidate(d2_vipt_rmw_candidate),
+    .vipt_issue_load(vipt_issue_load),
+    // Microsequencer and core control
+    .any_fault(any_fault),
+    .gp_fault_trigger(gp_fault_trigger),
+    .i_ex(i),
+    .i_first(i_first),
+    .i_rni_delay(i_rni_delay),
+    .interrupt_entry(interrupt_entry),
+    .mem_eff_size(mem_eff_size),
+    .mem_is_io(mem_is_io),
+    .mem_op_eligible(mem_op_eligible),
+    .q_flush(q_flush),
+    .stall(stall),
+    .stall_invlpg(stall_invlpg),
+    .stall_wio(stall_wio),
+    .stall_x87_direct(stall_x87_direct),
+    .uc_active(uc_active),
+    .uc_addr(uc_addr),
+    .uc_addr_mem_r(uc_addr_mem_r),
+    .uc_buscode(uc_buscode),
+    .uc_busreq(uc_busreq),
+    .uc_data_busreq(uc_data_busreq),
+    .uc_exec(uc_exec),
+    .uc_is_check_write(uc_is_check_write),
+    .uc_is_mem_busop(uc_is_mem_busop),
+    .uc_is_write(uc_is_write),
+    .uc_p_pure_dly(uc_p_pure_dly),
+    .x87_direct_mem_req(x87_direct_mem_req),
+    .pop_direct_r(pop_direct_r),
+    .rd_fast_finish(rd_fast_finish),
+    .rd_fast_valid_r(rd_fast_valid_r),
+    .ret_redirect(ret_redirect),
+    .rmw_fallback_delay_r(rmw_fallback_delay_r),
+    .rmw_fast_active_r(rmw_fast_active_r),
+    .stall_fast_store(stall_fast_store),
+    .stall_rmw_probe(stall_rmw_probe),
+    .stall_ucrd(stall_ucrd),
+    .vipt_load_ex_probed_r(vipt_load_ex_probed_r),
+    .vipt_load_ex_r(vipt_load_ex_r),
+    .vipt_load_exec_block(vipt_load_exec_block),
+    .vipt_load_replay_r(vipt_load_replay_r),
+    .vipt_load_slow_busy(vipt_load_slow_busy),
+    .vipt_load_slow_wait_r(vipt_load_slow_wait_r)
+);
 
 // Paging unit instantiation
 paging_unit paging_inst (
@@ -2139,13 +1975,14 @@ paging_unit paging_inst (
     .mem_req            (mem_req_to_paging),
     .mem_inta_req       (iack_req_to_paging),
     .mem_inta_addr      (IND),
-    .mem_ea_read        (mem_ea_read),      // modrm/stack/moffs reads SET-read (linear relocated at i_issue); microcode IND reads excluded
     .mem_req_precheck   ((mem_op_eligible &&
-                          (uc_data_busreq || x87_direct_mem_req)) ||
-                         vipt_slow_submit),
+                          (uc_data_busreq || x87_direct_mem_req) && !ucrd_route_pre &&
+                          !st_route) ||
+                         vipt_slow_submit || ucrd_slow_submit),
     .mem_req_upcoming   (mem_req_upcoming), // suppresses prefetch start to minimize contention
     .mem_accepted       (mem_accepted),     // ready: request accepted this cycle
     .mem_servicing      (mem_servicing),
+    .demand_idle        (paging_demand_idle),
     .mem_complete_now   (mem_complete_now), // combinational: bus op completing this cycle
     .mem_read_complete  (mem_read_complete),
     .mem_dly_grace      (mem_dly_grace),
@@ -2159,13 +1996,17 @@ paging_unit paging_inst (
     .mem_wdata          (mem_wdata),
     .mem_rd_ind         (paging_mem_rd_ind),
     .is_write_access    (paging_is_write_access),
-    .mem_check_only     (vipt_slow_submit ? 1'b0 : uc_is_check_write),
-    .cpl                (pg_cpl),
-    .mem_is_io          (vipt_slow_submit ? 1'b0 : mem_is_io),
+    .mem_check_only     (paging_owned_submit ? 1'b0 : uc_is_check_write),
+    .pretrans_valid     ((ucrd_slow_submit && ucrd_phys_ok_r) ||
+                         (vipt_slow_submit && vipt_slow_phys_ok_r)),
+    .pretrans_phys      (ucrd_slow_submit ? ucrd_phys_r : vipt_slow_phys_r),
+    .cpl                (ucrd_slow_submit ? ucrd_cpl_r : pg_cpl),
+    .mem_is_io          (paging_owned_submit ? 1'b0 : mem_is_io),
     .mem_be             (mem_be_now),
-    .vipt_preread       (dcache_vipt_probe_accepted),
-    .vipt_linear_addr   (vipt_probe_linear),
-    .vipt_fallback      (vipt_slow_submit),
+    .vipt_preread       (dcache_vipt_probe_valid || st_tlb_pre || sidecar_bg_pre),
+    .vipt_linear_addr   (st_tlb_pre ? issue_mem_linear :
+                         sidecar_bg_pre ? ind_linear : vipt_probe_linear),
+    .vipt_fallback      (paging_owned_submit),
     .vipt_tlb_hit       (vipt_tlb_hit),
     .vipt_tlb_phys_addr (vipt_tlb_phys_addr),
     .vipt_tlb_writable  (vipt_tlb_writable),
@@ -2448,6 +2289,7 @@ reg [31:0] TMPeSP;                  // Saved ESP for fault handling
 // Microcode PREF restarts from IND.
 wire [31:0] pf_flush_ip = IND;
 assign pf_flush_addr = branch_ustep_redirect ? (CS_base + ea_reg) :
+                       ret_redirect          ? (CS_base + vipt_load_wb_target_r) :
                        early_redirect        ? (CS_base + br_target) :
                        pe_mode_toggle_now    ? (CS_base + EIP) :
                                                (CS_base + pf_flush_ip);
@@ -2471,8 +2313,11 @@ end
 `endif
 
 // i_first PRECISE early branch redirect (NOT a prediction).
-assign early_redirect = branch_ustep_redirect ||
-                        (i_first && is_dword && br_is_call_rel);
+// A CALL redirects in its first cycle even while stalled behind an older bus
+// operation; its branch uStep, executing after the stall, then must not flush
+// again (a second flush to the same target drops the fetch the first adopted).
+assign early_redirect = (branch_ustep_redirect && !early_redirected) || ret_redirect ||
+                        (i_first && is_dword && br_is_call_rel && !early_redirected);
 // A fault or interrupt abandons the instruction that owned an early redirect.
 // Clear that ownership before its handler's microcode PREF reaches q_flush.
 always_ff @(posedge clk or negedge reset_n) begin
@@ -2624,6 +2469,8 @@ always_ff @(posedge clk) begin
         EIP <= 32'h0000FFF0;  // 386 reset vector offset
     end else if (branch_ustep_redirect) begin
         EIP <= ea_reg;
+    end else if (ret_redirect) begin
+        EIP <= vipt_load_wb_target_r;
     end else if (i_issue && !halted /*&& (~uc_active || i_rni_delay)*/) begin
         // An issue can land on a control transfer's final word -- doc/z486/old/core_notes_v51.md #25
         if (uc_exec && recipe_rni && (uc_dest == DEST_eIP)) begin
@@ -2824,8 +2671,13 @@ always_ff @(posedge clk) begin
         wr_restart_eip <= TMPeIP;
     if (page_fault && pg_fault_code[1])
         TMPeIP <= wr_restart_eip;
-    else if (data_page_fault && vipt_load_slow_wait_r)
+    else if (data_page_fault && vipt_load_slow_wait_r) begin
         TMPeIP <= vipt_load_slow_r.restart_eip;
+        // A direct POP has already written ESP; its fault restarts from the
+        // ESP it started with, even if a younger instruction since issued.
+        if (vipt_load_slow_r.restore_esp)
+            TMPeSP <= vipt_load_slow_r.esp_restore;
+    end
     else if (ifetch_page_fault) begin
         // A cross-page instruction can fault before i_issue captures its restart
         // state. The architectural registers still describe that boundary.
@@ -2938,7 +2790,7 @@ data_unit data_unit_inst (
     .recipe_rni(recipe_rni),
     .recipe_state(recipe_state),
     .hardwired_off(hardwired_off),
-    .recipe_commit_cancel(any_fault),
+    .recipe_commit_cancel(any_fault_issue),
     .recipe_shift_write(recipe_shift_write),
     .recipe_shift_data(recipe_shift_data),
     .recipe_memory_write(recipe_mem_write),
@@ -2963,6 +2815,7 @@ data_unit data_unit_inst (
     .ea_base_value(ea_base_value),
     .ea_index_value(ea_index_value),
     .forwarded_esp(forwarded_esp),
+    .pend_write_mask(pend_write_mask),
     .ind(IND),
     .ea(ea_reg),
     // Segmentation and protection: selectors, descriptor and protection sources
@@ -3054,9 +2907,9 @@ x87_unit #(.ENABLE_X87(ENABLE_X87)) x87 (
     .direct_stall(stall_x87_direct),
     .mem_accepted(mem_accepted),
     .mem_addr_low(ind_linear[1:0]),
-    .mem_read_complete(mem_read_complete),
+    .mem_read_complete(mem_read_complete || (ucrd_hit && ucrd_x87_r)),
     .mem_servicing(mem_servicing),
-    .mem_rdata(dcache_rdata),
+    .mem_rdata((ucrd_hit && ucrd_x87_r) ? dcache_vipt_resolve_data : dcache_rdata),
     .split_rdata(OPR_R),
     .cancel(gp_fault_trigger || page_fault || interrupt_entry || q_flush),
     .busy_n(x87_busy_n),

@@ -6,7 +6,7 @@
 | mov eax, ebx                   |            2 |            1 |        2 |            1 |
 | mov eax, imm32                 |            2 |            1 |        2 |            1 |
 | add eax, ebx                   |            2 |            1 |        2 |            1 |
-| pop eax                        |            4 |            1 |        3 |            2 |
+| pop eax                        |            4 |            1 |        3 |            1 |
 | jnz not-taken forward          |            3 |            1 |        3 |            1 |
 | jnz not-taken backward         |            3 |            1 |        3 |            1 |
 | jnz taken forward              |         9.25 |            3 |        7 |            3 |
@@ -33,8 +33,9 @@
 | movsx eax, byte [esi]          |            4 |            1 |        - |            1 |
 | movsx eax, word [esi]          |            4 |            1 |        - |            1 |
 | jnz taken backward             |         9.25 |            3 |        6 |            3 |
-| jmp taken backward             |         9.25 |            3 |        6 |            5 |
+| jmp taken backward             |         9.25 |            3 |        6 |            3 |
 | call taken                     |         9.25 |            3 |        7 |            3 |
+| ret (near)                     |           10 |            5 |        - |            4 |
 | mov eax,[esi] -> add ebx,eax   |            - |            1 |        - |            1 |
 | mov esi,[edi] -> mov eax,[esi] |            - |            2 |        - |            2 |
 

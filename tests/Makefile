@@ -38,7 +38,7 @@ X87_RTL := $(X87_DIR)/x87_pkg.sv \
 RTL_SRCS := $(Z486_DIR)/z486_pkg.sv $(X87_DIR)/x87_pkg.sv \
 			$(X87_DIR)/x87_ucode_pkg.sv $(Z486_DIR)/z486.sv \
 			$(Z486_DIR)/cpu_throttle.sv $(Z486_DIR)/interrupt_controller.sv \
-			$(Z486_DIR)/ucode_rom.sv $(Z486_DIR)/microsequencer.sv $(Z486_DIR)/event_control.sv $(Z486_DIR)/hardwired_control.sv \
+			$(Z486_DIR)/ucode_rom.sv $(Z486_DIR)/microsequencer.sv $(Z486_DIR)/event_control.sv $(Z486_DIR)/hardwired_control.sv $(Z486_DIR)/data_access.sv \
 			$(Z486_DIR)/data_unit.sv $(Z486_DIR)/address_unit.sv \
 			$(Z486_DIR)/shifter.sv $(Z486_DIR)/mul_div.sv \
 			$(Z486_DIR)/decoder.sv \
@@ -83,6 +83,7 @@ CPP186_SRCS := sim_main_test186.cpp
 
 # protected mode testbench sources
 TB_PROT_SRCS := tb_protected_mode.sv
+TB_PROT_DEPS := m0_profile.svh   # included by the testbench: prerequisite only
 CPP_PROT_SRCS := sim_main_protected_mode.cpp
 CPP_QUAKE_SNAPSHOT_SRCS := sim_main_quake_snapshot.cpp
 
@@ -125,20 +126,20 @@ obj_dir/Vtb_z486: $(RTL_SRCS) $(RTL_DEPS) $(TB_SRCS) $(CPP_SRCS)
 	$(VERILATOR) $(VFLAGS) --top-module tb_z486 $(TB_SRCS) $(RTL_SRCS) $(CPP_SRCS)
 	@echo "Build complete: obj_dir/Vtb_z486"
 
-obj_dir/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(CPP_PROT_SRCS)
+obj_dir/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(TB_PROT_DEPS) $(CPP_PROT_SRCS)
 	@echo "Building protected mode testbench with Verilator..."
 	cp -f ../*.hex .
 	$(VERILATOR) $(VFLAGS) --top-module tb_protected_mode $(TB_PROT_SRCS) $(RTL_SRCS) $(CPP_PROT_SRCS)
 	@echo "Build complete: obj_dir/Vtb_protected_mode"
 
-obj_dir_x87/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(CPP_PROT_SRCS)
+obj_dir_x87/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(TB_PROT_DEPS) $(CPP_PROT_SRCS)
 	@echo "Building x87-enabled protected mode testbench with Verilator..."
 	cp -f ../*.hex .
 	$(VERILATOR) $(VFLAGS) --Mdir obj_dir_x87 -GENABLE_X87=1 --top-module tb_protected_mode \
 		$(TB_PROT_SRCS) $(RTL_SRCS) $(CPP_PROT_SRCS)
 	@echo "Build complete: obj_dir_x87/Vtb_protected_mode"
 
-obj_dir_quake/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(CPP_QUAKE_SNAPSHOT_SRCS)
+obj_dir_quake/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(TB_PROT_DEPS) $(CPP_QUAKE_SNAPSHOT_SRCS)
 	@echo "Building 64MB workload snapshot replay..."
 	cp -f ../*.hex .
 	$(VERILATOR) $(VFLAGS_NOTRACE) --Mdir obj_dir_quake \
@@ -146,7 +147,7 @@ obj_dir_quake/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(CPP_
 		$(TB_PROT_SRCS) $(RTL_SRCS) $(CPP_QUAKE_SNAPSHOT_SRCS)
 	@echo "Build complete: obj_dir_quake/Vtb_protected_mode"
 
-obj_dir_quake_trace/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(CPP_QUAKE_SNAPSHOT_SRCS)
+obj_dir_quake_trace/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(TB_PROT_DEPS) $(CPP_QUAKE_SNAPSHOT_SRCS)
 	@echo "Building trace-enabled 64MB workload snapshot replay..."
 	cp -f ../*.hex .
 	$(VERILATOR) $(VFLAGS_FST) --Mdir obj_dir_quake_trace \

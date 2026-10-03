@@ -32,6 +32,15 @@ longint m0_d2late [0:3];
 longint m0_d2late_safe;
 // Port B's word selected for EX (pb_slot) on an edge that issued nothing.
 longint m0_pb_slot_noissue;
+// Unclassified dead slots: why port B's registered eligibility said no.
+//   0 eligible but late terms failed   1 multi-uStep predecessor, not qualified
+//   2 successor not taken from D1 at the predecessor's issue
+//   3 successor class not B1-eligible  4 successor unsafe (flags/EA/hazard)
+//   5 eligible-from-issue but other     6 predecessor issue not hardwired/shape
+longint m0_unclass [0:6];
+longint m0_unsafe [0:3];   // flags, EA vs predecessor, pending load commit, pending shift
+logic [3:0] m0_iss_unsafe;
+logic   m0_iss_pbload, m0_iss_type, m0_iss_safe, m0_iss_shape;
 // Bucket 0 split by the successor's recipe early kind (0 = not hardwired).
 longint m0_d2late_kind [0:7];
 
@@ -93,6 +102,8 @@ endtask
 
 initial begin : m0_profile_init
     for (integer i = 0; i < 12; i++) m0_chain_block[i] = 0;
+    for (integer i = 0; i < 7; i++) m0_unclass[i] = 0;
+    for (integer i = 0; i < 4; i++) m0_unsafe[i] = 0;
     for (integer i = 0; i < 9; i++) begin
         m0_supply_block[i] = 0;
         m0_starve_burst[i] = 0;
@@ -145,12 +156,12 @@ always @(posedge clk) begin : m0_profile_sample
         if (dut.q_flush)
             m0_after_flush = 1'b1;
 
-        if (dut.vipt_issue_load)                         m0_mempath[0] += 1;
-        if (dut.vipt_replay_try)                         m0_mempath[1] += 1;
+        if (dut.data_access_inst.vipt_issue_load)                         m0_mempath[0] += 1;
+        if (dut.data_access_inst.vipt_replay_try)                         m0_mempath[1] += 1;
         if (dut.vipt_slow_submit)                        m0_mempath[2] += 1;
-        if (dut.rd_fast_issue)                           m0_mempath[3] += 1;
-        if (dut.fast_store_accepted)                     m0_mempath[4] += 1;
-        if (dut.paging_inst.early_rd_accept)             m0_mempath[5] += 1;
+        if (dut.data_access_inst.rd_fast_issue)                           m0_mempath[3] += 1;
+        if (dut.data_access_inst.fast_store_accepted)                     m0_mempath[4] += 1;
+        if (dut.data_access_inst.ucrd_take)                               m0_mempath[5] += 1;
         if (dut.paging_inst.early_wr_accept)             m0_mempath[6] += 1;
         if (dut.paging_inst.req_mem_dcache_accept)       m0_mempath[7] += 1;
         if (dut.stall_mem)                               m0_mempath[8] += 1;
@@ -205,12 +216,37 @@ always @(posedge clk) begin : m0_profile_sample
         end
 
         // Every failed hardwired RNI handoff receives exactly one reason.
+        if (dut.i_issue) begin
+            m0_iss_pbload = dut.hardwired_control_inst.pb_load;
+            m0_iss_type   = dut.hardwired_control_inst.pbn_type;
+            m0_iss_safe   = dut.hardwired_control_inst.pbn_safe;
+            m0_iss_unsafe[0] = dut.hardwired_control_inst.pbn_recipe.reads_flags &&
+                               dut.hardwired_control_inst.issue_recipe.writes_flags &&
+                               !dut.hardwired_control_inst.pbn_recipe.jcc;
+            m0_iss_unsafe[1] = dut.hardwired_control_inst.pbn_recipe.uses_ea &&
+                dut.hardwired_control_inst.ea_conflict(dut.hardwired_control_inst.pred1_we,
+                    dut.hardwired_control_inst.pred1_widx, dut.hardwired_control_inst.pb_next_ea,
+                    dut.hardwired_control_inst.pb_next_instr,
+                    dut.hardwired_control_inst.issue_recipe.commit_sel == z486_pkg::RECIPE_COMMIT_ESP);
+            m0_iss_unsafe[2] = dut.hardwired_control_inst.mem_hazard &&
+                (dut.hardwired_control_inst.pb_next_ea.base_sel[dut.hardwired_control_inst.mem_widx] ||
+                 dut.hardwired_control_inst.pb_next_ea.index_sel[dut.hardwired_control_inst.mem_widx] ||
+                 dut.hardwired_control_inst.pbn_read_mask[dut.hardwired_control_inst.mem_widx]);
+            m0_iss_unsafe[3] = dut.hardwired_control_inst.shift_hazard &&
+                (dut.hardwired_control_inst.pb_next_ea.base_sel[dut.hardwired_control_inst.shift_widx] ||
+                 dut.hardwired_control_inst.pb_next_ea.index_sel[dut.hardwired_control_inst.shift_widx] ||
+                 dut.hardwired_control_inst.pbn_read_mask[dut.hardwired_control_inst.shift_widx]);
+            m0_iss_shape  = dut.hardwired_control_inst.issue_hardwired &&
+                ((!dut.hardwired_control_inst.issue_recipe.multi_ustep &&
+                  !dut.hardwired_control_inst.issue_recipe.jcc) ||
+                 dut.hardwired_control_inst.issue_recipe.jcc);
+        end
         if (m0_dead_hardwired_slot) begin
             m0_chain_block[0] += 1;
             if (dut.q_flush)
                 chain_reason = 10;
             else if (dut.interrupt_pending || dut.tf_active_r ||
-                     dut.single_step || dut.any_fault_issue ||
+                     dut.data_access_inst.single_step || dut.any_fault_issue ||
                      dut.interrupt_entry)
                 chain_reason = 9;
             else if (!dut.pb_valid && dut.decoder_fetch_blocked)
@@ -247,6 +283,18 @@ always @(posedge clk) begin : m0_profile_sample
             else
                 chain_reason = 11;
             m0_chain_block[chain_reason] += 1;
+            if (chain_reason == 11) begin
+                if (dut.hardwired_control_inst.pb_b1_ok_r)      m0_unclass[0] += 1;
+                else if (dut.hardwired_control_inst.recipe_state.multi_ustep) m0_unclass[1] += 1;
+                else if (!m0_iss_shape)                         m0_unclass[6] += 1;
+                else if (!m0_iss_pbload)                        m0_unclass[2] += 1;
+                else if (!m0_iss_type)                          m0_unclass[3] += 1;
+                else if (!m0_iss_safe) begin
+                    m0_unclass[4] += 1;
+                    for (int k = 0; k < 4; k++) if (m0_iss_unsafe[k]) m0_unsafe[k] += 1;
+                end
+                else                                            m0_unclass[5] += 1;
+            end
             if (chain_reason == 2) begin
                 if (dut.decq_empty)
                     m0_d2late[3] += 1;
@@ -327,6 +375,10 @@ final begin : m0_profile_report
             $display("M0_D2LATE %0d %0d", i, m0_d2late[i]);
         $display("M0_D2LATE_SAFE %0d", m0_d2late_safe);
         $display("M0_PB_SLOT_NOISSUE %0d", m0_pb_slot_noissue);
+        for (integer i = 0; i < 7; i++)
+            $display("M0_UNCLASS %0d %0d", i, m0_unclass[i]);
+        for (integer i = 0; i < 4; i++)
+            $display("M0_UNSAFE %0d %0d", i, m0_unsafe[i]);
         for (integer i = 0; i < 8; i++)
             $display("M0_D2LATE_KIND %0d %0d", i, m0_d2late_kind[i]);
         for (integer i = 0; i < 12; i++)

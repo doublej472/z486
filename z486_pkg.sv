@@ -93,6 +93,10 @@ typedef struct packed {
     hardwired_load_result_t result_kind;
     logic        is_alu;
     logic [4:0]  alu_op;
+    logic        restore_esp;       // a POP: its fault restores ESP from esp_restore
+    logic [31:0] esp_restore;
+    logic        is_ret;            // a RET: the data is the target; ESP becomes ret_esp
+    logic [31:0] ret_esp;
 } hardwired_load_token_t;
 
 // A load that has left the direct pipeline no longer needs a token-valid bit;
@@ -108,6 +112,10 @@ typedef struct packed {
     hardwired_load_result_t result_kind;
     logic        is_alu;
     logic [4:0]  alu_op;
+    logic        restore_esp;
+    logic [31:0] esp_restore;
+    logic        is_ret;
+    logic [31:0] ret_esp;
 } hardwired_load_payload_t;
 
 // A microsequencer redirect request and its destination.

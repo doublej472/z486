@@ -56,6 +56,8 @@ module hardwired_control
     input  logic        throttle_hold,
     input  logic        stall,
     input  logic        load_pipe_issue,     // Direct load bypasses its ROM recipe
+    input  logic        load_pipe_pop,       //   and it is a POP (writes ESP in its first cycle)
+    input  logic        load_pipe_ret,       //   and it is a RET (no fall-through successor)
     input  logic        load_wb_retire,      // Registered VIPT hit retires in WB
     input  logic        load_probe_wait,     // D2 direct load is waiting to issue
     input  logic        pb_valid,            // ROM port B holds the skeleton's first word
@@ -295,6 +297,13 @@ function automatic logic [7:0] pb_read_mask(input dec_entry_t e);
 endfunction
 wire [7:0] pbn_read_mask = pb_read_mask(pb_next_instr);
 
+// The slot is the predecessor's RNI word, a clock after this decision. A shift
+// older than the predecessor has committed by then (D2 EA reads forward it),
+// so only a shifting predecessor's own result conflicts.
+wire [2:0] pred_shift_widx = wide_widx(issue_instr.dst_reg_sel, issue_instr.operand_size == 2'd0);
+wire pbn_shift_conf = (issue_recipe.commit_sel == RECIPE_COMMIT_SHIFT) &&
+    (pb_next_ea.base_sel[pred_shift_widx] || pb_next_ea.index_sel[pred_shift_widx] ||
+     pbn_read_mask[pred_shift_widx]);
 recipe_meta_t pbn_recipe;
 assign pbn_recipe = recipe_metadata(pb_next_instr);
 wire pbn_type = pb_b1_type(pb_next_instr, pbn_recipe);
@@ -304,8 +313,7 @@ wire pbn_safe = (!pbn_recipe.reads_flags || !issue_recipe.writes_flags || pbn_re
                   issue_recipe.commit_sel == RECIPE_COMMIT_ESP)) &&
     !(mem_hazard && (pb_next_ea.base_sel[mem_widx] || pb_next_ea.index_sel[mem_widx] ||
                      pbn_read_mask[mem_widx])) &&
-    !(shift_hazard && (pb_next_ea.base_sel[shift_widx] || pb_next_ea.index_sel[shift_widx] ||
-                       pbn_read_mask[shift_widx]));
+    !pbn_shift_conf;
 wire skel_type = pb_b1_type(issue_instr, issue_recipe);
 // A decision taken at an instruction's issue must use that instruction's TF:
 // trap_active (tf_active_r) still describes its predecessor on this edge.
@@ -322,8 +330,12 @@ wire pb_b1_from_multi = recipe_state.hardwired && recipe_state.multi_ustep &&
 // a dead slot. Its successor may not read the load's M3 ALU result (no WB
 // forwarding) or, after a flag-writing load, the flags.
 wire pbn_load_alu_conf = issue_recipe.writes_flags && pbn_read_mask[issue_load_widx];
+// A direct POP writes ESP in its first cycle; a stack successor takes the
+// forwarded value, but an ESP base or index waits for the register.
 wire pb_b1_from_load = load_pipe_issue && !tf_issue &&
-    pb_load && pbn_type && pbn_safe && !pbn_load_alu_conf;
+    pb_load && pbn_type && pbn_safe && !pbn_load_alu_conf &&
+    !(load_pipe_pop && (pb_next_ea.base_sel[4] || pb_next_ea.index_sel[4])) &&
+    !load_pipe_ret;
 logic pb_b1_ok_r;
 logic pb_load_slot_r;   // the executing word is a direct load's first word
 always_ff @(posedge clk) begin

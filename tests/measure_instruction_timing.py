@@ -108,6 +108,7 @@ BRANCH_PHASES = [
     BranchPhase("conditional_jump_taken", "jnz taken backward", 9.25, branch_eip=0x90D, target_eip=0x90A),
     BranchPhase("unconditional_jump", "jmp taken backward", 9.25, branch_eip=0xA0F, target_eip=0xA0A),
     BranchPhase("call_taken", "call taken", 9.25, branch_eip=0x1611, target_eip=0x1619),
+    BranchPhase("ret_taken", "ret (near)", 10.0, branch_eip=0x1619, target_eip=0x1612),
 ]
 
 DEPENDENCY_PHASES = [
@@ -202,6 +203,7 @@ TARGET_486_CYCLES = {
     "conditional_jump_taken": 3.0,
     "unconditional_jump": 3.0,
     "call_taken": 3.0,
+    "ret_taken": 5.0,
 }
 
 
