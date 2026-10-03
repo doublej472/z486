@@ -367,7 +367,7 @@ task automatic test_transcendental(
             $display("v2 result/aux=%h/%h flags=%b%b%b%b",
                      v2_result, v2_auxiliary_result, v2_invalid, v2_inexact,
                      v2_denormal_operand, v2_range_incomplete);
-            $fatal(1, "x87 transcendental mismatch");
+            if (!$test$plusargs("trans_continue")) $fatal(1, "x87 transcendental mismatch");
         end
     end
 endtask
@@ -902,6 +902,31 @@ initial begin
                         x87_empty(), 1'b0, 1'b0, 1'b0, 2'd2, 2'd0);
     test_transcendental(x87_from_m64(64'h7ff8_1234_5678_9abc),
                         x87_empty(), 1'b0, 1'b0, 1'b0, 2'd2, 2'd0);
+    // Randomized sweep: arguments from 2^-40 to 2^62 (range reduction over
+    // the whole significand) for sin/cos/tan, then atan2 pairs, all modes.
+    begin
+        logic [63:0] trans_seed;
+        logic [63:0] trans_arg;
+        logic [63:0] trans_arg_b;
+        integer trans_case;
+        trans_seed = 64'h9e37_79b9_7f4a_7c15;
+        for (trans_case = 0; trans_case < 400; trans_case = trans_case + 1) begin
+            trans_seed = trans_seed ^ (trans_seed << 13);
+            trans_seed = trans_seed ^ (trans_seed >> 7);
+            trans_seed = trans_seed ^ (trans_seed << 17);
+            trans_arg = {trans_seed[63], 11'(983 + (trans_seed[62:56] % 103)),
+                         trans_seed[51:0]};
+            trans_arg_b = {trans_seed[55], 11'(1013 + (trans_seed[54:50] % 21)),
+                           trans_seed[49:0], trans_seed[63:62]};
+            if (trans_case < 300)
+                test_transcendental(x87_from_m64(trans_arg), x87_empty(),
+                                    trans_seed[1], trans_seed[2] && !trans_seed[1],
+                                    1'b0, 2'd2, trans_seed[4:3]);
+            else
+                test_transcendental(x87_from_m64(trans_arg_b), x87_from_m64(trans_arg),
+                                    1'b0, 1'b0, 1'b1, 2'd2, trans_seed[4:3]);
+        end
+    end
     for (case_index = 0; case_index < 10; case_index = case_index + 1) begin
         test_arithmetic(x87_from_m64(arith_a[case_index]),
                         x87_from_m64(arith_b[case_index]),

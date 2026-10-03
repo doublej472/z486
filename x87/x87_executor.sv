@@ -46,6 +46,7 @@ logic seq_exec_valid;       // Current control-store word may update executor st
 logic seq_done;             // FINISH pulse, aligned with commit_action.
 logic [7:0] uaddr;          // Current numeric microcode address.
 x87_uop_t uop;              // Current 64-bit horizontal control word.
+x87_uop_t uop_rom;
 
 x87_reg_t result_r;         // Provisional numeric result; never writes stack directly.
 logic [63:0] transfer_r;    // Provisional integer/IEEE store payload.
@@ -111,9 +112,9 @@ logic [58:0] divsqrt_subtract_ext;
 logic [57:0] divsqrt_after_subtract;
 logic divsqrt_next_bit;
 logic divsqrt_remainder_nonzero;
-logic [52:0] trans_range_sig_r;
+logic [5:0] trans_range_bitpos_r;   // Operand significand bit fed to the next pass.
+logic       trans_range_bitvalid_r; // Clear once every significand bit is in.
 logic [7:0] trans_count_r;
-logic [120:0] trans_range_remainder_r; // Fixed-point pi/2 range-reduction state.
 logic [1:0] trans_quadrant_r;          // Low quotient bits from range reduction.
 logic trans_cordic_sub_r;
 logic [6:0] trans_atan_address_r;
@@ -122,18 +123,25 @@ logic trans_shift_x_r;
 logic trans_result_sign_r;
 logic [82:0] trans_magnitude_r;
 logic signed [16:0] trans_exp_r;
-logic trans_aux_sign_r;
-logic [82:0] trans_aux_magnitude_r;
 logic trans_rounding_aux_r;
 x87_reg_t trans_auxiliary_result_r;
 logic trans_range_bit;
-logic trans_range_subtract;
-logic [121:0] trans_range_shifted;
-logic [122:0] trans_range_subtract_ext;
-logic [120:0] trans_range_next;
-logic [1:0] trans_quadrant_next;
-logic signed [121:0] trans_reduced_q120;
-logic signed [82:0] trans_reduced_q80;
+// Range reduction keeps the Q120 remainder, scaled by 2^16, in five 28-bit
+// scratch limbs at words 4..8, so its top three limbs are exactly the Q80
+// angle the CORDIC loads into Z. Each quotient bit is one non-restoring pass
+// over the limbs, lowest first.
+logic [2:0]  trans_limb_r;           // Remainder limb in the current pass.
+logic [1:0]  trans_range_mode_r;     // Pass kind (TRANS_RANGE_*).
+logic        trans_range_neg_r;      // Remainder is negative.
+logic        trans_range_shift_r;    // Previous limb's top bit, shifted in.
+logic        trans_range_first_r;    // First pass: the remainder starts at zero.
+logic        trans_range_nonzero_r;  // Compare pass saw a nonzero difference limb.
+logic        trans_range_greater_r;  // Remainder exceeds pi/4.
+logic [27:0] trans_range_old;        // Current limb as read (zero on the first pass).
+logic [27:0] trans_range_operand;    // Limb after the pass's shift.
+logic [27:0] trans_range_const;      // pi/2 or pi/4 limb, scaled by 2^16.
+logic        trans_range_sub;        // Pass subtracts the constant.
+logic [28:0] trans_range_sum;
 logic [3:0] cordic_read_addr_a;     // First synchronous CORDIC scratch read.
 logic [3:0] cordic_read_addr_b;     // Second synchronous CORDIC scratch read.
 logic [27:0] cordic_read_data_a;
@@ -158,8 +166,11 @@ logic cordic_z_sign_r;
 logic [3:0] cordic_output_base_r;
 logic [1:0] cordic_output_mode_r;
 logic [28:0] cordic_add_result;
-logic signed [82:0] cordic_primary_r;
-logic signed [82:0] cordic_auxiliary_r;
+// The signed primary and auxiliary CORDIC results are captured into scratch
+// (primary in the Z words, auxiliary in the idle bank's X words); an
+// absolute-value pass then writes the magnitude into trans_magnitude_r.
+logic [3:0]  trans_abs_base_r;       // Scratch base of the value being loaded.
+logic [28:0] trans_abs_sum;          // Limb of sign ? -value : value.
 logic trans_operation;
 logic trans_normalize_more;
 logic trans_needs_aux;
@@ -168,6 +179,13 @@ localparam logic [120:0] TRANS_PIO2_Q120 =
     121'h1921fb54442d18469898cc51701b83a;
 localparam logic [120:0] TRANS_PIO4_Q120 =
     121'h0c90fdaa22168c234c4c6628b80dc1d;
+localparam logic [139:0] TRANS_PIO2_S = {3'b000, TRANS_PIO2_Q120, 16'h0};
+localparam logic [139:0] TRANS_PIO4_S = {3'b000, TRANS_PIO4_Q120, 16'h0};
+localparam logic [1:0] TRANS_RANGE_STEP    = 2'd0; // R = 2R + bit -+ pi/2
+localparam logic [1:0] TRANS_RANGE_CORRECT = 2'd1; // R = R + pi/2
+localparam logic [1:0] TRANS_RANGE_COMPARE = 2'd2; // sign(R - pi/4), no write
+localparam logic [1:0] TRANS_RANGE_FOLD    = 2'd3; // R = R - pi/2
+localparam logic [3:0] TRANS_RANGE_BASE    = 4'd4;
 localparam logic signed [82:0] TRANS_CORDIC_K_Q80 =
     83'h009b74eda8435e5a67f5f9;
 localparam logic signed [82:0] TRANS_PI_Q80 =
@@ -276,25 +294,43 @@ assign divsqrt_remainder_nonzero =
         ? (divsqrt_remainder_r != 58'h0)
         : (divsqrt_remainder_r[53:0] != 54'h0);
 
-assign trans_range_bit = trans_range_sig_r[52];
-assign trans_range_shifted = {trans_range_remainder_r, trans_range_bit};
-assign trans_range_subtract_ext =
-    {1'b0, trans_range_shifted} - {2'b0, TRANS_PIO2_Q120};
-assign trans_range_subtract = !trans_range_subtract_ext[122];
-assign trans_range_next = trans_range_subtract
-                        ? trans_range_subtract_ext[120:0]
-                        : trans_range_shifted[120:0];
-assign trans_quadrant_next =
-    {trans_quadrant_r[0], trans_range_subtract};
+// The operand is held for the whole operation, so each pass takes its next
+// significand bit straight from it.
+assign trans_range_bit = trans_range_bitvalid_r && operand.sig[trans_range_bitpos_r];
+assign trans_abs_sum = {1'b0, trans_result_sign_r ? ~cordic_read_data_a
+                                                   : cordic_read_data_a} +
+                       {28'h0, cordic_carry_r};
+
+function automatic logic [27:0] trans_range_limb(
+    input logic [139:0] value,
+    input logic [2:0]   index
+);
+    case (index)
+        3'd0: return value[27:0];
+        3'd1: return value[55:28];
+        3'd2: return value[83:56];
+        3'd3: return value[111:84];
+        default: return value[139:112];
+    endcase
+endfunction
+
 always_comb begin
-    if (trans_range_remainder_r > TRANS_PIO4_Q120)
-        trans_reduced_q120 = $signed({1'b0, trans_range_remainder_r}) -
-                             $signed({1'b0, TRANS_PIO2_Q120});
+    trans_range_old = trans_range_first_r ? 28'h0 : cordic_read_data_a;
+    if (trans_range_mode_r == TRANS_RANGE_STEP)
+        trans_range_operand = {trans_range_old[26:0], trans_range_shift_r} |
+            ((trans_limb_r == 3'd0) ? {11'h0, trans_range_bit, 16'h0} : 28'h0);
     else
-        trans_reduced_q120 = $signed({1'b0, trans_range_remainder_r});
+        trans_range_operand = trans_range_old;
+    trans_range_const = trans_range_limb(
+        (trans_range_mode_r == TRANS_RANGE_COMPARE) ? TRANS_PIO4_S : TRANS_PIO2_S,
+        trans_limb_r);
+    trans_range_sub = (trans_range_mode_r == TRANS_RANGE_STEP)
+                    ? !trans_range_neg_r
+                    : (trans_range_mode_r != TRANS_RANGE_CORRECT);
+    trans_range_sum = {1'b0, trans_range_operand} +
+                      {1'b0, trans_range_sub ? ~trans_range_const : trans_range_const} +
+                      {28'h0, cordic_carry_r};
 end
-assign trans_reduced_q80 =
-    {trans_reduced_q120[121], trans_reduced_q120[121:40]};
 
 function automatic logic [27:0] cordic_vector_limb(
     input logic signed [82:0] value,
@@ -344,7 +380,7 @@ always_comb begin
     initial_y = trans_atan2
               ? $signed({2'b00, operand.sig, 28'h0})
               : 83'sh0;
-    initial_z = trans_atan2 ? 83'sh0 : trans_reduced_q80;
+    initial_z = 83'sh0;
     current_x_base = cordic_x_base(cordic_bank_r);
     current_y_base = cordic_y_base(cordic_bank_r);
     next_x_base = cordic_x_base(!cordic_bank_r);
@@ -455,6 +491,7 @@ always_comb begin
                 cordic_write_data = cordic_vector_limb(
                     initial_y, cordic_load_index_r - 4'd3);
             end else begin
+                cordic_write_enable = trans_atan2;
                 cordic_write_addr = CORDIC_Z_BASE +
                                      cordic_load_index_r - 4'd6;
                 cordic_write_data = cordic_vector_limb(
@@ -492,6 +529,44 @@ always_comb begin
         end
         default: ;
     endcase
+
+    // Range-reduction passes: a begin word reads limb 0; each step word
+    // writes limb k from the limb read last cycle and reads limb k + 1.
+    if ((uop.engine == X87_ENGINE_TRANS_RANGE_BEGIN_STEP) ||
+        (uop.engine == X87_ENGINE_TRANS_RANGE_BEGIN_CORRECT) ||
+        (uop.engine == X87_ENGINE_TRANS_RANGE_BEGIN_COMPARE) ||
+        (uop.engine == X87_ENGINE_TRANS_RANGE_BEGIN_FOLD))
+        cordic_read_addr_a = TRANS_RANGE_BASE;
+    if (uop.engine == X87_ENGINE_TRANS_RANGE_STEP) begin
+        cordic_read_addr_a = TRANS_RANGE_BASE + {1'b0, trans_limb_r} + 4'd1;
+        cordic_write_enable = (trans_range_mode_r != TRANS_RANGE_COMPARE);
+        cordic_write_addr = TRANS_RANGE_BASE + {1'b0, trans_limb_r};
+        cordic_write_data = trans_range_sum[27:0];
+    end
+
+    // Captured results go to scratch: primary into Z (in place for FPATAN,
+    // whose source is Z), auxiliary into the X words of the idle bank.
+    if (uop.scratch_write == X87_SCRATCH_WRITE_PRIMARY) begin
+        cordic_write_enable = 1'b1;
+        cordic_write_addr = CORDIC_Z_BASE + cordic_limb_r;
+        cordic_write_data = cordic_normalize_top(cordic_add_result[27:0],
+                                                 cordic_limb_r);
+    end
+    if (uop.scratch_write == X87_SCRATCH_WRITE_AUX) begin
+        cordic_write_enable = 1'b1;
+        cordic_write_addr = cordic_x_base(!cordic_bank_r) + cordic_limb_r;
+        cordic_write_data = cordic_normalize_top(cordic_add_result[27:0],
+                                                 cordic_limb_r);
+    end
+    // Absolute-value pass: read the top limb for the sign, then limbs 0..2.
+    if (uop.engine == X87_ENGINE_TRANS_ABS_BEGIN_PRIMARY)
+        cordic_read_addr_a = CORDIC_Z_BASE + 4'd2;
+    if (uop.engine == X87_ENGINE_TRANS_ABS_BEGIN_AUX)
+        cordic_read_addr_a = cordic_x_base(!cordic_bank_r) + 4'd2;
+    if (uop.engine == X87_ENGINE_TRANS_ABS_SIGN)
+        cordic_read_addr_a = trans_abs_base_r;
+    if (uop.engine == X87_ENGINE_TRANS_ABS_STEP)
+        cordic_read_addr_a = trans_abs_base_r + {2'b00, cordic_limb_r} + 4'd1;
 end
 
 x87_cordic_scratch cordic_scratch (
@@ -566,13 +641,81 @@ always_comb begin
         cordic_limb_r != 2'd2;
     conditions[X87_COND_CORDIC_LOAD_MORE] =
         cordic_load_index_r != 4'd8;
+    // An alignment pass shifts one bit right, lowest limb first, so each limb
+    // reads the bit it receives from the limb above before that is rewritten.
     conditions[X87_COND_CORDIC_ALIGN_MORE] =
-        cordic_limb_r != 2'd0;
+        cordic_limb_r != 2'd2;
+    conditions[X87_COND_RANGE_LIMB_MORE] = trans_limb_r != 3'd4;
+    conditions[X87_COND_RANGE_NONNEG] = !trans_range_neg_r;
+    conditions[X87_COND_RANGE_NOT_GREATER] = !trans_range_greater_r;
     conditions[X87_COND_ARITH_DIRECT] =
         is_nan(operand) || is_nan(operand_b) ||
         is_infinity(operand) || is_infinity(operand_b) ||
         is_zero(operand) || is_zero(operand_b);
 end
+
+`ifdef X87_ABLATE
+// Area measurement only (see x87_control): microcode fields owned by an
+// ablated feature decode as HOLD, so synthesis prunes their datapath.
+localparam int X87_ABLATE_MASK = `X87_ABLATE;
+always_comb begin
+    uop = uop_rom;
+    if (X87_ABLATE_MASK[4]) begin   // Transcendentals: range reduction and CORDIC.
+        if (((uop_rom.engine == X87_ENGINE_TRANS_RANGE_BEGIN_STEP) || (uop_rom.engine == X87_ENGINE_TRANS_RANGE_STEP) || (uop_rom.engine == X87_ENGINE_TRANS_RANGE_BEGIN_CORRECT) || (uop_rom.engine == X87_ENGINE_TRANS_RANGE_BEGIN_COMPARE) || (uop_rom.engine == X87_ENGINE_TRANS_RANGE_BEGIN_FOLD) || (uop_rom.engine == X87_ENGINE_TRANS_ABS_BEGIN_PRIMARY) || (uop_rom.engine == X87_ENGINE_TRANS_ABS_BEGIN_AUX) || (uop_rom.engine == X87_ENGINE_TRANS_ABS_SIGN) || (uop_rom.engine == X87_ENGINE_TRANS_ABS_STEP) || (uop_rom.engine == X87_ENGINE_TRANS_CORDIC_PREP) || (uop_rom.engine == X87_ENGINE_CORDIC_ALIGN_PREP) || ((uop_rom.engine >= X87_ENGINE_CORDIC_X_PREP) && (uop_rom.engine <= X87_ENGINE_CORDIC_OUTPUT_CAPTURE))))
+            uop.engine = X87_ENGINE_HOLD;
+        if (uop_rom.classify == X87_CLASSIFY_TRANS) uop.classify = X87_CLASSIFY_HOLD;
+        if (uop_rom.pack == X87_PACK_PACK_TRANS) uop.pack = X87_PACK_HOLD;
+        if (uop_rom.alu_route == X87_ALU_PREP_ROUND_TRANS) uop.alu_route = X87_ALU_HOLD;
+        if (((uop_rom.state == X87_STATE_TRANS_SELECT) || (uop_rom.state == X87_STATE_TRANS_NORMALIZE) || (uop_rom.state == X87_STATE_TRANS_LOAD_AUX)))
+            uop.state = X87_STATE_HOLD;
+        uop.scratch_read = X87_SCRATCH_READ_HOLD;
+        uop.scratch_write = X87_SCRATCH_WRITE_HOLD;
+    end
+    if (X87_ABLATE_MASK[6]) begin   // Divide and square root.
+        if (((uop_rom.engine == X87_ENGINE_DIV_ITERATE) || (uop_rom.engine == X87_ENGINE_SQRT_ITERATE)))
+            uop.engine = X87_ENGINE_HOLD;
+        if (((uop_rom.prepare == X87_PREPARE_DIV) || (uop_rom.prepare == X87_PREPARE_SQRT))) uop.prepare = X87_PREPARE_HOLD;
+        if (uop_rom.classify == X87_CLASSIFY_DIVSQRT) uop.classify = X87_CLASSIFY_HOLD;
+        if (uop_rom.pack == X87_PACK_PACK_DIVSQRT) uop.pack = X87_PACK_HOLD;
+        if (uop_rom.alu_route == X87_ALU_PREP_ROUND_DIVSQRT) uop.alu_route = X87_ALU_HOLD;
+    end
+    if (X87_ABLATE_MASK[7]) begin   // Multiply.
+        if (((uop_rom.engine == X87_ENGINE_MUL_ISSUE) || (uop_rom.engine == X87_ENGINE_MUL_ACCUMULATE)))
+            uop.engine = X87_ENGINE_HOLD;
+        if (uop_rom.prepare == X87_PREPARE_MUL) uop.prepare = X87_PREPARE_HOLD;
+        if (uop_rom.classify == X87_CLASSIFY_MUL) uop.classify = X87_CLASSIFY_HOLD;
+        if (uop_rom.pack == X87_PACK_PACK_MUL) uop.pack = X87_PACK_HOLD;
+        if (uop_rom.alu_route == X87_ALU_PREP_ROUND_MUL) uop.alu_route = X87_ALU_HOLD;
+    end
+    if (X87_ABLATE_MASK[8]) begin   // Integer load/store (FILD/FIST).
+        if (((uop_rom.prepare == X87_PREPARE_LOAD_FIST) || (uop_rom.prepare == X87_PREPARE_FILD))) uop.prepare = X87_PREPARE_HOLD;
+        if (((uop_rom.classify == X87_CLASSIFY_FIST) || (uop_rom.classify == X87_CLASSIFY_FIST_RANGE))) uop.classify = X87_CLASSIFY_HOLD;
+        if (((uop_rom.pack == X87_PACK_PACK_FIST) || (uop_rom.pack == X87_PACK_FIST_INVALID) || (uop_rom.pack == X87_PACK_PACK_FILD)))
+            uop.pack = X87_PACK_HOLD;
+    end
+    if (X87_ABLATE_MASK[9]) begin   // m32/m64 real load/store.
+        if (((uop_rom.prepare == X87_PREPARE_FST) || (uop_rom.prepare == X87_PREPARE_FLD))) uop.prepare = X87_PREPARE_HOLD;
+        if (((uop_rom.pack == X87_PACK_ROUND_PACK_FST) || (uop_rom.pack == X87_PACK_PACK_FST_SPECIAL) || (uop_rom.pack == X87_PACK_PACK_FLD_DENORMAL)))
+            uop.pack = X87_PACK_HOLD;
+    end
+    if (X87_ABLATE_MASK[10]) begin  // FRNDINT.
+        if (uop_rom.prepare == X87_PREPARE_LOAD_ROUNDINT) uop.prepare = X87_PREPARE_HOLD;
+        if (uop_rom.classify == X87_CLASSIFY_ROUNDINT) uop.classify = X87_CLASSIFY_HOLD;
+        if (((uop_rom.pack == X87_PACK_ROUNDINT_SPECIAL) || (uop_rom.pack == X87_PACK_ROUNDINT_SUBUNIT)))
+            uop.pack = X87_PACK_HOLD;
+    end
+    if (X87_ABLATE_MASK[11]) begin  // Add/subtract.
+        if (uop_rom.engine == X87_ENGINE_ADDSUB_ALIGN) uop.engine = X87_ENGINE_HOLD;
+        if (uop_rom.prepare == X87_PREPARE_ADDSUB) uop.prepare = X87_PREPARE_HOLD;
+        if (uop_rom.classify == X87_CLASSIFY_ADDSUB) uop.classify = X87_CLASSIFY_HOLD;
+        if (uop_rom.pack == X87_PACK_PACK_ADDSUB) uop.pack = X87_PACK_HOLD;
+        if (((uop_rom.alu_route == X87_ALU_CALCULATE_ADDSUB) || (uop_rom.alu_route == X87_ALU_NORMALIZE_ADDSUB) || (uop_rom.alu_route == X87_ALU_PREP_ROUND_ADDSUB)))
+            uop.alu_route = X87_ALU_HOLD;
+    end
+end
+`else
+assign uop = uop_rom;
+`endif
 
 x87_sequencer sequencer (
     .clk(clk),
@@ -584,7 +727,7 @@ x87_sequencer sequencer (
     .exec_valid(seq_exec_valid),
     .done(seq_done),
     .uaddr(uaddr),
-    .uop(uop)
+    .uop(uop_rom)
 );
 
 assign debug_uaddr = uaddr;
@@ -1733,7 +1876,7 @@ always_ff @(posedge clk) begin
                 default: begin end
             endcase
 
-            if (uop.state == X87_STATE_TRANS_SELECT)
+            if (uop.engine == X87_ENGINE_TRANS_ABS_BEGIN_PRIMARY)
                 inexact <= 1'b1;
         end
     end
@@ -1798,10 +1941,17 @@ end
 // CORDIC iteration, and primary/auxiliary result normalization state.
 always_ff @(posedge clk) begin
     if (reset) begin
-        trans_range_sig_r <= 53'h0;
+        trans_range_bitpos_r <= 6'd0;
+        trans_range_bitvalid_r <= 1'b0;
         trans_count_r <= 8'h0;
-        trans_range_remainder_r <= 121'h0;
         trans_quadrant_r <= 2'b00;
+        trans_limb_r <= 3'd0;
+        trans_range_mode_r <= TRANS_RANGE_STEP;
+        trans_range_neg_r <= 1'b0;
+        trans_range_shift_r <= 1'b0;
+        trans_range_first_r <= 1'b0;
+        trans_range_nonzero_r <= 1'b0;
+        trans_range_greater_r <= 1'b0;
         trans_cordic_sub_r <= 1'b0;
         trans_atan_address_r <= 7'h0;
         trans_shift_x_r <= 1'b0;
@@ -1823,13 +1973,10 @@ always_ff @(posedge clk) begin
         cordic_z_sign_r <= 1'b0;
         cordic_output_base_r <= 4'h0;
         cordic_output_mode_r <= CORDIC_OUT_COPY;
-        cordic_primary_r <= 83'sh0;
-        cordic_auxiliary_r <= 83'sh0;
+        trans_abs_base_r <= 4'h0;
         trans_result_sign_r <= 1'b0;
         trans_magnitude_r <= 83'h0;
         trans_exp_r <= 17'sd0;
-        trans_aux_sign_r <= 1'b0;
-        trans_aux_magnitude_r <= 83'h0;
         trans_rounding_aux_r <= 1'b0;
     end else begin
         if (start)
@@ -1901,25 +2048,74 @@ always_ff @(posedge clk) begin
                              !is_zero(operand) &&
                              (unbiased_exp < 17'sd63) &&
                              (unbiased_exp > -17'sd27)) begin
-                    trans_range_sig_r <= operand.sig;
+                    trans_range_bitpos_r <= 6'd52;
+                    trans_range_bitvalid_r <= 1'b1;
                     trans_count_r <= unbiased_exp[7:0] + 8'd121;
-                    trans_range_remainder_r <= 121'h0;
+                    trans_range_first_r <= 1'b1;
+                    trans_range_neg_r <= 1'b0;
                     trans_quadrant_r <= 2'b00;
                 end
             end
 
             case (uop.engine)
-                X87_ENGINE_TRANS_RANGE_ITERATE: begin
-                    trans_range_sig_r <= trans_range_sig_r << 1;
-                    trans_range_remainder_r <= trans_range_next;
-                    trans_quadrant_r <= trans_quadrant_next;
+                X87_ENGINE_TRANS_RANGE_BEGIN_STEP,
+                X87_ENGINE_TRANS_RANGE_BEGIN_CORRECT,
+                X87_ENGINE_TRANS_RANGE_BEGIN_COMPARE,
+                X87_ENGINE_TRANS_RANGE_BEGIN_FOLD: begin
+                    trans_limb_r <= 3'd0;
+                    trans_range_shift_r <= 1'b0;
+                    trans_range_nonzero_r <= 1'b0;
+                    case (uop.engine)
+                        X87_ENGINE_TRANS_RANGE_BEGIN_STEP: begin
+                            trans_range_mode_r <= TRANS_RANGE_STEP;
+                            cordic_carry_r <= !trans_range_neg_r;
+                        end
+                        X87_ENGINE_TRANS_RANGE_BEGIN_CORRECT: begin
+                            trans_range_mode_r <= TRANS_RANGE_CORRECT;
+                            cordic_carry_r <= 1'b0;
+                        end
+                        X87_ENGINE_TRANS_RANGE_BEGIN_COMPARE: begin
+                            trans_range_mode_r <= TRANS_RANGE_COMPARE;
+                            cordic_carry_r <= 1'b1;
+                        end
+                        default: begin
+                            trans_range_mode_r <= TRANS_RANGE_FOLD;
+                            cordic_carry_r <= 1'b1;
+                        end
+                    endcase
                 end
-                X87_ENGINE_TRANS_RANGE_FINALIZE: begin
-                    trans_quadrant_r <=
-                        (trans_range_remainder_r > TRANS_PIO4_Q120)
-                            ? trans_quadrant_r + 2'd1
-                            : trans_quadrant_r;
-                    trans_atan_address_r <= 7'd0;
+                X87_ENGINE_TRANS_RANGE_STEP: begin
+                    trans_limb_r <= trans_limb_r + 3'd1;
+                    cordic_carry_r <= trans_range_sum[28];
+                    trans_range_shift_r <= trans_range_old[27];
+                    if (trans_range_sum[27:0] != 28'h0)
+                        trans_range_nonzero_r <= 1'b1;
+                    if (trans_limb_r == 3'd4) begin
+                        case (trans_range_mode_r)
+                            TRANS_RANGE_STEP: begin
+                                // Non-restoring: the quotient bit is the
+                                // new remainder's sign, inverted.
+                                trans_range_neg_r <= trans_range_sum[27];
+                                trans_quadrant_r <= {trans_quadrant_r[0],
+                                                     !trans_range_sum[27]};
+                                if (trans_range_bitpos_r == 6'd0)
+                                    trans_range_bitvalid_r <= 1'b0;
+                                else
+                                    trans_range_bitpos_r <= trans_range_bitpos_r - 6'd1;
+                                trans_range_first_r <= 1'b0;
+                            end
+                            TRANS_RANGE_CORRECT:
+                                trans_range_neg_r <= trans_range_sum[27];
+                            TRANS_RANGE_COMPARE:
+                                trans_range_greater_r <= !trans_range_sum[27] &&
+                                    (trans_range_nonzero_r ||
+                                     (trans_range_sum[27:0] != 28'h0));
+                            default: begin
+                                trans_range_neg_r <= trans_range_sum[27];
+                                trans_quadrant_r <= trans_quadrant_r + 2'd1;
+                            end
+                        endcase
+                    end
                 end
                 X87_ENGINE_TRANS_CORDIC_PREP: begin
                     cordic_load_index_r <= 4'd0;
@@ -1927,12 +2123,10 @@ always_ff @(posedge clk) begin
                     cordic_x_sign_r[0] <= 1'b0;
                     cordic_y_sign_r[0] <= 1'b0;
                     cordic_z_sign_r <= trans_atan2
-                                       ? 1'b0 : trans_reduced_q80[82];
-                    cordic_primary_r <= 83'sh0;
-                    cordic_auxiliary_r <= 83'sh0;
+                                       ? 1'b0 : trans_range_neg_r;
                 end
                 X87_ENGINE_CORDIC_ALIGN_PREP:
-                    cordic_limb_r <= 2'd2;
+                    cordic_limb_r <= 2'd0;
                 X87_ENGINE_CORDIC_BEGIN: begin
                     trans_count_r <= 8'd80;
                     cordic_iteration_r <= 7'd0;
@@ -2038,6 +2232,29 @@ always_ff @(posedge clk) begin
                     cordic_rhs_low_r <= cordic_vector_limb(
                         TRANS_PI_Q80, cordic_limb_r);
                 end
+                X87_ENGINE_TRANS_ABS_BEGIN_PRIMARY: begin
+                    trans_abs_base_r <= CORDIC_Z_BASE;
+                    trans_exp_r <= 17'sd16383;
+                end
+                X87_ENGINE_TRANS_ABS_BEGIN_AUX: begin
+                    trans_abs_base_r <= cordic_x_base(!cordic_bank_r);
+                    trans_exp_r <= 17'sd16383;
+                    trans_rounding_aux_r <= 1'b1;
+                end
+                X87_ENGINE_TRANS_ABS_SIGN: begin
+                    trans_result_sign_r <= cordic_read_data_a[27];
+                    cordic_carry_r <= cordic_read_data_a[27];
+                    cordic_limb_r <= 2'd0;
+                end
+                X87_ENGINE_TRANS_ABS_STEP: begin
+                    case (cordic_limb_r)
+                        2'd0: trans_magnitude_r[27:0] <= trans_abs_sum[27:0];
+                        2'd1: trans_magnitude_r[55:28] <= trans_abs_sum[27:0];
+                        default: trans_magnitude_r[82:56] <= trans_abs_sum[26:0];
+                    endcase
+                    cordic_carry_r <= trans_abs_sum[28];
+                    cordic_limb_r <= cordic_limb_r + 2'd1;
+                end
                 default: ;
             endcase
 
@@ -2062,7 +2279,7 @@ always_ff @(posedge clk) begin
                 X87_SCRATCH_WRITE_LOAD:
                     cordic_load_index_r <= cordic_load_index_r + 4'd1;
                 X87_SCRATCH_WRITE_ALIGN:
-                    cordic_limb_r <= cordic_limb_r - 2'd1;
+                    cordic_limb_r <= cordic_limb_r + 2'd1;
                 X87_SCRATCH_WRITE_X: begin
                     cordic_carry_r <= cordic_add_result[28];
                     if (cordic_limb_r == 2'd2)
@@ -2083,23 +2300,8 @@ always_ff @(posedge clk) begin
                         cordic_z_sign_r <= cordic_write_data[26];
                     cordic_limb_r <= cordic_limb_r + 2'd1;
                 end
-                X87_SCRATCH_WRITE_PRIMARY: begin
-                    if (cordic_limb_r == 2'd0)
-                        cordic_primary_r[27:0] <= cordic_add_result[27:0];
-                    else if (cordic_limb_r == 2'd1)
-                        cordic_primary_r[55:28] <= cordic_add_result[27:0];
-                    else
-                        cordic_primary_r[82:56] <= cordic_add_result[26:0];
-                    cordic_carry_r <= cordic_add_result[28];
-                    cordic_limb_r <= cordic_limb_r + 2'd1;
-                end
+                X87_SCRATCH_WRITE_PRIMARY,
                 X87_SCRATCH_WRITE_AUX: begin
-                    if (cordic_limb_r == 2'd0)
-                        cordic_auxiliary_r[27:0] <= cordic_add_result[27:0];
-                    else if (cordic_limb_r == 2'd1)
-                        cordic_auxiliary_r[55:28] <= cordic_add_result[27:0];
-                    else
-                        cordic_auxiliary_r[82:56] <= cordic_add_result[26:0];
                     cordic_carry_r <= cordic_add_result[28];
                     cordic_limb_r <= cordic_limb_r + 2'd1;
                 end
@@ -2107,18 +2309,6 @@ always_ff @(posedge clk) begin
             endcase
 
             case (uop.state)
-                X87_STATE_TRANS_SELECT: begin
-                    if (trans_tangent_pair) begin
-                        trans_aux_sign_r <= cordic_auxiliary_r[82];
-                        trans_aux_magnitude_r <= cordic_auxiliary_r[82]
-                            ? -cordic_auxiliary_r : cordic_auxiliary_r;
-                    end
-                    trans_result_sign_r <= cordic_primary_r[82];
-                    trans_magnitude_r <= cordic_primary_r[82]
-                        ? -cordic_primary_r : cordic_primary_r;
-                    trans_exp_r <= 17'sd16383;
-                end
-
                 X87_STATE_TRANS_NORMALIZE: begin
                     if (trans_magnitude_r[82:81] != 2'b00) begin
                         trans_magnitude_r <= trans_magnitude_r >> 1;
@@ -2129,12 +2319,6 @@ always_ff @(posedge clk) begin
                     end
                 end
 
-                X87_STATE_TRANS_LOAD_AUX: begin
-                    trans_result_sign_r <= trans_aux_sign_r;
-                    trans_magnitude_r <= trans_aux_magnitude_r;
-                    trans_exp_r <= 17'sd16383;
-                    trans_rounding_aux_r <= 1'b1;
-                end
                 default: ;
             endcase
         end

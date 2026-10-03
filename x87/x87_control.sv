@@ -73,9 +73,24 @@ logic [15:0] control_word;             // Exception masks, PC, RC, and infinity 
 logic [15:0] status_flags;             // Sticky exceptions, condition codes, ES, and B.
 logic [10:0] last_fop;                 // Most recently accepted architectural FOP.
 logic [15:0] tag_word;                 // Two architectural tag bits per physical stack row.
+// Tag-word updates are collected as requests while the clocked block runs and
+// applied once at its end: a whole-word load, port A and port B row writes
+// (alongside the stack RAM ports), then rows popped from TOP. One shared
+// update replaces a row decoder and value mux per call site.
+logic        tag_full_we;
+logic [15:0] tag_full_value;
+logic        tag_a_we;
+logic  [2:0] tag_a_index;
+logic  [1:0] tag_a_value;
+logic        tag_b_we;
+logic  [2:0] tag_b_index;
+logic  [1:0] tag_b_value;
+logic  [1:0] tag_pop_count;
 logic        command_pending;          // Command ROM and stack RAM return next cycle.
 logic [10:0] command_fop;              // FOP retained through dispatch and status policy.
 x87_command_decode_t command_decode;   // Synchronous generated command descriptor.
+x87_command_decode_t command_decode_rom;
+x87_exec_op_t        v2_exec_op_port;  // Executor operation as presented to the port.
 logic        direct_m32_pending;       // One direct FOP/data pair waiting for dispatch.
 logic [10:0] direct_m32_fop_r;
 logic [31:0] direct_m32_data_r;
@@ -140,8 +155,6 @@ x87_reg_t     store_source;
 logic [79:0]  store_source_raw;
 logic         store_bcd;
 logic         bcd_convert_pending;
-logic [63:0]  bcd_binary;
-logic [71:0]  bcd_digits;
 logic  [6:0]  bcd_shift_count;
 logic         bcd_sign;
 logic         pop_pending;
@@ -288,23 +301,21 @@ function automatic logic [2:0] transfer_byte_count(input logic [3:0] be);
            {2'b00, be[2]} + {2'b00, be[3]};
 endfunction
 
-function automatic logic [79:0] append_transfer_bytes(
+function automatic logic [79:0] place_transfer_word(
     input logic [79:0] payload,
     input logic [3:0]  byte_offset,
     input logic [31:0] data,
     input logic [3:0]  be
 );
     logic [79:0] merged;
-    integer lane;
-    integer target;
+    logic [2:0]  slot;
+    integer half;
     begin
         merged = payload;
-        target = byte_offset;
-        for (lane = 0; lane < 4; lane = lane + 1) begin
-            if (be[lane] && (target < 10)) begin
-                merged[target*8 +: 8] = data[lane*8 +: 8];
-                target = target + 1;
-            end
+        for (half = 0; half < 2; half = half + 1) begin
+            slot = byte_offset[3:1] + half[2:0];
+            if (be[half*2] && (slot < 3'd5))
+                merged[slot*16 +: 16] = data[half*16 +: 16];
         end
         return merged;
     end
@@ -420,9 +431,47 @@ function automatic logic [159:0] pack_state_pair(
     end
 endfunction
 
+task automatic set_tag_a(input logic [2:0] index, input logic [1:0] value);
+    begin
+        // synthesis translate_off
+        if (tag_a_we) $error("x87 tag port A written twice in one cycle");
+        if ((tag_pop_count != 0) && ((index == top) ||
+            ((tag_pop_count == 2) && (index == top + 3'd1))))
+            $error("x87 tag port A write after a pop of the same row");
+        // synthesis translate_on
+        tag_a_we = 1'b1;
+        tag_a_index = index;
+        tag_a_value = value;
+    end
+endtask
+
+task automatic set_tag_b(input logic [2:0] index, input logic [1:0] value);
+    begin
+        // synthesis translate_off
+        if (tag_b_we) $error("x87 tag port B written twice in one cycle");
+        // synthesis translate_on
+        tag_b_we = 1'b1;
+        tag_b_index = index;
+        tag_b_value = value;
+    end
+endtask
+
+task automatic set_tag_word(input logic [15:0] value);
+    begin
+        tag_full_we = 1'b1;
+        tag_full_value = value;
+    end
+endtask
+
+task automatic pop_tags(input logic [1:0] count);
+    begin
+        tag_pop_count = count;
+    end
+endtask
+
 task automatic clear_stack;
     begin
-        tag_word <= 16'hffff;
+        set_tag_word(16'hffff);
     end
 endtask
 
@@ -431,7 +480,7 @@ task automatic write_stack(input logic [2:0] index, input x87_reg_t value);
         stack_addr_a <= index;
         stack_write_data_a <= x87_to_m80(value);
         stack_write_a <= 1'b1;
-        tag_word[index*2 +: 2] <= x87_tag(value);
+        set_tag_a(index, x87_tag(value));
     end
 endtask
 
@@ -443,7 +492,7 @@ task automatic write_stack_raw(
         stack_addr_a <= index;
         stack_write_data_a <= value;
         stack_write_a <= 1'b1;
-        tag_word[index*2 +: 2] <= stack_tag_from_m80(value);
+        set_tag_a(index, stack_tag_from_m80(value));
     end
 endtask
 
@@ -456,7 +505,7 @@ task automatic write_stack_raw_tagged(
         stack_addr_a <= index;
         stack_write_data_a <= value;
         stack_write_a <= 1'b1;
-        tag_word[index*2 +: 2] <= value_tag;
+        set_tag_a(index, value_tag);
     end
 endtask
 
@@ -529,7 +578,7 @@ endtask
 
 task automatic pop_value;
     begin
-        tag_word[top*2 +: 2] <= 2'b11;
+        pop_tags(2'd1);
         top <= top + 3'd1;
     end
 endtask
@@ -597,7 +646,7 @@ task automatic accept_environment_word(
                 status_flags <= value;
                 top <= value[13:11];
             end
-            3'd2: tag_word <= value;
+            3'd2: set_tag_word(value);
             default: ; // Instruction and operand pointers live in the 80386.
         endcase
     end
@@ -657,15 +706,35 @@ assign read_req_ready = !read_resp_valid &&
                          ((tx_kind != TX_NONE) && transfer_pop_valid));
 wire [2:0] rx_fragment_bytes = transfer_byte_count(transfer_pop_data[35:32]);
 wire [3:0] rx_byte_count_next = rx_byte_count + rx_fragment_bytes;
-wire [79:0] rx_payload_next = append_transfer_bytes(
+// The 80386 sends a numeric operand low part first in whole 16-bit words
+// (dwords, or words from 16-bit code and the m80 tail), so fragments land at
+// even byte offsets with their bytes in the low lanes.
+wire [79:0] rx_payload_next = place_transfer_word(
     rx_payload, rx_byte_count, transfer_pop_data[31:0],
     transfer_pop_data[35:32]);
+// FSAVE packs register pairs at stream indices 6, 11, 16 and 21.
+wire [2:0] fsave_pair_row = top + ((tx_index == 5'd11) ? 3'd2 :
+                                   (tx_index == 5'd16) ? 3'd4 :
+                                   (tx_index == 5'd21) ? 3'd6 : 3'd0);
+// synthesis translate_off
+always_ff @(posedge clk) begin
+    if (!reset && transfer_pop_valid && (rx_kind != RX_NONE) &&
+        (rx_kind != RX_ENV) && (rx_kind != RX_STATE) &&
+        (rx_byte_count[0] ||
+         !((transfer_pop_data[35:32] == 4'hf) || (transfer_pop_data[35:32] == 4'h3))))
+        $error("x87 operand fragment be=%h at byte %0d is not a low-lane dword/word",
+               transfer_pop_data[35:32], rx_byte_count);
+end
+// synthesis translate_on
 wire [2:0] tx_entry_bytes = transfer_byte_count(transfer_pop_data[35:32]);
 wire [2:0] tx_request_bytes = transfer_byte_count(read_req_be);
 wire tx_entry_consumed = tx_byte_offset + tx_request_bytes >= tx_entry_bytes;
 wire v2_exec_start = v2_exec_pending && !v2_exec_busy;
 logic [71:0] bcd_adjusted;
 integer bcd_digit;
+// FBSTP converts in place in the idle transmit shift register: digits in
+// [135:64], the binary magnitude in [63:0], one double-dabble step a clock.
+wire [71:0] bcd_digits = tx_state_shift[135:64];
 always_comb begin
     bcd_adjusted = bcd_digits;
     for (bcd_digit = 0; bcd_digit < 18; bcd_digit = bcd_digit + 1)
@@ -756,8 +825,47 @@ assign tx_consume_fire = (tx_kind != TX_NONE) &&
 x87_command_rom command_rom (
     .clk(clk),
     .address(core_cmd_fop),
-    .decode(command_decode)
+    .decode(command_decode_rom)
 );
+
+`ifdef X87_ABLATE
+// Area measurement only: X87_ABLATE is a feature bitmask whose commands and
+// executor operations are decoded as absent, so synthesis prunes their logic.
+localparam int X87_ABLATE_MASK = `X87_ABLATE;
+function automatic logic ablated_action(input x87_command_action_t action);
+    return (X87_ABLATE_MASK[0] && (action == X87_CMD_STORE_BCD)) ||
+           (X87_ABLATE_MASK[1] && (action == X87_CMD_FSCALE)) ||
+           (X87_ABLATE_MASK[2] && (action == X87_CMD_FPREM)) ||
+           (X87_ABLATE_MASK[3] && ((action == X87_CMD_FYL2X) ||
+                                   (action == X87_CMD_F2XM1))) ||
+           (X87_ABLATE_MASK[4] && ((action == X87_CMD_FPTAN) ||
+                                   (action == X87_CMD_FPATAN) ||
+                                   (action == X87_CMD_TRIG))) ||
+           (X87_ABLATE_MASK[5] && ((action == X87_CMD_TX_ENV) ||
+                                   (action == X87_CMD_TX_STATE) ||
+                                   (action == X87_CMD_RX_ENV) ||
+                                   (action == X87_CMD_RX_STATE)));
+endfunction
+function automatic logic ablated_exec_op(input x87_exec_op_t op);
+    return (X87_ABLATE_MASK[4] && (op == X87_ARITH_TRANS)) ||
+           (X87_ABLATE_MASK[6] && ((op == X87_ARITH_DIV) || (op == X87_ARITH_SQRT))) ||
+           (X87_ABLATE_MASK[7] && (op == X87_ARITH_MUL)) ||
+           (X87_ABLATE_MASK[8] && ((op == X87_CONVERT_FILD) || (op == X87_CONVERT_FIST))) ||
+           (X87_ABLATE_MASK[9] && ((op == X87_CONVERT_FLD_M32) || (op == X87_CONVERT_FLD_M64) ||
+                                   (op == X87_CONVERT_FST_M32) || (op == X87_CONVERT_FST_M64))) ||
+           (X87_ABLATE_MASK[10] && (op == X87_CONVERT_FRNDINT)) ||
+           (X87_ABLATE_MASK[11] && ((op == X87_ARITH_ADD) || (op == X87_ARITH_SUB)));
+endfunction
+always_comb begin
+    command_decode = command_decode_rom;
+    if (ablated_action(command_decode_rom.action))
+        command_decode.action = X87_CMD_NONE;
+end
+assign v2_exec_op_port = ablated_exec_op(v2_exec_op) ? X87_ARITH_COMPARE : v2_exec_op;
+`else
+assign command_decode = command_decode_rom;
+assign v2_exec_op_port = v2_exec_op;
+`endif
 
 x87_transfer_fifo transfer_fifo (
     .clk(clk),
@@ -813,7 +921,7 @@ x87_executor executor (
     .clk(clk),
     .reset(reset),
     .start(v2_exec_start),
-    .exec_op(v2_exec_op),
+    .exec_op(v2_exec_op_port),
     .integer_size(v2_exec_size),
     .precision_control(control_word[9:8]),
     .rounding_mode(executor_rounding_mode),
@@ -845,6 +953,15 @@ x87_executor executor (
 );
 
 always_ff @(posedge clk) begin
+    tag_full_we = 1'b0;
+    tag_full_value = 16'h0;
+    tag_a_we = 1'b0;
+    tag_a_index = 3'd0;
+    tag_a_value = 2'b00;
+    tag_b_we = 1'b0;
+    tag_b_index = 3'd0;
+    tag_b_value = 2'b00;
+    tag_pop_count = 2'd0;
     if (reset) begin
         control_word <= 16'h037f;
         status_flags <= 16'h0000;
@@ -895,8 +1012,6 @@ always_ff @(posedge clk) begin
         store_source_raw <= 80'h0;
         store_bcd <= 1'b0;
         bcd_convert_pending <= 1'b0;
-        bcd_binary <= 64'h0;
-        bcd_digits <= 72'h0;
         bcd_shift_count <= 7'd0;
         bcd_sign <= 1'b0;
         pop_pending <= 1'b0;
@@ -1082,8 +1197,7 @@ always_ff @(posedge clk) begin
                             if (store_pop && control_word[0])
                                 pop_pending <= 1'b1;
                         end else begin
-                            bcd_binary <= bcd_magnitude;
-                            bcd_digits <= 72'h0;
+                            tx_state_shift <= {96'h0, bcd_magnitude};
                             bcd_shift_count <= 7'd64;
                             bcd_sign <= v2_exec_transfer_out[63];
                             bcd_convert_pending <= 1'b1;
@@ -1134,13 +1248,12 @@ always_ff @(posedge clk) begin
         end
 
         if (bcd_convert_pending) begin
-            bcd_binary <= {bcd_binary[62:0], 1'b0};
-            bcd_digits <= {bcd_adjusted[70:0], bcd_binary[63]};
+            tx_state_shift[135:0] <= {bcd_adjusted[70:0], tx_state_shift[63:0], 1'b0};
             bcd_shift_count <= bcd_shift_count - 7'd1;
             if (bcd_shift_count == 7'd1) begin
                 tx_state_shift <= {
                     80'h0, {bcd_sign, 7'h00,
-                            bcd_adjusted[70:0], bcd_binary[63]}};
+                            bcd_adjusted[70:0], tx_state_shift[63]}};
                 tx_count <= 2'd3;
                 tx_last_be <= 4'h3;
                 tx_index <= 5'd0;
@@ -1465,9 +1578,7 @@ always_ff @(posedge clk) begin
                     command_complete_pulse <= 1'b0;
                 end
                 if (arith_pop_count != 0) begin
-                    tag_word[top*2 +: 2] <= 2'b11;
-                    if (arith_pop_count == 2)
-                        tag_word[(top + 3'd1)*2 +: 2] <= 2'b11;
+                    pop_tags(arith_pop_count);
                     top <= top + arith_pop_count;
                 end
             end
@@ -1662,8 +1773,7 @@ always_ff @(posedge clk) begin
                             stack_addr_b <= new_top;
                             stack_write_data_b <= x87_to_m80(x87_indefinite());
                             stack_write_b <= 1'b1;
-                            tag_word[new_top*2 +: 2] <=
-                                x87_tag(x87_indefinite());
+                            set_tag_b(new_top, x87_tag(x87_indefinite()));
                             top <= new_top;
                         end
                     end else begin
@@ -1693,7 +1803,7 @@ always_ff @(posedge clk) begin
                             result_write_index <= top + 3'd1;
                             result_write_raw <= x87_to_m80(x87_indefinite());
                             result_write_pending <= 1'b1;
-                            tag_word[top*2 +: 2] <= 2'b11;
+                            pop_tags(2'd1);
                             top <= top + 3'd1;
                             command_complete_pulse <= 1'b0;
                         end
@@ -1912,9 +2022,7 @@ always_ff @(posedge clk) begin
                                         ? cmd_st_index : st0_index,
                                     x87_indefinite());
                             if (command_decode.pop_count != 0) begin
-                                tag_word[top*2 +: 2] <= 2'b11;
-                                if (command_decode.pop_count == 2)
-                                    tag_word[(top + 3'd1)*2 +: 2] <= 2'b11;
+                                pop_tags(command_decode.pop_count);
                                 top <= top + command_decode.pop_count;
                             end
                         end
@@ -1969,8 +2077,8 @@ always_ff @(posedge clk) begin
                                 stack_write_data_b <= x87_to_m80(x87_indefinite());
                                 stack_write_b <= 1'b1;
                             end
-                            tag_word[st0_index*2 +: 2] <= 2'b10;
-                            tag_word[cmd_st_index*2 +: 2] <= 2'b10;
+                            set_tag_a(st0_index, 2'b10);
+                            set_tag_b(cmd_st_index, 2'b10);
                         end
                     end else begin
                         stack_addr_a <= st0_index;
@@ -1981,14 +2089,12 @@ always_ff @(posedge clk) begin
                             stack_write_data_b <= stack_read_raw_a;
                             stack_write_b <= 1'b1;
                         end
-                        tag_word[st0_index*2 +: 2] <=
-                            tag_word[cmd_st_index*2 +: 2];
-                        tag_word[cmd_st_index*2 +: 2] <=
-                            tag_word[st0_index*2 +: 2];
+                        set_tag_a(st0_index, tag_word[cmd_st_index*2 +: 2]);
+                        set_tag_b(cmd_st_index, tag_word[st0_index*2 +: 2]);
                     end
                 end
                 X87_CMD_FFREE:
-                    tag_word[cmd_st_index*2 +: 2] <= 2'b11;
+                    set_tag_a(cmd_st_index, 2'b11);
                 X87_CMD_FSTP_ST: begin
                     if (stack_empty(st0_index)) begin
                         raise_stack_fault(1'b0);
@@ -2149,37 +2255,30 @@ always_ff @(posedge clk) begin
         // the CPU eventually reads it.
         if (tx_produce_fire) begin
             if (tx_kind == TX_STATE) begin
+                // Register pairs are packed at indices 6, 11, 16 and 21 from
+                // rows read two entries ahead (TOP+0/1, +2/3, +4/5, +6/7).
                 case (tx_index)
-                    5'd6:
+                    5'd6, 5'd11, 5'd16, 5'd21:
                         tx_state_shift <= pack_state_pair(
-                            stack_read_raw_a, stack_read_raw_b, top);
-                    5'd9: begin
-                        tx_state_shift <= tx_state_shift >> 32;
-                        stack_addr_a <= top + 3'd2;
-                        stack_addr_b <= top + 3'd3;
-                    end
-                    5'd11:
-                        tx_state_shift <= pack_state_pair(
-                            stack_read_raw_a, stack_read_raw_b, top + 3'd2);
-                    5'd14: begin
-                        tx_state_shift <= tx_state_shift >> 32;
-                        stack_addr_a <= top + 3'd4;
-                        stack_addr_b <= top + 3'd5;
-                    end
-                    5'd16:
-                        tx_state_shift <= pack_state_pair(
-                            stack_read_raw_a, stack_read_raw_b, top + 3'd4);
-                    5'd19: begin
-                        tx_state_shift <= tx_state_shift >> 32;
-                        stack_addr_a <= top + 3'd6;
-                        stack_addr_b <= top + 3'd7;
-                    end
-                    5'd21:
-                        tx_state_shift <= pack_state_pair(
-                            stack_read_raw_a, stack_read_raw_b, top + 3'd6);
+                            stack_read_raw_a, stack_read_raw_b, fsave_pair_row);
                     default:
                         if (tx_index >= 5'd7)
                             tx_state_shift <= tx_state_shift >> 32;
+                endcase
+                case (tx_index)
+                    5'd9: begin
+                        stack_addr_a <= top + 3'd2;
+                        stack_addr_b <= top + 3'd3;
+                    end
+                    5'd14: begin
+                        stack_addr_a <= top + 3'd4;
+                        stack_addr_b <= top + 3'd5;
+                    end
+                    5'd19: begin
+                        stack_addr_a <= top + 3'd6;
+                        stack_addr_b <= top + 3'd7;
+                    end
+                    default: ;
                 endcase
             end else if (tx_kind == TX_VALUE) begin
                 tx_state_shift <= tx_state_shift >> 32;
@@ -2233,6 +2332,21 @@ always_ff @(posedge clk) begin
             tx_generation_done <= 1'b0;
             tx_byte_offset <= 3'd0;
         end
+    end
+
+    // Apply this cycle's tag requests in architectural order.
+    begin
+        logic [15:0] tag_next;
+        tag_next = tag_full_we ? tag_full_value : tag_word;
+        if (tag_a_we)
+            tag_next[tag_a_index*2 +: 2] = tag_a_value;
+        if (tag_b_we)
+            tag_next[tag_b_index*2 +: 2] = tag_b_value;
+        if (tag_pop_count != 0)
+            tag_next[top*2 +: 2] = 2'b11;
+        if (tag_pop_count == 2)
+            tag_next[(top + 3'd1)*2 +: 2] = 2'b11;
+        tag_word <= tag_next;
     end
 end
 
