@@ -31,10 +31,17 @@ arithmetic hardware across operations to keep its FPGA area manageable.
 
 ![z486 architecture](docs/architecture.svg)
 
-The top-level module is `z486`. Its main configuration parameters include
-`DCACHE_SET_BITS`, `ICACHE_SET_BITS`, and `ENABLE_X87`.
+The code is roughly organized following the i486 block diagram in US Patent
+5,134,693, Fig. 1. The redrawing below labels each unit with the z486 sources
+that implement it.
+
+![z486 sources on the i486 block diagram](docs/block_diagram.svg)
 
 ## Performance
+
+The following are performance numbers for the first version of z486 (August 2026). Later
+versions are substantially faster. For example, Dhrystone CPI of the October version is
+2.0 instead of 2.8.
 
 ### Dhrystone 2.1
 

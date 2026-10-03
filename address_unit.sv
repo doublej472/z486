@@ -1,20 +1,7 @@
-// Address formation inside the segmentation unit
 //
-// US5204953 Fig. 1: latch 15 (I bus: base/index, IP, or fed-back EA), latch
-// 16 (R bus, K2Q displacement, or fed-back EA), latch 17 (segment base). The
-// EA adder and the three-input LA adder run in parallel in D2.2; a base +
-// scaled index + displacement takes a second D2 clock through the feedback.
+// Address Unit
+// Effective and linear address formation for D2 issue and the microcode IND sequence
 //
-// Signal map (patent -> RTL):
-//   I bus base/index read (D2)        ea_base / ea_index -> ea_base_value / ea_index_value
-//   K2Q displacement into latch 16    displacement
-//   second D2 clock (EA feedback)     split_ea_prepare / split_ea_use
-//   EA bus                            issue_ea, ea
-//   LA bus (D2.2)                     issue_linear, issue_linear_low
-//   multi-address E sequence          ind, ind_delta, ind_linear
-//
-// Owns the architectural address registers and their relocated linear form.
-// D2 supplies an effective address; segmentation supplies the active base/mask.
 `include "z486_platform.svh"
 module address_unit
     import z486_pkg::*;

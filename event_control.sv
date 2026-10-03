@@ -1,29 +1,7 @@
-// Event control: the i486 control unit's event arbitration beside the
-// microsequencer.
 //
-// Fu/Saini/Gelsinger Fig. 1 draws one "control" unit holding the control ROM
-// and a "control and protection test unit"; US5134693 Fig. 1 feeds it the
-// decoder's IWORD/entry point and returns microinstructions to segmentation,
-// datapath and FPU. z486 splits that unit into three owners:
+// Event Control
+// Fault, trap and interrupt redirects of the microsequencer, and the instruction lifecycle
 //
-//   microsequencer.sv   control ROM pipeline, uPC and address arbitration
-//   protection.sv       protection test PLA (PLA4) and its redirects
-//   event_control.sv    this module: which event redirects the sequencer, and
-//                       when; the macro-instruction lifecycle; fault delivery
-//
-// Signal map (i486 term -> RTL):
-//   fault/exception entry to microcode        seq_fault_redirect (#GP/#SS/#PF/#DF)
-//   instruction-boundary interrupt/trap entry seq_boundary_redirect (TF, NMI, INTR)
-//   control-ROM branch conditions             seq_conditions
-//   microcode sequencing enable               seq_advance
-//   double-fault combination (386 SCNTFF)     fault_delivery_state, double_fault_start
-//   shutdown on a fault during #DF            triple_fault_reset
-//   E-stage occupancy / halt                  uc_active, halted
-//
-// Stages: everything here is E (microcode-controlled) or the E commit edge;
-// there is no general WB stage. Deviation from the i486: z486 executes the
-// original 386 microcode, so the sequencer predicates (misc/error-code/task
-// flags) are the 386 microcode's, not the i486's.
 `include "z486_platform.svh"
 module event_control
     import z486_pkg::*;

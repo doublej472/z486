@@ -1,5 +1,7 @@
-// DSP-Based 32x32 Multiplier
-// Details: doc/z486/implementation_notes.md#src-24-z486-dsp-mul-sv-1
+//
+// DSP Multiplier
+// 32x32 signed/unsigned multiplier built from FPGA DSP blocks
+//
 module dsp_mul (
     input               clk,
     input               reset_n,

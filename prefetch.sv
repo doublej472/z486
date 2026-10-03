@@ -1,27 +1,7 @@
+//
 // Prefetcher
+// 32-byte prefetch queue feeding the K1Q decode window and the K2Q literal window
 //
-// US5293592 Fig. 2: prefetch register 26 (32 bytes) feeds mux 27, which
-// drives two decoder ports: K1Q, any three adjacent bytes at pointer K1P, to
-// the D1 decoder; and K2Q, any four adjacent bytes at pointer K2P, carrying
-// the displacement or immediate to D2/segmentation. After a jump the
-// prefetcher returns K1PJ, the byte where the new code begins. Fu/Saini: the
-// queue is two 16-byte buffers filled a whole line per clock over the 128-bit
-// cache path; prefetch has the lowest LA-bus priority (US5255377).
-//
-// Signal map (patent -> RTL):
-//   register 26 (32 bytes)             prefetch_queue[0:7]
-//   K1Q / K1P (D1 decode window)       k1q, k1q_early, k1q_avail / k1p_word, k1p_boff, k1p_adv
-//   K2Q / K2P (literal window)         k2q, k2q_avail / k2p_off (from the pop cursor)
-//   K1PJ (jump start byte)             k1pj_boff (with pf_fetch_word_start)
-//   K1V / K2V port valid               k1q_avail / k2q_avail
-//   instruction retire from the queue  pop_now, pop_len (pf_rptr, pf_byte_offset)
-//   128-bit line from the cache        pf_rdata via the paging toggle interface
-//
-// FPGA deviations: K1Q is 8 bytes wide (a 64-bit window) so D1 can decode an
-// instruction's full structural length in one clock, and k1q_early reads the
-// synchronous entry ROM a cycle ahead; K2Q is addressed relative to the pop
-// cursor; a one-line speculative branch-target buffer (spec_*) prefetches a
-// relative branch's target line.
 `include "z486_platform.svh"
 module prefetch
     import z486_pkg::*;
@@ -65,8 +45,6 @@ module prefetch
     input             pf_suspend,    // external suspend (e.g. page fault handler active)
     input             halt_speculative, // decode queue holds a taken JMP/CALL: stop fetching past it
 
-    // z486 speculative branch-target line (doc/z486/old/m4.md). spec_req at a relative branch's i_issue latches the target line address; the...
-    // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-54
     input             spec_req,
     input      [31:0] spec_linear,
     input             spec_owner,    // the currently-executing instruction is the
@@ -97,8 +75,6 @@ reg [31:0] pf_fault_addr_r;
 reg        pf_drop_inflight;         // Drop next prefetch result (flush during in-flight)
 reg [31:0] pf_fetch_addr;            // Next LINEAR cache-line address to prefetch
 
-// Speculative branch-target line buffer. spec_addr is the line address of the OUTSTANDING or BUFFERED fetch and only updates at launch; a...
-// Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-87
 reg         spec_pend;               // latched request waiting for the port
 reg  [31:0] spec_pend_addr;          // requested target (full: line + in-line offset)
 reg  [31:4] spec_addr;               // line address of the in-flight/buffered fetch
@@ -192,8 +168,6 @@ wire pf_can_fetch_after_flush = q_flush && !pf_suspend && !pf_inflight;
 assign ifetch_fault_code = pf_fault_code_r;
 assign ifetch_fault_addr = pf_fault_addr_r;
 
-// Spec fetch launch: takes priority over sequential prefetch for the shared port; never launches during a flush or while a request is...
-// Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-165
 wire spec_match_now = spec_req && spec_valid && !spec_poison && !spec_inflight &&
                       (spec_addr == spec_linear[31:4]);
 // A request that hits the victim entry swaps it into the active buffer
@@ -209,12 +183,8 @@ wire spec_inflight_match = spec_req && spec_inflight && !spec_poison && !spec_pe
                            (spec_addr == spec_linear[31:4]);
 wire spec_want   = ((spec_req && !spec_match_now && !spec_b_match && !spec_inflight_match) ||
                     spec_pend);
-// !pf_redirect_queued/!pf_drop_inflight: the queued-redirect handshake makes pf_inflight look idle (req toggled back to ack) while the...
-// Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-178
 wire spec_launch = spec_want && !pf_inflight && !q_flush && !pf_suspend &&
                    !pf_redirect_queued && !pf_drop_inflight;
-// Flush-time spec outcomes (evaluated during q_flush): Hit decision is OWNERSHIP, not an address compare: the flushing branch is the same...
-// Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-185
 wire spec_line_match   = spec_valid && !spec_poison && spec_owner;
 wire spec_adopt        = spec_inflight && !spec_poison && !pf_ack_edge && spec_owner;
 wire spec_data_now     = spec_inflight && !spec_poison && pf_ack_edge && !pf_fault &&
@@ -354,8 +324,6 @@ always @(posedge clk) if (PF_EVT) begin
 end
 // synthesis translate_on
 
-// D1 window: registered from the queue's NEXT state at the NEXT cursor, so the decoder always sees the byte rotate of the new cursor...
-// Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-342
 // If D2 backpressure blocks a structural handoff, the D1 cursor holds. Build
 // that hold window without the late k1p_adv/i_issue cursor adder; the already
 // required preread window below supplies the advancing case. The late control
@@ -497,8 +465,6 @@ always_ff @(posedge clk or negedge reset_n) begin
                 pf_fetch_addr <= {pf_flush_addr[31:4], 4'b0000} + 32'd16;
                 pf_fetch_word_start <= 2'd0;
                 pf_linear_addr <= {pf_flush_addr[31:4], 4'b0000} + 32'd16;
-                // A sequential prefetch may still be in flight down the OLD path: its fill would land on top of the freshly seeded queue (at the...
-                // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-403
                 if (pf_inflight && !pf_ack_edge && !spec_inflight) begin
                     pf_drop_inflight <= 1'b1;
                     pf_redirect_queued <= 1'b1;
@@ -517,12 +483,8 @@ always_ff @(posedge clk or negedge reset_n) begin
                 pf_req_toggle <= pf_ack_toggle;
             end
             spec_pend <= 1'b0;
-            // spec_valid deliberately SURVIVES the flush: the buffered line's data is linear-tagged and stays correct (CR3/CR0 changes and...
-            // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-428
             if (spec_adopt || (spec_inflight && pf_ack_edge))
                 spec_inflight <= 1'b0;
-            // Track the adopted fill so its arriving line is ALSO captured into the buffer (spec_addr/spec_off still hold the target): otherwise a...
-            // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-438
             spec_adopted_r <= spec_adopt;
             if (spec_data_now) begin
                 // Ack in the flush cycle itself: seed consumed it; buffer too.
@@ -577,8 +539,6 @@ always_ff @(posedge clk or negedge reset_n) begin
             pf_fault_reported <= 1'b1;
         end
 
-        // Latch a spec request; a newer request replaces an older PENDING one but never the address of a fetch already in flight. Ownership-based...
-        // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-489
         if (spec_req && !q_flush) begin
             if (spec_match_now || spec_inflight_match) begin
                 // Buffered or in-flight line holds this target: re-own, no refetch.
@@ -615,8 +575,6 @@ always_ff @(posedge clk or negedge reset_n) begin
             spec_b_valid <= 1'b0;
         if (spec_kill) begin
             spec_valid <= 1'b0;
-            // Also cancel a pending adopted-fill capture: after an adopting flush spec_inflight is already clear (no poison path), but the arriving...
-            // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-512
             spec_adopted_r <= 1'b0;
             if (spec_inflight)
                 spec_poison <= 1'b1;
@@ -644,8 +602,6 @@ always_ff @(posedge clk or negedge reset_n) begin
             end else if (good_ack) begin
                 pf_linear_addr <= pf_fetch_addr + 32'd16;
             end else begin
-                // Testbenches seed pf_fetch_addr directly to CS.base+EIP. If that initial address is in the middle of a cache line, derive the queue...
-                // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-545
                 pf_linear_addr <= {pf_fetch_addr[31:4], 4'b0000};
                 if (q_empty && pf_fetch_addr[3:0] != 4'h0) begin
                     pf_fetch_word_start <= pf_fetch_addr[3:2];

@@ -1,23 +1,7 @@
-// Cache unit (i486 cache, part of the K unit).
 //
-// The i486 has one unified 8 KB four-way write-through cache with 16-byte
-// lines; the cache "is actually a physical part of the prefetch (K) unit"
-// (US5255377). It is physically addressed from the paging unit's PA bus plus
-// the untranslated page offset, and fills whole lines over the 128-bit path
-// to the prefetcher (Grochowski/Shoemaker; Crawford).
+// Cache Unit
+// A20 masking, the instruction and data caches, the VIPT load port and request steering
 //
-// Signal map (i486 -> RTL):
-//   PA bus + page offset (E.1 TLB, E cache)     dcache_req_phys_addr, *_phys_addr_raw
-//   A20M# masking before the tags               a20_enable
-//   R/M data buses to datapath/segmentation     dcache_rdata (via bus_unit), dcache_vipt_resolve_data
-//   128-bit line to the prefetcher (KBRD)       icache_rdata
-//   KBA/KBWR to the bus unit                    dcache_mem_*, icache_mem_*
-//   EADS# invalidation                          snoop_addr / snoop_valid
-//
-// FPGA deviations: split I-cache and D-cache (z486 decision; see
-// doc/z486/i486_lessons.md, "unified cache"), a VIPT preread/finalize port for
-// one-clock loads (vipt_probe / vipt_resolve), and the write buffer inside the
-// D-cache as its store queue, whose stores patch the I-cache (store_patch_*).
 module cache_unit
     import z486_pkg::*;
 #(

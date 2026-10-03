@@ -128,7 +128,7 @@ DEPENDENCY_PHASES = [
 
 
 # Best-case z386 0.4 baseline (= 21.z386 / 24.z486 M0), measured 20260705
-# (doc/z486/old/m0.md). Constants show progress vs the pre-hardwired
+# Constants show progress vs the pre-hardwired
 # starting point.
 Z386_04_MIN_CYCLES = {
     "load": 3.0,
@@ -163,7 +163,7 @@ Z386_04_MIN_CYCLES = {
     "call_taken": 7.0,
 }
 
-# 80486 targets: the original design goals (doc/z486/old/ideas.md) plus
+# 80486 targets: the original design goals plus
 # published i486 cycle counts where the design table is silent.
 TARGET_486_CYCLES = {
     "load": 1.0,

@@ -1,5 +1,7 @@
-// Microcode ROM with predecode. The physical ROM stores a 37-bit native microcode word plus a 3-bit v52 D2 early kind. Execution still...
-// Details: doc/z486/implementation_notes.md#src-24-z486-ucode-rom-sv-1
+//
+// Microcode ROM
+// Original 80386 microcode with per-word predecode
+//
 `include "z486_platform.svh"
 module ucode_rom
     import z486_pkg::*;

@@ -1,7 +1,5 @@
 `timescale 1ns/1ns
 
-// Testbench for z486 - Protected Mode Test Runner Generic testbench for protected mode tests with configurable segment descriptors and...
-// Details: doc/z486/implementation_notes.md#src-24-z486-tests-tb-protected-mode-sv-3
 
 /* verilator lint_off SYNCASYNCNET */
 

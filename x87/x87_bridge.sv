@@ -1,4 +1,7 @@
-// Registered adapter between paging's preclassified x87 requests and streams.
+//
+// x87 Bridge
+// Registered adapter from paging's x87 port requests to the x87 streams
+//
 module x87_bridge (
     input  logic        clk,
     input  logic        reset,

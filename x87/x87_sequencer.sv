@@ -1,3 +1,7 @@
+//
+// x87 Microsequencer
+// Control-store sequencing for the numeric microprograms
+//
 module x87_sequencer
     import x87_ucode_pkg::*;
 (

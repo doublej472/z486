@@ -1,29 +1,7 @@
-// Segmentation unit
 //
-// Fu/Saini/Gelsinger Fig. 1 places the descriptor registers, the "limit and
-// attribute PLA" and address formation in one segmentation unit.
-// US5204953 Figs. 1-2 put both adders there: a two-input effective-address
-// adder (latches 15 + 16) and a three-input linear-address adder (15 + 16 +
-// segment base 17) working in parallel in D2.2; E checks the effective
-// address for limit and access rights. US5201043 adds alignment checking.
+// Segmentation Unit
+// Descriptor caches, segment limit and access checks, and address formation
 //
-// Signal map (patent -> RTL):
-//   descriptor registers, segment base 17      desc_cache[], seg_base_for()
-//   limit and attribute PLA (E check)          seg_limit_r, base_diff, seg_fault
-//   ISLA / IESSEG (D1.2 early-start controls)  address_unit d2_start / d2_ea, init_* (INIT_SEG)
-//   latches 15/16, EA adder 14                 address_unit_inst: ea_base/ea_index/displacement -> issue_ea
-//   three-input LA adder 12, LA bus (D2.2)     address_unit_inst: issue_linear (issue_seg_base + EA)
-//   CSLA/DCIMD multi-address sequencing (E)    address_unit_inst: IND, ind_delta, ind_linear
-//   GSBR bus-cycle spec                        seg_sel, is_dtable, descsw_mode
-//   SINTR alignment fault                      (not implemented; 386 microcode has no #AC)
-//
-// Stages: D2 forms the EA and LA for the issuing instruction (address_unit
-// issue_* ports); E runs the microcode IND sequence and the limit check. There
-// is no general WB stage; descriptor loads commit in the E commit edge.
-// FPGA deviations: the E-stage relocation is registered (ind_linear) rather
-// than re-added per access, and the limit check subtracts from the registered
-// limit to keep access_size off the 32-bit path.
-// Details: doc/z486/implementation_notes.md#src-24-z486-segmentation-unit-sv-1
 module segmentation_unit
     import z486_pkg::*;
 (
@@ -199,8 +177,6 @@ wire [31:0] GS_base = desc_cache[SEG_GS].base;
 
 wire [31:0] eff_offset = (addr_size || is_dtable) ? offset : {16'h0, offset[15:0]};
 
-// Pending base: the value seg_base_r will hold next cycle. Mirrors exactly the seg_base_r next-state in the always_ff below (same...
-// Details: doc/z486/implementation_notes.md#src-24-z486-segmentation-unit-sv-83
 reg [31:0] seg_base_pending_c;
 reg        addr_size_pending_c;
 reg        is_dtable_pending_c;
@@ -587,8 +563,6 @@ always_ff @(posedge clk) begin
         i_addr32_r <= 1'b0;
         i_stack_op_r <= 1'b0;
     end else if (seg_cmd_valid) begin
-        // seg_base_r / addr_size / is_dtable next-state is computed ONCE in the always_comb above (seg_base_pending_c / addr_size_pending_c /...
-        // Details: doc/z486/implementation_notes.md#src-24-z486-segmentation-unit-sv-384
         seg_base_r <= seg_base_pending_c;
         addr_size  <= addr_size_pending_c;
         is_dtable  <= is_dtable_pending_c;

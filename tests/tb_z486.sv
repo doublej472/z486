@@ -565,6 +565,5 @@ module tb_z486 #(
     end
 
     // Waveform dump initial begin if ($test$plusargs("trace")) begin $dumpfile("trace.vcd"); $dumpvars(0, tb_z486); end end
-    // Details: doc/z486/implementation_notes.md#src-24-z486-tests-tb-z486-sv-553
 
 endmodule

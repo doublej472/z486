@@ -1,5 +1,7 @@
-// Registered arctangent table for the serialized Q80 CORDIC. Quartus maps
-// the constants to M10Ks; simulation uses the generated case table below.
+//
+// x87 CORDIC ROM
+// Arctangent table for the serial CORDIC
+//
 `include "z486_platform.svh"
 module x87_cordic_rom (
     input  logic               clk,

@@ -1,5 +1,7 @@
-// Two synchronous ports store the eight architectural 80-bit x87 registers.
-// Decode happens at the consumer so untouched m80 values round-trip exactly.
+//
+// x87 Register Stack
+// Two-port storage for the eight 80-bit x87 registers
+//
 `include "z486_platform.svh"
 module x87_stack_mem (
     input  logic        clk,

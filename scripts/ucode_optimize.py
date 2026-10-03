@@ -9,7 +9,7 @@ common-instruction recipe inventory and
 generates its SystemVerilog lookup and human-readable manifest, so microcode
 words and the recipes that consume them cannot silently drift apart.
 
-37-bit word field layout (see doc/microcode/fields.txt):
+37-bit word field layout:
     bus[5:0]  sub[7:6]  op[10:8]  aluop[17:11]  src[23:18]  dst[30:24]  alusrc[36:31]
   RNI = op field 0 (default 7);  DLY = sub field 0 (default 3).
 """
@@ -298,7 +298,7 @@ PATCHES = [
     Patch(0x268, "REP STOS: skip redundant per-element count check",
           fields=dict(alusrc=0x3D, aluop=0x47)),
 
-    # ---- v52 direct ALU usteps -------------------------------------------
+    # ---- direct ALU usteps -------------------------------------------
     # Every hardwired ALU retire word owns its architectural write through one
     # destination encoding. This replaces the parallel RECIPE_COMMIT_ALU write
     # site while leaving SEQ/hardwired_off to execute the original slot writeback.

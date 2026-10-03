@@ -1,23 +1,7 @@
-// Bus interface unit
 //
-// US5073969 describes the i486 bus interface unit: the bus controller, the
-// write buffers, cycle-type and burst decode, and dynamic bus sizing.
-// Grochowski/Shoemaker: a data fetch and a code fetch in the same clock go
-// data first; external invalidations arrive through AHOLD/EADS#.
+// Bus Interface Unit
+// External bus arbitration, cycle types and response tracking for the caches, I/O and x87
 //
-// Signal map (i486 -> RTL):
-//   XA / XD external address and data          addr, be, dout / din, line_din
-//   ADS#/RDY# bus cycle handshake              valid / ready, resp_valid
-//   BLAST#/burst line fill                     burstcount, line_read, line_resp_valid
-//   M/IO#, INTA, coprocessor cycles            io, inta, x87_req_* (x87 port space)
-//   write buffers (4 x 80 bits)                l1_cache store queue, drained as dcache_mem_* writes
-//   bus arbitration (data before code)         ext_direct_req > ext_dcache_req > ext_icache_req
-//   KBA/KBWR, KBRD to the cache/prefetcher     dcache_mem_*, icache_mem_*
-//
-// FPGA deviations: the write buffer lives inside l1_cache (as its store queue)
-// because stores patch and forward at cache lookup; this unit orders I/O,
-// INTA and device cycles after it drains (dcache_stores_drained). One
-// registered request slot (ext_*_r) replaces the i486's bus-cycle pipeline.
 module bus_unit
     import z486_pkg::*;
 #(

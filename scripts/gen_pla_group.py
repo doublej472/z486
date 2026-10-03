@@ -145,7 +145,6 @@ def main():
 
     body = []
     body.append("// Generated second-level group PLA; do not edit by hand.")
-    body.append("// Details: doc/z486/implementation_notes.md#src-24-z486-pla-entry-svh-561")
     body.append("function automatic logic [6:0] pla_group_lookup(")
     body.append("    input [10:0] addr_in")
     body.append(");")

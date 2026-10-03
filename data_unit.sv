@@ -1,30 +1,7 @@
-// Main datapath
 //
-// Fu/Saini/Gelsinger Fig. 1: the register file, ALU, barrel shifter and
-// flags, joined to the cache by the two 32-bit data buses and to
-// segmentation by the base/index bus. US5142635 Figs. 2-5 detail it: the
-// register file reads base/index onto the I bus in D2 (one clock ahead of
-// E data reads), results write back in WB, and "shorters" bypass a result to
-// E or D2 before it is written. The same patent's stack engine keeps ESP, an
-// advanced ASP and a shadow SSP with a dedicated stack-pointer adder on the J
-// bus.
+// Data Unit
+// Register file, ALU, shifter, multiply/divide, flags and result forwarding
 //
-// Signal map (i486 -> RTL):
-//   register file (DREG), 3 read / 1 write     eax..edi, read_gpr_value(), write_gpr
-//   I bus base/index read (D2)                 ea_base/ea_index -> ea_base_value/ea_index_value
-//   ALU / barrel shifter / multiply-divide     alu_inst / shifter_inst / mul_div_inst
-//   ALU latch, write-back value                sigma, alu_result, shift_result
-//   R bus memory operand, write data           opr_r / opr_w, memory_write_source_value
-//   shorters: WB -> E / D2 bypass              pending-write table (pend_*_mask: delay slot, deferred
-//                                              shift, load WB, ROM load) -> gpr_ex_view / gpr_ea_view;
-//                                              eflags_fwd (flags), branch_condition_true (Jcc)
-//   stack engine (ispval, SPADD)               stack_op/stack_dir -> sigma = ESP +/- 2/4 at instr_start
-//   flags                                      eflags, uc_flags, flags_backup (386 microcode FLAGSB)
-//
-// Stages: operand reads and ALU/shift in E; results commit on the E commit
-// edge (z486 has no general WB stage) except deferred load/shift commits
-// (recipe_memory_write / recipe_shift_write). Deviation: ESP is ordinary
-// register-file state, without the i486's ASP/SSP stack engine.
 `include "z486_platform.svh"
 module data_unit
     import z486_pkg::*;

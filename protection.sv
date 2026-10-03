@@ -1,5 +1,7 @@
-// 80386 Protection Unit, including the Test PLA Implements hardware-accelerated privilege checking and protection validation for...
-// Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-1
+//
+// 80386 Protection Unit
+// Protection test PLA for hardware-accelerated privilege checking and protection validation
+//
 module protection_unit
     import z486_pkg::*;
 (
@@ -242,8 +244,6 @@ always_comb begin
         rw_comb   = test_state_vector[1];
         a_comb   = test_state_vector[0];
     end else begin
-        // Normal mode: Compute state vector from descriptor (Tiny PLA) The lower 4 bits of alujmp_op control muxes that select which pre-computed...
-        // Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-166
 
         if (aluop_type == 4'hE) begin  // PTSELE
             // PTSELE (0x6E): selector-only test — p1/p2 use RPL vs CPL only, not DPL.
@@ -266,8 +266,6 @@ always_comb begin
             p1_comb = (selector_rpl > cpl_live);     // Not used by current PLA4 terms for PTSELA
             p2_comb = ~(selector_rpl != cpl_live);   // 1=match (RPL == CPL), 0=mismatch
         end else if (aluop_type == 4'h8) begin   // PTOVRR
-            // TSTDES (0x68): inside LD_DESCRIPTOR — descriptor privilege check p1: RPL vs DPL violation (0=ok, 1=violation) p2: DPL vs CPL match...
-            // Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-208
             if (desc_s && desc_x && desc_ce)
                 p1_comb = (desc_dpl > selector_rpl);
             else
@@ -305,8 +303,6 @@ always_comb begin
             // For PTSELA (aluop 0xA): selector test — remap ce to TI bit,
             // clear other descriptor bits (no descriptor read yet)
             if (aluop_type == 4'hA) begin
-                // if (test_const == TST_PORTIO_BIT) begin // IO permission bitmap check: PROTUN holds (bitmap & mask). // Pass (no fault) when PROTUN ==...
-                // Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-255
                 u_comb  = 1'b0;
                 x_comb  = 1'b0;
                 ce_comb = selector_ti;
@@ -328,7 +324,6 @@ assign state_vector_comb = {p1_comb, p2_comb, b13_comb, b12_comb, p_comb,
                             u_comb, x_comb, ce_comb, rw_comb, a_comb};
 
 // Stage 1: Register Tiny PLA outputs (posedge clk when pipe_en)
-// Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-282
 wire s0_is_checking = test_en && (aluop_type != 4'hB);
 
 always_ff @(posedge clk) begin
@@ -461,12 +456,8 @@ always_comb begin
         TST_PORTIO_BIT: begin
             // this is a hack
             pla_test_addr = s1_desc_low16_nonzero ? UADDR_GENERAL_FAULT1 : 12'h000;
-            // // Term 136: !p2 → 0x85B if (!p2) pla_test_addr = pla_test_addr | 12'h85B; // Term 137: !p → 0x85B if (!p) pla_test_addr =...
-            // Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-408
         end
 
-        // TST_SEL_ARPL (0x05) - ARPL Check Compares dest RPL (from descriptor_hi[1:0] at test time) against latched source RPL (from READ_RPL)....
-        // Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-416
         TST_SEL_ARPL: begin
             if (s1_desc_rpl >= s1_arpl_rpl) begin
                 pla_test_addr = 12'h6B3;  // ARPL_FAILED: dest RPL >= source RPL, no adjustment
@@ -585,8 +576,6 @@ always_comb begin
         // TST_DES_SIMPLE (0x10) - Test Non-Stack Segment Load (variant 2)
         //----------------------------------------------------------------------
         TST_DES_SIMPLE: begin
-            // CPL privilege guard: on the real 386, the SPTR bus operation at the segment load entry point (e.g., uc=580) reads the GDT descriptor...
-            // Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-539
             if (s1_cpl > s1_desc_dpl && !(x && ce)) begin
                 // CPL exceeds DPL for non-conforming segment: fall through to 5D1 (#GP)
                 // Conforming code segments (x=1, ce=1) allow DPL <= CPL (term 90 handles)
@@ -756,8 +745,6 @@ always_comb begin
         // TST_DES_CGDEST (0x17) - Call Gate Destination Code Segment
         //----------------------------------------------------------------------
         TST_DES_CGDEST: begin
-            // CPL privilege guard: on the real 386, SPTR at uc=8bc pre-validates CPL vs target DPL before LD_DESCRIPTOR runs. Since SPTR is not...
-            // Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-713
             if (s1_desc_dpl > s1_cpl) begin
                 // Target DPL exceeds CPL: illegal outward transition → #GP
             end else begin
@@ -999,7 +986,6 @@ always_comb begin
         end
 
         // JMP_GFAULT_INT (0x2A) - Unconditional redirect to GP fault handler
-        // Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-958
         6'h2A: begin
             pla_test_addr = 12'h865;
         end
@@ -1285,7 +1271,6 @@ end
 assign pla_test_output = {pla_test_flags, pla_test_addr, 2'b00};
 
 // Output Extraction
-// Details: doc/z486/implementation_notes.md#src-24-z486-protection-sv-1249
 
 //==============================================================================
 // Stage 2: Register PLA4 outputs (posedge clk when pipe_en)

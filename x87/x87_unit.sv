@@ -1,20 +1,7 @@
-// Floating-point unit, CPU-facing top.
 //
-// Fu/Saini/Gelsinger Fig. 1 draws the i486 FPU beside the integer units,
-// sharing the cache's R/M data buses and receiving microinstructions from the
-// control unit; US5134693 Figs. 1-5 give its datapath, the Fmicro/Fconr
-// control path and delayed-exception handling, and US5226127 the WAIT
-// elision. The FPU runs in parallel with integer execution (Fu/Saini Fig. 5).
+// Floating-Point Unit
+// CPU-facing x87 top, using the 387 I/O port protocol (0xF8/0xFC)
 //
-// Signal map (i486 -> RTL):
-//   microinstruction from control (Fmicro)   386 F8/FC port protocol: req_* (x87_bridge)
-//   operand over the R/M buses               direct_* m32 read transport, mem_*, split_rdata
-//   BUSY# / PEREQ / ERROR# (386 interface)    busy_n / pereq / error_n
-//   FPU pipeline freeze on integer faults     cancel
-//
-// Deviation: z486 keeps the 387 coprocessor protocol that the 386 microcode
-// expects (commands and operands through I/O ports 0xF8/0xFC) instead of
-// direct microinstruction dispatch; see doc/z486/i486_lessons.md item 4.
 module x87_unit #(
     parameter ENABLE_X87 = 0
 )(

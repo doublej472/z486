@@ -288,8 +288,6 @@ wire is_adjust = (op == ALU_DAA) || (op == ALU_DAS) || (op == ALU_AAA) || (op ==
 wire [31:0] R = slice_result;
 wire flag_byte_mode = is_byte || is_adjust;
 
-// Zero-flag anticipation for adder-based ops, independent of the carry chain: x + y + cin == 0 (mod 2^w) ⟺ (x ^ y)[w-1:0] == ({(x|y),...
-// Details: doc/z486/implementation_notes.md#src-24-z486-alu-sv-299
 wire [31:0] za_neq = (arg1_bus ^ arg2_bus) ^
                      {arg1_bus[30:0] | arg2_bus[30:0], carry_in0};
 wire zfa_byte  = ~|za_neq[7:0];

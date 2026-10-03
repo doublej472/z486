@@ -1,5 +1,7 @@
-// Synchronous x87 control store. The generated image is the source
-// of truth; simulation and Quartus consume equivalent generated forms.
+//
+// x87 Microcode ROM
+// Synchronous x87 control store from the generated image
+//
 `include "z486_platform.svh"
 module x87_ucode_rom
     import x87_ucode_pkg::*;

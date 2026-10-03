@@ -1,3 +1,7 @@
+//
+// x87 Microcode Package
+// Microcode word fields for the numeric control store
+//
 package x87_ucode_pkg;
 
 typedef enum logic [2:0] {

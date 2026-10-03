@@ -1,5 +1,7 @@
-// Read-only physically indexed, physically tagged L1 instruction cache. CPU-side contract: * cpu_addr is a physical byte address. * A...
-// Details: doc/z486/implementation_notes.md#src-24-z486-l1-icache-sv-1
+//
+// L1 Instruction Cache
+// Read-only physically indexed, physically tagged instruction cache
+//
 `include "z486_platform.svh"
 module l1_icache #(
     // 8KB icache (128 sets x 4 ways x 16 B); use SET_BITS=8 for 16KB.
@@ -590,7 +592,6 @@ always_ff @(posedge clk) begin
                         // Only the tag-RAM fill write sets valid for fill_way.
                         // Do not restore any other way from the fill-start
                         // snapshot: a snoop during this fill must survive.
-                        // Details: doc/z486/implementation_notes.md#src-24-z486-l1-icache-sv-491
                         plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
                         state <= S_IDLE;
                         ready_r <= 1'b1;

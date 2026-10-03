@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate ucode.mif (40-bit Quartus ROM init) from ucode.hex.
 
-The microcode ROM stores the native 37-bit word in bits 36:0 and the v52 D2
+The microcode ROM stores the native 37-bit word in bits 36:0 and the D2
 early kind in bits 39:37.  The 14 execution predecode bits remain computed in
 the ROM output register stage (see ucode_rom.sv).
 """

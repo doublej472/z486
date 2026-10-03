@@ -1,23 +1,9 @@
+//
+// Data Access Pipeline
+// Direct loads, microcode reads, RMW and direct stores through the L1 probe port and sidecar TLB
+//
 `include "z486_platform.svh"
 `default_nettype none
-// Data-access pipeline: the CPU side of the L1's probe/resolve port, the
-// sidecar TLB's requesters, and the direct store port.
-//
-// US5255377 and Grochowski/Shoemaker: the TLB and the cache tags are read in
-// parallel. Each access presents its linear address (the set index) in one
-// cycle; the sidecar TLB translation and the tag compare finalize the next
-// (doc/z486 L1 contract). Requesters:
-//   direct loads   MOV/MOVX/ALU r,m, moffs, POP, RET probe at D2 issue,
-//                  resolve in EX and write their GPR in WB (a RET writes ESP
-//                  and redirects to its target); a miss enters paging from
-//                  the slow slot, a younger token waits in the replay slot
-//   microcode RD   the RD word probes, a hit commits OPR_R the next cycle,
-//                  a miss enters paging from its token
-//   RMW overlay    RD_FAST prereads the operand at D2 issue; WR_FAST posts the
-//                  result to the same write-qualified physical address
-//   direct stores  a write whose page the sidecar TLB holds posts to the L1
-//                  without a paging cycle
-// Paging remains the path for misses, walks, crossings, I/O and faults.
 module data_access
     import z486_pkg::*;
 (

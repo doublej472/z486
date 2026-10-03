@@ -1,7 +1,7 @@
-// Arithmetic FPU behind x87_control's command, stack, and transfer unit.
-// Horizontal micro-ops steer shared formatting/rounding resources and the
-// independently owned add, multiply, divide/square-root, and transcendental
-// datapaths below.
+//
+// x87 Executor
+// Add, multiply, divide/square root and transcendental datapaths with shared rounding
+//
 module x87_executor
     import x87_pkg::*, x87_ucode_pkg::*;
 (

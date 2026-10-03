@@ -1,5 +1,7 @@
-// Fixed-clock architectural execution-rate controller. Memory and peripherals
-// continue at clk speed while execution cycles accrue and repay rate debt.
+//
+// CPU Throttle
+// Fixed-clock execution-rate limiter; memory and peripherals keep running at full speed
+//
 module cpu_throttle #(
     parameter logic [6:0] CLOCK_RATE_MHZ = 7'd85
 )(

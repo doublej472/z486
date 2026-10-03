@@ -1,9 +1,7 @@
-// z486 memory side: the bus interface unit and the cache unit.
 //
-// This wrapper holds only the two owners and their interconnect:
-//   bus_unit    external arbitration, cycle types, response tracking (US5073969)
-//   cache_unit  A20 masking, D-cache (with its store queue as the write
-//               buffer) and I-cache, VIPT preread, request steering
+// Memory Unit
+// Connects the bus interface unit and the cache unit
+//
 module memory #(
     parameter PROTECT_UMA_ROM = 0,
     parameter DCACHE_SET_BITS = 7,

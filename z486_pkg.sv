@@ -1,4 +1,7 @@
-// 80386 Package - shared types and constants
+//
+// z486 Package
+// Shared types and constants
+//
 package z486_pkg;
 
 //=============================================================================
@@ -463,7 +466,6 @@ function automatic [15:0] dec_ea_onehots(input dec_entry_t e);
 endfunction
 
 // Segment Descriptor Cache
-// Details: doc/z486/implementation_notes.md#src-24-z486-z486-pkg-sv-457
 
 // Segment register indices
 localparam [3:0] SEG_ES  = 4'd0;
@@ -886,8 +888,6 @@ localparam ALUSRC_IMM = 6'h09;        // Full immediate
 localparam ALUSRC_TMPB = 6'h0B;
 localparam ALUSRC_TMPC = 6'h0C;
 localparam ALUSRC_TMPD = 6'h0D;
-// z486 extension (M5 F-ALUM): OPR_R as an ALU source. 0x0F is unused as a consumed ALU source in the base CROM (only 880/88E carry it,...
-// Details: doc/z486/implementation_notes.md#src-24-z486-z486-pkg-sv-857
 localparam ALUSRC_OPR_R = 6'h0F;
 localparam ALUSRC_ALLONES = 6'h10;    // 0xFFFFFFFF mask
 localparam ALUSRC_TMPG = 6'h12;
@@ -1376,7 +1376,6 @@ localparam PF_W = 1;      // 0=read, 1=write
 localparam PF_U = 2;      // 0=supervisor, 1=user
 
 // Protection Unit (PLA4) Test Constants
-// Details: doc/z486/implementation_notes.md#src-24-z486-z486-pkg-sv-1339
 
 // Selector validation tests (PLA4 test constants 0x00-0x0F)
 localparam logic [5:0] TST_SEL_NONSS    = 6'h00;  // Non-stack segment selector (DS/ES/FS/GS)

@@ -1,4 +1,7 @@
-// Architectural interrupt latches and the STI/MOV-SS interrupt shadow.
+//
+// Interrupt Latches
+// Architectural interrupt latches and the STI/MOV SS interrupt shadow
+//
 module interrupt_controller
     import z486_pkg::*;
 (

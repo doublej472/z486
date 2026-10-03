@@ -1,5 +1,7 @@
-// Microcode-driven integer multiply/divide unit. It owns the DSP multiplier,
-// private product/quotient state, and one non-restoring divide iteration.
+//
+// Multiply/Divide Unit
+// Microcode-driven integer multiply and non-restoring divide
+//
 module mul_div
     import z486_pkg::*;
 (

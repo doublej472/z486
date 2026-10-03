@@ -1,5 +1,7 @@
-// Two mirrored memories implement a two-read, one-write scratch file. The
-// synchronous read boundary keeps scratch data out of sequencer address logic.
+//
+// x87 CORDIC Scratch
+// Two-read, one-write scratch file built from two mirrored memories
+//
 `include "z486_platform.svh"
 module x87_cordic_scratch (
     input  logic        clk,

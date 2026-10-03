@@ -1,28 +1,7 @@
-// Microsequencer: the control unit's ROM pipeline.
 //
-// US5390311 Figs. 2-4 (80486 embodiment): an entry-point PLA maps the opcode
-// to a control-ROM address; the ROM is organised in 32-line blocks of 4-line
-// segments, and a flow longer than a segment takes a delayed jump. US5293592:
-// the decoder latches the entry point in D1; microcode controls E from its
-// first clock. Fu/Saini Fig. 1 places the control ROM with the "control and
-// protection test unit" in one control unit.
+// Microsequencer
+// Two-port microcode ROM pipeline, micro-address sequencing and redirects
 //
-// The ROM has two read ports (one M10K copy, true dual-port):
-//   port B serves D2: the skeleton's first word, read when it loads;
-//   port A serves EX: every following word, micro-jumps, calls, handlers.
-// At issue EX takes port B's word (pb_slot) and port A continues at entry+1.
-//
-// Signal map (i486 -> RTL):
-//   decoder-supplied first line (latches 35) ROM port B: pb_load/pb_load_entry, pb_valid, pb_slot
-//   control ROM, ROM address register        ROM port A: uaddr, uc_addr_mem -> uc
-//   microinstruction to the units            uc, uc_* field decode, uc_next (predecode)
-//   delayed jump / next-to-last line         exec_redirect (one delay slot), i_rni_delay
-//   redirect priority                        fault > boundary > port-B continuation > exec
-//
-// Event arbitration (which fault, trap or interrupt redirects the sequencer)
-// lives in event_control.sv; the protection test PLA in protection.sv.
-// Deviation: z486 runs the original 386 microcode (2,560 x 40-bit ROM) with
-// one uniform delay slot rather than the i486's segment-structured ROM.
 `include "z486_platform.svh"
 module microsequencer
     import z486_pkg::*;

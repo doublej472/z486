@@ -1,5 +1,7 @@
-// Shared three-word coprocessor transfer queue. Direction is owned by the
-// command controller; the queue itself is a neutral ready/valid boundary.
+//
+// x87 Transfer FIFO
+// Three-word ready/valid queue for CPU-x87 transfers
+//
 module x87_transfer_fifo (
     input  logic        clk,
     input  logic        reset,

@@ -1,5 +1,7 @@
-// Microcode-driven barrel shifter. This module owns SHIFT1 setup state, the
-// optimized shift operand muxes, the barrel datapath, and SHIFT2 flag retirement.
+//
+// Barrel Shifter
+// Microcode-driven shifts and rotates, from SHIFT1 setup to SHIFT2 flags
+//
 module shifter
     import z486_pkg::*;
 (

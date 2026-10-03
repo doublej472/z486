@@ -1,28 +1,7 @@
-// Paging unit
 //
-// US5255377 Figs. 1-3: the paging unit arbitrates the linear-address (LA) bus
-// among three requesters in fixed priority - paging itself (page-directory
-// and page-table walks), then segmentation (data references formed in D2),
-// then the prefetcher. It receives a linear address in PH2 and looks it up in
-// the TLB in the following PH1 (E.1); the page-frame bits leave on the PA bus
-// to the cache, and the low 12 bits bypass paging. The data sheet gives a
-// 32-entry four-way TLB with pseudo-LRU.
+// Paging Unit
+// Linear-address arbitration, TLB lookup, page walks and page faults
 //
-// Signal map (i486 -> RTL):
-//   requester 1: paging (walker)             paging_walker walker_inst, walk_request (internal)
-//   requester 2: segmentation (demand)       mem_req, linear_addr, mem_* ; VIPT preread vipt_*
-//   requester 3: prefetcher                  pf_req_toggle, pf_linear_addr, pf_ack_toggle, pf_rdata
-//   arbitration                              walk in progress owns the port; in PG_IDLE a demand
-//                                            request is taken before a pending prefetch (idle_pf_req)
-//   TLB (E.1)                                paging_tlb tlb_inst; sidecar VIPT TLB for D2 prereads
-//   PA bus (+ page offset) to the cache      dcache_req_* / icache_req_*
-//   page fault to control                    page_fault, fault_code, cr2_out
-//
-// FPGA deviations: a D2 VIPT preread of a sidecar TLB lets one-clock loads
-// start before the authoritative lookup; prefetch uses a toggle handshake;
-// the unit also splits DWORD-crossing accesses. There is no registered
-// LA-bus replay slot (doc/z486/i486_lessons.md item 5).
-// Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-1
 
 `include "z486_platform.svh"
 module paging_unit
@@ -66,8 +45,6 @@ module paging_unit
     output reg          mem_opt_wait,      // Optimistic read past its grace cycle and still in flight:
                                            // sequencer must stall any uop until completion
     output              mem_write_wait,    // Demand WRITE that did not post in its PG_MEM_TLB cycle
-                                           // and can still fault (permission now, walk fault later, or the second half of a crossing access). The issuing instruction may already...
-                                           // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-49
     input        [31:0] linear_addr,       // Registered linear (reloc(IND)) for BOTH the demand path
                                            // (-> req_linear / tlb_lookup_addr) and the live TLB; the
                                            // seg-adder stays off the live cone since it is registered
@@ -254,8 +231,6 @@ always_ff @(posedge clk) begin
         vipt_refill_pending_r <= vipt_refill_capture;
     end
 end
-// P0/P1 prefetch timing: P0 prefetch toggles pf_req_toggle and presents pf_linear_addr. P1 paging translates the registered prefetch...
-// Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-189
 wire idle_pf_req = s_idle && pf_pending && !fast_path_pending && !pf_fast_pending;
 
 paging_tlb tlb_inst (
@@ -376,8 +351,6 @@ wire slow_tlb_user_ok = !slow_is_user_mode || tlb_user;
 wire slow_tlb_write_ok = !req_is_write || tlb_writable || (!slow_is_user_mode && !wp_enable);
 wire slow_tlb_access_ok = slow_tlb_user_ok && slow_tlb_write_ok;
 
-// Live precompute of "this demand write will post" (TLB hit, writable, dirty — no fault, no page walk), from the live TLB + the...
-// Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-292
 wire live_is_user     = (cpl == 2'd3);
 wire live_user_ok     = !live_is_user || live_tlb_user;
 wire live_store_perm_ok = live_tlb_writable ||
@@ -465,8 +438,6 @@ always_ff @(posedge clk) begin
 end
 // synthesis translate_on
 wire req_mem_posted_done = req_mem_dcache_accept && req_is_write && dcache_req_complete;
-// Loop 1: release the post-write DLY when the write posts. write_will_post (registered from the live TLB at PG_IDLE) replaces the...
-// Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-377
 assign mem_write_dly_grace = (state == PG_MEM_TLB) && req_is_write && write_will_post && !req_crossing;
 // Fault-capable window of a demand write (see the port comment).  States
 // after translation succeeds (WALK_LOOKUP, CROSS_LOOKUP2/WAIT2, IDLE with
@@ -475,8 +446,6 @@ assign mem_write_wait = req_is_write && !mem_write_dly_grace &&
                         (state == PG_MEM_TLB   || state == PG_WALKING     ||
                          state == PG_CROSS_WAIT1 || state == PG_CROSS_PREP2 ||
                          state == PG_CROSS_TLB2  || state == PG_CROSS_WALK2);
-// Posted-write completion, computed from the registered/demand write terms only. The combinational dcache_req_valid/dcache_req_write...
-// Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-390
 wire posted_write_isw = (state == PG_MEM_TLB) ? req_is_write : dcache_req_write_r;
 wire dcache_posted_write_done = (dcache_req_valid_r || req_mem_dcache_candidate) &&
                                 posted_write_isw && dcache_req_accepted && dcache_req_complete;
@@ -490,8 +459,6 @@ wire [31:0] fast_pf_phys = pg_enable ? {tlb_physical_addr[31:12], pf_linear_addr
 assign mem_accepted = mem_accepted_r || idle_mem_ready;
 wire        req_mem_present    = (state == PG_MEM_TLB);
 
-// Early write: post a cacheable, non-crossing, non-check-only write at PG_IDLE from the live TLB. Validated (zero EARLY-WRITE mismatches...
-// Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-415
 wire        early_wr_idx_drive = idle_data_req && mem_write && !mem_is_io;
 wire        early_wr_present   = early_wr_idx_drive && !idle_mem_crossing &&
                                  !mem_check_only && live_store_posts;
@@ -518,8 +485,6 @@ wire        pretrans_accept    = pretrans_present && dcache_req_accepted;
 wire        early_present      = early_wr_present || pretrans_present;
 
 assign dcache_req_valid = dcache_req_valid_r || req_mem_dcache_candidate || early_present;
-// PIPT cache request: drive the cache off the physical address only -- no separate early-index port. Page frame [31:12] uses the...
-// Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-433
 wire [19:0] dcache_req_frame  = pretrans_present ? pretrans_phys[31:12] :
                                 early_present   ? early_phys[31:12] :
                                 req_mem_present  ? req_mem_phys[31:12] :
@@ -894,8 +859,6 @@ always_ff @(posedge clk or negedge reset_n) begin
                                        linear_addr[1:0], 1'b0, 1'b0);
                         fast_path_pending <= 1'b1;
                     end else if (early_wr_accept) begin
-                        // Early posted write: the store-queue write was enqueued this cycle from the live physical (accept => post), so the access is done. Clear...
-                        // Details: doc/z486/implementation_notes.md#src-24-z486-paging-unit-sv-764
                         latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size),
                                        linear_addr[1:0], 1'b0, 1'b0);
                         mem_servicing <= 1'b0;

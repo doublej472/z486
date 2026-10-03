@@ -1,3 +1,7 @@
+//
+// Platform Selection
+// Vendor and feature defines for board builds
+//
 `ifndef Z486_PLATFORM_SVH
 `define Z486_PLATFORM_SVH
 

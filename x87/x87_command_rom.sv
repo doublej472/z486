@@ -1,5 +1,7 @@
-// Synchronous x87 command decoder. The generated image replaces repeated
-// ESC/FOP comparisons in the control unit with a BRAM lookup.
+//
+// x87 Command ROM
+// ESC opcode to x87 command decode in block RAM
+//
 `include "z486_platform.svh"
 module x87_command_rom
     import x87_ucode_pkg::*;

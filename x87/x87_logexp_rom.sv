@@ -1,6 +1,7 @@
-// Synchronous lookup ROM shared by FYL2X and F2XM1. Each word returns the
-// selected Q52 sample and its precomputed delta to the successor. Address
-// ranges 0/256/512 select log2/exp2/exp2(-x); 768 and 769 are exp2 endpoints.
+//
+// x87 Log/Exp ROM
+// log2 and exp2 sample table shared by FYL2X and F2XM1
+//
 `include "z486_platform.svh"
 module x87_logexp_rom (
     input  logic         clk,

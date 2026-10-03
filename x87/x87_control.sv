@@ -1,8 +1,7 @@
-// x87 data interface and control unit: command decode, microsequencing,
-// environment/status state, CPU transfers, and the 8-entry register stack.
-// The Intel 80387 block diagram places the stack inside the FPU; keeping its
-// RAM here lets stack and transfer control share one owner. Arithmetic is
-// delegated to x87_executor.
+//
+// x87 Control
+// Command decode, microsequencing, status, CPU transfers and the register stack
+//
 `include "x87_logexp_rom.sv"
 
 module x87_control

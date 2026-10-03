@@ -1,3 +1,7 @@
+//
+// x87 Package
+// Shared x87 types and helper functions
+//
 package x87_pkg;
 
 typedef enum logic [2:0] {

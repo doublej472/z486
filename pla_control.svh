@@ -1,5 +1,7 @@
-// Generated instruction-layout PLA from doc/microcode/microcode_rom1_260103.txt.
-// Details: doc/z486/implementation_notes.md#src-24-z486-pla-control-svh-1
+//
+// Instruction Layout PLA
+// Generated from the 80386 instruction-layout ROM dump
+//
 function automatic logic [11:0] pla_control_opcode_lookup(
     input        has_0f,
     input [7:0] instruction

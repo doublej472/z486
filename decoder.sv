@@ -1,27 +1,7 @@
-// Instruction decoder: D1 decode and D2 execution set-up.
 //
-// US5293592 Figs. 2, 5, 6: decoder 31 (a PLA) always receives three bytes on
-// K1Q; code control 36 steps K1P past the whole instruction and sets K2P to
-// its literal; latches 35 hold the first microinstruction's controls and the
-// ROM entry point; execution set-up stage 34 (the D2 controller) works on the
-// preceding instruction while D1 decodes this one. Pipeline control 37 adds
-// one D1 clock per prefix and for 0F. US5390311 gives the entry-point PLA.
+// Instruction Decoder
+// D1 structural decode and entry point lookup, D2 literal capture and issue set-up
 //
-// Signal map (patent -> RTL):
-//   decoder 31 (D1 PLA) on K1Q            build_struct_work(), struct_len on k1q
-//   code control 36: K1P / K2P            k1p_adv, k1p_preread_adv / k2p_off, pop_now, pop_len
-//   entry-point PLA (US5390311)           entry_rom (preread on k1q_early), d1_issue_entry_point
-//   latches 35 (D1 -> D2 boundary)        the skeleton register (skel_*)
-//   execution set-up stage 34 (D2)        literal capture phases A/B -> d2_entry, d2_push
-//   prefix / 0F extra D1 clocks           prefix state before the skeleton
-//   IWORD to control                      i_bus (D2 entry)
-//
-// Stages: banners below mark D1 (structural decode), the D1->D2 skeleton
-// register, and D2 (literal capture and entry resolution). The hardwired
-// first microinstructions (the patent's decoder-supplied first lines) are in
-// hardwired_control.sv. Deviations: K1Q is an 8-byte window so D1 finds the
-// full structural length in one clock; the entry ROM is an M10K read one
-// cycle ahead on k1q_early. D1 holds its instruction until D2 takes it.
 
 `include "z486_platform.svh"
 module decoder
