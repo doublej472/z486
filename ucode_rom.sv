@@ -6,13 +6,24 @@ module ucode_rom
 #(
     parameter INIT_HEX = "ucode.hex"
 ) (
+    // Clock
     input              clk,
-    input              addr_ce,
-    input              q_ce,
-    input       [11:0] addr,
-    output      [50:0] q_early,
-    output      [50:0] q,
-    output      [2:0]  q_kind_early,
+
+    // Port A (EX): the sequencer's address; its word feeds the output register
+    input              addr_ce,         // load the port-A address register
+    input       [11:0] addr,            // port-A word address
+    output      [2:0]  q_kind_early,    // recipe kind of port A's word
+
+    // Port B (D2): the D2 skeleton's first word, read when the skeleton loads
+    input              addr_b_ce,       // load the port-B address register
+    input       [11:0] addr_b,          // port-B word address (the skeleton's entry)
+    output      [2:0]  q_kind_b,        // recipe kind of port B's word
+
+    // Output register: loads port A's word, or port B's at issue (q_sel_b), with predecode
+    input              q_ce,            // load the output register
+    input              q_sel_b,         // it loads port B's word (registered terms only)
+    output      [50:0] q_early,         // the selected word, predecoded, before the register
+    output      [50:0] q,               // the executing microword
     output      [5:0]  q_shift_source,
     output      [3:0]  q_shift_source_class,
     output      [1:0]  q_shift2_source,
@@ -256,34 +267,85 @@ function automatic [8:0] ind_ctrl_predecode(input [36:0] w);
 endfunction
 
 `ifdef Z486_USE_ALTERA_UCODE_ROM
-wire [39:0] q_mem;
-reg  [50:0] q_r;
+wire [39:0] q_mem_a;
+wire [39:0] q_mem_b;
 
+// Two read ports from one copy: in true dual-port mode an M10K is 512 x 20
+// per port, so 2,560 x 40 takes the same ten blocks as single-port 256 x 40.
 altsyncram #(
-    .operation_mode("ROM"),
-	    .width_a(40),
-	    .widthad_a(12),
-	    .numwords_a(2560),
-	    .outdata_reg_a("UNREGISTERED"),
-	    .address_aclr_a("NONE"),
-	    .outdata_aclr_a("NONE"),
+    .operation_mode("BIDIR_DUAL_PORT"),
+    .width_a(40),
+    .widthad_a(12),
+    .numwords_a(2560),
+    .width_b(40),
+    .widthad_b(12),
+    .numwords_b(2560),
+    .outdata_reg_a("UNREGISTERED"),
+    .outdata_reg_b("UNREGISTERED"),
+    .address_reg_b("CLOCK1"),
+    .indata_reg_b("CLOCK1"),
+    .wrcontrol_wraddress_reg_b("CLOCK1"),
+    .address_aclr_a("NONE"),
+    .address_aclr_b("NONE"),
+    .outdata_aclr_a("NONE"),
+    .outdata_aclr_b("NONE"),
+    .read_during_write_mode_mixed_ports("DONT_CARE"),
+    .power_up_uninitialized("FALSE"),
     .init_file("ucode.mif"),
     .ram_block_type("M10K"),
     .intended_device_family("Cyclone V"),
     .lpm_type("altsyncram")
 ) microcode_rom_altsyncram (
     .address_a(addr),
+    .address_b(addr_b),
     .clock0(clk),
+    .clock1(clk),
     .clocken0(addr_ce),
-    .q_a(q_mem),
+    .clocken1(addr_b_ce),
+    .data_a(40'd0),
+    .data_b(40'd0),
+    .wren_a(1'b0),
+    .wren_b(1'b0),
+    .q_a(q_mem_a),
+    .q_b(q_mem_b),
     .aclr0(1'b0),
+    .aclr1(1'b0),
     .addressstall_a(1'b0),
-    .clocken1(1'b1),
+    .addressstall_b(1'b0),
     .clocken2(1'b1),
     .clocken3(1'b1),
     .rden_a(1'b1),
+    .rden_b(1'b1),
+    .byteena_a(1'b1),
+    .byteena_b(1'b1),
     .eccstatus()
 );
+`else
+`ifdef Z486_USE_LOGIC_UCODE_ROM
+(* ramstyle = "logic" *) reg [39:0] microcode_rom [0:2559];
+`else
+`Z486_BLOCK_RAM reg [39:0] microcode_rom [0:2559];
+`endif
+reg [39:0] q_mem_a;
+reg [39:0] q_mem_b;
+
+initial begin
+    $readmemh(INIT_HEX, microcode_rom);
+end
+
+always_ff @(posedge clk) begin
+    if (addr_ce)
+        q_mem_a <= microcode_rom[addr];
+    if (addr_b_ce)
+        q_mem_b <= microcode_rom[addr_b];
+end
+`endif
+
+// The executing word comes from port A, or from port B when the issuing
+// instruction's first word was read ahead there. The select is registered, so
+// the mux adds no late control to the ROM-output registers.
+wire [39:0] q_mem = q_sel_b ? q_mem_b : q_mem_a;
+reg  [50:0] q_r;
 
 always_ff @(posedge clk) begin
     if (q_ce) begin
@@ -305,44 +367,8 @@ end
 
 assign q = q_r;
 assign q_early = {ucode_predecode(q_mem[36:0]), q_mem[36:0]};
-assign q_kind_early = q_mem[39:37];
-`else
-`ifdef Z486_USE_LOGIC_UCODE_ROM
-(* ramstyle = "logic" *) reg [39:0] microcode_rom [0:2559];
-`else
-`Z486_BLOCK_RAM reg [39:0] microcode_rom [0:2559];
-`endif
-	reg [39:0] q_mem;
-	reg [50:0] q_r;
-
-initial begin
-    $readmemh(INIT_HEX, microcode_rom);
-end
-
-	always_ff @(posedge clk) begin
-	    if (addr_ce)
-	        q_mem <= microcode_rom[addr];
-	    if (q_ce) begin
-	        q_r <= {ucode_predecode(q_mem[36:0]), q_mem[36:0]};
-	        q_shift_source_r <= q_mem[23:18];
-	        q_shift_source_class_r <= shift_source_predecode(q_mem[23:18]);
-	        q_shift2_source_r <= shift2_source_predecode(q_mem[23:18]);
-	        q_is_shift2_r <= (q_mem[17:11] == ALUJMP_SHIFT2);
-	        q_shift_uc_carry_r <= shift_uc_carry_predecode(q_mem[36:0]);
-	        q_shift_alu_src_r <= q_mem[36:31];
-	        q_shift_aluop_r <= q_mem[17:11];
-	        q_shift_sigma_sel_r <= shift_sigma_predecode(q_mem[17:11]);
-	        q_dly_source_r <= dly_source_predecode(q_mem[23:18]);
-	        q_mem_ctrl_r <= mem_ctrl_predecode(q_mem[36:0]);
-	        q_ind_ctrl_r <= ind_ctrl_predecode(q_mem[36:0]);
-	        q_fpu_f8_r <= fpu_f8_predecode(q_mem[36:0]);
-	    end
-	end
-
-assign q = q_r;
-assign q_early = {ucode_predecode(q_mem[36:0]), q_mem[36:0]};
-assign q_kind_early = q_mem[39:37];
-`endif
+assign q_kind_early = q_mem_a[39:37];
+assign q_kind_b = q_mem_b[39:37];
 
 assign q_shift_source = q_shift_source_r;
 assign q_shift_source_class = q_shift_source_class_r;

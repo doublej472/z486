@@ -1,4 +1,4 @@
-// Segmentation unit (i486 "S" unit).
+// Segmentation unit
 //
 // Fu/Saini/Gelsinger Fig. 1 places the descriptor registers, the "limit and
 // attribute PLA" and address formation in one segmentation unit.

@@ -23,7 +23,8 @@ module l1_cache #(
     input         cpu_valid,
     input         cpu_write,
     input         cpu_uncacheable,
-    output        cpu_ready,
+    output        cpu_ready,      // a read may be presented (registered)
+    output        cpu_wr_ready,   // a write may be presented (registered)
     output        cpu_resp_valid,
     output        stores_drained,
 
@@ -32,6 +33,9 @@ module l1_cache #(
     output [31:0] store_patch_addr,
     output [31:0] store_patch_data,
     output  [3:0] store_patch_be,
+    // The coherence patch consumer cannot take a store this cycle; holds off
+    // a store accepted behind another store's S_LOOKUP.
+    input         store_patch_busy,
     output        store_patch_valid,
 
     // Side-effect-free hardwired-load path. D2 selects the RAM word; EX
@@ -82,11 +86,11 @@ localparam integer TAG_LSB = SET_MSB + 1;
 localparam integer TAG_MSB = PHYS_ADDR_BITS - 1;
 localparam integer TAG_RAM_BITS = (TAG_BITS < 16) ? 16 : (TAG_BITS + 1);
 localparam integer TAG_VALID_BIT = TAG_BITS;
-localparam integer STOREQ_DEPTH = 3;
-localparam integer STOREQ_IDX_BITS = 2;
-localparam integer STOREQ_CNT_BITS = 2;
-localparam [STOREQ_CNT_BITS-1:0] STOREQ_DEPTH_VALUE = 2'd3;
-localparam [STOREQ_IDX_BITS-1:0] STOREQ_LAST_IDX = 2'd2;
+localparam integer STOREQ_DEPTH = `ifdef STOREQ_DEPTH_OVERRIDE `STOREQ_DEPTH_OVERRIDE `else 4 `endif;
+localparam integer STOREQ_IDX_BITS = $clog2(STOREQ_DEPTH);
+localparam integer STOREQ_CNT_BITS = $clog2(STOREQ_DEPTH + 1);
+localparam [STOREQ_CNT_BITS-1:0] STOREQ_DEPTH_VALUE = STOREQ_CNT_BITS'(STOREQ_DEPTH);
+localparam [STOREQ_IDX_BITS-1:0] STOREQ_LAST_IDX = STOREQ_IDX_BITS'(STOREQ_DEPTH - 1);
 localparam [SET_BITS-1:0] LAST_SET = SET_BITS'(NUM_SETS - 1);
 
 // Address decomposition. Include the complete physical tag so larger SDRAM
@@ -270,6 +274,16 @@ begin
 end
 endfunction
 
+// Slot holding the k-th oldest entry.
+function automatic [STOREQ_IDX_BITS-1:0] storeq_age_idx(
+    input [STOREQ_IDX_BITS-1:0] tail, input integer k);
+    integer i;
+begin
+    i = tail + k;
+    storeq_age_idx = STOREQ_IDX_BITS'((i >= STOREQ_DEPTH) ? i - STOREQ_DEPTH : i);
+end
+endfunction
+
 function automatic [STOREQ_IDX_BITS-1:0] storeq_prev_idx(input [STOREQ_IDX_BITS-1:0] idx);
 begin
     storeq_prev_idx = (idx == {STOREQ_IDX_BITS{1'b0}}) ? STOREQ_LAST_IDX : (idx - 1'b1);
@@ -329,7 +343,18 @@ wire [3:0] lookup_hit_vec = {
 };
 wire lookup_hit = |lookup_hit_vec;
 wire [1:0] lookup_way = way_encode(lookup_hit_vec);
-wire [31:0] lookup_way_data = way_data_mux(lookup_way, rd_data0_r, rd_data1_r, rd_data2_r, rd_data3_r);
+wire [31:0] lookup_way_ram_data = way_data_mux(lookup_way, rd_data0_r, rd_data1_r, rd_data2_r, rd_data3_r);
+// A read may preread its dword in the cycle a store patches the data RAM (a
+// pipelined store, or a VIPT probe below). When both name the same dword and
+// way, take the registered patch value rather than the RAM read that raced it;
+// a read that came after the patch merges the same bytes harmlessly.
+reg         patch_fwd_valid_r;
+reg  [1:0]  patch_fwd_way_r;
+reg  [31:0] patch_fwd_data_r;
+reg  [SET_BITS+WORD_OFFSET_BITS-1:0] patch_fwd_addr_r;
+wire patch_fwd_hit = patch_fwd_valid_r && (patch_fwd_way_r == lookup_way) &&
+                     (patch_fwd_addr_r == {req_set_r, req_word_r});
+wire [31:0] lookup_way_data = patch_fwd_hit ? patch_fwd_data_r : lookup_way_ram_data;
 wire [TAG_BITS-1:0] vipt_resolve_tag =
     vipt_resolve_phys_addr[TAG_MSB:TAG_LSB];
 wire [3:0] vipt_hit_vec = {
@@ -339,8 +364,14 @@ wire [3:0] vipt_hit_vec = {
     rd_valid0_r && (rd_tag0_r == vipt_resolve_tag)
 };
 wire [1:0] vipt_hit_way = way_encode(vipt_hit_vec);
-wire [31:0] vipt_way_data = way_data_mux(
+wire [31:0] vipt_way_ram_data = way_data_mux(
     vipt_hit_way, rd_data0_r, rd_data1_r, rd_data2_r, rd_data3_r);
+// A probe may preread in the cycle a store patches the same dword (the probe
+// shares the read port with a store's S_LOOKUP). Take the registered patch
+// value over the RAM read that raced it; set/word bits are page-offset bits.
+wire vipt_patch_fwd_hit = patch_fwd_valid_r && (patch_fwd_way_r == vipt_hit_way) &&
+    (patch_fwd_addr_r == vipt_resolve_phys_addr[SET_MSB:BYTE_OFFSET_BITS]);
+wire [31:0] vipt_way_data = vipt_patch_fwd_hit ? patch_fwd_data_r : vipt_way_ram_data;
 // A younger VIPT lookup may share the preread used to capture an older store
 // to the same word. The store reaches S_LOOKUP while that younger request
 // finalizes, so forward its registered bytes over the RAM's old data.
@@ -356,7 +387,19 @@ assign vipt_resolve_hit = vipt_resolve_valid && cache_enable &&
 wire [BRAM_ADDR_BITS-1:0] req_bram_addr = {req_set_r, req_word_r};
 wire can_accept_cpu = (state == S_IDLE) && !reset && (!cpu_write || cpu_protect_write || storeq_can_accept);
 wire ready_when_idle = !reset && storeq_can_accept;
-wire accept_cpu = cpu_valid && ready_r && can_accept_cpu;
+// Store pipelining, like the i486 write buffer taking one store per clock:
+// while a store enqueues in S_LOOKUP, accept the next store and preread its
+// set on the free RAM read port. lookup_wr_room_r holds the queue capacity for
+// that store, computed when the current store was accepted. The opening is
+// registered state only: requesters see it through cpu_wr_ready without any
+// address, TLB or request-type term.
+reg  lookup_wr_room_r;
+wire lookup_store_busy = (state == S_LOOKUP) && req_valid_r &&
+                         req_write_r && !req_protect_write_r;
+wire lookup_wr_open = lookup_store_busy && lookup_wr_room_r && !store_patch_busy;
+assign cpu_wr_ready = ready_r || lookup_wr_open;
+wire lookup_wr_accept = cpu_valid && cpu_write && lookup_wr_open;
+wire accept_cpu = (cpu_valid && ready_r && can_accept_cpu) || lookup_wr_accept;
 wire [29:0] req_addr_dw = req_addr_r[31:2];
 wire [29:0] fill_addr_dw = {req_addr_r[31:4], fill_count};
 logic [31:0] lookup_forward_data;
@@ -410,68 +453,15 @@ always_comb begin
     bypass_forward_data = mem_dout;
     wide_line_data = mem_line_dout;
 
-    unique case (storeq_tail)
-        2'd0: begin
-            if (storeq_count > 0) begin
-                lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
-                fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], fill_addr_dw);
-                bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
-                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_r[31:4]);
-            end
-            if (storeq_count > 1) begin
-                lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
-                fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], fill_addr_dw);
-                bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
-                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_r[31:4]);
-            end
-            if (storeq_count > 2) begin
-                lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
-                fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], fill_addr_dw);
-                bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
-                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_r[31:4]);
-            end
+    // Oldest to youngest, so the youngest matching store's bytes win.
+    for (int k = 0; k < STOREQ_DEPTH; k++) begin
+        if (k < storeq_count) begin
+            lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[storeq_age_idx(storeq_tail, k)], storeq_addr[storeq_age_idx(storeq_tail, k)], storeq_data[storeq_age_idx(storeq_tail, k)], storeq_be[storeq_age_idx(storeq_tail, k)], req_addr_dw);
+            fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[storeq_age_idx(storeq_tail, k)], storeq_addr[storeq_age_idx(storeq_tail, k)], storeq_data[storeq_age_idx(storeq_tail, k)], storeq_be[storeq_age_idx(storeq_tail, k)], fill_addr_dw);
+            bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[storeq_age_idx(storeq_tail, k)], storeq_addr[storeq_age_idx(storeq_tail, k)], storeq_data[storeq_age_idx(storeq_tail, k)], storeq_be[storeq_age_idx(storeq_tail, k)], req_addr_dw);
+            wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[storeq_age_idx(storeq_tail, k)], storeq_addr[storeq_age_idx(storeq_tail, k)], storeq_data[storeq_age_idx(storeq_tail, k)], storeq_be[storeq_age_idx(storeq_tail, k)], req_addr_r[31:4]);
         end
-        2'd1: begin
-            if (storeq_count > 0) begin
-                lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
-                fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], fill_addr_dw);
-                bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
-                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_r[31:4]);
-            end
-            if (storeq_count > 1) begin
-                lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
-                fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], fill_addr_dw);
-                bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
-                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_r[31:4]);
-            end
-            if (storeq_count > 2) begin
-                lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
-                fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], fill_addr_dw);
-                bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
-                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_r[31:4]);
-            end
-        end
-        default: begin
-            if (storeq_count > 0) begin
-                lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
-                fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], fill_addr_dw);
-                bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_dw);
-                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[2], storeq_addr[2], storeq_data[2], storeq_be[2], req_addr_r[31:4]);
-            end
-            if (storeq_count > 1) begin
-                lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
-                fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], fill_addr_dw);
-                bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_dw);
-                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[0], storeq_addr[0], storeq_data[0], storeq_be[0], req_addr_r[31:4]);
-            end
-            if (storeq_count > 2) begin
-                lookup_forward_data = forward_storeq_slot(lookup_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
-                fill_word_data = forward_storeq_slot(fill_word_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], fill_addr_dw);
-                bypass_forward_data = forward_storeq_slot(bypass_forward_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_dw);
-                wide_line_data = forward_storeq_line_slot(wide_line_data, storeq_valid[1], storeq_addr[1], storeq_data[1], storeq_be[1], req_addr_r[31:4]);
-            end
-        end
-    endcase
+    end
 end
 
 // Preread runs on every ready idle cycle, with no cpu_valid/TLB gating: when
@@ -479,23 +469,23 @@ end
 // sees (it is only entered on accept_cpu).  This keeps the TLB-hit cone off
 // the wide rd_*_r register enables.
 wire idle_preread = (state == S_IDLE) && ready_r;
+// The store-pipelining preread, likewise ungated by the late accept.
+wire lookup_wr_preread = lookup_wr_open;
 // A posted store patches at most one data way during S_LOOKUP.  The inferred
-// cache RAMs have an independent read port, so an unrelated VIPT lookup can
-// preread the next load in that cycle.  A lookup in the store's set is
-// replayed: besides possible data read-during-write ambiguity, it must observe
-// the PLRU update made by the store hit before choosing a miss victim.
+// cache RAMs have an independent read port, so a VIPT lookup can preread the
+// next load in that cycle, in the store's set too: a read that races the patch
+// takes the registered patch value (vipt_patch_fwd_hit). Store hits change no
+// tag, and a probe that misses falls back to the paging path, which chooses
+// any victim from current PLRU state.
 wire store_lookup_preread = (state == S_LOOKUP) && req_valid_r &&
                             req_write_r && !req_protect_write_r;
-wire store_lookup_alias = store_lookup_preread &&
-                          (vipt_probe_set == req_set_r);
 // Store hits patch the cache before it can accept another probe; store misses
 // have no matching line, and later fills are patched before the tag is valid.
 // Capacity is a registered-state fact. Demand arbitration must not feed back
 // through D2 issue; a denied speculative probe is replayed by the CPU.
 assign vipt_probe_ready = idle_preread || store_lookup_preread;
 wire vipt_probe_fire = vipt_probe_valid &&
-                       (idle_preread || (store_lookup_preread &&
-                                        !store_lookup_alias)) &&
+                       (idle_preread || store_lookup_preread) &&
                        !cpu_preread_priority;
 // When an accepted demand store owns the preread RAM at the same page offset,
 // its RAM address is also the exact VIPT lookup address. Share that read
@@ -521,6 +511,24 @@ wire data_store_write = (state == S_LOOKUP) && req_valid_r && req_write_r &&
 wire data_fill_write = (state == S_FILL) &&
                        (mem_resp_valid || wide_fill_install);
 wire [1:0] data_write_way = data_store_write ? lookup_way : fill_way;
+
+always_ff @(posedge clk) begin
+    if (reset)
+        patch_fwd_valid_r <= 1'b0;
+    else
+        patch_fwd_valid_r <= data_store_write;
+    patch_fwd_way_r <= lookup_way;
+    patch_fwd_addr_r <= {req_set_r, req_word_r};
+    patch_fwd_data_r <= merge32(lookup_way_data, req_din_r, req_be_r);
+end
+
+// synthesis translate_off
+// A valid demand request always owns the preread, so a pipelined store never
+// shares the RAM read port with a VIPT probe.
+always @(posedge clk)
+    if (!reset && lookup_wr_accept && !cpu_preread_priority)
+        $fatal(1, "L1 pipelined store accepted without preread priority");
+// synthesis translate_on
 wire [BRAM_ADDR_BITS-1:0] data_write_addr = data_store_write ?
                                             req_bram_addr :
                                             {fill_set, fill_count};
@@ -547,7 +555,7 @@ wire tag_fill_way2 = tag_fill_write && (fill_way == 2'd2);
 wire tag_fill_way3 = tag_fill_write && (fill_way == 2'd3);
 
 always_ff @(posedge clk) begin
-    if (idle_preread || vipt_probe_fire) begin
+    if (idle_preread || lookup_wr_preread || vipt_probe_fire) begin
         rd_tag_entry0_r <= tag_way0[preread_set];
         rd_tag_entry1_r <= tag_way1[preread_set];
         rd_tag_entry2_r <= tag_way2[preread_set];
@@ -603,6 +611,7 @@ always_ff @(posedge clk) begin
         storeq_tail <= {STOREQ_IDX_BITS{1'b0}};
         storeq_count <= {STOREQ_CNT_BITS{1'b0}};
         storeq_draining <= 1'b0;
+        lookup_wr_room_r <= 1'b0;
         fill_requested <= 1'b0;
         fill_target_returned <= 1'b0;
         wide_fill_line <= 128'd0;
@@ -677,6 +686,7 @@ always_ff @(posedge clk) begin
                     req_valid_r <= 1'b1;
                     state <= S_LOOKUP;
                 end
+                lookup_wr_room_r <= (storeq_count <= STOREQ_CNT_BITS'(STOREQ_DEPTH - 2));
             end
 
             S_LOOKUP: begin
@@ -704,8 +714,28 @@ always_ff @(posedge clk) begin
                     if (lookup_hit && !req_uncacheable_r) begin
                         plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
                     end
-                    state <= S_IDLE;
-                    ready_r <= (storeq_count_wr_next != STOREQ_DEPTH_VALUE);
+                    // Capture the pipelined store like S_IDLE does: on the
+                    // registered opening, not on the TLB-qualified accept.
+                    if (lookup_wr_open) begin
+                        req_addr_r <= cpu_addr;
+                        req_din_r <= cpu_din;
+                        req_be_r <= cpu_be;
+                        req_write_r <= cpu_write;
+                        req_uncacheable_r <= request_uncacheable;
+                        req_protect_write_r <= cpu_protect_write;
+                        req_tag_r <= cpu_tag;
+                        req_set_r <= cpu_set;
+                        req_word_r <= cpu_word;
+                    end
+                    lookup_wr_room_r <= (storeq_count_wr_next <=
+                                         STOREQ_CNT_BITS'(STOREQ_DEPTH - 2));
+                    if (lookup_wr_accept) begin
+                        req_valid_r <= 1'b1;
+                        ready_r <= 1'b0;
+                    end else begin
+                        state <= S_IDLE;
+                        ready_r <= (storeq_count_wr_next != STOREQ_DEPTH_VALUE);
+                    end
                 end else if (req_uncacheable_r) begin
                     if (storeq_empty && !storeq_draining && !mem_valid_r && !mem_busy) begin
                         mem_valid_r <= 1'b1;

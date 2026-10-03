@@ -256,7 +256,7 @@ wire        mem_servicing;          // memory request in flight
 wire        mem_dly_grace;          // optimistic read: DLY may execute this (lookup) cycle
 wire        mem_write_dly_grace;    // posted write in PG_MEM_TLB: next non-bus uop may execute now
 wire        mem_write_wait;         // unposted demand write still fault-capable: stall ALL uops
-                                    // (its instruction may already have chained away)
+                                    // (its instruction may already have issued a successor)
 wire        mem_opt_wait;           // optimistic read missed: stall all uops until fill done
 wire        mem_accepted;           // memory request accepted (ready pulse)
 wire        mem_complete_now;       // combinational, request completing THIS cycle
@@ -362,7 +362,6 @@ seq_redirect_t seq_boundary_redirect;
 seq_condition_t seq_conditions;
 
 // Instruction lifecycle: D2 start -> issue into EX -> first EX -> RNI -> delay slot.
-wire       i_entry;                 // Normal (non-chained) D2 start
 wire       i_issue;                 // D2 transfers one instruction into EX
 reg        i_first;                 // First ucode execution cycle after issue
 wire       i_rni_raw;               // Raw RNI decode from the resident ROM word
@@ -383,20 +382,18 @@ wire       any_fault_issue;
 wire       any_fault;
 reg        any_fault_r;
 
-wire       d2_start;                // Launch a macro entry address into the ROM
-wire [11:0] d2_start_entry;         // Entry address selected on d2_start
-wire       d2_valid;                // A launched macro entry is resident in D2
 wire       d2_ready;                // D2 may transfer its instruction to EX
 wire       d2_push;                 // Decoder completed the resident D2 payload
-reg        d2_valid_r;
-reg        d2_waited_r;             // D2 held after predecessor delay slot
-reg        d2_stale_slot_r;         // D2 also waited during predecessor delay slot
 reg        d2_ea_split_done_r;      // D2a captured base + scaled index
 wire       d2_ea_split_wait;        // Three-term EA needs its D2a cycle
+wire       d2_ea_split_conflict;    // Its base/index is written on this edge
 reg        throttle_parked_r;       // predecessor retired; successor D2 waits for rate debt
-wire [11:0] d2_entry_r;             // Effective entry resident in D2
-wire        d2_rom_mem_resident;    // D2 entry tag aligned with ROM q_mem
-wire       init_cycle = d2_valid_r; // Temporary waveform alias; not control logic
+wire [11:0] issue_entry;            // Entry of the instruction issuing now
+wire        pb_load;                // Skeleton loads: ROM port B reads its entry
+wire [11:0] pb_load_entry;
+wire        pb_valid;               // Port B holds the skeleton's first word
+wire        pb_issue;               // Skeleton may issue into a dead RNI slot
+wire        pb_slot;                // Port B supplies the next executing word
 wire uc_active;  // Tracks when instruction execution has begun
 wire fault_suppress_delay_slot;  // Fault handling: suppress delay slot after fault triggers
 wire interrupt_entry;  // Interrupt handler is being entered
@@ -405,8 +402,8 @@ wire       prot_test_inflight;      // Protection test is waiting for a result
 wire [31:0] COUNTR;                 // Data Unit counter register
 
 // Hardwired common-instruction control. See doc/z486/hardwired_instructions.md.
-// A recipe contains one to three native uSteps; chaining may reclaim an obsolete
-// RNI slot. Results remain owned by the Data and Address Units.
+// A recipe contains one to three native uSteps; a successor may take its dead
+// RNI slot from ROM port B. Results remain owned by the Data and Address Units.
 recipe_state_t recipe_state;               // Current hardwired recipe state
 recipe_pending_write_t recipe_mem_write;   // Deferred load commit
 recipe_pending_write_t recipe_shift_write; // Deferred shift commit
@@ -419,10 +416,8 @@ wire       branch_ustep_rni;          // synthetic RNI, independent of execution
 wire       branch_ustep_exec;         // execute bounded branch uStep this cycle
 recipe_meta_t d2_recipe;             // D2 instruction's generated recipe class
 wire       x87_direct_candidate;              // D2 entry is the direct x87 overlay
+wire       flags_backup_active;     // Set at i_issue/FLGSBA, cleared on interrupt_entry - guards FLAGSB writes
 wire       d2_hardwired;             // D2 entry is a bounded hardwired recipe
-wire       chain_start;                // launch a chained hardwired successor
-wire       chain_from_next;               // successor comes from registered skid entry
-wire [11:0] chain_entry;          // chained successor's ROM entry
 wire       jcc_fold_active;            // not-taken Jcc occupies reclaimed slot
 wire       d2_vipt_candidate;          // Hardwired MOV/MOVX register load
 wire       d2_vipt_load;               // Candidate accepted by the VIPT probe
@@ -460,7 +455,6 @@ reg [7:0]  vipt_load_wb_dst_onehot_r;
 reg [1:0]  vipt_load_wb_size_r;
 reg        vipt_load_wb_is_alu_r;
 reg [4:0]  vipt_load_wb_alu_op_r;
-reg        vipt_load_rom_shadow_r;     // Held VIPT D2 owns the resident ROM word
 reg        vipt_load_overlap_r;        // Plain-load successor owns EX while load completes
 wire       vipt_load_slow_busy = vipt_load_slow_req_r || vipt_load_slow_wait_r;
 wire       vipt_load_busy = vipt_load_ex_r.valid || vipt_load_replay_r.valid ||
@@ -524,12 +518,14 @@ wire [31:0] vipt_load_wb_data = vipt_load_wb_data_r;
 // Empty D2 may launch directly from D1. Otherwise the resident D2 skeleton
 // supplies a registered entry address when the current instruction ends.
 wire       d1_issue_direct;
-wire [11:0] d1_issue_entry_point;
 dec_entry_t d1_issue_entry;
-wire       i_entry_raw = (i_rni || i_rni_delay || ~uc_active) && ~halted && !stall &&
-                         (d1_issue_direct || !decq_empty) && !q_flush && !d2_valid &&
-                         !fault_suppress_delay_slot && !interrupt_entry;
-assign     i_entry = i_entry_raw && !any_fault_issue;
+// Every D2 instruction's first word is read ahead on ROM port B when it
+// enters the skeleton, so no boundary launches port A: the skeleton issues
+// from port B in the RNI delay slot (B2) or an idle sequencer (B3), and a
+// dead RNI slot (B1) is pb_issue.
+wire       pb_issue_b23 = pb_valid && (i_rni_delay || ~uc_active) &&
+                          ~halted && !q_flush && !fault_suppress_delay_slot &&
+                          !interrupt_entry && !any_fault_issue;
 
 // D2 -> EX readiness. Keep this factored from the valid bit so v53 can move
 // D2 ownership without changing the meaning of the transfer edge.
@@ -553,7 +549,15 @@ wire        throttle_atomic_chain = recipe_state.hardwired && uc_active && i_rni
 // predecessor has already retired, overlap it with the final repayment cycle.
 wire        throttle_release_cycle = throttle_parked_r && throttle_release_ready;
 
-assign     d2_valid = d2_valid_r;
+// An instruction occupies D2 exactly when ROM port B holds its first word.
+wire       d2_resident = pb_valid;
+// A trap, NMI or interrupt taken at this boundary owns the sequencer next: the
+// D2 instruction must not issue (its port-B word is dropped; the handler's
+// control transfer re-decodes the front end).
+wire       boundary_take = i_rni_delay && !stall && !page_fault &&
+    ((tf_trap_pending && !single_step) ||
+     (nmi_request_active && !single_step) ||
+     (intr_pending && EFLAGS[9] && !single_step && !inhibit_interrupts));
 wire       d2_payload_ready = d2_push && !d2_ea_split_wait;
 wire       d2_ready_base = d2_payload_ready && !stall &&
                       (!throttle_hold || throttle_atomic_chain ||
@@ -594,8 +598,8 @@ assign     d2_ready = d2_ready_base &&
 wire       d2_vipt_issue_ready = d2_ready_base &&
                                   (!vipt_load_ex_r.valid ||
                                    vipt_load_ex_probed_r);
-wire       i_issue_reference = d2_valid && d2_ready;
-assign     i_issue = d2_valid &&
+wire       i_issue_reference = (pb_issue_b23 || pb_issue) && d2_ready;
+assign     i_issue = (pb_issue_b23 || pb_issue) &&
                      (d2_vipt_load ? d2_vipt_issue_ready : d2_ready);
 
 // synthesis translate_off
@@ -620,12 +624,7 @@ wire       stall_wio = uc_active && uc_is_wio &&
                        !interrupt_pending && !single_step;
 wire       stall_x87_direct;
 wire       stall_invlpg;
-// An entry may reach the ROM before its D2 literals arrive. Let the ending
-// instruction execute its architectural RNI and delay slot, then hold the ROM
-// word until D2 can transfer it to EX. The RNI cycle can also prepare a split
-// EA; stalling it would suppress the current instruction's delay-slot writeback.
-wire       stall_d2 = d2_valid && !d2_payload_ready && !i_rni && !i_rni_delay;
-assign stall = stall_mem || stall_wio || stall_d2 || stall_x87_direct ||
+assign stall = stall_mem || stall_wio || stall_x87_direct ||
                stall_invlpg || stall_fast_store || stall_rmw_probe;
 
 // Repeat
@@ -634,19 +633,17 @@ wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight)
                            && !(uc_is_wio && interrupt_pending);
 
 // uc_exec: master enable for microcode execution
-wire       d2_release_hold = d2_valid && (d2_waited_r || d2_stale_slot_r);
-// A blocked direct load/RMW leaves the Jcc ROM delay word resident after the
-// synthetic branch uStep. Keep its stale PREF from redirecting the frontend.
 wire       vipt_load_overlap_wb = vipt_load_overlap_r &&
                      vipt_load_wb_valid_r && !vipt_load_ex_r.valid &&
                      !vipt_load_replay_r.valid && !vipt_load_slow_busy;
 wire       vipt_load_exec_block = vipt_load_busy && !vipt_load_overlap_wb;
-assign uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) &&
-                 !stall_wio && !stall_d2 && !stall_x87_direct && !stall_invlpg &&
+// uc_slot_live: every hold on the executing word except a direct load's own
+// ROM words, which the data pipeline completes. A dead slot issues on it.
+wire       uc_slot_live = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) &&
+                 !stall_wio && !stall_x87_direct && !stall_invlpg &&
                  !stall_fast_store && !stall_rmw_probe &&
-                 !d2_release_hold && !throttle_parked_r && !recipe_slot_stale &&
-                 !vipt_load_exec_block && !rmw_fallback_delay_r &&
-                 !(vipt_load_rom_shadow_r && recipe_state.jcc);
+                 !throttle_parked_r && !recipe_slot_stale && !rmw_fallback_delay_r;
+assign uc_exec = uc_slot_live && !vipt_load_exec_block;
 wire       uc_exec_writeback = uc_exec;  // local copies for reducing fanout
 wire       uc_exec_shift = uc_exec;
 
@@ -654,9 +651,9 @@ assign     seg_cmd_valid = i_issue || uc_exec;
 
 dec_entry_t i_bus;            // Instruction resident in unified D2
 wire       decq_has_jmp_call; // D1/D2 holds a JMP/CALL rel (halt speculative prefetch)
-dec_entry_t i_bus2;           // Registered D1 skid successor
+dec_entry_t pb_next_instr;    // Instruction entering the D2 skeleton from D1
+ea_dec_t    skel_load_ea_dec; // Its EA decode, latched by the Address Unit
 dec_entry_t i;                // Current instruction (latched at i_issue; written far below)
-wire       decq_has2;         // i_bus2 is valid
 
 // A direct load may remain in EX, replay, slow-path, or WB state after the
 // frontend has prepared its successor. Unlike ordinary source operands, an
@@ -680,50 +677,31 @@ wire [7:0] vipt_pending_dst_mask =
     vipt_load_wb_alu_dst_mask;
 assign d2_vipt_ea_hazard = |(d2_ea_read_mask & vipt_pending_dst_mask);
 
+// A dead slot takes port B's word only when the instruction would issue now:
+// no register still owed by a direct load (d2_ready_base interlocks it for
+// every instruction); beside a direct load in EX, only once that load has
+// probed and is a plain load (the registered half of the overlap rule); and a
+// load must be a direct load accepted by the probe with a free or probed EX
+// token, or another load with EX free; a direct RMW needs the probe and no
+// direct RMW still in flight.
+wire       pb_load_ready = !x87_direct_candidate && !d2_vipt_ea_hazard &&
+    (!vipt_load_ex_r.valid || d2_vipt_candidate ||
+     (vipt_load_ex_probed_r && !vipt_load_ex_r.is_alu)) &&
+    (!d2_vipt_rmw_candidate ||
+     (dcache_vipt_probe_ready && !vipt_load_replay_r.valid && !vipt_load_slow_busy &&
+      !rmw_fast_active_r && !mem_servicing)) &&
+    (z486_pkg::recipe_early_kind(i_bus.entry_point) != RECIPE_EARLY_LOAD ||
+     ((d2_vipt_candidate ? (d2_vipt_load &&
+                            (!vipt_load_ex_r.valid || vipt_load_ex_probed_r))
+                         : !vipt_load_ex_r.valid) &&
+      !vipt_load_replay_r.valid && !vipt_load_slow_busy));
+
 dec_entry_t d2_entry;         // entry completing D2 this cycle (AGU/i_entry source)
 ea_dec_t    d2_agu_dec;       // EA decode for d2_entry
 
-// An immediate register ALU instruction may have a resident D2 skeleton before
-// its literal payload completes.  During the first uStep of an independent
-// two-uStep shift, launch its already-qualified entry point without waiting
-// for that payload.
-// D2->EX remains gated by d2_push, so this only overlaps the synchronous ROM
-// lookup; it does not combine literal decode or operand execution into this
-// cycle.  ADC/SBB and a destination alias retain the normal dependency path.
-wire [2:0] prestart_shift_widx = (op_size == 2'd0)
-                                ? {1'b0, i.dst_reg_sel[1:0]}
-                                : i.dst_reg_sel;
-wire [2:0] prestart_alu_widx = (i_bus.operand_size == 2'd0)
-                             ? {1'b0, i_bus.dst_reg_sel[1:0]}
-                             : i_bus.dst_reg_sel;
-wire [2:0] prestart_alu_group = i_bus.modrm[5:3];
-wire shift_alu_prestart = recipe_state.hardwired &&
-    recipe_state.multi_ustep &&
-    (recipe_state.commit_sel == RECIPE_COMMIT_SHIFT) && uc_exec &&
-    (uc_next[10:8] == 3'b000) && !decq_empty && !d2_valid &&
-    (i_bus.entry_point == 12'h023) && i_bus.has_modrm &&
-    (i_bus.modrm[7:6] == 2'b11) &&
-    (i_bus.rep_lock == PREFIX_NOREPLOCK) &&
-    (prestart_alu_group != 3'b010) &&
-    (prestart_alu_group != 3'b011) &&
-    (prestart_alu_group != 3'b111) &&
-    (prestart_alu_widx != prestart_shift_widx) &&
-    !q_flush && !throttle_hold && !interrupt_pending && !tf_active_r &&
-    !single_step && !any_fault_issue;
 
-// A normal boundary uses i_entry. Chaining and the narrow D1 prestart launch
-// a successor early, while its completed D2 payload still owns issue.
-assign d2_start = i_entry || chain_start || shift_alu_prestart;
-wire [11:0] d2_start_entry_arch = chain_start ? chain_entry :
-                      shift_alu_prestart ? i_bus.entry_point :
-                      (decq_empty ? d1_issue_entry_point : i_bus.entry_point);
-// D1 resolves qualified overlays. Keep live CR0/x87 state out of the D2 ROM
-// address; unsafe cases branch to the generated fallback after i_issue.
-assign d2_start_entry = d2_start_entry_arch;
-
-// q is EX-owned. A completed ROM lookup may wait in q_mem, but it advances
-// into q only on the D2->EX transfer edge.
-wire        d2_rom_cancel = interrupt_at_boundary || any_fault || any_fault_issue;
+// A fault or an event taken at the boundary holds the ROM output register.
+wire        rom_q_hold = interrupt_at_boundary || any_fault || any_fault_issue;
 // A replayed RMW preread holds the overlay entry word resident, like DLY.
 wire        microcode_rom_base_ce = !stall_mem && !stall_wio && !repeat_active &&
                                     !stall_rmw_probe;
@@ -910,10 +888,12 @@ wire [31:0] spec_disp      = i_bus.branch_rel8 ? {{24{i_bus.displacement[7]}}, i
                                           : i_bus.displacement;
 // Stale-EIP pop guard: a pop CHAINED into a control transfer's
 wire        spec_eip_stale = uc_exec && recipe_rni && (uc_dest == DEST_eIP);
-wire [31:0] spec_target_eip = EIP + ({27'd0, i_bus.length} + spec_disp);
+// A 16-bit operand size truncates the new EIP to 16 bits.
+wire [31:0] spec_target_sum = EIP + ({27'd0, i_bus.length} + spec_disp);
+wire [31:0] spec_target_eip = i_bus.data32 ? spec_target_sum : {16'h0, spec_target_sum[15:0]};
 assign spec_target_lin = CS_base + spec_target_eip;
 assign pf_spec_req = i_issue && (i_bus.rel_branch_kind != REL_BRANCH_NONE) &&
-                     i_bus.data32 && !hardwired_off && !spec_eip_stale;
+                     !hardwired_off && !spec_eip_stale;
 // Ownership: set when an instruction's i_issue requests a spec fetch, cleared
 // by any later pop, flush, or interrupt entry - so it is only up while the
 // requesting branch itself is the current instruction, which is exactly when
@@ -971,15 +951,14 @@ decoder decoder_inst (
     // Decoded instruction output
     .i_bus      (i_bus),
     .decq_empty (decq_empty),
-    .i_bus2     (i_bus2),
-    .decq_has2  (decq_has2),
     .decq_has_jmp_call(decq_has_jmp_call),
+    .pb_load(pb_load),
+    .pb_entry(pb_load_entry),
 
-    // Unified D2 payload and registered D1 skid
+    // Unified D2 payload
     .d2_entry   (d2_entry),
     .d2_push    (d2_push),
     .d1_issue_direct(d1_issue_direct),
-    .d1_issue_entry_point(d1_issue_entry_point),
     .d1_issue_entry(d1_issue_entry),
     .fetch_blocked(decoder_fetch_blocked)
 );
@@ -998,7 +977,7 @@ always_ff @(posedge clk)
 //                    and required forwarding to start memory operations at i_issue)
 //=============================================================================
 
-// Decode an entry's precomputed EA selectors for the head and chain targets.
+// Decode an entry's precomputed EA selectors.
 function automatic ea_dec_t ea_decode_of(input dec_entry_t e);
     ea_dec_t r;
     // Defaults (also the "no modrm / has moffs" case)
@@ -1039,12 +1018,9 @@ function automatic [31:0] onehot_gpr_mux(input [7:0] sel);
     endcase
 endfunction
 
-ea_dec_t ea_dec_cur;    // queue head (i_entry latch source, chain2 target)
+ea_dec_t ea_dec_cur;    // D2 head
 assign ea_dec_cur = ea_decode_of(i_bus);
 
-// z486 chain-INTO memory/LEA (EA reg-match): the target's i_p
-ea_dec_t chain_next_ea;  // chain1 target = the entry behind the head
-assign chain_next_ea = ea_decode_of(i_bus2);
 
 // Hardwired recipe policy: classify the D2 instruction, prove successor
 // overlap safe, and replace only recipe slots known to be redundant.
@@ -1052,20 +1028,17 @@ hardwired_control hardwired_control_inst (
     .clk(clk),
     .reset_n(reset_n),
     .issue_instr(i_bus),
-    .next_instr(i_bus2),
     .exec_instr(i),
     .issue_ea(ea_dec_cur),
-    .next_ea(chain_next_ea),
-    .decq_has2(decq_has2),
     .decq_empty(decq_empty),
     .d2_push(d2_payload_ready),
     .d2_kind(d2_kind),
-    .d2_valid(d2_valid),
-    .d2_waited(d2_waited_r),
+
     .i_issue(i_issue),
     .i_first(i_first),
     .uc_active(uc_active),
     .uc_exec(uc_exec),
+    .uc_slot_live(uc_slot_live),
     .i_rni(i_rni),
     .i_rni_delay(i_rni_delay),
     .uc_next_rni(uc_next[10:8] == 3'b000),
@@ -1090,14 +1063,19 @@ hardwired_control hardwired_control_inst (
     .stall(stall),
     .load_pipe_issue(vipt_issue_load),
     .load_wb_retire(direct_wb_retire),
-    .load_probe_wait(d2_valid && d2_vipt_candidate && !d2_vipt_load),
+    .load_probe_wait(d2_resident && d2_vipt_candidate && !d2_vipt_load),
+    .pb_valid(pb_valid),
+    .tf_issue(EFLAGS[8]),
+    .pb_load_ready(pb_load_ready),
+    .pb_load(pb_load),
+    .pb_next_instr(pb_next_instr),
+    .pb_next_ea(skel_load_ea_dec),
     .issue_recipe(d2_recipe),
     .issue_hardwired(d2_hardwired),
     .x87_direct_candidate(x87_direct_candidate),
     .disabled(hardwired_off),
-    .chain_start(chain_start),
-    .chain_from_next(chain_from_next),
-    .chain_entry(chain_entry),
+    .pb_issue(pb_issue),
+    .pb_slot(pb_slot),
     .recipe_rni(recipe_rni),
     .recipe_state(recipe_state),
     .slot_stale(recipe_slot_stale),
@@ -1111,54 +1089,33 @@ hardwired_control hardwired_control_inst (
 // microsequencer; this block controls only the macro instruction presented to it.
 always_ff @(posedge clk) begin
     if (!reset_n) begin
-        d2_valid_r <= 1'b0;
-        d2_waited_r <= 1'b0;
-        d2_stale_slot_r <= 1'b0;
         d2_ea_split_done_r <= 1'b0;
         throttle_parked_r <= 1'b0;
         stack_init_pending <= 1'b0;
     end else begin
-        if (d2_start || i_issue || q_flush || any_fault) begin
-            d2_waited_r <= 1'b0;
-            d2_stale_slot_r <= 1'b0;
-        end else if (stall_d2) begin
-            d2_waited_r <= 1'b1;
-        end else if (d2_valid && !d2_payload_ready && i_rni_delay &&
-                     (uc_exec || recipe_slot_stale)) begin
-            // q remains on the predecessor's slot while D2 waits. Suppress
-            // that stale word when D2 becomes ready on the following cycle.
-            d2_stale_slot_r <= 1'b1;
-        end
-
         if (q_flush || any_fault)
             d2_ea_split_done_r <= 1'b0;
         else if (d2_ea_split_wait)
-            d2_ea_split_done_r <= 1'b1;
-        else if (d2_start || i_issue)
+            // A partial sum captured while its base or index is written is
+            // stale: capture again on the next cycle.
+            d2_ea_split_done_r <= !d2_ea_split_conflict;
+        else if (i_issue)
             d2_ea_split_done_r <= 1'b0;
 
-        if (!d2_valid || i_issue || q_flush || any_fault ||
+        if (!d2_resident || i_issue || q_flush || any_fault ||
             interrupt_at_boundary || throttle_full)
             throttle_parked_r <= 1'b0;
-        else if (d2_valid && i_rni_delay && throttle_hold &&
+        else if (d2_resident && i_rni_delay && throttle_hold &&
                  (uc_exec || recipe_slot_stale))
             // Retire the predecessor's architectural delay slot on this edge,
             // then keep the prefetched successor out of EX until release.
             throttle_parked_r <= 1'b1;
 
-        if (any_fault)
-            d2_valid_r <= 1'b0;
-        if (i_entry)
-            d2_valid_r <= 1'b1;
-
         if (i_issue) begin
-            d2_valid_r <= 1'b0;
             i_first <= 1'b1;
             stack_init_pending <= i_bus.stack_op;
         end
 
-        if (chain_start || shift_alu_prestart)
-            d2_valid_r <= 1'b1;
 
         if (!stall) begin
             if (stack_init_pending && !i_issue)
@@ -1166,16 +1123,6 @@ always_ff @(posedge clk) begin
             if (i_first && !i_issue)
                 i_first <= 1'b0;
         end
-
-        if (q_flush || page_fault)
-            d2_valid_r <= 1'b0;
-
-        // Boundary recognition is last and overrides speculative D2 state.
-        if (i_rni_delay && !stall && !page_fault &&
-            ((tf_trap_pending && !single_step) ||
-             (nmi_request_active && !single_step) ||
-             (intr_pending && EFLAGS[9] && !single_step && !inhibit_interrupts)))
-            d2_valid_r <= 1'b0;
     end
 end
 
@@ -1281,7 +1228,6 @@ always_ff @(posedge clk) begin
         vipt_load_wb_size_r <= 2'd2;
         vipt_load_wb_is_alu_r <= 1'b0;
         vipt_load_wb_alu_op_r <= 5'd0;
-        vipt_load_rom_shadow_r <= 1'b0;
         vipt_load_overlap_r <= 1'b0;
     end else begin
         vipt_load_wb_valid_r <= 1'b0;
@@ -1290,13 +1236,6 @@ always_ff @(posedge clk) begin
             vipt_load_overlap_r <= 1'b0;
         if (i_issue && d2_plain_load_overlap_ready)
             vipt_load_overlap_r <= 1'b1;
-
-        if (i_rni_delay && (d2_vipt_candidate || d2_vipt_rmw_candidate))
-            vipt_load_rom_shadow_r <= 1'b1;
-        if (i_issue || !d2_valid ||
-            !(d2_vipt_candidate || d2_vipt_rmw_candidate) ||
-            q_flush || any_fault)
-            vipt_load_rom_shadow_r <= 1'b0;
 
         // The EX slot normally advances or empties every cycle.
         vipt_load_ex_r.valid <= 1'b0;
@@ -1504,7 +1443,7 @@ always_ff @(posedge clk) begin
         early_kind_probe_r <= d2_kind;
 end
 
-// A chained PUSH's RNI word holds post-push ESP in SIGMA. A following stack
+// A PUSH's RNI word holds post-push ESP in SIGMA. A following stack
 // recipe consumes this focused bypass during its own D2 address calculation.
 wire        recipe_esp_fwd = recipe_rni && (recipe_state.commit_sel == RECIPE_COMMIT_ESP);
 
@@ -1629,12 +1568,13 @@ wire [31:0] forwarded_esp = recipe_esp_fwd ? SIGMA :
                                             : recipe_shift_data) :
                             vipt_esp_fwd ? vipt_esp_value : ESP;
 
-// D1 supplies registered selectors to the Address Unit. Literal displacement
-// remains a D2 value and is consumed when the instruction fires.
-ea_dec_t d2_start_ea_dec;
-assign d2_start_ea_dec = (chain_start && chain_from_next) ? chain_next_ea :
-                         (i_entry && decq_empty)
-                             ? ea_decode_of(d1_issue_entry) : ea_dec_cur;
+// The Address Unit latches the base/index selectors of the instruction that
+// enters the D2 skeleton from D1's handoff, as the
+// i486's D2 set-up stage holds the address mode decoded in D1. Literal
+// displacement remains a D2 value and is consumed when the instruction fires.
+// The instruction entering the skeleton, for the port-B dead-slot decision.
+assign pb_next_instr = d1_issue_entry;
+assign skel_load_ea_dec = ea_decode_of(d1_issue_entry);
 gpr_ref_t ea_base_ref;
 gpr_ref_t ea_index_ref;
 wire [31:0] ea_base_value;
@@ -1646,7 +1586,7 @@ assign d2_agu_dec = ea_decode_of(d2_entry);
 // Decoder completion may describe the incoming entry while the current D2
 // instruction issues.  Do not consume its split cycle until that entry is
 // actually resident, or the partial sum can retain the previous selectors.
-wire d2_ea_three_term = d2_valid && d2_push &&
+wire d2_ea_three_term = d2_resident && d2_push &&
                         (d2_entry.ea_complex || d2_entry.ea_uses_post_pop_esp);
 wire [31:0] d2_agu_base  = onehot_gpr_mux(d2_agu_dec.base_sel);
 wire [31:0] d2_agu_index = onehot_gpr_mux(d2_agu_dec.index_sel);
@@ -1727,8 +1667,13 @@ wire [7:0] d2_split_commit_mask =
     (recipe_shift_write.valid ? gpr_wr_expand(recipe_shift_write.dst) : 8'h00) |
     (vipt_load_wb_valid_r ? vipt_load_wb_dst_onehot_r : 8'h00);
 wire d2_ea_split_refresh = d2_ea_split_done_r &&
-    (((d2_agu_dec.base_sel | d2_agu_dec.index_sel) &
-      d2_split_commit_mask) != 8'h00);
+    (((d2_agu_dec.base_sel | d2_agu_dec.index_sel) & d2_split_commit_mask) != 8'h00);
+// D2 may capture the partial sum while its predecessor still executes. If the
+// executing uop (a recipe's RNI commit included: ea_inval_gpr) writes the base
+// or index on the capture edge, the capture is stale: do not mark it done, and
+// capture again next cycle. This ends at d2_ea_split_done_r, off the issue path.
+assign d2_ea_split_conflict = ((d2_agu_dec.base_sel | d2_agu_dec.index_sel) &
+                               (ea_inval_gpr | d2_split_commit_mask)) != 8'h00;
 assign d2_ea_split_wait = d2_ea_three_term &&
                           (!d2_ea_split_done_r || d2_ea_split_refresh);
 // Clear-all events: segment state may change under any committed seg
@@ -1783,8 +1728,8 @@ reg  [3:0]  uc_seg_cmd;
 reg  [3:0]  uc_seg_target;
 reg  [31:0] uc_seg_data;
 // Decoded instruction register (all fields from decoder, latched at i_issue)
-// dec_entry_t i; -- declaration moved up beside i_bus2 (Quartus cannot
-// forward-reference struct members from the fast-chain gates)
+// dec_entry_t i; -- declaration moved up beside i_bus (Quartus cannot
+// forward-reference struct members)
 wire [3:0] modrm_resolved_seg = apply_seg_override_type(
     calc_default_seg_type(i.modrm, i.sib, i.has_sib, i.addr32), i.seg);
 
@@ -1863,9 +1808,9 @@ segmentation_unit seg_unit (
     // Decoder D2: issuing instruction, EA recipe, displacement and D2 segment base (ISLA/IESSEG, K2Q)
     .au_instr_issue(i_issue),
     .au_instr(i_bus),
-    .au_d2_start(d2_start),
-    .au_d2_ea(d2_start_ea_dec),
-    .au_split_ea_prepare(d2_ea_three_term && d2_valid && !i_issue),
+    .au_d2_start(pb_load),
+    .au_d2_ea(skel_load_ea_dec),
+    .au_split_ea_prepare(d2_ea_three_term && !i_issue),
     .au_split_ea_use(d2_ea_three_term && d2_ea_split_done_r),
     .au_split_ea_adjust(d2_entry.ea_uses_post_pop_esp ? (d2_entry.data32 ? 3'd4 : 3'd2) : 3'd0),
     .au_displacement(d2_agu_dec.disp),
@@ -2049,12 +1994,9 @@ wire io_busop_wr = uc_p_io_wr && mem_is_io;
 
 wire iack_busop = uc_p_iack;        // IACK bus operation (interrupt acknowledge)
 
-// A delayed D2 entry may already occupy the shared ROM q while it is still
-// waiting for literals. It is not an EX uop yet and must not issue its bus op.
-assign mem_op_eligible = core_live && !mem_servicing &&
-                         !stall_d2 && !d2_release_hold &&
+// A stale slot word (a dead slot that issued nothing) starts no bus cycle.
+assign mem_op_eligible = core_live && !mem_servicing && !recipe_slot_stale &&
                          !throttle_parked_r && !vipt_load_exec_block &&
-                         !vipt_load_rom_shadow_r &&
                          !(i_rni_delay && d2_vipt_candidate);
 // A failed protection test redirects after its third architectural delay uop.
 // That uop may finish internal setup, but its protected bus operation must not
@@ -2065,7 +2007,7 @@ wire uc_data_busreq = !prot_redirect_prev &&
 assign uc_busreq = uc_data_busreq || iack_busop;
 assign mem_req_current = mem_op_eligible && uc_busreq;  // drives paging unit
 // Delay prefetch on upcoming demand memory
-wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || d2_valid);
+wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || d2_resident);
 
 // Implicit supervisor access: descriptor table and TSS reads, cross-privilege
 // stack writes use CPL=0 for paging regardless of current CPL.
@@ -2177,7 +2119,7 @@ assign d2_vipt_rmw = d2_vipt_rmw_candidate &&
                      // The retiring WR_FAST owns the demand preread, but a
                      // same-word successor can share it.  Admit the successor
                      // on the acceptance edge so N/N+1/N+2 is truly a
-                     // three-cycle first-to-first chain; backpressure still
+                     // three-cycle first-to-first sequence; backpressure still
                      // keeps the younger instruction out of EX.
                      (!rmw_fast_active_r || fast_store_accepted) &&
                      !mem_servicing;
@@ -2367,7 +2309,7 @@ protection_unit protection_unit_inst (
 
 //=============================================================================
 // Unit 7: Execution - microcoded and hardwired instruction control
-// "chaining" means hardwired issue into a reclaimed microcode slot.
+// A successor takes a dead slot with its first word from ROM port B.
 //=============================================================================
 
 wire double_fault_start;
@@ -2390,8 +2332,7 @@ event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
     .stall(stall),
     .repeat_active(repeat_active),
     .q_flush(q_flush),
-    .d2_valid(d2_valid),
-    .d2_waited_r(d2_waited_r),
+    .d2_resident(d2_resident),
     .i_issue(i_issue),
     .i_first(i_first),
     .i_rni(i_rni),
@@ -2498,12 +2439,11 @@ wire       uc_jump_taken_prev;          // Jump taken last cycle (for RNi: termi
 reg [31:0] TMPeIP;                  // Saved EIP for RPTI (repeat instruction)
 reg [31:0] wr_restart_eip;          // TMPeIP captured at every demand-write issue: a write
                                     // fault (perm/walk/crossing) may surface after the issuing
-                                    // instruction chained away and TMPeIP moved on
+                                    // instruction issued a successor and TMPeIP moved on
 reg [31:0] TMPeSP;                  // Saved ESP for fault handling
-wire       flags_backup_active;     // Set at i_issue/FLGSBA, cleared on interrupt_entry - guards FLAGSB writes
 
 // Hardwired relative-branch target and microcode PREF restart selection.
-// Target formation remains beside EIP/redirect ownership, while chain_start
+// Target formation remains beside EIP/redirect ownership; hardwired_control
 // owns branch eligibility, folding, and synthetic-RNI control.
 // Microcode PREF restarts from IND.
 wire [31:0] pf_flush_ip = IND;
@@ -2539,7 +2479,7 @@ always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n)                                  early_redirected <= 1'b0;
     else if (any_fault || interrupt_entry)         early_redirected <= 1'b0;
     else if (early_redirect)                       early_redirected <= 1'b1;
-    else if (i_entry || i_issue)                   early_redirected <= 1'b0;
+    else if (i_issue)                              early_redirected <= 1'b0;
 end
 
 assign uc_is_wio = uc_p_wio;  // WIO: wait for interrupt/IO (HLT, only with RPT)
@@ -2555,33 +2495,43 @@ assign gp_fault_wr_op = rd_fast_valid_r || uc_is_write ||
 // The sequencer consumes the execution, fault, and instruction-boundary
 // commands above and owns the microcode ROM pipeline and address arbitration.
 microsequencer microsequencer_inst (
+    // Clock and reset
     .clk(clk),
     .reset_n(reset_n),
+    // ROM port B (D2): the D2 skeleton's first word, read when the skeleton loads (US5293592 latches 35)
+    .pb_load(pb_load),
+    .pb_load_entry(pb_load_entry),
+    .pb_kill(boundary_take || interrupt_entry),
+    .pb_valid(pb_valid),
+    // D2 -> EX issue: the issuing instruction's first word comes from port B (pb_slot)
+    .i_issue(i_issue),
+    .pb_slot(pb_slot),
+    .issue_entry(issue_entry),
+    .d2_kind(d2_kind),
+    // ROM port A (EX): the sequencer's address and ROM pipeline
     .rom_base_ce(microcode_rom_base_ce),
-    .q_flush(q_flush),
-    .d2_cancel(d2_rom_cancel),
-    .d2_start(d2_start),
-    .d2_start_entry(d2_start_entry),
-    .d2_valid(d2_valid),
+    .rom_q_ce(microcode_rom_ce),
+    .q_hold(rom_q_hold),
     .seq_advance(seq_advance),
-    .macro_entry_valid(i_entry_raw),
-    .chain_entry_valid(chain_start || shift_alu_prestart),
+    .uaddr(uaddr),
+    .uaddr_next(uaddr_next),
+    .uc_addr(uc_addr),
+    .uc_addr_mem(uc_addr_mem_r),
+    // Execution control (event control and the execution core)
+    .q_flush(q_flush),
+    .stall(stall),
     .uc_exec(uc_exec),
     .repeat_active(repeat_active),
-    .prot_redirect_prev(prot_redirect_prev),
-    .jcc_fold_active(jcc_fold_active),
-    .branch_ustep_rni(branch_ustep_rni),
-    .load_wb_retire(direct_wb_retire),
     .macro_active(uc_active),
     .instr_eip_written(instr_eip_written),
     .any_fault(any_fault),
-    .i_issue(i_issue),
-    .stall(stall),
     .page_fault(page_fault),
+    // Micro-branch conditions and redirect sources (protection, recipes, divide, faults, boundaries)
+    .conditions(seq_conditions),
     .pe(pe),
     .vm(vm),
     .cpl_nonzero(cpl != 2'b00),
-    .conditions(seq_conditions),
+    .prot_redirect_prev(prot_redirect_prev),
     .prot_redirect_valid(prot_redirect_taken),
     .prot_redirect_target(prot_jump_addr),
     .recipe_redirect_valid(recipe_fallback_taken),
@@ -2592,19 +2542,16 @@ microsequencer microsequencer_inst (
     .gate_redirect(gate_detect_now),
     .fault_redirect(seq_fault_redirect),
     .boundary_redirect(seq_boundary_redirect),
-    .uaddr(uaddr),
-    .uaddr_next(uaddr_next),
-    .uc_addr(uc_addr),
-    .uc_addr_mem(uc_addr_mem_r),
+    // End of instruction: RNI, synthetic RNIs and the delay slot
+    .jcc_fold_active(jcc_fold_active),
+    .branch_ustep_rni(branch_ustep_rni),
+    .load_wb_retire(direct_wb_retire),
+    .i_rni(i_rni_raw),
     .i_rni_delay(i_rni_delay),
     .i_rni_delay_ea(i_rni_delay_ea),
     .jump_taken_prev(uc_jump_taken_prev),
     .pref_suppress_prev(uc_pref_suppress_prev),
-    .i_rni(i_rni_raw),
-    .d2_entry(d2_entry_r),
-    .d2_kind(d2_kind),
-    .d2_rom_mem_resident(d2_rom_mem_resident),
-    .rom_q_ce(microcode_rom_ce),
+    // Microinstruction to the units (port A's ROM output, predecoded)
     .uc(uc),
     .uc_next(uc_next),
     .uc_source_shift(uc_source_shift),
@@ -2623,13 +2570,20 @@ microsequencer microsequencer_inst (
     .uc_ctl_pref(uc_ctl_pref)
 );
 
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && pb_slot && i_issue && (issue_entry != i_bus.entry_point))
+        $fatal(1, "port-B issue entry %03x differs from the D2 entry %03x",
+               issue_entry, i_bus.entry_point);
+// synthesis translate_on
+
 // Instruction Signals (latched at i_issue)
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         i <= '0;
     end else if (i_issue) begin
         i <= i_bus;
-        i.entry_point <= d2_entry_r;
+        i.entry_point <= issue_entry;
     end
     if (interrupt_entry)
         i.rel_branch_kind <= REL_BRANCH_NONE;
@@ -2671,7 +2625,7 @@ always_ff @(posedge clk) begin
     end else if (branch_ustep_redirect) begin
         EIP <= ea_reg;
     end else if (i_issue && !halted /*&& (~uc_active || i_rni_delay)*/) begin
-        // z486: a chained i_issue can land on a control transfer's fina -- doc/z486/old/core_notes_v51.md #25
+        // An issue can land on a control transfer's final word -- doc/z486/old/core_notes_v51.md #25
         if (uc_exec && recipe_rni && (uc_dest == DEST_eIP)) begin
             automatic logic [31:0] tgt = is_dword
                                        ? eip_source_value
@@ -3139,7 +3093,7 @@ interrupt_controller interrupts (
 );
 
 wire throttle_active_cycle = (i_issue && !throttle_parked_r) ||
-                             (uc_active && !stall && !d2_release_hold &&
+                             (uc_active && !stall &&
                               !throttle_parked_r);
 
 cpu_throttle #(.CLOCK_RATE_MHZ(CLOCK_RATE_MHZ)) throttle (

@@ -4,42 +4,37 @@
 // (latches 35), so "the decoder in effect provides the first two lines of
 // microcode" while the control ROM is accessed; Fu/Saini call these the
 // hardwired microinstructions issued in D1 and D2. In z486 they are generated
-// recipes of one to three native uSteps for the common instructions, and a
-// successor may start early in a reclaimed RNI slot (chaining).
+// recipes of one to three native uSteps for the common instructions. A
+// successor whose first word ROM port B already holds takes a dead slot.
 //
 // Signal map (i486 -> RTL):
 //   first microcode lines from latches 35     recipe_state, recipe uSteps
 //   D2 set-up hazard checks (load-use rule)   predecessor/successor dependency checks
-//   early start of the next instruction       chain_start, shift_alu_prestart
+//   next instruction into a dead slot         pb_dead_slot, pb_b1_ok_r, pb_slot
 //   Jcc resolved in the first E clock         Jcc folding, branch_ustep_*
 //
 // Hardwired common-instruction control. Terminology:
 //   hardwired instruction - architectural instruction selected for this control;
 //   recipe                - its generated sequence of one to three uSteps;
 //   issue                 - i_issue transfers one instruction from D2 into EX;
-//   chaining              - starts its successor early in a reclaimed RNI slot.
-// See doc/z486/hardwired_instructions.md. Chain decisions remain combinational
-// into the ROM so slot reclamation does not add an issue cycle.
+//   dead slot             - a word whose work is done; the successor takes it.
+// See doc/z486/hardwired_instructions.md.
 module hardwired_control
     import z486_pkg::*;
 (
     input  logic        clk,
     input  logic        reset_n,
     input  dec_entry_t  issue_instr,     // Instruction entering execution
-    input  dec_entry_t  next_instr,      // Following instruction for chain decision
     input  dec_entry_t  exec_instr,      // Instruction currently in execution
     input  ea_dec_t     issue_ea,        // Issuing instruction EA dependencies
-    input  ea_dec_t     next_ea,         // Following instruction EA dependencies
-    input  logic        decq_has2,
     input  logic        decq_empty,
     input  logic        d2_push,
     input  logic [2:0]  d2_kind,
-    input  logic        d2_valid,
-    input  logic        d2_waited,       // D2 already consumed a wait cycle
     input  logic        i_issue,
     input  logic        i_first,
     input  logic        uc_active,
     input  logic        uc_exec,
+    input  logic        uc_slot_live,        // uc_exec without a direct load's own hold
     input  logic        i_rni,
     input  logic        i_rni_delay,
     input  logic        uc_next_rni,
@@ -63,14 +58,19 @@ module hardwired_control
     input  logic        load_pipe_issue,     // Direct load bypasses its ROM recipe
     input  logic        load_wb_retire,      // Registered VIPT hit retires in WB
     input  logic        load_probe_wait,     // D2 direct load is waiting to issue
+    input  logic        pb_valid,            // ROM port B holds the skeleton's first word
+    input  logic        tf_issue,            // TF of the instruction issuing now (live EFLAGS)
+    input  logic        pb_load_ready,       // a load skeleton could issue now (registered terms)
+    input  logic        pb_load,             // the skeleton takes a new instruction this edge
+    input  dec_entry_t  pb_next_instr,       //   that instruction (D1 handoff)
+    input  ea_dec_t     pb_next_ea,          //   and its EA decode
 
     output recipe_meta_t issue_recipe,
     output logic        issue_hardwired,
     output logic        x87_direct_candidate,
     output logic        disabled,
-    output logic        chain_start,      // Start a successor in a reclaimed slot
-    output logic        chain_from_next,  // Successor is behind the queue head
-    output logic [11:0] chain_entry,      // Successor's ROM entry
+    output logic        pb_issue,         // Issue the skeleton into a dead RNI slot (B1)
+    output logic        pb_slot,          // ROM port B supplies the next executing word
     output logic        recipe_rni,       // Current recipe uStep contains RNI
     output recipe_state_t recipe_state,  // Latched execution recipe
     output logic        slot_stale,       // Suppress the reclaimed RNI slot
@@ -80,7 +80,6 @@ module hardwired_control
     output logic        branch_redirect   // Hardwired branch redirects frontend
 );
 
-recipe_meta_t next_recipe;
 logic branch_ustep_r;
 logic branch_ustep_jcc_r;
 logic jcc_fold_r;
@@ -98,7 +97,6 @@ initial if ($test$plusargs("z486_hardwired_off") ||
 
 assign issue_recipe = recipe_metadata(issue_instr);
 assign disabled = hardwired_off;
-assign next_recipe = recipe_metadata(next_instr);
 assign issue_hardwired = issue_recipe.hardwired && !hardwired_off;
 assign x87_direct_candidate =
     issue_recipe.commit_sel == RECIPE_ACTION_X87_DIRECT;
@@ -150,8 +148,6 @@ wire [2:0] pred1_widx = (issue_recipe.commit_sel == RECIPE_COMMIT_ESP) ? 3'd4 :
     wide_widx(issue_recipe.writes_srcreg ? issue_instr.src_reg_sel
                                       : issue_instr.dst_reg_sel,
                !issue_recipe.writes_srcreg && issue_recipe.op_byte);
-wire ea1_conflict = ea_conflict(pred1_we, pred1_widx, next_ea, next_instr,
-                                issue_recipe.commit_sel == RECIPE_COMMIT_ESP);
 
 wire pred2_we = recipe_state.commit_sel != RECIPE_COMMIT_NONE;
 wire [2:0] pred2_widx = (recipe_state.commit_sel == RECIPE_COMMIT_SIGSRC)
@@ -165,7 +161,6 @@ wire mem_hazard = mem_set || mem_commit.valid;
 wire [2:0] mem_hreg = mem_set ? exec_instr.dst_reg_sel : mem_commit.dst;
 wire [1:0] mem_hsize = mem_set ? op_size : mem_commit.size;
 wire [2:0] mem_widx = wide_widx(mem_hreg, mem_hsize == 2'd0);
-wire mem_conf1 = hazard_uses(next_ea, next_instr, mem_hazard, mem_widx);
 wire mem_confN = hazard_uses(issue_ea, issue_instr, mem_hazard, mem_widx);
 
 // MOVZX/MOVSX use SRCREG as their architectural destination in the original
@@ -180,20 +175,12 @@ wire [2:0] issue_load_dst = issue_load_is_movx
 wire [2:0] issue_load_widx = wide_widx(issue_load_dst,
                                       !issue_load_is_movx &&
                                       (issue_instr.operand_size == 2'd0));
-wire load_data_conf1 = next_instr.recipe_gpr_read_mask[issue_load_widx];
-// Match the i486 load-use rule. Registered cache data forwards to every
-// hardwired GPR data input without a bubble. An EA base/index waits one cycle,
-// then uses the D2 WB bypass; a miss naturally extends that interlock. M3's
-// private ALU result is later than plain load WB, so any dependent data use
-// must also wait for architectural commit.
-wire load_alu_result_conf1 = issue_recipe.writes_flags && load_data_conf1;
 
 wire shift_set = recipe_rni && uc_exec && (recipe_state.commit_sel == RECIPE_COMMIT_SHIFT);
 wire shift_hazard = shift_set || shift_commit.valid;
 wire [2:0] shift_hreg = shift_set ? exec_instr.dst_reg_sel : shift_commit.dst;
 wire [1:0] shift_hsize = shift_set ? op_size : shift_commit.size;
 wire [2:0] shift_widx = wide_widx(shift_hreg, shift_hsize == 2'd0);
-wire shift_conf1 = hazard_uses(next_ea, next_instr, shift_hazard, shift_widx);
 // A shift captured on this edge is not architectural until the following WB
 // edge, so its dependent D2 head must wait.  An already-pending shift commits
 // on the current issue edge; the new instruction reads its operands one cycle
@@ -203,18 +190,6 @@ wire shift_confN = hazard_uses(
     issue_ea, issue_instr, shift_set,
     wide_widx(exec_instr.dst_reg_sel, op_size == 2'd0));
 
-wire next_chain_safe = decq_has2 && next_recipe.hardwired &&
-    (!next_recipe.reads_flags || !issue_recipe.writes_flags || next_recipe.jcc) &&
-    (!next_recipe.uses_ea || !ea1_conflict) && !mem_conf1 && !shift_conf1;
-// A direct ALU predecessor has not produced its result or flags at the D2
-// chain point. Plain-load register consumers use WB forwarding; dependent M3
-// register and flag consumers wait for architectural commit.
-// A pointer-dependent successor may launch its ROM entry immediately; the
-// registered D2 EA mask below issue supplies the one-cycle pointer interlock.
-// Only an M3 data result, which has no WB forwarding path, blocks the launch.
-wire next_load_chain_safe = next_chain_safe && !load_alu_result_conf1 &&
-    !(issue_recipe.writes_flags && next_recipe.reads_flags);
-
 wire loaduse_conflict =
     (issue_recipe.reads_dst && gpr_overlap(exec_instr.dst_reg_sel,
         op_size == 2'd0, issue_instr.dst_reg_sel, issue_recipe.op_byte)) ||
@@ -222,7 +197,7 @@ wire loaduse_conflict =
         op_size == 2'd0, issue_instr.src_reg_sel, issue_recipe.op_byte)) ||
     (issue_recipe.reads_ecx && gpr_overlap(exec_instr.dst_reg_sel,
         op_size == 2'd0, 3'd1, 1'b0));
-wire head_chain_safe = !decq_empty && d2_push && issue_recipe.hardwired &&
+wire head_issue_safe = !decq_empty && d2_push && issue_recipe.hardwired &&
     (!issue_recipe.reads_flags || !recipe_state.writes_flags || issue_recipe.jcc) &&
     (!issue_recipe.uses_ea || !ea2_conflict) &&
     // Loads forward their deferred OPR_R value to all GPR data readers.  EA
@@ -252,31 +227,142 @@ always_ff @(posedge clk)
         $fatal(1, "FORWARDED JCC CONDITION MISMATCH");
 // synthesis translate_on
 
-wire chain_after_single = i_issue && issue_hardwired &&
-    ((!issue_recipe.multi_ustep && !issue_recipe.jcc) || fold_now) && next_chain_safe;
-wire chain_after_load = load_pipe_issue && next_load_chain_safe;
-wire chain_after_multi = recipe_state.hardwired && recipe_state.multi_ustep && uc_exec && uc_next_rni &&
-    !i_issue && !i_rni_delay && !q_flush && head_chain_safe;
-wire chain_after_jcc = recipe_active && recipe_state.jcc && uc_exec && jcc_issue_valid_r &&
-    !jcc_exec_taken && !q_flush && head_chain_safe && !jcc_fold_r;
-wire chain_start_unstalled = (chain_after_single || chain_after_load ||
-                              chain_after_multi || chain_after_jcc) &&
-    (!d2_valid || i_issue) && !d2_waited && !throttle_hold &&
-    !interrupt_pending && !trap_active && !single_step && !any_fault_issue;
-// Every chain source already implies an accepted issue or uc_exec. State the
-// common stall boundary explicitly so stalled memory/x87 fault cones cannot
-// reach the microcode-ROM address through speculative chain arbitration.
-assign chain_start = chain_start_unstalled && !stall;
-assign chain_from_next = chain_after_single || chain_after_load;
-assign chain_entry = (chain_after_single || chain_after_load)
-                   ? next_instr.entry_point : issue_instr.entry_point;
+//-----------------------------------------------------------------------------
+// Dead-slot issue from ROM port B (B1): US5293592 latches 35 hold the first
+// microinstruction, so a successor needs no ROM launch to take a dead RNI
+// slot. Whether it may take the next one is decided a cycle early and
+// registered:
+//   - at a single-uStep predecessor's issue, for the instruction entering the
+//     skeleton from D1, against that predecessor;
+//   - one word before a multi-uStep predecessor's RNI, for the resident
+//     skeleton.
+// Every hardwired recipe qualifies. Microcode instructions (x87 included)
+// issue from port B at the RNI delay slot or into an idle sequencer.
+//-----------------------------------------------------------------------------
+function automatic logic pb_b1_type(input dec_entry_t e, input recipe_meta_t r);
+    logic [2:0] k;
+    begin
+        k = recipe_early_kind(e.entry_point);
+        pb_b1_type = r.hardwired &&
+                     ((k == RECIPE_EARLY_BRANCH) ||
+                      (e.rel_branch_kind == REL_BRANCH_CALL) ||
+                      (!r.jcc && !r.br_rel && (e.rel_branch_kind == REL_BRANCH_NONE) &&
+                       ((k == RECIPE_EARLY_NONE) || (k == RECIPE_EARLY_EA) ||
+                        (k == RECIPE_EARLY_LOAD) || (k == RECIPE_EARLY_STORE) ||
+                        (k == RECIPE_EARLY_RMW) || (k == RECIPE_EARLY_STACK))));
+    end
+endfunction
 
-// synthesis translate_off
+// The successor's GPR reads for the dead-slot decision, from its opcode and
+// register fields alone, so it does not wait for the D1 entry point (the
+// group entry table would otherwise set the cycle). A superset of
+// recipe_gpr_read_mask for every hardwired recipe (checked in simulation):
+//   source field      two-operand ALU/CMP/TEST (not r,m), MOV r,r and stores, SHLD/SHRD
+//   destination field all but the MOV family (88-8B, A0-A3, B0-BF, C6/C7),
+//                     LEA, POP, RET and relative branches
+//   ECX               shifts and SHLD/SHRD by CL; ESP for a stack operation.
+function automatic logic [7:0] pb_read_mask(input dec_entry_t e);
+    logic [7:0] mask;
+    logic op_byte, src_read, dst_read, ecx_read;
+    logic [7:0] o;
+    begin
+        o = e.opcode;
+        if (o[7:4] == 4'h4 || o[7:4] == 4'h5)
+            op_byte = 1'b0;
+        else if (o[7:4] == 4'hB && !e.has_0f)
+            op_byte = !o[3];
+        else
+            op_byte = !o[0];
+        src_read = e.has_0f
+            ? ((o == 8'hA4) || (o == 8'hA5) || (o == 8'hAC) || (o == 8'hAD))
+            : (((o[7:6] == 2'b00) && !o[2] && !(o[1] && (e.modrm[7:6] != 2'b11))) ||
+               (o == 8'h84) || (o == 8'h85) ||
+               (o == 8'h88) || (o == 8'h89) || (o == 8'hA2) || (o == 8'hA3) ||
+               (((o == 8'h8A) || (o == 8'h8B)) && (e.modrm[7:6] == 2'b11)));
+        dst_read = (e.rel_branch_kind == REL_BRANCH_NONE) &&
+            (e.has_0f ||
+             !(((o >= 8'h88) && (o <= 8'h8B)) || (o == 8'h8D) || (o[7:4] == 4'hB) ||
+               ((o >= 8'hA0) && (o <= 8'hA3)) || (o == 8'hC2) || (o == 8'hC3) ||
+               (o == 8'hC6) || (o == 8'hC7) || (o[7:3] == 5'b01011)));
+        ecx_read = e.has_0f ? ((o == 8'hA5) || (o == 8'hAD))
+                            : ((o == 8'hD2) || (o == 8'hD3));
+        mask = e.stack_op ? 8'h10 : 8'h00;
+        if (dst_read) mask[op_byte ? {1'b0, e.dst_reg_sel[1:0]} : e.dst_reg_sel] = 1'b1;
+        if (src_read) mask[op_byte ? {1'b0, e.src_reg_sel[1:0]} : e.src_reg_sel] = 1'b1;
+        if (ecx_read) mask[3'd1] = 1'b1;
+        pb_read_mask = mask;
+    end
+endfunction
+wire [7:0] pbn_read_mask = pb_read_mask(pb_next_instr);
+
+recipe_meta_t pbn_recipe;
+assign pbn_recipe = recipe_metadata(pb_next_instr);
+wire pbn_type = pb_b1_type(pb_next_instr, pbn_recipe);
+wire pbn_safe = (!pbn_recipe.reads_flags || !issue_recipe.writes_flags || pbn_recipe.jcc) &&
+    (!pbn_recipe.uses_ea ||
+     !ea_conflict(pred1_we, pred1_widx, pb_next_ea, pb_next_instr,
+                  issue_recipe.commit_sel == RECIPE_COMMIT_ESP)) &&
+    !(mem_hazard && (pb_next_ea.base_sel[mem_widx] || pb_next_ea.index_sel[mem_widx] ||
+                     pbn_read_mask[mem_widx])) &&
+    !(shift_hazard && (pb_next_ea.base_sel[shift_widx] || pb_next_ea.index_sel[shift_widx] ||
+                       pbn_read_mask[shift_widx]));
+wire skel_type = pb_b1_type(issue_instr, issue_recipe);
+// A decision taken at an instruction's issue must use that instruction's TF:
+// trap_active (tf_active_r) still describes its predecessor on this edge.
+// A Jcc's slot (folded, or its branch uStep) is dead when the branch falls
+// through; a taken branch blocks the issue and its flush drops the word.
+wire pb_b1_from_issue = i_issue && issue_hardwired &&
+    ((!issue_recipe.multi_ustep && !issue_recipe.jcc) || (issue_recipe.jcc && !jcc_unsafe)) &&
+    !tf_issue &&
+    pb_load && pbn_type && pbn_safe;
+wire pb_b1_from_multi = recipe_state.hardwired && recipe_state.multi_ustep &&
+    uc_exec && uc_next_rni && !i_issue && !i_rni_delay && !q_flush &&
+    pb_valid && skel_type && head_issue_safe;
+// A direct load completes in the data pipeline, so its first word is already
+// a dead slot. Its successor may not read the load's M3 ALU result (no WB
+// forwarding) or, after a flag-writing load, the flags.
+wire pbn_load_alu_conf = issue_recipe.writes_flags && pbn_read_mask[issue_load_widx];
+wire pb_b1_from_load = load_pipe_issue && !tf_issue &&
+    pb_load && pbn_type && pbn_safe && !pbn_load_alu_conf;
+logic pb_b1_ok_r;
+logic pb_load_slot_r;   // the executing word is a direct load's first word
 always_ff @(posedge clk) begin
-    if (reset_n && chain_start_unstalled && stall)
-        $fatal(1, "Chain source active while execution is stalled");
+    if (!reset_n || q_flush || any_fault) begin
+        pb_b1_ok_r <= 1'b0;
+        pb_load_slot_r <= 1'b0;
+    end else if (!stall) begin
+        // A successor that waits out its EA interlock on the load's first
+        // word stays eligible for the load's retire word.
+        pb_b1_ok_r <= pb_b1_from_issue || pb_b1_from_multi || pb_b1_from_load ||
+                      (pb_b1_ok_r && pb_load_slot_r && !pb_issue);
+        pb_load_slot_r <= load_pipe_issue;
+    end
 end
-// synthesis translate_on
+
+// A dead slot: the instruction's work is done, so its successor may take the
+// slot from port B (B1). A hardwired recipe's RNI word qualifies (a store or
+// push slot's work is done by the hardwired commit), as does a Jcc that falls
+// through (folded, or in its branch uStep) and a direct load's first word.
+// Legality (predecessor shape, hazards) is the registered pb_b1_ok_r. With
+// the RNI delay slot (B2) and an idle sequencer (B3) these decide, from
+// registered terms only, when the ROM output and port A switch to port B.
+wire pb_dead_slot = (recipe_rni && !recipe_state.jcc && !branch_ustep_rni &&
+                     !jcc_fold_r) ||
+                    (recipe_state.jcc && jcc_issue_valid_r && i_first &&
+                     (jcc_fold_r || branch_ustep_rni)) ||
+                    pb_load_slot_r;
+// The dead slot takes port B's word only when the issue is already known: the
+// registered eligibility, a complete payload, and no pending interrupt, trap
+// or throttle. A stall freezes the ROM output; a fault suppresses the slot.
+// So a word that is loaded but not issued never runs its bus operation.
+wire pb_b1_ready = pb_b1_ok_r && d2_push && pb_load_ready && !throttle_hold &&
+                   !interrupt_pending && !trap_active && !single_step && !disabled;
+assign pb_slot = pb_valid &&
+                 ((pb_dead_slot && pb_b1_ready) || i_rni_delay || !uc_active);
+
+assign pb_issue = pb_dead_slot && pb_b1_ready && (pb_load_slot_r || load_wb_retire ? uc_slot_live : uc_exec) && pb_valid &&
+                  !branch_redirect && !any_fault_issue && !q_flush && !stall;
+
 
 //=============================================================================
 // Bounded branch uStep and recipe state
@@ -319,7 +405,9 @@ always_ff @(posedge clk) begin
             branch_ustep_r <= issue_hardwired &&
                 ((d2_kind == RECIPE_EARLY_BRANCH) ||
                  (issue_instr.rel_branch_kind == REL_BRANCH_CALL)) &&
-                issue_instr.data32 &&
+                // A 16-bit CALL pushes a 16-bit return address in microcode.
+                (issue_instr.data32 ||
+                 (issue_instr.rel_branch_kind != REL_BRANCH_CALL)) &&
                 (!issue_instr.stack_op ||
                  (issue_instr.rel_branch_kind == REL_BRANCH_CALL)) &&
                 (!issue_recipe.jcc || !jcc_unsafe);
@@ -358,10 +446,35 @@ always_ff @(posedge clk) begin
 end
 
 //=============================================================================
-// Simulation checks and chaining diagnostics
+// Simulation checks
 //=============================================================================
 
 // synthesis translate_off
+always @(posedge clk)
+    if (reset_n && pb_load && pbn_type &&
+        |(recipe_gpr_read_mask(pb_next_instr) & ~pbn_read_mask))
+        $fatal(1, "pb_read_mask misses a GPR read: entry %03x opcode %02x mask %02x exact %02x",
+               pb_next_instr.entry_point, pb_next_instr.opcode, pbn_read_mask,
+               recipe_gpr_read_mask(pb_next_instr));
+
+// A dead slot that took port B's word without an issue must not execute it:
+// the word belongs to an instruction still in D2.
+logic pb_unissued_r;
+always_ff @(posedge clk)
+    if (!reset_n || q_flush || any_fault) pb_unissued_r <= 1'b0;
+    else if (!stall) pb_unissued_r <= pb_slot && pb_dead_slot && !i_issue;
+longint pb_unissued_n = 0, pb_unissued_exec_n = 0;
+always @(posedge clk)
+    if (reset_n && pb_unissued_r && !stall) begin
+        pb_unissued_n <= pb_unissued_n + 1;
+        if (uc_exec && uc_active && !i_first) begin
+            pb_unissued_exec_n <= pb_unissued_exec_n + 1;
+            $error("port-B word executes without issue");
+        end
+    end
+final $display("PB_UNISSUED dead-slot selections %0d, executed %0d",
+               pb_unissued_n, pb_unissued_exec_n);
+
 always @(posedge clk)
     if (reset_n && fold_active && uc_exec &&
         condition_true(exec_instr.branch_condition, flags_live))

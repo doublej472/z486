@@ -1,4 +1,4 @@
-// Prefetcher (i486 "K" unit front end; v71 M2 step 1 naming).
+// Prefetcher
 //
 // US5293592 Fig. 2: prefetch register 26 (32 bytes) feeds mux 27, which
 // drives two decoder ports: K1Q, any three adjacent bytes at pointer K1P, to
@@ -110,6 +110,12 @@ reg         spec_valid;              // spec_line holds the line at spec_addr
 reg         spec_adopted_r;          // post-flush fill is an adopted spec line: buffer it too
 reg         spec_poison;             // a store/snoop occurred since the fetch started
 reg [127:0] spec_line;
+// Victim entry: the previously buffered target line, kept when a new spec
+// request replaces it, so two branches in one loop (a not-taken exit test and
+// the back edge) do not evict each other's target every iteration.
+reg         spec_b_valid;
+reg  [31:4] spec_b_addr;
+reg [127:0] spec_b_line;
 
 // Normal 386 self-modifying code performs a frontend-flushing branch after
 // the store. Keep the buffered target coherent for that branch without
@@ -117,6 +123,8 @@ reg [127:0] spec_line;
 wire spec_store_hit = spec_store_valid &&
                       (spec_addr == spec_store_linear[31:4]);
 wire spec_kill = spec_global_kill || spec_store_hit;
+wire spec_b_store_hit = spec_store_valid &&
+                        (spec_b_addr == spec_store_linear[31:4]);
 
 // synthesis translate_off
 bit TRACE_FLUSH_EN;
@@ -188,7 +196,14 @@ assign ifetch_fault_addr = pf_fault_addr_r;
 // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-165
 wire spec_match_now = spec_req && spec_valid && !spec_poison && !spec_inflight &&
                       (spec_addr == spec_linear[31:4]);
-wire spec_want   = ((spec_req && !spec_match_now) || spec_pend);
+// A request that hits the victim entry swaps it into the active buffer
+// instead of fetching. Skip the swap in a cycle with any store or global
+// kill, so a stale victim line can never become active.
+wire spec_b_match = spec_req && !spec_match_now && spec_b_valid &&
+                    !spec_inflight && !spec_pend &&
+                    !spec_store_valid && !spec_global_kill &&
+                    (spec_b_addr == spec_linear[31:4]);
+wire spec_want   = ((spec_req && !spec_match_now && !spec_b_match) || spec_pend);
 // !pf_redirect_queued/!pf_drop_inflight: the queued-redirect handshake makes pf_inflight look idle (req toggled back to ack) while the...
 // Details: doc/z486/implementation_notes.md#src-24-z486-prefetch-sv-178
 wire spec_launch = spec_want && !pf_inflight && !q_flush && !pf_suspend &&
@@ -442,6 +457,8 @@ always_ff @(posedge clk or negedge reset_n) begin
         spec_pend_addr <= '0;
         spec_addr <= '0;
         spec_off <= '0;
+        spec_b_valid <= 1'b0;
+        spec_b_addr <= '0;
     end else begin
         pf_ack_prev <= pf_ack_toggle;
         ifetch_fault <= 1'b0;
@@ -553,7 +570,23 @@ always_ff @(posedge clk or negedge reset_n) begin
             if (spec_match_now) begin
                 // Buffered line already holds this target: re-own, no refetch.
                 spec_off <= spec_linear[3:0];
+            end else if (spec_b_match) begin
+                // The victim holds this target: swap the two entries.
+                spec_off <= spec_linear[3:0];
+                spec_addr <= spec_b_addr;
+                spec_line <= spec_b_line;
+                spec_valid <= 1'b1;
+                spec_poison <= 1'b0;
+                spec_b_addr <= spec_addr;
+                spec_b_line <= spec_line;
+                spec_b_valid <= spec_valid && !spec_poison;
             end else begin
+                // Keep the line being replaced as the victim.
+                if (spec_valid && !spec_poison && !spec_inflight) begin
+                    spec_b_addr <= spec_addr;
+                    spec_b_line <= spec_line;
+                    spec_b_valid <= 1'b1;
+                end
                 spec_pend <= 1'b1;
                 spec_pend_addr <= spec_linear;
                 spec_valid <= 1'b0;
@@ -565,6 +598,8 @@ always_ff @(posedge clk or negedge reset_n) begin
         // Store commit / external snoop: the buffered (or in-flight) target
         // line may be stale; poison it (386 jump-must-refetch semantics).
         // A pending (not yet launched) request will fetch fresh data.
+        if (spec_global_kill || spec_b_store_hit)
+            spec_b_valid <= 1'b0;
         if (spec_kill) begin
             spec_valid <= 1'b0;
             // Also cancel a pending adopted-fill capture: after an adopting flush spec_inflight is already clear (no poison path), but the arriving...

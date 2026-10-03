@@ -67,6 +67,7 @@ module tb_l1_cache;
         .cpu_write(cpu_write),
         .cpu_uncacheable(cpu_addr[31:17] == 15'h5),
         .cpu_ready(cpu_ready),
+        .cpu_wr_ready(),
         .cpu_resp_valid(cpu_resp_valid),
         .stores_drained(stores_drained),
         .vipt_probe_offset(vipt_probe_offset),
@@ -93,6 +94,7 @@ module tb_l1_cache;
 
         .snoop_addr(snoop_addr),
         .snoop_valid(snoop_valid),
+        .store_patch_busy(1'b0),
         .cache_enable(1'b1)
     );
 

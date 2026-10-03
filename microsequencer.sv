@@ -7,12 +7,17 @@
 // first clock. Fu/Saini Fig. 1 places the control ROM with the "control and
 // protection test unit" in one control unit.
 //
+// The ROM has two read ports (one M10K copy, true dual-port):
+//   port B serves D2: the skeleton's first word, read when it loads;
+//   port A serves EX: every following word, micro-jumps, calls, handlers.
+// At issue EX takes port B's word (pb_slot) and port A continues at entry+1.
+//
 // Signal map (i486 -> RTL):
-//   entry point latched in D1 (latches 35)   d2_start_entry, d2_entry
-//   control ROM, ROM address register        ucode_rom (q_mem/q), uaddr, uc_addr_mem
+//   decoder-supplied first line (latches 35) ROM port B: pb_load/pb_load_entry, pb_valid, pb_slot
+//   control ROM, ROM address register        ROM port A: uaddr, uc_addr_mem -> uc
 //   microinstruction to the units            uc, uc_* field decode, uc_next (predecode)
 //   delayed jump / next-to-last line         exec_redirect (one delay slot), i_rni_delay
-//   redirect priority                        fault_redirect > boundary_redirect > chain/macro entry > exec
+//   redirect priority                        fault > boundary > port-B continuation > exec
 //
 // Event arbitration (which fault, trap or interrupt redirects the sequencer)
 // lives in event_control.sv; the protection test PLA in protection.sv.
@@ -22,35 +27,48 @@
 module microsequencer
     import z486_pkg::*;
 (
+    // Clock and reset
     input  logic        clk,
     input  logic        reset_n,
 
-    input  logic        rom_base_ce,          // Base ROM pipeline clock-enable
-    input  logic        q_flush,
-    input  logic        d2_cancel,
-    input  logic        d2_start,             // D2 presents a new entry point
-    input  logic [11:0] d2_start_entry,       // PLA/recipe entry selected in D1/D2
-    input  logic        d2_valid,
+    // D2 -> EX issue: the first word comes from port B (pb_slot)
     input  logic        i_issue,              // D2 transfers its instruction to EX
+    input  logic        pb_slot,              // port B supplies the next executing word
+    output logic [11:0] issue_entry,          // entry of the instruction issuing now
+    output logic [2:0]  d2_kind,              // recipe kind of the issuing first word
 
-    input  logic        seq_advance,          // Advance sequencer and ROM pipeline
-    input  logic        macro_entry_valid,    // Launch decoded macro instruction
-    input  logic        chain_entry_valid,     // Start a chained successor entry
-    input  logic        uc_exec,              // Current micro-op may take effect
-    input  logic        repeat_active,
-    input  logic        prot_redirect_prev,   // Protection redirect delay-slot state
-    input  logic        jcc_fold_active,      // Folded Jcc supplies synthetic RNI
-    input  logic        branch_ustep_rni,     // Hardwired branch supplies synthetic RNI
-    input  logic        load_wb_retire,       // Registered VIPT hit supplies synthetic RNI
-    input  logic        macro_active,
-    input  logic        instr_eip_written,
-    input  logic        any_fault,
+    // ROM port A (EX): the sequencer's address and ROM pipeline
+    input  logic        rom_base_ce,          // ROM pipeline clock-enable (not stalled)
+    output logic        rom_q_ce,             // ROM output-register clock-enable
+    input  logic        q_hold,               // a fault or boundary event holds the ROM output
+    input  logic        seq_advance,          // step to the next sequential word
+    output logic [11:0] uaddr,                // registered port-A address
+    output logic [11:0] uaddr_next,           // arbitrated next port-A address
+    output logic [11:0] uc_addr,              // address of the executing micro-op
+    output logic [11:0] uc_addr_mem,          // address in the ROM memory stage
+
+    // ROM port B (D2): the skeleton's first word, read when it loads (latches 35)
+    input  logic        pb_load,              // the skeleton loads: read its entry word
+    input  logic [11:0] pb_load_entry,        //   at this entry point
+    input  logic        pb_kill,              // a boundary event drops the resident word
+    output logic        pb_valid,             // port B holds the skeleton's first word
+
+    // Execution control (event control and the execution core)
+    input  logic        q_flush,              // front-end redirect
     input  logic        stall,
+    input  logic        uc_exec,              // the current micro-op takes effect
+    input  logic        repeat_active,        // REP iteration holds the word
+    input  logic        macro_active,         // a macro instruction owns EX
+    input  logic        instr_eip_written,    // the instruction already wrote EIP
+    input  logic        any_fault,
     input  logic        page_fault,
+
+    // Micro-branch conditions and redirect sources
+    input  seq_condition_t conditions,       // precomputed micro-branch conditions
     input  logic        pe,
     input  logic        vm,
     input  logic        cpl_nonzero,
-    input  seq_condition_t conditions,       // Precomputed micro-branch conditions
+    input  logic        prot_redirect_prev,   // protection redirect delay-slot state
     input  logic        prot_redirect_valid,
     input  logic [11:0] prot_redirect_target,
     input  logic        recipe_redirect_valid,
@@ -59,26 +77,23 @@ module microsequencer
     input  logic        div_redirect_valid,
     input  logic [11:0] div_redirect_target,
     input  logic        gate_redirect,
-    input  seq_redirect_t fault_redirect,     // Highest-priority fault target
-    input  seq_redirect_t boundary_redirect,  // Interrupt/reset boundary target
+    input  seq_redirect_t fault_redirect,     // highest-priority fault target
+    input  seq_redirect_t boundary_redirect,  // interrupt/reset boundary target
 
-    output logic [11:0] uaddr,                // Registered ROM request address
-    output logic [11:0] uaddr_next,           // Arbitrated next ROM address
-    output logic [11:0] uc_addr,              // Address of executing micro-op
-    output logic [11:0] uc_addr_mem,          // Address in ROM memory stage
-    output logic        i_rni_delay,           // RNI delay slot is executing
-    output logic        i_rni_delay_ea,        // Low-fanout copy for D2 EA bypass
-    output logic        jump_taken_prev,      // Micro-jump delay-slot state
-    output logic        pref_suppress_prev,   // Taken conditional PREF suppression
-    output logic        i_rni,
+    // End of instruction: RNI, synthetic RNIs and the delay slot
+    input  logic        jcc_fold_active,      // a folded Jcc supplies a synthetic RNI
+    input  logic        branch_ustep_rni,     // a hardwired branch supplies a synthetic RNI
+    input  logic        load_wb_retire,       // a direct-load hit supplies a synthetic RNI
+    output logic        i_rni,                // the executing word ends the instruction
+    output logic        i_rni_delay,          // the RNI delay slot is executing
+    output logic        i_rni_delay_ea,       // low-fanout copy for the D2 EA bypass
+    output logic        jump_taken_prev,      // micro-jump delay-slot state
+    output logic        pref_suppress_prev,   // taken conditional PREF suppression
 
-    output logic [11:0] d2_entry,             // Entry associated with resident D2 word
-    output logic [2:0]  d2_kind,              // Resident recipe/microcode kind
-    output logic        d2_rom_mem_resident,  // D2 entry reached ROM memory stage
-    output logic        rom_q_ce,             // ROM output-register clock-enable
-
+    // Microinstruction to the units: the ROM output register (port A's word, or
+    // port B's at issue) and its predecoded fields
     output logic [50:0] uc,
-    output logic [50:0] uc_next,              // ROM-early word, one cycle ahead of uc
+    output logic [50:0] uc_next,              // the word that becomes uc next cycle
     output logic [5:0]  uc_source_shift,
     output logic [3:0]  uc_shift_source_class,
     output logic [1:0]  uc_shift2_source,
@@ -95,14 +110,8 @@ module microsequencer
     output logic        uc_ctl_pref
 );
 
-logic        d2_rom_mem_r;
-logic        d2_rom_q_r;
-logic        d2_launch_id_r;
-logic        d2_id_r;
-logic        d2_rom_mem_id_r;
-logic        d2_rom_q_id_r;
-logic [2:0]  d2_rom_q_kind_r;
-logic        d2_slot_prefetched_r;
+logic        pb_valid_r;           // port B holds the skeleton's first word
+logic [11:0] pb_entry_r;           //   read at this entry point
 `Z486_KEEP logic i_rni_delay_ea_r;
 
 assign i_rni_delay_ea = i_rni_delay_ea_r;
@@ -139,11 +148,8 @@ assign i_rni = rni_base || jcc_fold_active || branch_ustep_rni ||
 
 seq_redirect_t exec_redirect;
 
-wire d2_rom_hold = d2_valid && d2_rom_mem_resident && !i_issue && !d2_cancel;
-wire d2_delay_preload = d2_valid && d2_rom_mem_resident && i_issue &&
-                        !d2_start && !d2_slot_prefetched_r;
-wire rom_addr_ce = rom_base_ce && !d2_rom_hold;
-assign rom_q_ce = rom_base_ce && !d2_rom_hold && !d2_cancel;
+wire rom_addr_ce = rom_base_ce;
+assign rom_q_ce = rom_base_ce && !q_hold;
 
 always_comb begin
     exec_redirect = '0;
@@ -219,14 +225,11 @@ always_comb begin
     uaddr_next = uaddr;
     if (seq_advance)
         uaddr_next = uaddr + 12'd1;
-    if (d2_delay_preload)
-        uaddr_next = d2_entry + 12'd1;
-    if (macro_entry_valid)
-        uaddr_next = d2_start_entry;
     if (exec_redirect.valid)
         uaddr_next = exec_redirect.target;
-    if (chain_entry_valid)
-        uaddr_next = d2_start_entry;
+    // An instruction issuing from port B continues at its next word.
+    if (pb_slot)
+        uaddr_next = pb_entry_r + 12'd1;
     if (fault_redirect.valid)
         uaddr_next = fault_redirect.target;
     if (boundary_redirect.valid)
@@ -235,19 +238,46 @@ always_comb begin
         uaddr_next = 12'h000;
 end
 
-wire [11:0] rom_addr = d2_delay_preload ? (d2_entry + 12'd1) : uaddr_next;
+wire [11:0] rom_addr = uaddr_next;
 wire [50:0] rom_q;
 wire [50:0] rom_q_early;
 wire [2:0]  rom_kind_early;
+wire [2:0]  rom_kind_b;
+
+// Port B tracks the skeleton: its address register loads with the skeleton,
+// so the word is resident while the instruction waits in D2. An issue from
+// port B (US5293592 latches 35: the decoder supplies the first line) needs
+// no port-A launch; port A continues at the following word. Every issue
+// takes port B's word (pb_slot).
+always_ff @(posedge clk) begin
+    if (!reset_n || q_flush || pb_kill)
+        pb_valid_r <= 1'b0;
+    else if (pb_load)
+        pb_valid_r <= 1'b1;
+    else if (i_issue)
+        pb_valid_r <= 1'b0;
+    if (pb_load)
+        pb_entry_r <= pb_load_entry;
+end
+assign pb_valid = pb_valid_r;
+assign issue_entry = pb_entry_r;
 
 ucode_rom microcode_rom_inst (
+    // Clock
     .clk(clk),
+    // Port A (EX): the sequencer's address; its word feeds the output register
     .addr_ce(rom_addr_ce),
-    .q_ce(rom_q_ce),
     .addr(rom_addr),
+    .q_kind_early(rom_kind_early),
+    // Port B (D2): the D2 skeleton's first word, read when the skeleton loads
+    .addr_b_ce(pb_load),
+    .addr_b(pb_load_entry),
+    .q_kind_b(rom_kind_b),
+    // Output register: loads port A's word, or port B's at issue (q_sel_b), with predecode
+    .q_ce(rom_q_ce),
+    .q_sel_b(pb_slot),
     .q_early(rom_q_early),
     .q(rom_q),
-    .q_kind_early(rom_kind_early),
     .q_shift_source(uc_source_shift),
     .q_shift_source_class(uc_shift_source_class),
     .q_shift2_source(uc_shift2_source),
@@ -264,45 +294,13 @@ ucode_rom microcode_rom_inst (
 
 assign uc = rom_q;
 assign uc_next = rom_q_early;
-assign d2_rom_mem_resident = d2_rom_mem_r && (d2_rom_mem_id_r == d2_id_r);
-wire d2_rom_resident = d2_rom_q_r && (d2_rom_q_id_r == d2_id_r);
-assign d2_kind = d2_rom_resident ? d2_rom_q_kind_r : rom_kind_early;
-// Keep each macro entry tagged across q_mem and q so a replaced D2 entry
-// cannot execute the predecessor's still-resident ROM word.
-always_ff @(posedge clk) begin
-    if (!reset_n || q_flush) begin
-        d2_rom_mem_r <= 1'b0;
-        d2_rom_q_r <= 1'b0;
-        d2_entry <= 12'h000;
-        d2_launch_id_r <= 1'b0;
-        d2_id_r <= 1'b0;
-        d2_rom_mem_id_r <= 1'b0;
-        d2_rom_q_id_r <= 1'b0;
-        d2_rom_q_kind_r <= 3'b000;
-        d2_slot_prefetched_r <= 1'b0;
-    end else begin
-        if (rom_addr_ce) begin
-            d2_rom_mem_r <= d2_start;
-            if (d2_start) begin
-                d2_entry <= d2_start_entry;
-                d2_launch_id_r <= !d2_launch_id_r;
-                d2_id_r <= !d2_launch_id_r;
-                d2_rom_mem_id_r <= !d2_launch_id_r;
-            end
-        end
-        if (rom_q_ce) begin
-            d2_rom_q_r <= d2_rom_mem_r;
-            d2_rom_q_id_r <= d2_rom_mem_id_r;
-            d2_rom_q_kind_r <= rom_kind_early;
-        end
-        if (d2_start)
-            d2_slot_prefetched_r <= 1'b0;
-        else if (d2_delay_preload && rom_addr_ce)
-            d2_slot_prefetched_r <= 1'b1;
-        else if (i_issue)
-            d2_slot_prefetched_r <= 1'b0;
-    end
-end
+assign d2_kind = rom_kind_b;
+
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && i_issue && !pb_slot)
+        $fatal(1, "an issue without port B's first word");
+// synthesis translate_on
 
 // Sequencer state updates retain the original in-block priority. RNI delay
 // cancellation is last so a page fault cannot expose a stale delay slot.
@@ -324,7 +322,7 @@ always_ff @(posedge clk) begin
         if (rom_addr_ce)
             uc_addr_mem <= rom_addr;
         if (rom_q_ce) begin
-            uc_addr <= uc_addr_mem;
+            uc_addr <= pb_slot ? pb_entry_r : uc_addr_mem;
             // The m80 store tail executes after a dword-stride loop, but its
             // immutable `wr W` word writes only the final two bytes.
             uc_force_word <= uc_addr_mem == UADDR_FPU_STORE_TAIL;

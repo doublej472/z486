@@ -76,6 +76,7 @@ module cache_unit
     output logic dcache_req_is_device_mmio,
     output logic [31:0] dcache_req_phys_addr,
     output logic dcache_cpu_ready,
+    output logic dcache_cpu_wr_ready,
     output logic dcache_cpu_resp_valid,
     output logic [31:0] dcache_cpu_dout,
     output logic dcache_stores_drained,
@@ -213,7 +214,7 @@ wire [3:0] icache_write_patch_be = icache_write_snoop_pending
                                  ? icache_write_snoop_be_r
                                  : dcache_store_patch_be;
 
-assign fast_store_accepted = fast_store_valid && dcache_cpu_ready;
+assign fast_store_accepted = fast_store_valid && dcache_cpu_wr_ready;
 
 assign icache_req_accepted = icache_cpu_ready;
 assign icache_req_complete = icache_cpu_resp_valid;
@@ -272,6 +273,8 @@ l1_cache #(
     // aperture decode on their register inputs.
     .cpu_uncacheable(1'b0),
     .cpu_ready(dcache_cpu_ready),
+    .cpu_wr_ready(dcache_cpu_wr_ready),
+    .store_patch_busy(snoop_valid || icache_write_snoop_pending),
     .cpu_resp_valid(dcache_cpu_resp_valid),
     .stores_drained(dcache_stores_drained),
     .store_patch_addr(dcache_store_patch_addr),

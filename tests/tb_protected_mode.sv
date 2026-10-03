@@ -152,11 +152,11 @@ module tb_protected_mode #(
                     cpu_store_states[1] += 1;
                 else if (dut.stall_wio || dut.stall_x87_direct)
                     cpu_store_states[2] += 1;
-                else if (dut.stall_d2)
+                else if (1'b0)
                     cpu_store_states[3] += 1;
                 else if (dut.throttle_parked_r)
                     cpu_store_states[4] += 1;
-                else if (!dut.d2_valid)
+                else if (!dut.pb_valid)
                     cpu_store_states[5] += 1;
                 else if (!dut.d2_ready)
                     cpu_store_states[6] += 1;
@@ -350,14 +350,14 @@ module tb_protected_mode #(
 
             cpu_stall_cycles[0] += dut.stall_mem;
             cpu_stall_cycles[1] += !dut.stall_mem && dut.stall_wio;
-            cpu_stall_cycles[2] += !dut.stall_mem && !dut.stall_wio && dut.stall_d2;
+            cpu_stall_cycles[2] += !dut.stall_mem && !dut.stall_wio && 1'b0;
             cpu_stall_cycles[3] += !dut.stall_mem && !dut.stall_wio &&
-                                   !dut.stall_d2 && dut.stall_x87_direct;
+                                   !1'b0 && dut.stall_x87_direct;
             cpu_stall_cycles[4] += !dut.stall && dut.throttle_parked_r;
             cpu_stall_cycles[5] += !dut.stall && !dut.throttle_parked_r &&
-                                   !dut.uc_active && dut.decq_empty && !dut.d2_valid;
+                                   !dut.uc_active && dut.decq_empty && !dut.pb_valid;
             cpu_stall_cycles[6] += !dut.stall && !dut.throttle_parked_r &&
-                                   !dut.uc_active && !(dut.decq_empty && !dut.d2_valid);
+                                   !dut.uc_active && !(dut.decq_empty && !dut.pb_valid);
             cpu_stall_cycles[7] += dut.decoder_fetch_blocked;
             cpu_stall_cycles[8] += dut.mem_servicing;
             cpu_stall_cycles[9] += dut.q_flush;
@@ -377,7 +377,7 @@ module tb_protected_mode #(
                 dut.hardwired_control_inst.uc_exec && dut.hardwired_control_inst.uc_next_rni &&
                 !dut.hardwired_control_inst.i_issue) begin
                 cpu_load_chain[0] += 1;
-                if (dut.hardwired_control_inst.chain_start)
+                if (dut.hardwired_control_inst.pb_issue)
                     cpu_load_chain[1] += 1;
                 else if (dut.hardwired_control_inst.decq_empty)
                     cpu_load_chain[2] += 1;
@@ -398,7 +398,7 @@ module tb_protected_mode #(
                     cpu_load_chain[8] += 1;
                 else if (dut.hardwired_control_inst.shift_confN)
                     cpu_load_chain[9] += 1;
-                else if (!dut.hardwired_control_inst.head_chain_safe)
+                else if (!dut.hardwired_control_inst.head_issue_safe)
                     cpu_load_chain[10] += 1;
                 else
                     cpu_load_chain[11] += 1;
@@ -1336,15 +1336,59 @@ module tb_protected_mode #(
                     stop_match_count <= stop_match_count + 1;
                 end else begin
                     longint unsigned checksum [0:3];
+                    // Stores still in the D-cache write path at the stop are
+                    // part of the architectural state: overlay them, oldest
+                    // first, so the hash does not depend on drain timing.
+                    logic [7:0] pend [int unsigned];
+                    begin
+                        int unsigned depth, k, slot;
+                        depth = $size(dut.memory_inst.cache_unit_inst.dcache_inst.storeq_valid);
+                        for (k = 0; k < depth; k++) begin
+                            slot = (dut.memory_inst.cache_unit_inst.dcache_inst.storeq_tail + k) % depth;
+                            if (dut.memory_inst.cache_unit_inst.dcache_inst.storeq_valid[slot])
+                                for (int b = 0; b < 4; b++)
+                                    if (dut.memory_inst.cache_unit_inst.dcache_inst.storeq_be[slot][b])
+                                        pend[{dut.memory_inst.cache_unit_inst.dcache_inst.storeq_addr[slot], 2'b00} + b] =
+                                            dut.memory_inst.cache_unit_inst.dcache_inst.storeq_data[slot][8*b +: 8];
+                        end
+                        // An accepted store still in lookup (S_LOOKUP = 2) is younger.
+                        if (dut.memory_inst.cache_unit_inst.dcache_inst.state == 3'd2 &&
+                            dut.memory_inst.cache_unit_inst.dcache_inst.req_valid_r &&
+                            dut.memory_inst.cache_unit_inst.dcache_inst.req_write_r &&
+                            !dut.memory_inst.cache_unit_inst.dcache_inst.req_protect_write_r)
+                            for (int b = 0; b < 4; b++)
+                                if (dut.memory_inst.cache_unit_inst.dcache_inst.req_be_r[b])
+                                    pend[{dut.memory_inst.cache_unit_inst.dcache_inst.req_addr_r[31:2], 2'b00} + b] =
+                                        dut.memory_inst.cache_unit_inst.dcache_inst.req_din_r[8*b +: 8];
+                        // An older instruction's store presented on this very edge is youngest.
+                        if (dut.memory_inst.cache_unit_inst.dcache_cpu_req &&
+                            dut.memory_inst.cache_unit_inst.dcache_cpu_write)
+                            for (int b = 0; b < 4; b++)
+                                if (dut.memory_inst.cache_unit_inst.dcache_cpu_be[b])
+                                    pend[{dut.memory_inst.cache_unit_inst.dcache_cpu_addr[31:2], 2'b00} + b] =
+                                        dut.memory_inst.cache_unit_inst.dcache_cpu_wdata[8*b +: 8];
+                    end
                     for (int range_index = 0; range_index < checksum_count; range_index++) begin
                         checksum[range_index] = 64'hcbf29ce484222325;
                         for (int i = 0; i < checksum_bytes[range_index]; i++) begin
                             if ((checksum_start[range_index] + i) < MEM_SIZE) begin
+                                int unsigned a;
+                                a = checksum_start[range_index] + i;
                                 checksum[range_index] = checksum[range_index] ^
-                                                        mem[checksum_start[range_index] + i];
+                                                        (pend.exists(a) ? pend[a] : mem[a]);
                                 checksum[range_index] = checksum[range_index] *
                                                         64'h00000100000001b3;
                             end
+                        end
+                    end
+                    begin
+                        string dump_file;
+                        int fd;
+                        if ($value$plusargs("dump_low_mem=%s", dump_file)) begin
+                            fd = $fopen(dump_file, "w");
+                            for (int unsigned a = 0; a < 32'h000a0000; a++)
+                                $fwrite(fd, "%02x\n", pend.exists(a) ? pend[a] : mem[a]);
+                            $fclose(fd);
                         end
                     end
                     $display("");
@@ -1592,6 +1636,9 @@ module tb_protected_mode #(
                 $display("Progress: cycle=%0d instr=%0d", cycle, instruction_count);
 
             // Trace instructions
+            // One line per D2 -> EX issue: cycle, EIP after the issue, ROM entry.
+            if ($test$plusargs("trace_issue") && dut.i_issue && !dut.stall)
+                $display("ISSUE %0d %08X %03X", cycle, dut.EIP, dut.issue_entry);
             if ($test$plusargs("trace_instr") && instruction_boundary && !prev_instruction_boundary)
                 $display("INSTR[%0d]: CS:EIP=%04X:%08X IR=%02X EAX=%08X",
                          instruction_count, dut.CS, dut.EIP, dut.i.opcode, dut.EAX);

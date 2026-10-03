@@ -14,14 +14,14 @@
 //   latches 35 (D1 -> D2 boundary)        the skeleton register (skel_*)
 //   execution set-up stage 34 (D2)        literal capture phases A/B -> d2_entry, d2_push
 //   prefix / 0F extra D1 clocks           prefix state before the skeleton
-//   IWORD to control                      i_bus (D2 entry), i_bus2 (skid successor)
+//   IWORD to control                      i_bus (D2 entry)
 //
 // Stages: banners below mark D1 (structural decode), the D1->D2 skeleton
 // register, and D2 (literal capture and entry resolution). The hardwired
 // first microinstructions (the patent's decoder-supplied first lines) are in
 // hardwired_control.sv. Deviations: K1Q is an 8-byte window so D1 finds the
 // full structural length in one clock; the entry ROM is an M10K read one
-// cycle ahead on k1q_early; a one-entry skid (i_bus2) decouples D1 from D2.
+// cycle ahead on k1q_early. D1 holds its instruction until D2 takes it.
 
 `include "z486_platform.svh"
 module decoder
@@ -55,15 +55,15 @@ module decoder
     // Decoded instruction output
     output dec_entry_t  i_bus,          // Decoded instruction
     output              decq_empty,     // Legacy name: unified D2 has no skeleton
-    output dec_entry_t  i_bus2,         // Registered D1 skid successor
-    output              decq_has2,      // skid successor can complete D2 in one cycle
     output              decq_has_jmp_call, // JMP/CALL rel in flight (halt speculative prefetch)
+    // Microsequencer ROM port B: the skeleton's first word is read ahead
+    output              pb_load,        // the skeleton takes a new instruction this edge
+    output       [11:0] pb_entry,       //   and this is its entry point
 
     // Unified D2 payload and empty-pipe D1 launch
     output dec_entry_t  d2_entry,       // instruction completing D2
     output              d2_push,        // d2_entry is complete this cycle
     output              d1_issue_direct,// handoff has no older D2 skeleton
-    output       [11:0] d1_issue_entry_point,
     output dec_entry_t  d1_issue_entry, // live structural entry for empty-pipe launch
     output              fetch_blocked   // decoder is waiting for unfetched bytes
 );
@@ -88,12 +88,15 @@ typedef struct packed {
     logic       lit2_mirror_disp;
     logic       fields_fit;          // both literal fields fit the first D2 window
     logic       need_sib;
+    logic [4:0] body_len;            // bytes from the opcode on (no prefixes, no 0F)
+    logic [4:0] adv_len;             // body_len including a SIB byte in view (D1 cursor)
     logic [2:0] pending_imm_size;
     logic       pending_imm_sign_extend;
 } decoder_work_t;
 
 `include "pla_control.svh"
 `include "pla_entry.svh"
+`include "length_table.svh"
 
 //=============================================================================
 // D1 - structural decode
@@ -108,18 +111,8 @@ logic [3:0]  prefix_count;
 logic [1:0]  prefix_rep_lock;
 logic [2:0]  prefix_seg;
 reg         code32_r;     // Local CS.D copy; frontend flush hides its one-cycle update latency.
+reg         skel_v;       // D2 holds an instruction
 
-reg            d1_sib;      // SIB sub-cycle pending (cursor held)
-decoder_work_t pend_work;   // struct_work parked across the SIB sub-cycle
-decoder_work_t skid;        // one registered D1 successor ahead of D2
-reg            skid_v;
-reg            skel_v;
-reg [4:0]      skid_lit_off;
-reg            skid_one_d2;
-reg [31:0]     skid_raw_lo_r;
-reg [31:0]     skid_raw_hi_r;
-reg [1:0]      skid_raw_lit_off_r;
-reg            skid_raw_valid_r;
 
 // Byte aliases at the D1 cursor.  The cursor does not advance until the
 // skeleton handoff, so during the SIB sub-cycle the sib byte is byte 2.
@@ -130,9 +123,9 @@ wire       data32 = code32_r ^ prefix_66;
 wire       addr32 = code32_r ^ prefix_67;
 wire [15:0] entry_rom_sel;
 
-wire consume_prefix = !d1_sib && !prefix_0f && is_prefix(opcode) &&
+wire consume_prefix = !prefix_0f && is_prefix(opcode) &&
                       (k1q_avail >= 6'd1);
-wire consume_0f     = !d1_sib && !prefix_0f && (opcode == 8'h0f) &&
+wire consume_0f     = !prefix_0f && (opcode == 8'h0f) &&
                       (k1q_avail >= 6'd1);
 
 decoder_work_t struct_work;
@@ -140,26 +133,30 @@ logic [2:0]    struct_len;
 // Some simulators do not include signals referenced only inside a task in an
 // always_comb sensitivity set. Pass the task's live decode inputs explicitly
 // so structural decode is reevaluated when the D1 window advances.
-wire [45:0] struct_work_inputs = {
-    opcode, modrm, prefix_0f, prefix_rep, prefix_count, data32, addr32,
+wire [53:0] struct_work_inputs = {
+    opcode, modrm, sib_b, prefix_0f, prefix_rep, prefix_count, data32, addr32,
     prefix_rep_lock, prefix_seg, entry_rom_sel, pe_enable
 };
 always_comb build_struct_work(struct_work_inputs, struct_work, struct_len);
 
-wire struct_bytes_ok = !d1_sib && (k1q_avail >= {3'b000, struct_len});
-wire sib_bytes_ok    = d1_sib && (k1q_avail >= 6'd3);   // opcode+modrm+sib in view
+wire struct_bytes_ok = k1q_avail >= {3'b000, struct_len};
 
 // skel_free: d2_done's terms are k2q_avail / out_full / phase - all
 // register-derived, never i_issue (L1) - so the same-edge free is legal.
 wire d2_done;
-wire d1_slot_ready = !skid_v || i_issue;
+// D1 holds its instruction until D2 takes it (no buffer between them).
+wire d1_slot_ready = !skel_v || i_issue;
 
-wire d1_to_sib  = !consume_prefix && !consume_0f &&
-                  struct_bytes_ok && struct_work.need_sib;
-wire d1_preread_handoff = !consume_prefix && !consume_0f &&
-    ((struct_bytes_ok && !struct_work.need_sib) || sib_bytes_ok);
+// D1 decodes opcode, ModR/M and SIB together, as decoder 31 always takes
+// three bytes on K1Q (US5293592). An instruction with a SIB byte waits until
+// that byte is in view; the decoded address mode then goes to D2 in the
+// skeleton, where the address is formed.
+wire sib_in_view = k1q_avail >= 6'd3;
+wire d1_struct_ready = struct_bytes_ok &&
+                       (!struct_work.need_sib || sib_in_view);
+wire d1_preread_handoff = !consume_prefix && !consume_0f && d1_struct_ready;
 wire d1_handoff = !consume_prefix && !consume_0f && d1_slot_ready &&
-                  ((struct_bytes_ok && !struct_work.need_sib) || sib_bytes_ok);
+                  d1_struct_ready;
 
 // Preread the macro-entry PLA from M10K one cycle before D1 handoff. The
 // speculative cursor deliberately ignores D2 backpressure; when D1 cannot
@@ -217,7 +214,8 @@ initial $readmemh("pla_group_entry.hex", group_entry_rom);
 
 decoder_work_t handoff_work;
 always_comb begin
-    handoff_work = d1_sib ? capture_sib(pend_work, sib_b) : struct_work;
+    handoff_work = struct_work.need_sib ? capture_sib(struct_work, sib_b)
+                                        : struct_work;
 end
 wire [11:0] handoff_entry_point = recipe_effective_entry(
     handoff_work.entry.entry_point,
@@ -271,13 +269,29 @@ wire [4:0] handoff_lit_off = handoff_work.entry.length -
 // bytes AND the literal bytes D2 will capture), so the cursor lands on the
 // next instruction's first byte.  It may pass not-yet-fetched literal
 // bytes; k1q_avail clamps to 0 in that case and D1 waits for the fill.
-wire [4:0] handoff_adv = handoff_work.entry.length -
-                         {1'b0, prefix_count} - (prefix_0f ? 5'd1 : 5'd0);
-// Prefix and 0F bytes have already advanced the D1 cursor. Relative to the
-// registered raw D1 window, the first literal follows only opcode/ModR/M/SIB.
-wire [4:0] handoff_raw_lit_off_w = handoff_lit_off -
-                                    {1'b0, prefix_count} -
-                                    (prefix_0f ? 5'd1 : 5'd0);
+// Prefix and 0F bytes took their own D1 clocks and already advanced the
+// cursor, so the advance is the body length alone, as code control 36
+// advances K1P (US5293592). No prefix arithmetic sits in the K1Q loop.
+// The SIB byte's length term is part of D1's two-table length (adv_len).
+wire [4:0] handoff_adv = struct_work.adv_len;
+// Relative to the registered raw D1 window, the first literal follows only
+// opcode/ModR/M/SIB.
+wire [4:0] handoff_raw_lit_off_w = handoff_work.body_len -
+                                   ({2'b00, handoff_work.lit1_size} +
+                                    {2'b00, handoff_work.lit2_size});
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && (d1_handoff || d1_preread_handoff) &&
+        (handoff_work.entry.length !=
+         handoff_work.body_len + {1'b0, prefix_count} + (prefix_0f ? 5'd1 : 5'd0)))
+        $fatal(1, "D1 body length %0d + prefixes disagrees with length %0d",
+               handoff_work.body_len, handoff_work.entry.length);
+always @(posedge clk)
+    if (reset_n && (d1_handoff || d1_preread_handoff) &&
+        (handoff_adv != handoff_work.body_len))
+        $fatal(1, "D1 cursor advance %0d disagrees with the captured length %0d",
+               handoff_adv, handoff_work.body_len);
+// synthesis translate_on
 wire [1:0] handoff_raw_lit_off = handoff_raw_lit_off_w[1:0];
 
 // The entry PLA result is valid during D1 handoff, one cycle before the
@@ -297,7 +311,6 @@ wire handoff_raw_valid = (k1q_avail >= handoff_raw_end);
 // Launch the synchronous ROM as soon as structural decode owns an empty D2.
 // D2 holds the returned word while late or second literals are captured.
 assign d1_issue_direct = d1_handoff && !skel_v;
-assign d1_issue_entry_point = handoff_entry_point;
 always_comb begin
     d1_issue_entry = handoff_d2.entry;
 end
@@ -323,20 +336,13 @@ reg            skel_window_valid_r;
 reg            skel_window_raw_r; // skel_lit_r is the low half of the D1 window
 wire           head_v = skel_v;  // temporary trace compatibility alias
 
-// Register the raw literal window on the D1 handoff edge. The skid keeps its
-// own copy so promotion never has to route i_issue through the live prefetch
-// aligner and back into the D2 literal register.
-wire promote_skid_capture = i_issue && skid_v;
-wire promote_handoff_capture = d1_handoff &&
-                                ((!skel_v && !i_issue) || (i_issue && !skid_v));
-wire incoming_capture = promote_skid_capture || promote_handoff_capture;
+// The raw literal window registers on the D1 handoff edge.
+wire incoming_capture = d1_handoff;
 
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
         code32_r <= 1'b0;
         skel_v <= 1'b0;
-        skid_v <= 1'b0;
-        d1_sib <= 1'b0;
         prefix_66 <= 1'b0;
         prefix_67 <= 1'b0;
         prefix_0f <= 1'b0;
@@ -344,15 +350,9 @@ always_ff @(posedge clk or negedge reset_n) begin
         prefix_count <= 4'd0;
         prefix_rep_lock <= PREFIX_NOREPLOCK;
         prefix_seg <= PREFIX_NOSEG;
-        skid_raw_lo_r <= 32'd0;
-        skid_raw_hi_r <= 32'd0;
-        skid_raw_lit_off_r <= 2'd0;
-        skid_raw_valid_r <= 1'b0;
     end else if (q_flush) begin
         code32_r <= D;
         skel_v <= 1'b0;
-        skid_v <= 1'b0;
-        d1_sib <= 1'b0;
         prefix_66 <= 1'b0;
         prefix_67 <= 1'b0;
         prefix_0f <= 1'b0;
@@ -386,17 +386,7 @@ always_ff @(posedge clk or negedge reset_n) begin
             end
         end
 
-        if (d1_to_sib) begin
-            pend_work <= struct_work;
-            d1_sib <= 1'b1;
-        end
-
         if (d1_handoff) begin
-            d1_sib <= 1'b0;
-            skid_raw_lo_r <= k1q[31:0];
-            skid_raw_hi_r <= k1q[63:32];
-            skid_raw_lit_off_r <= handoff_raw_lit_off;
-            skid_raw_valid_r <= handoff_raw_valid;
             // The skeleton carries the prefix state; clear for the next one.
             prefix_66 <= 1'b0;
             prefix_67 <= 1'b0;
@@ -407,40 +397,13 @@ always_ff @(posedge clk or negedge reset_n) begin
             prefix_seg <= PREFIX_NOSEG;
         end
 
-        // The skid holds one structurally decoded successor while D2 owns the
-        // current instruction. On issue it promotes from registered state,
-        // keeping the full D1 decoder out of the ROM-address path.
-        if (i_issue) begin
-            if (skid_v) begin
-                skel <= skid;
-                skel_v <= 1'b1;
-                skel_lit_off <= skid_lit_off;
-                if (d1_handoff) begin
-                    skid <= handoff_d2;
-                    skid_v <= 1'b1;
-                    skid_lit_off <= handoff_lit_off;
-                    skid_one_d2 <= handoff_one_d2;
-                end else begin
-                    skid_v <= 1'b0;
-                end
-            end else if (d1_handoff) begin
-                skel <= handoff_d2;
-                skel_v <= 1'b1;
-                skel_lit_off <= handoff_lit_off;
-            end else begin
-                skel_v <= 1'b0;
-            end
-        end else if (d1_handoff) begin
-            if (!skel_v) begin
-                skel <= handoff_d2;
-                skel_v <= 1'b1;
-                skel_lit_off <= handoff_lit_off;
-            end else begin
-                skid <= handoff_d2;
-                skid_v <= 1'b1;
-                skid_lit_off <= handoff_lit_off;
-                skid_one_d2 <= handoff_one_d2;
-            end
+        // D2 takes D1's instruction when it is empty or its instruction issues.
+        if (d1_handoff) begin
+            skel <= handoff_d2;
+            skel_v <= 1'b1;
+            skel_lit_off <= handoff_lit_off;
+        end else if (i_issue) begin
+            skel_v <= 1'b0;
         end
     end
 end
@@ -509,11 +472,10 @@ wire       d2_stepA  = d2_can && !finishing;
 wire       d2_late_capture = skel_v && !d2_window_valid && bytes_ok;
 
 // A retained prefetch fault becomes architectural only when one of the decode
-// stages is genuinely blocked on bytes, not while the queue can still run or
-// D1 is merely backpressured by its skid slot.
-wire d1_bytes_blocked = !skid_v &&
-                        (d1_sib ? !sib_bytes_ok :
-                         (!consume_prefix && !consume_0f && !struct_bytes_ok));
+// stages is genuinely blocked on bytes, not while D1 is merely waiting for
+// D2 to take its instruction.
+wire d1_bytes_blocked = !skel_v && !consume_prefix && !consume_0f &&
+                        !d1_struct_ready;
 wire d2_bytes_blocked = skel_v && !d2_window_valid && !bytes_ok;
 assign fetch_blocked = d1_bytes_blocked || d2_bytes_blocked;
 
@@ -549,13 +511,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         skel_window_raw_r <= 1'b0;
     end else if (q_flush) begin
         skel_window_valid_r <= 1'b0;
-    end else if (i_issue && skid_v) begin
-        skel_lit_r <= skid_raw_lo_r;
-        skel_raw_hi_r <= skid_raw_hi_r;
-        skel_raw_lit_off_r <= skid_raw_lit_off_r;
-        skel_window_valid_r <= skid_raw_valid_r;
-        skel_window_raw_r <= 1'b1;
-    end else if (promote_handoff_capture) begin
+    end else if (d1_handoff) begin
         skel_lit_r <= k1q[31:0];
         skel_raw_hi_r <= k1q[63:32];
         skel_raw_lit_off_r <= handoff_raw_lit_off;
@@ -589,18 +545,15 @@ always_comb begin
     push_entry.recipe_gpr_read_mask = recipe_gpr_read_mask(skel.entry);
 end
 
-dec_entry_t skid_entry;
-always_comb begin
-    skid_entry = skid.entry;
-    skid_entry.recipe_gpr_read_mask = recipe_gpr_read_mask(skid.entry);
-end
-
 assign d2_entry = push_entry;
 assign d2_push  = d2_complete;
 assign i_bus = push_entry;
 assign decq_empty = !skel_v;
-assign i_bus2 = skid_entry;
-assign decq_has2 = skel_v && skid_v && skid_one_d2;
+
+// Port B reads the incoming skeleton's entry word on the edge it is loaded,
+// so the word is resident for the instruction's whole D2 residency.
+assign pb_load = d1_handoff;
+assign pb_entry = handoff_d2.entry.entry_point;
 
 assign pop_now = d2_done;
 assign pop_len = skel.entry.length;
@@ -650,7 +603,7 @@ always @(posedge clk) begin
     if (D1_EVT && d1_handoff)
         $display("%0t D1HO op=%02x modrm=%02x len=%0d adv=%0d(sib=%b slen=%0d) litoff=%0d A=%0d/%0d B=%0d/%0d pcnt=%0d 0f=%b",
                  $time, handoff_work.entry.opcode, handoff_work.entry.modrm,
-                 handoff_work.entry.length, k1p_adv, d1_sib, struct_len,
+                 handoff_work.entry.length, k1p_adv, struct_work.need_sib, struct_len,
                  handoff_lit_off, handoff_work.lit1_kind, handoff_work.lit1_size,
                  handoff_work.lit2_kind, handoff_work.lit2_size,
                  prefix_count, prefix_0f);
@@ -683,15 +636,15 @@ endfunction
 
 assign decq_has_jmp_call =
     (d2_push && entry_jmp_call(push_entry)) ||
-    (skid_v && skid_one_d2 && entry_jmp_call(skid.entry)) ||
-    (d1_handoff && handoff_one_d2 && entry_jmp_call(d1_issue_entry));
+    // D1 holds a decoded instruction until D2 takes it.
+    (d1_preread_handoff && handoff_one_d2 && entry_jmp_call(d1_issue_entry));
 
 //=============================================================================
 // Structural Decode
 //=============================================================================
 
 task automatic build_struct_work(
-    input logic [45:0]    sensitivity_inputs,
+    input logic [53:0]    sensitivity_inputs,
     output decoder_work_t w,
     output logic [2:0]    s_len
 );
@@ -714,6 +667,8 @@ task automatic build_struct_work(
     logic        is_movzx_word;
     logic        is_xlat;
     logic        is_byte_operand;
+    logic [3:0]  len_opc;
+    logic [2:0]  len_disp;
     begin
         w = '0;
         s_len = 3'd1;
@@ -934,6 +889,21 @@ task automatic build_struct_work(
             end
         end
 
+        // The cursor advance is on the K1Q loop: take the opcode-side length
+        // from one flat table and the displacement from the raw ModR/M bits,
+        // in parallel, then add once. entry.length keeps the serial terms;
+        // the handoff check ties the two in simulation.
+        len_opc = d1_length_lookup(prefix_0f, opcode, data32, addr32,
+                                   modrm[5] | modrm[4]);
+        len_disp = (addr32 && (modrm[7:6] != 2'b11) && (modrm[2:0] == 3'b100))
+                 ? 3'd0 : modrm_disp_size(addr32, modrm, 8'h00, 1'b0);
+        w.body_len = {2'b00, len_opc[2:0]} +
+                     (len_opc[3] ? {2'b00, len_disp} : 5'd0);
+        // The D1 cursor advance: opcode side plus ModR/M side (SIB byte and
+        // displacement), two parallel table lookups and one add.
+        w.adv_len = {2'b00, len_opc[2:0]} +
+                    (len_opc[3] ? {2'b00, d1_modrm_length_lookup(addr32, modrm, sib_b[2:0])}
+                                : 5'd0);
         w.entry.length = {1'b0, prefix_count} + (prefix_0f ? 5'd1 : 5'd0) +
                          {2'b00, s_len} + {2'b00, disp_size} +
                          {2'b00, imm_total_size};
@@ -970,6 +940,7 @@ function automatic decoder_work_t capture_sib(input decoder_work_t in,
         out.entry.ea_uses_post_pop_esp = !in.entry.has_0f &&
             (in.entry.opcode == 8'h8F) && (sib_byte[2:0] == 3'b100);
         out.entry.length = in.entry.length + 5'd1 + {2'b00, disp_size};
+        out.body_len = in.body_len + 5'd1 + {2'b00, disp_size};
 
         if (disp_size != 3'd0) begin
             out.lit1_kind = LIT_DISP;

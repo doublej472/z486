@@ -57,6 +57,7 @@ module bus_unit
     input  logic dcache_req_is_device_mmio,
     input  logic [31:0] dcache_req_phys_addr,
     input  logic dcache_cpu_ready,
+    input  logic dcache_cpu_wr_ready,
     input  logic dcache_cpu_resp_valid,
     input  logic [31:0] dcache_cpu_dout,
     input  logic dcache_stores_drained,
@@ -148,11 +149,14 @@ wire ext_icache_accept = ext_valid_r && ready && (ext_src_r == EXT_SRC_ICACHE);
 wire direct_rd_resp_now = resp_valid &&
                           (direct_rd_pending || (ext_direct_accept && !ext_write_r));
 
-wire normal_req_accepted = normal_cache_req ? (dcache_cpu_ready && !fast_store_valid)
+// The L1 takes a write in more cycles than a read (behind another store's
+// lookup), so each request type sees its own registered ready.
+wire dcache_req_ready = dcache_req_write ? dcache_cpu_wr_ready : dcache_cpu_ready;
+wire normal_req_accepted = normal_cache_req ? (dcache_req_ready && !fast_store_valid)
                                             : ext_direct_accept;
 wire normal_req_complete = dcache_cpu_resp_valid ||
                            (normal_cache_req && dcache_req_write &&
-                            dcache_cpu_ready && !fast_store_valid) ||
+                            dcache_cpu_wr_ready && !fast_store_valid) ||
                            direct_rd_resp_now ||
                            (ext_direct_accept && ext_write_r);
 wire normal_read_complete = dcache_cpu_resp_valid || direct_rd_resp_now;

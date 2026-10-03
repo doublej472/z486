@@ -339,9 +339,6 @@ function automatic logic condition_true(input logic [3:0] cond,
     endcase
 endfunction
 
-// Optimizer-generated recipe lookup and entry-point-derived metadata.
-`include "ucode_recipes.svh"
-
 // Prefix enums
 typedef enum logic [1:0] {
     PREFIX_NOREPLOCK = 2'b00,
@@ -349,6 +346,9 @@ typedef enum logic [1:0] {
     PREFIX_REPNE     = 2'b10,  // F2
     PREFIX_REP       = 2'b11   // F3
 } prefix_replock_t;
+
+// Optimizer-generated recipe lookup and entry-point-derived metadata.
+`include "ucode_recipes.svh"
 
 typedef enum logic [2:0] {
     PREFIX_NOSEG = 3'b000,

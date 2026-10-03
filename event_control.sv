@@ -47,8 +47,7 @@ module event_control
     input  logic stall,
     input  logic repeat_active,
     input  logic q_flush,
-    input  logic d2_valid,
-    input  logic d2_waited_r,
+    input  logic d2_resident,      // an instruction occupies D2 (port A or port B)
     input  logic i_issue,
     input  logic i_first,
     input  logic i_rni,
@@ -251,12 +250,12 @@ assign gate_detect_cond = pe && (uc_buscode == BUSOP_SDEL) &&
                           (desc_raw_hi[11:8] == 4'hC);
 assign gate_detect_now = uc_exec && gate_detect_cond;
 
-assign seq_advance = ((((i_issue && !d2_waited_r) | uc_exec |
+assign seq_advance = (((i_issue | uc_exec |
                         direct_wb_retire) |
                        (fault_suppress_delay_slot & !stall)) &
                       !halted && !repeat_active);
 
-// Fault redirects override macro and chained entries. A page fault has priority over a
+// Fault redirects override the port-B continuation. A page fault has priority over a
 // simultaneous segment/general-protection fault, matching the original tree.
 always_comb begin
     seq_fault_redirect = '0;
@@ -390,7 +389,7 @@ always_ff @(posedge clk) begin
             dbg_first_done <= 1'b1;
             if (single_step)
                 halted <= 1'b1;
-            if (!i_issue && !d2_valid)
+            if (!i_issue)
                 uc_active <= 1'b0;
         end
 
@@ -464,7 +463,7 @@ end
 
 // synthesis translate_off
 always @(posedge clk)
-    if (reset_n && throttle_parked_r && !d2_valid)
+    if (reset_n && throttle_parked_r && !d2_resident)
         $fatal(1, "throttle parked without a resident D2 successor");
 
 // RPTI marks its restarted instruction by writing EIP before presenting an

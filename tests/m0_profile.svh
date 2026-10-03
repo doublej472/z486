@@ -15,6 +15,25 @@ longint m0_supply_control [0:5];
 longint m0_supply_length [0:15];
 longint m0_supply_crossing [0:1];
 longint m0_supply_demand [0:1];
+// Data-access routes into the D-cache, one count per accepted access:
+// 0 VIPT direct load issue, 1 VIPT replay probe, 2 VIPT slow (paging) submit,
+// 3 RD_FAST RMW issue, 4 WR_FAST store, 5 paging early read, 6 paging early
+// write, 7 paging PG_MEM_TLB access, 8 stall_mem cycles, 9 dcache_req refused.
+longint m0_mempath [0:9];
+// Dead slots whose successor was decoded but not loaded into D2 (chain
+// reason 2), split by what kept it from issuing in this cycle:
+// 0 D2 complete, no split EA: a decoded first uStep would issue it now (M2);
+// 1 D2 complete but a base+index+disp EA still needs its D2a cycle;
+// 2 successor in the skeleton, literals still being captured;
+// 3 successor still in D1 (direct D1 issue only): decoder latency (M1).
+longint m0_d2late [0:3];
+// Of bucket 0: the successor is a hardwired recipe that passes the chain
+// hazard rules (head_issue_safe), so it could take the dead slot directly.
+longint m0_d2late_safe;
+// Port B's word selected for EX (pb_slot) on an edge that issued nothing.
+longint m0_pb_slot_noissue;
+// Bucket 0 split by the successor's recipe early kind (0 = not hardwired).
+longint m0_d2late_kind [0:7];
 
 logic        m0_have_previous;
 longint      m0_previous_issue_cycle;
@@ -34,14 +53,13 @@ wire m0_dead_hardwired_slot =
 wire m0_instruction_supply_blocked =
     !dut.stall && !dut.throttle_hold &&
     (dut.decoder_fetch_blocked ||
-     ((!dut.uc_active || m0_dead_hardwired_slot) && !dut.d2_valid &&
-      !dut.d1_issue_direct && dut.decq_empty));
+     ((!dut.uc_active || m0_dead_hardwired_slot) && !dut.pb_valid &&
+      dut.decq_empty));
 wire m0_pf_request_launched = dut.prefetch_inst.spec_launch ||
                               dut.prefetch_inst.pf_can_fetch_after_flush ||
                               dut.prefetch_inst.pf_can_fetch;
 wire [5:0] m0_pf_bytes = dut.prefetch_inst.pf_byte_count;
-wire [1:0] m0_decq_depth = {1'b0, dut.decoder_inst.skel_v} +
-                            {1'b0, dut.decoder_inst.skid_v};
+wire [1:0] m0_decq_depth = {1'b0, dut.decoder_inst.skel_v};
 
 function automatic integer m0_interval_bin(input longint value);
     m0_interval_bin = value >= 16 ? 16 : value;
@@ -94,6 +112,11 @@ initial begin : m0_profile_init
         m0_supply_crossing[i] = 0;
         m0_supply_demand[i] = 0;
     end
+    for (integer i = 0; i < 10; i++) m0_mempath[i] = 0;
+    for (integer i = 0; i < 4; i++) m0_d2late[i] = 0;
+    m0_d2late_safe = 0;
+    m0_pb_slot_noissue = 0;
+    for (integer i = 0; i < 8; i++) m0_d2late_kind[i] = 0;
     m0_have_previous = 1'b0;
     m0_previous_control = 3'd0;
     m0_previous_crossing = 1'b0;
@@ -121,6 +144,19 @@ always @(posedge clk) begin : m0_profile_sample
 
         if (dut.q_flush)
             m0_after_flush = 1'b1;
+
+        if (dut.vipt_issue_load)                         m0_mempath[0] += 1;
+        if (dut.vipt_replay_try)                         m0_mempath[1] += 1;
+        if (dut.vipt_slow_submit)                        m0_mempath[2] += 1;
+        if (dut.rd_fast_issue)                           m0_mempath[3] += 1;
+        if (dut.fast_store_accepted)                     m0_mempath[4] += 1;
+        if (dut.paging_inst.early_rd_accept)             m0_mempath[5] += 1;
+        if (dut.paging_inst.early_wr_accept)             m0_mempath[6] += 1;
+        if (dut.paging_inst.req_mem_dcache_accept)       m0_mempath[7] += 1;
+        if (dut.stall_mem)                               m0_mempath[8] += 1;
+        if (dut.pb_slot && !dut.i_issue && !dut.stall)   m0_pb_slot_noissue += 1;
+        if (dut.paging_inst.dcache_req_valid && !dut.paging_inst.dcache_req_accepted)
+                                                         m0_mempath[9] += 1;
 
         // Issue-to-issue intervals.  Control-transfer classes are exclusive;
         // load and store successor boundaries are additional orthogonal rows.
@@ -177,12 +213,11 @@ always @(posedge clk) begin : m0_profile_sample
                      dut.single_step || dut.any_fault_issue ||
                      dut.interrupt_entry)
                 chain_reason = 9;
-            else if (!dut.d2_valid && dut.decoder_fetch_blocked)
+            else if (!dut.pb_valid && dut.decoder_fetch_blocked)
                 chain_reason = 3;
-            else if (!dut.d2_valid && dut.decq_empty &&
-                     !dut.d1_issue_direct)
+            else if (!dut.pb_valid && dut.decq_empty)
                 chain_reason = 1;
-            else if (!dut.d2_valid)
+            else if (!dut.pb_valid)
                 chain_reason = 2;
             else if (!dut.d2_payload_ready)
                 chain_reason = 3;
@@ -206,12 +241,27 @@ always @(posedge clk) begin : m0_profile_sample
                      dut.pf_spec_owner_r)
                 chain_reason = 8;
             else if (!dut.hardwired_control_inst.issue_recipe.hardwired ||
-                     dut.d2_waited_r || dut.throttle_hold || dut.stall_d2 ||
+                     dut.throttle_hold || 1'b0 ||
                      !dut.d2_ready)
                 chain_reason = 6;
             else
                 chain_reason = 11;
             m0_chain_block[chain_reason] += 1;
+            if (chain_reason == 2) begin
+                if (dut.decq_empty)
+                    m0_d2late[3] += 1;
+                else if (!dut.d2_push)
+                    m0_d2late[2] += 1;
+                else if (dut.d2_entry.ea_complex)
+                    m0_d2late[1] += 1;
+                else begin
+                    m0_d2late[0] += 1;
+                    m0_d2late_kind[dut.hardwired_control_inst.issue_recipe.hardwired
+                        ? z486_pkg::recipe_early_kind(dut.i_bus.entry_point) : 3'd0] += 1;
+                    if (dut.hardwired_control_inst.head_issue_safe)
+                        m0_d2late_safe += 1;
+                end
+            end
         end
 
         // Count only empty/insufficient frontend states that currently block
@@ -271,6 +321,14 @@ end
 
 final begin : m0_profile_report
     if ($test$plusargs("profile_m0")) begin
+        for (integer i = 0; i < 10; i++)
+            $display("M0_MEMPATH %0d %0d", i, m0_mempath[i]);
+        for (integer i = 0; i < 4; i++)
+            $display("M0_D2LATE %0d %0d", i, m0_d2late[i]);
+        $display("M0_D2LATE_SAFE %0d", m0_d2late_safe);
+        $display("M0_PB_SLOT_NOISSUE %0d", m0_pb_slot_noissue);
+        for (integer i = 0; i < 8; i++)
+            $display("M0_D2LATE_KIND %0d %0d", i, m0_d2late_kind[i]);
         for (integer i = 0; i < 12; i++)
             $display("M0_CHAIN %0d %0d", i, m0_chain_block[i]);
         for (integer i = 0; i < 9; i++) begin

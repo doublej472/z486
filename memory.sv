@@ -94,6 +94,7 @@ module memory #(
 
 wire [31:0] dcache_cpu_dout;
 wire dcache_cpu_ready;
+wire dcache_cpu_wr_ready;
 wire dcache_cpu_resp_valid;
 wire [31:0] dcache_mem_addr;
 wire [3:0] dcache_mem_be;
@@ -164,6 +165,7 @@ cache_unit #(.PROTECT_UMA_ROM(PROTECT_UMA_ROM), .DCACHE_SET_BITS(DCACHE_SET_BITS
     .dcache_req_is_device_mmio(dcache_req_is_device_mmio),
     .dcache_req_phys_addr(dcache_req_phys_addr),
     .dcache_cpu_ready(dcache_cpu_ready),
+    .dcache_cpu_wr_ready(dcache_cpu_wr_ready),
     .dcache_cpu_resp_valid(dcache_cpu_resp_valid),
     .dcache_cpu_dout(dcache_cpu_dout),
     .dcache_stores_drained(dcache_stores_drained),
@@ -225,6 +227,7 @@ bus_unit #(.ENABLE_X87(ENABLE_X87)) bus_unit_inst (
     .dcache_req_is_device_mmio(dcache_req_is_device_mmio),
     .dcache_req_phys_addr(dcache_req_phys_addr),
     .dcache_cpu_ready(dcache_cpu_ready),
+    .dcache_cpu_wr_ready(dcache_cpu_wr_ready),
     .dcache_cpu_resp_valid(dcache_cpu_resp_valid),
     .dcache_cpu_dout(dcache_cpu_dout),
     .dcache_stores_drained(dcache_stores_drained),
