@@ -1249,7 +1249,7 @@ endtask
 
 // synthesis translate_off
 always_ff @(posedge clk)
-    if (reset_n && fast_opr_commit && dcache_read_complete &&
+    if (reset_n && fast_opr_commit && dcache_read_complete && !opr_is_walk_r &&
         !opr_is_write_r && !opr_suppress_r)
         $fatal(1, "simultaneous demand and RD_FAST OPR_R commits");
 // synthesis translate_on

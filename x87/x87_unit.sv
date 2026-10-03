@@ -34,7 +34,17 @@ module x87_unit #(
     input  logic        direct_launch,      // Instruction issue checks the m32 overlay.
     input  logic        direct_candidate,   // Recipe is an eligible m32 x87 form.
     input  logic        direct_allowed,     // CR0 and runtime policy permit x87 use.
-    input  logic [10:0] direct_fop,         // FOP paired with the direct operand.
+    input  logic [10:0] direct_fop,         // FOP of the executing instruction.
+    input  logic        direct_reg,         // The issuing x87 form is a register form.
+    input  logic        direct_store,       // ...an m32 store (FST/FSTP/FIST/FISTP m32).
+    input  logic        direct_data32,      // ...in 32-bit operand size.
+    input  logic        store_word,         // The store overlay's command/read word is current.
+    input  logic        store_go,           // ...and its destination check completed (no memory stall).
+    output logic        store_opr_commit,   // The store result arrived: write OPR_R.
+    output logic        store_hold,         // Hold the ROM at the store word until then.
+    output logic [31:0] store_opr_data,
+    output logic        direct_taken,       // The issued x87 overlay went direct.
+    output logic        direct_reg_taken,   // ...as a register form (no operand).
     output logic        direct_active,      // One direct transport owns instruction issue.
     output logic        direct_mem_req,     // Launch fault-checked demand read through paging.
     output logic        direct_stall,       // Hold retirement until control accepts the operand.
@@ -60,10 +70,36 @@ logic        direct_crossing_r;    // Dword spans two naturally aligned memory w
 logic        direct_data_valid_r;  // Complete fault-checked operand is buffered.
 logic [31:0] direct_data_r;        // Buffered direct m32 operand.
 wire         direct_valid = direct_active && direct_data_valid_r;
+// Register forms: the FOP is posted to the bridge as a command write, in the
+// executing instruction's first cycle. Taken only when the 386 routine would
+// post it at once: CR0 allows x87 use, no unmasked exception is pending, the
+// x87 is idle or may queue one command, and the bridge is free (no posted or
+// direct command still waiting), so the bridge accepts it immediately.
+logic        direct_reg_r;         // The issued instruction took the register path.
+logic        dcmd_pending_r;       // ...and its command awaits bridge acceptance.
+logic        posted_pending;       // The bridge holds a posted write.
+logic        br_accepted, br_complete;
+logic        br_read_complete;
+logic [31:0] br_rdata;
+// m32 stores: in the store word, post the FOP, then read the result from the
+// data port; the sequencer holds in that word until it arrives.
+typedef enum logic [1:0] {ST_IDLE, ST_CMD, ST_READ, ST_DONE} st_state_t;
+st_state_t   st_state;
+logic        direct_st_r;          // The issued instruction took the store path.
+wire         st_cmd = direct_st_r && store_go && !cancel &&
+                      (st_state == ST_IDLE || st_state == ST_CMD);
+wire         st_read_req = (st_state == ST_READ);
+logic        st_read_issued_r;     // The bridge accepted the result read.
+wire         dcmd_sel = dcmd_pending_r || st_cmd || st_read_req;
+wire         own_cmd = dcmd_pending_r || st_cmd;     // a command write (F8)
+wire         own_read = st_read_req && !st_read_issued_r;
+assign direct_taken = direct_active || direct_reg_r || direct_st_r;
+assign direct_reg_taken = direct_reg_r;
 wire         direct_release = direct_valid && direct_ready;
 
 assign direct_mem_req = direct_active && !direct_issued_r && !direct_data_valid_r;
-assign direct_stall = direct_active && !direct_release;
+assign store_hold = direct_st_r && store_word && (st_state != ST_DONE);
+assign direct_stall = (direct_active && !direct_release) || store_hold;
 
 generate
 if (ENABLE_X87) begin : gen_x87
@@ -80,13 +116,32 @@ if (ENABLE_X87) begin : gen_x87
     wire        read_req_ready;
     wire        read_resp_valid;
     wire [31:0] read_resp_data;
+    wire        ctl_busy_n, ctl_pereq;
+    // A posted port write is the x87's as soon as the bridge accepts it: until
+    // it dispatches, report BUSY# and PEREQ as control does for an accepted
+    // command, so the coprocessor-wait microcode samples a settled protocol.
+    assign busy_n = ctl_busy_n && !posted_pending;
+    assign pereq  = ctl_pereq || posted_pending;
 
+    // The direct command has the bridge to itself: no ESC routine (the only
+    // source of paging's x87 cycles) runs while it waits. Paging sees neither
+    // its acceptance nor its completion.
+    assign req_accepted = br_accepted && !dcmd_sel;
+    assign req_complete = br_complete && !dcmd_sel;
+    assign req_read_complete = br_read_complete && !dcmd_sel;
+    assign req_rdata = br_rdata;
+    assign store_opr_commit = st_read_req && br_read_complete;
+    assign store_opr_data = br_rdata;
     x87_bridge bridge (
         .clk(clk), .reset(!reset_n),
-        .req_valid(req_valid), .req_data_port(req_data_port),
-        .req_write(req_write), .req_be(req_be), .req_wdata(req_wdata),
-        .req_accepted(req_accepted), .req_complete(req_complete),
-        .req_read_complete(req_read_complete), .req_rdata(req_rdata),
+        .req_valid(own_cmd || own_read || (!dcmd_sel && req_valid)),
+        .req_data_port(own_cmd ? 1'b0 : own_read ? 1'b1 : req_data_port),
+        .req_write(own_cmd || (!dcmd_sel && req_write)),
+        .req_be(own_cmd ? 4'h3 : own_read ? 4'hF : req_be),
+        .req_wdata(own_cmd ? {21'd0, direct_fop} : req_wdata),
+        .req_accepted(br_accepted), .req_complete(br_complete),
+        .req_read_complete(br_read_complete), .req_rdata(br_rdata),
+        .posted_pending(posted_pending),
         .cmd_valid(cmd_valid), .cmd_fop(cmd_fop), .cmd_ready(cmd_ready),
         .word_in_valid(word_in_valid), .word_in_be(word_in_be),
         .word_in_data(word_in_data), .word_in_ready(word_in_ready),
@@ -107,12 +162,19 @@ if (ENABLE_X87) begin : gen_x87
         .read_req_data_port(read_req_data_port), .read_req_be(read_req_be),
         .read_req_ready(read_req_ready), .read_resp_valid(read_resp_valid),
         .read_resp_data(read_resp_data),
-        .busy_n(busy_n), .pereq(pereq), .error_n(error_n),
+        .busy_n(ctl_busy_n), .pereq(ctl_pereq), .error_n(error_n),
         .queue_safe(queue_safe), .debug_state(debug_state)
     );
 end else begin : gen_no_x87
     assign req_accepted = 1'b0;
     assign req_complete = 1'b0;
+    assign store_opr_commit = 1'b0;
+    assign store_opr_data = 32'h0;
+    assign br_accepted = 1'b0;
+    assign br_read_complete = 1'b0;
+    assign br_rdata = 32'h0;
+    assign br_complete = 1'b0;
+    assign posted_pending = 1'b0;
     assign req_read_complete = 1'b0;
     assign req_rdata = 32'h0;
     assign busy_n = 1'b1;
@@ -126,6 +188,11 @@ endgenerate
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
+        direct_st_r         <= 1'b0;
+        st_state            <= ST_IDLE;
+        st_read_issued_r    <= 1'b0;
+        direct_reg_r        <= 1'b0;
+        dcmd_pending_r      <= 1'b0;
         direct_active       <= 1'b0;
         direct_issued_r     <= 1'b0;
         direct_crossing_r   <= 1'b0;
@@ -138,9 +205,34 @@ always_ff @(posedge clk) begin
             direct_data_valid_r <= 1'b0;
         end
 
+        if (dcmd_pending_r && br_accepted)
+            dcmd_pending_r <= 1'b0;
+
+        case (st_state)
+            ST_IDLE: if (st_cmd) st_state <= br_accepted ? ST_READ : ST_CMD;
+            ST_CMD:  if (br_accepted) st_state <= ST_READ;
+            ST_READ: begin
+                if (own_read && br_accepted) st_read_issued_r <= 1'b1;
+                if (br_read_complete) begin
+                    st_state <= ST_DONE;
+                    st_read_issued_r <= 1'b0;
+                end
+            end
+            ST_DONE: if (!store_word) st_state <= ST_IDLE;
+        endcase
+
         if (direct_launch) begin
-            direct_active       <= ENABLE_X87 && direct_candidate &&
-                                 direct_allowed && queue_safe;
+            direct_active       <= ENABLE_X87 && direct_candidate && !direct_reg &&
+                                 !direct_store && direct_allowed && queue_safe;
+            direct_st_r         <= ENABLE_X87 && direct_candidate && direct_store && direct_data32 &&
+                                 direct_allowed && error_n && (busy_n || queue_safe) &&
+                                 !posted_pending && !dcmd_pending_r && (st_state == ST_IDLE);
+            direct_reg_r        <= ENABLE_X87 && direct_candidate && direct_reg &&
+                                 direct_allowed && error_n && (busy_n || queue_safe) &&
+                                 !posted_pending && !dcmd_pending_r;
+            dcmd_pending_r      <= ENABLE_X87 && direct_candidate && direct_reg &&
+                                 direct_allowed && error_n && (busy_n || queue_safe) &&
+                                 !posted_pending && !dcmd_pending_r;
             direct_issued_r     <= 1'b0;
             direct_crossing_r   <= 1'b0;
             direct_data_valid_r <= 1'b0;
@@ -160,6 +252,11 @@ always_ff @(posedge clk) begin
         end
 
         if (cancel) begin
+            direct_st_r         <= 1'b0;
+            st_state            <= ST_IDLE;
+            st_read_issued_r    <= 1'b0;
+            direct_reg_r        <= 1'b0;
+            dcmd_pending_r      <= 1'b0;
             direct_active       <= 1'b0;
             direct_issued_r     <= 1'b0;
             direct_data_valid_r <= 1'b0;

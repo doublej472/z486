@@ -116,6 +116,8 @@ module data_unit
     output logic [31:0] ea_index_value,           // Index GPR value for address unit
     input  logic [31:0] forwarded_esp,            // ESP including pending stack update
     output logic [7:0]  pend_write_mask,          // GPRs a late producer writes on this edge
+    input  logic        x87_reg_commit,           // a direct register-form x87 op records FIP/FCS/FOP
+    input  logic        x87_store_commit,         // a direct m32 store records FIP/FCS:FOP/operand
     input  logic [31:0] ind,
     input  logic [31:0] ea,
 
@@ -730,6 +732,22 @@ always_ff @(posedge clk) begin
 
         if (aluop == ALUJMP_PTSELE && !gate_detect)
             tmph <= alu_dst;
+
+        // The 4CE/4CF/4D0 moves of the original routine, for a register-form
+        // x87 instruction that posted its command directly.
+        if (x87_reg_commit) begin
+            fsveip <= tmpeip;
+            csopcd <= {16'd0, cs};
+            tmpf   <= {21'd0, instr.fop};
+        end
+        // The store routine's moves: CSOPCD = FOP << 16 | CS (53D/555/557),
+        // OPROFF = the operand offset (53E/575), FSVeIP (56E), TMPF (56A).
+        if (x87_store_commit) begin
+            fsveip <= tmpeip;
+            csopcd <= {5'd0, instr.fop, cs};
+            oproff <= ind;
+            tmpf   <= {21'd0, instr.fop};
+        end
 
         if (gate_detect) begin
             tmpb <= desc_raw_hi;

@@ -29,6 +29,7 @@ DEST_USTEP_RPTI_EIP = 0x6D # Optimizer-owned: restart EIP write.
 DEST_USTEP_TASK_CS = 0x6E  # Optimizer-owned: task load establishes CS RPL.
 DEST_USTEP_FAULT_DONE = 0x6F # Optimizer-owned: fault delivery completion.
 DEST_USTEP_INVLPG = 0x70   # Optimizer-owned: invalidate one TLB page.
+DEST_USTEP_X87_STORE = 0x71 # Optimizer-owned: x87 store command and result read.
 DEST_USTEP_ALU = 0x7E       # Optimizer-owned: commit this word's ALU result to DSTREG.
 DEST_USTEP_BSWAP = 0x7C     # Optimizer-owned: byte-swap SRCREG into itself.
 ALUJMP_JDESCA = 0x20        # Optimizer-owned: jump if descriptor A bit is set.
@@ -82,13 +83,15 @@ class OverlayQualifier(IntEnum):
     X87_M32_FLOAT = 1
     RMW_MEMORY = 2
     RMW_UNARY = 3
+    X87_REG = 4
+    X87_ST_M32 = 5
 
 
 class RecipeAction(IntEnum):
     """Registered D2 actions selected by optimizer-owned entry addresses."""
 
     NONE = 0
-    X87_M32_LOAD = 1
+    X87_OVERLAY = 1
     INVLPG = 2
     RMW_FAST = 3
 
@@ -161,6 +164,33 @@ PATCHES = [
           copy_from=0x20E),
     Patch(0x9C6, "x87 m32 direct-load overlay: retire after x87 queue accepts operand",
           copy_from=0x20F),
+
+    # Register-form FP instructions (4C1) post their FOP straight to the
+    # integrated x87; hardware records FIP/FCS/FOP (the 4CE/4CF/4D0 moves) when
+    # the direct path is taken, so neither word writes state and the fallback
+    # to the original 4C1 routine is clean.
+    Patch(0x9D1, "x87 register direct overlay: command posted at issue",
+          copy_from=0x20E),
+    Patch(0x9D2, "x87 register direct overlay: retire",
+          copy_from=0x20F),
+
+    # FST/FSTP/FIST/FISTP m32 (53C) in 32-bit code: check the destination for
+    # writing first (FSTP pops, so the store must not fault after the
+    # command), then hardware posts the FOP and reads the result into OPR_R,
+    # and the word after writes it back. The first two words write nothing,
+    # so the fallback to 53C (whose protection test raises #NM first) is clean.
+    Patch(0x9D3, "x87 m32 store overlay: fallback point",
+          copy_from=0x20E),
+    Patch(0x9D4, "x87 m32 store overlay: fallback delay slot",
+          copy_from=0x20E),
+    Patch(0x9D5, "x87 m32 store overlay: check the destination for writing",
+          copy_from=0x030, fields=dict(bus=0x0A)),
+    Patch(0x9D6, "x87 m32 store overlay: after the check (DLY), command and result read into OPR_R",
+          copy_from=0x030, fields=dict(dst=DEST_USTEP_X87_STORE, sub=0)),
+    Patch(0x9D7, "x87 m32 store overlay: write the result back and retire",
+          copy_from=0x0AE, fields=dict(op=0)),
+    Patch(0x9D8, "x87 m32 store overlay: RNI delay slot waits for the write",
+          copy_from=0x047),
 
     # Cached RMW alternate entries. RD_FAST/WR_FAST are semantic actions owned
     # by the entry, while the ordinary fields keep ALU, flags, OPR_R/OPR_W and
@@ -455,8 +485,16 @@ HARDWIRED_RECIPES = [
 OVERLAY_RECIPES = [
     OverlayRecipe("x87-m32-load", 0x4D7, 0x9C5, EarlyKind.LOAD,
                   (0x9C5, 0x9C6), OverlayQualifier.X87_M32_FLOAT,
-                  RecipeAction.X87_M32_LOAD, "x87-direct-m32",
+                  RecipeAction.X87_OVERLAY, "x87-direct-m32",
                   ("ea", "paging", "x87-order")),
+    OverlayRecipe("x87-reg", 0x4C1, 0x9D1, EarlyKind.NONE,
+                  (0x9D1, 0x9D2), OverlayQualifier.X87_REG,
+                  RecipeAction.X87_OVERLAY, "x87-direct-reg",
+                  ("x87-order",)),
+    OverlayRecipe("x87-st-m32", 0x53C, 0x9D3, EarlyKind.SEQ,
+                  (0x9D3, 0x9D4, 0x9D5, 0x9D6, 0x9D7, 0x9D8), OverlayQualifier.X87_ST_M32,
+                  RecipeAction.X87_OVERLAY, "x87-direct-store",
+                  ("ea", "paging", "x87-order"), True),
     OverlayRecipe("rmw-m-r-fast", 0x04A, 0x9CB, EarlyKind.RMW,
                   (0x9CB, 0x9CC, 0x9CD), OverlayQualifier.RMW_MEMORY,
                   RecipeAction.RMW_FAST, "store/flags",
@@ -596,8 +634,8 @@ def validate_recipes(words: list[int]) -> None:
             raise ValueError(f"overlay {recipe.name}: source and overlay entries match")
         if recipe.action == RecipeAction.NONE:
             raise ValueError(f"overlay {recipe.name}: invalid action {recipe.action}")
-        if not 1 <= len(recipe.targets) <= 3 or recipe.targets[0] != recipe.entry:
-            raise ValueError(f"overlay {recipe.name}: target must be 1..3 words from its entry")
+        if not 1 <= len(recipe.targets) <= 6 or recipe.targets[0] != recipe.entry:
+            raise ValueError(f"overlay {recipe.name}: target must be 1..6 words from its entry")
         for addr in recipe.targets:
             if not 0 <= addr < ROM_DEPTH or words[addr] == default_word:
                 raise ValueError(f"overlay {recipe.name}: invalid target word 0x{addr:03X}")
@@ -673,6 +711,11 @@ def render_recipe_svh(words: list[int]) -> str:
     def overlay_qualifier_expr(recipe: OverlayRecipe) -> str:
         if recipe.qualifier == OverlayQualifier.X87_M32_FLOAT:
             return "(opcode == 8'hD8) || ((opcode == 8'hD9) && (modrm[5:3] == 3'd0))"
+        if recipe.qualifier == OverlayQualifier.X87_REG:
+            return "modrm[7:6] == 2'b11"
+        if recipe.qualifier == OverlayQualifier.X87_ST_M32:
+            return "(modrm[7:6] != 2'b11) && ((opcode == 8'hD9) || (opcode == 8'hDB)) && " \
+                   "((modrm[5:3] == 3'd2) || (modrm[5:3] == 3'd3))"
         if recipe.qualifier == OverlayQualifier.RMW_UNARY:
             return "(modrm[7:6] != 2'b11) && ((((opcode == 8'hF6) || (opcode == 8'hF7)) && " \
                    "((modrm[5:3] == 3'd2) || (modrm[5:3] == 3'd3))) || " \
@@ -1032,11 +1075,12 @@ def render_recipe_svh(words: list[int]) -> str:
         "            end",
     ]
     for recipe in OVERLAY_RECIPES:
-        if recipe.action == RecipeAction.X87_M32_LOAD:
+        if recipe.action == RecipeAction.X87_OVERLAY:
+            uses_ea = "1'b0" if recipe.qualifier == OverlayQualifier.X87_REG else "1'b1"
             lines += [
                 f"            12'h{recipe.entry:03X}: begin",
-                "                // Variable-latency direct transport; normal sequencer retirement.",
-                "                r.commit_sel = RECIPE_ACTION_X87_DIRECT; r.uses_ea = 1'b1;",
+                "                // Direct x87 transport; normal sequencer retirement.",
+                f"                r.commit_sel = RECIPE_ACTION_X87_DIRECT; r.uses_ea = {uses_ea};",
                 "            end",
             ]
         elif recipe.action == RecipeAction.RMW_FAST:

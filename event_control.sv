@@ -55,7 +55,7 @@ module event_control
     input  logic direct_wb_retire,
     input  logic rmw_fallback_delay_r,
     input  logic throttle_parked_r,
-    input  logic x87_direct_active,
+    input  logic x87_direct_taken,   // the x87 overlay went direct at issue
 
     // Decoder: D2 entry and the EX instruction register
     input  dec_entry_t i_bus,
@@ -243,8 +243,8 @@ end
 // the following overlay word is the architectural jump delay slot.
 assign recipe_fallback_taken =
     (uc_exec && i_first &&
-     (i.ucode_action == RECIPE_ACTION_X87_M32_LOAD) &&
-     !x87_direct_active) || rmw_fallback_delay_r;
+     (i.ucode_action == RECIPE_ACTION_X87_OVERLAY) &&
+     !x87_direct_taken) || rmw_fallback_delay_r;
 assign gate_detect_cond = pe && (uc_buscode == BUSOP_SDEL) &&
                           !gate_in_progress && !desc_raw_hi[12] &&
                           (desc_raw_hi[11:8] == 4'hC);

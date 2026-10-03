@@ -1528,13 +1528,25 @@ always_ff @(posedge clk) begin
                         sticky_r <= operand.round_bit ||
                                     operand.sticky_bit;
                     end else begin
+                        // Align to the integer point in one step, as the
+                        // 4/1-bit loop would: guard takes the last bit shifted
+                        // out, sticky every bit below it. The count is then
+                        // zero and the right-shift loop is skipped.
+                        logic [5:0]  sc;
+                        logic [67:0] aligned_in;
+                        logic        lower_sticky;
                         shift_count = 17'sd52 - unbiased_r;
-                        count_r <= (shift_count > 17'sd54) ? 6'd54
-                                                          : 6'(shift_count);
-                        guard_r <= 1'b0;
+                        sc = (shift_count > 17'sd54) ? 6'd54 : 6'(shift_count);
+                        aligned_in = {15'h0, operand.sig};
+                        lower_sticky = 1'b0;
+                        for (int b = 0; b < 54; b++)
+                            if ((b + 1) < int'(sc) && aligned_in[b]) lower_sticky = 1'b1;
+                        work_r <= aligned_in >> sc;
+                        count_r <= 6'd0;
+                        guard_r <= (sc != 6'd0) ? aligned_in[sc - 6'd1] : 1'b0;
                         sticky_r <= operand.guard_bit ||
                                     operand.round_bit ||
-                                    operand.sticky_bit;
+                                    operand.sticky_bit || lower_sticky;
                     end
                 end
 
@@ -1637,16 +1649,27 @@ always_ff @(posedge clk) begin
                 X87_PREPARE_FILD: begin
                     logic signed [63:0] signed_input;
                     logic [63:0] magnitude;
+                    logic [5:0]  lead;      // left shift that puts the MSB at bit 52
                     signed_input = sized_integer(transfer_in, integer_size);
                     magnitude = signed_input[63] ? (~signed_input + 64'd1)
                                                  : signed_input;
+                    // An integer below 2^52 normalizes exactly by a left shift:
+                    // do it here, in one step, instead of the 4/1-bit loop
+                    // (the loop then has nothing to do and is skipped).
+                    lead = 6'd0;
+                    for (int b = 0; b <= 52; b++)
+                        if (magnitude[b]) lead = 6'(52 - b);
                     result_r <= x87_zero(1'b0);
                     direct_ready_r <= signed_input == 0;
                     shift_right_r <= |magnitude[63:53];
-                    shift_left_r <= (magnitude != 0) &&
-                                    !(|magnitude[63:52]);
-                    work_r <= {4'h0, magnitude};
-                    format_exp_r <= 17'sd16435;
+                    shift_left_r <= 1'b0;
+                    if ((magnitude != 0) && !(|magnitude[63:52])) begin
+                        work_r <= {4'h0, magnitude << lead};
+                        format_exp_r <= 17'sd16435 - 17'(lead);
+                    end else begin
+                        work_r <= {4'h0, magnitude};
+                        format_exp_r <= 17'sd16435;
+                    end
                     guard_r <= 1'b0;
                     round_r <= 1'b0;
                     sticky_r <= 1'b0;

@@ -15,6 +15,7 @@ module tb_x87_bridge;
     logic req_complete;
     logic req_read_complete;
     logic [31:0] req_rdata;
+    logic        posted_pending;
 
     logic cmd_valid;
     logic [10:0] cmd_fop;
@@ -48,6 +49,9 @@ module tb_x87_bridge;
         #1;
         if (!req_accepted)
             $fatal(1, "x87 bridge did not accept idle request");
+        // Writes are posted: they complete on acceptance.
+        if (write_req && (!req_complete || req_read_complete))
+            $fatal(1, "x87 bridge posted write did not complete on acceptance");
         @(negedge clk);
         req_valid = 1'b0;
     end
@@ -67,15 +71,17 @@ module tb_x87_bridge;
         repeat (4) @(posedge clk);
         reset <= 1'b0;
 
-        // Command writes are held until the sidecar accepts them.
+        // Command writes are held until the sidecar accepts them; the bridge
+        // reports the posted write pending until then.
         begin_req(32'h8000_00f8, 1'b1, 4'h3, 32'h0000_03e3);
         repeat (2) @(negedge clk);
-        if (!cmd_valid || cmd_fop != 11'h3e3)
+        if (!cmd_valid || cmd_fop != 11'h3e3 || !posted_pending)
             $fatal(1, "x87 command stream mismatch");
         cmd_ready = 1'b1;
         @(negedge clk);
         cmd_ready = 1'b0;
-        wait_complete(1'b0, 32'h0);
+        if (posted_pending)
+            $fatal(1, "x87 bridge posted write still pending after dispatch");
 
         // Operand words preserve their width and data.
         begin_req(32'h8000_00fc, 1'b1, 4'hf, 32'h4004_0000);
@@ -85,7 +91,8 @@ module tb_x87_bridge;
         word_in_ready = 1'b1;
         @(negedge clk);
         word_in_ready = 1'b0;
-        wait_complete(1'b0, 32'h0);
+        if (posted_pending)
+            $fatal(1, "x87 bridge posted operand still pending after dispatch");
 
         // Read request and response are independently backpressured.
         begin_req(32'h8000_00fc, 1'b0, 4'h3, 32'h0);

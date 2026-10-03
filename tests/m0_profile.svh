@@ -38,7 +38,32 @@ longint m0_pb_slot_noissue;
 //   3 successor class not B1-eligible  4 successor unsafe (flags/EA/hazard)
 //   5 eligible-from-issue but other     6 predecessor issue not hardwired/shape
 longint m0_unclass [0:6];
-longint m0_unsafe [0:3];   // flags, EA vs predecessor, pending load commit, pending shift
+longint m0_unsafe [0:3];
+// A direct load's first word (a dead slot) left unused:
+//   0 total  1 no D2 instruction  2 D2 payload incomplete  3 EA interlock on a
+//   pending load  4 eligibility register low  5 D2 not ready  6 issued late terms
+//   (pb_load_ready/throttle/interrupt)  7 other
+longint m0_ldslot [0:7];
+// ...eligibility low, by the term at the load's issue: 0 successor not taken
+// from D1  1 class  2 unsafe  3 M3 ALU-result read  4 POP ESP base  5 RET  6 other
+longint m0_ldelig [0:6];
+logic   m0_iss_aluconf, m0_iss_popesp, m0_iss_ret;
+logic [8:0] m0_iss_nextop;              // {has_0f, opcode} of the successor at issue
+longint m0_ldclass_op [0:511];
+logic   m0_iss_nexthw;
+longint m0_ldclass_nothw;
+// Cycles spent in ESC (x87) routines, by executing microcode address.
+longint m0_esc_uc [0:4095];
+longint m0_esc_uc_mem [0:4095];
+longint m0_esc_total, m0_esc_xbusy;
+logic   m0_x87_busy;
+generate
+    if (ENABLE_X87) begin : gen_m0_x87
+        assign m0_x87_busy = dut.x87.gen_x87.control.executor.busy;
+    end else begin : gen_m0_nox87
+        assign m0_x87_busy = 1'b0;
+    end
+endgenerate   // flags, EA vs predecessor, pending load commit, pending shift
 logic [3:0] m0_iss_unsafe;
 logic   m0_iss_pbload, m0_iss_type, m0_iss_safe, m0_iss_shape;
 // Bucket 0 split by the successor's recipe early kind (0 = not hardwired).
@@ -104,6 +129,12 @@ initial begin : m0_profile_init
     for (integer i = 0; i < 12; i++) m0_chain_block[i] = 0;
     for (integer i = 0; i < 7; i++) m0_unclass[i] = 0;
     for (integer i = 0; i < 4; i++) m0_unsafe[i] = 0;
+    for (integer i = 0; i < 8; i++) m0_ldslot[i] = 0;
+    for (integer i = 0; i < 7; i++) m0_ldelig[i] = 0;
+    for (integer i = 0; i < 512; i++) m0_ldclass_op[i] = 0;
+    m0_ldclass_nothw = 0;
+    for (integer i = 0; i < 4096; i++) begin m0_esc_uc[i] = 0; m0_esc_uc_mem[i] = 0; end
+    m0_esc_total = 0; m0_esc_xbusy = 0;
     for (integer i = 0; i < 9; i++) begin
         m0_supply_block[i] = 0;
         m0_starve_burst[i] = 0;
@@ -220,6 +251,14 @@ always @(posedge clk) begin : m0_profile_sample
             m0_iss_pbload = dut.hardwired_control_inst.pb_load;
             m0_iss_type   = dut.hardwired_control_inst.pbn_type;
             m0_iss_safe   = dut.hardwired_control_inst.pbn_safe;
+            m0_iss_aluconf = dut.hardwired_control_inst.pbn_load_alu_conf;
+            m0_iss_popesp = dut.hardwired_control_inst.load_pipe_pop &&
+                (dut.hardwired_control_inst.pb_next_ea.base_sel[4] ||
+                 dut.hardwired_control_inst.pb_next_ea.index_sel[4]);
+            m0_iss_ret = dut.hardwired_control_inst.load_pipe_ret;
+            m0_iss_nextop = {dut.hardwired_control_inst.pb_next_instr.has_0f,
+                             dut.hardwired_control_inst.pb_next_instr.opcode};
+            m0_iss_nexthw = dut.hardwired_control_inst.pbn_recipe.hardwired;
             m0_iss_unsafe[0] = dut.hardwired_control_inst.pbn_recipe.reads_flags &&
                                dut.hardwired_control_inst.issue_recipe.writes_flags &&
                                !dut.hardwired_control_inst.pbn_recipe.jcc;
@@ -240,6 +279,37 @@ always @(posedge clk) begin : m0_profile_sample
                 ((!dut.hardwired_control_inst.issue_recipe.multi_ustep &&
                   !dut.hardwired_control_inst.issue_recipe.jcc) ||
                  dut.hardwired_control_inst.issue_recipe.jcc);
+        end
+        if ((dut.i.opcode[7:3] == 5'b11011) && !dut.i.has_0f && dut.uc_active) begin
+            m0_esc_total += 1;
+            m0_esc_uc[dut.uc_addr] += 1;
+            if (dut.stall_mem) m0_esc_uc_mem[dut.uc_addr] += 1;
+            if (m0_x87_busy) m0_esc_xbusy += 1;
+        end
+        if (dut.hardwired_control_inst.pb_load_slot_r && !dut.i_issue && !dut.stall &&
+            !dut.q_flush) begin
+            m0_ldslot[0] += 1;
+            if (!dut.pb_valid)                                m0_ldslot[1] += 1;
+            else if (!dut.d2_push)                            m0_ldslot[2] += 1;
+            else if (dut.d2_vipt_ea_hazard)                   m0_ldslot[3] += 1;
+            else if (!dut.hardwired_control_inst.pb_b1_ok_r) begin
+                m0_ldslot[4] += 1;
+                if (!m0_iss_pbload)        m0_ldelig[0] += 1;
+                else if (!m0_iss_type) begin
+                    m0_ldelig[1] += 1;
+                    m0_ldclass_op[m0_iss_nextop] += 1;
+                    if (!m0_iss_nexthw) m0_ldclass_nothw += 1;
+                end
+                else if (!m0_iss_safe)     m0_ldelig[2] += 1;
+                else if (m0_iss_aluconf)   m0_ldelig[3] += 1;
+                else if (m0_iss_popesp)    m0_ldelig[4] += 1;
+                else if (m0_iss_ret)       m0_ldelig[5] += 1;
+                else                       m0_ldelig[6] += 1;
+            end
+            else if (!dut.d2_ready)                           m0_ldslot[5] += 1;
+            else if (!dut.pb_load_ready || dut.throttle_hold ||
+                     dut.interrupt_pending)                   m0_ldslot[6] += 1;
+            else                                              m0_ldslot[7] += 1;
         end
         if (m0_dead_hardwired_slot) begin
             m0_chain_block[0] += 1;
@@ -379,6 +449,17 @@ final begin : m0_profile_report
             $display("M0_UNCLASS %0d %0d", i, m0_unclass[i]);
         for (integer i = 0; i < 4; i++)
             $display("M0_UNSAFE %0d %0d", i, m0_unsafe[i]);
+        for (integer i = 0; i < 8; i++)
+            $display("M0_LDSLOT %0d %0d", i, m0_ldslot[i]);
+        for (integer i = 0; i < 7; i++)
+            $display("M0_LDELIG %0d %0d", i, m0_ldelig[i]);
+        $display("M0_LDCLASS_NOTHW %0d", m0_ldclass_nothw);
+        $display("M0_ESC_TOTAL %0d executor_busy %0d", m0_esc_total, m0_esc_xbusy);
+        for (integer i = 0; i < 4096; i++)
+            if (m0_esc_uc[i] > 20000)
+                $display("M0_ESC_UC %03x %0d mem %0d", i, m0_esc_uc[i], m0_esc_uc_mem[i]);
+        for (integer i = 0; i < 512; i++)
+            if (m0_ldclass_op[i] > 200) $display("M0_LDCLASS_OP %03x %0d", i, m0_ldclass_op[i]);
         for (integer i = 0; i < 8; i++)
             $display("M0_D2LATE_KIND %0d %0d", i, m0_d2late_kind[i]);
         for (integer i = 0; i < 12; i++)

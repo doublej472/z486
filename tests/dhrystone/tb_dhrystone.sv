@@ -115,6 +115,8 @@ module tb_dhrystone;
     );
 
 `ifdef Z486_CURRENT_CORE
+// The core runs with z486's default (no x87); the profiler guards on this.
+localparam ENABLE_X87 = 0;
 `include "m0_profile.svh"
 `endif
 

@@ -864,6 +864,7 @@ localparam DEST_USTEP_RPTI_EIP = 7'h6D; // RPTI restart EIP write
 localparam DEST_USTEP_TASK_CS = 7'h6E;  // Task load establishes full CS selector
 localparam DEST_USTEP_FAULT_DONE = 7'h6F; // Fault delivery completion marker
 localparam DEST_USTEP_INVLPG = 7'h70;    // 486 single-page TLB invalidation
+localparam DEST_USTEP_X87_STORE = 7'h71; // x87 store overlay: command + result read into OPR_R
 localparam DEST_LATTTF = 7'h78;  // Faulting linear address (page fault)
 localparam DEST_PFERRC = 7'h7A;  // Page fault error code
 localparam DEST_PDBR = 7'h7B;    // Page directory base register (CR3) for LPCR reads

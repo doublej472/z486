@@ -9,7 +9,7 @@ localparam logic [2:0] RECIPE_EARLY_BRANCH = 3'd6;
 localparam logic [2:0] RECIPE_EARLY_STACK  = 3'd7;
 
 localparam logic [1:0] RECIPE_ACTION_NONE = 2'd0;
-localparam logic [1:0] RECIPE_ACTION_X87_M32_LOAD = 2'd1;
+localparam logic [1:0] RECIPE_ACTION_X87_OVERLAY = 2'd1;
 localparam logic [1:0] RECIPE_ACTION_INVLPG = 2'd2;
 localparam logic [1:0] RECIPE_ACTION_RMW_FAST = 2'd3;
 
@@ -24,6 +24,14 @@ function automatic logic [11:0] recipe_effective_entry(
         12'h4D7: begin
             if ((opcode == 8'hD8) || ((opcode == 8'hD9) && (modrm[5:3] == 3'd0)))
                 recipe_effective_entry = 12'h9C5;
+        end
+        12'h4C1: begin
+            if (modrm[7:6] == 2'b11)
+                recipe_effective_entry = 12'h9D1;
+        end
+        12'h53C: begin
+            if ((modrm[7:6] != 2'b11) && ((opcode == 8'hD9) || (opcode == 8'hDB)) && ((modrm[5:3] == 3'd2) || (modrm[5:3] == 3'd3)))
+                recipe_effective_entry = 12'h9D3;
         end
         12'h04A: begin
             if (modrm[7:6] != 2'b11)
@@ -44,6 +52,8 @@ endfunction
 function automatic logic [11:0] recipe_fallback_entry(input logic [11:0] entry);
     unique case (entry)
         12'h9C5: recipe_fallback_entry = 12'h4D7;
+        12'h9D1: recipe_fallback_entry = 12'h4C1;
+        12'h9D3: recipe_fallback_entry = 12'h53C;
         12'h9CB: recipe_fallback_entry = 12'h04A;
         12'h9CE: recipe_fallback_entry = 12'h04E;
         default: recipe_fallback_entry = entry;
@@ -52,7 +62,9 @@ endfunction
 
 function automatic logic [1:0] recipe_action(input logic [11:0] entry);
     unique case (entry)
-        12'h9C5: recipe_action = RECIPE_ACTION_X87_M32_LOAD;
+        12'h9C5: recipe_action = RECIPE_ACTION_X87_OVERLAY;
+        12'h9D1: recipe_action = RECIPE_ACTION_X87_OVERLAY;
+        12'h9D3: recipe_action = RECIPE_ACTION_X87_OVERLAY;
         12'h9CB: recipe_action = RECIPE_ACTION_RMW_FAST;
         12'h9CE: recipe_action = RECIPE_ACTION_RMW_FAST;
         12'h9C7: recipe_action = RECIPE_ACTION_INVLPG;
@@ -62,7 +74,7 @@ endfunction
 
 function automatic logic [2:0] recipe_early_kind(input logic [11:0] entry);
     unique case (entry)
-        12'h003, 12'h005, 12'h01D, 12'h01F, 12'h021, 12'h023, 12'h025, 12'h0F9, 12'h0FC, 12'h0FF, 12'h102, 12'h105, 12'h1E8, 12'h1F0, 12'h9C9: recipe_early_kind = RECIPE_EARLY_NONE;
+        12'h003, 12'h005, 12'h01D, 12'h01F, 12'h021, 12'h023, 12'h025, 12'h0F9, 12'h0FC, 12'h0FF, 12'h102, 12'h105, 12'h1E8, 12'h1F0, 12'h9C9, 12'h9D1: recipe_early_kind = RECIPE_EARLY_NONE;
         12'h0B9: recipe_early_kind = RECIPE_EARLY_EA;
         12'h019, 12'h027, 12'h02C, 12'h031, 12'h035, 12'h1EB, 12'h1F3, 12'h9C5: recipe_early_kind = RECIPE_EARLY_LOAD;
         12'h013, 12'h015: recipe_early_kind = RECIPE_EARLY_STORE;
@@ -329,7 +341,15 @@ function automatic recipe_meta_t recipe_metadata(input dec_entry_t e);
                 end
             end
             12'h9C5: begin
-                // Variable-latency direct transport; normal sequencer retirement.
+                // Direct x87 transport; normal sequencer retirement.
+                r.commit_sel = RECIPE_ACTION_X87_DIRECT; r.uses_ea = 1'b1;
+            end
+            12'h9D1: begin
+                // Direct x87 transport; normal sequencer retirement.
+                r.commit_sel = RECIPE_ACTION_X87_DIRECT; r.uses_ea = 1'b0;
+            end
+            12'h9D3: begin
+                // Direct x87 transport; normal sequencer retirement.
                 r.commit_sel = RECIPE_ACTION_X87_DIRECT; r.uses_ea = 1'b1;
             end
             12'h9CB: begin

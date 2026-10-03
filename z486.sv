@@ -405,6 +405,11 @@ wire        x87_busy_n;
 wire        x87_pereq;
 wire        x87_error_n;
 wire        x87_direct_active;
+wire        x87_direct_taken;          // the issued x87 overlay went direct
+wire        x87_direct_reg_taken;      // ...as a register form
+wire        x87_store_opr_commit;      // the x87 m32 store result arrived for OPR_R
+wire [31:0] x87_store_opr_data;
+wire        x87_store_hold;            // the store word waits for the x87 result
 wire        x87_direct_mem_req;
 
 // Microcode and macro-instruction lifecycle interconnect.
@@ -687,7 +692,7 @@ ea_dec_t    d2_agu_dec;       // EA decode for d2_entry
 wire        rom_q_hold = interrupt_at_boundary || any_fault || any_fault_issue;
 // A replayed RMW preread holds the overlay entry word resident, like DLY.
 wire        microcode_rom_base_ce = !stall_mem && !stall_wio && !repeat_active &&
-                                    !stall_rmw_probe;
+                                    !stall_rmw_probe && !x87_store_hold;
 `Z486_NO_PRUNE reg [2:0] early_kind_probe_r;
 wire [5:0]  uc_source_shift;
 wire [3:0]  uc_shift_source_class;
@@ -2013,8 +2018,8 @@ paging_unit paging_inst (
     .vipt_tlb_user      (vipt_tlb_user),
     .vipt_tlb_dirty     (vipt_tlb_dirty),
     .vipt_tlb_is_vga_mem(vipt_tlb_is_vga_mem),
-    .fast_opr_commit    (fast_opr_commit),
-    .fast_opr_data      (fast_opr_data),
+    .fast_opr_commit    (fast_opr_commit || x87_store_opr_commit),
+    .fast_opr_data      (x87_store_opr_commit ? x87_store_opr_data : fast_opr_data),
 
     // Prefetch (toggle protocol)
     .pf_req_toggle      (pf_req_toggle),
@@ -2181,7 +2186,7 @@ event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
     .direct_wb_retire(direct_wb_retire),
     .rmw_fallback_delay_r(rmw_fallback_delay_r),
     .throttle_parked_r(throttle_parked_r),
-    .x87_direct_active(x87_direct_active),
+    .x87_direct_taken(x87_direct_taken),
     // Decoder: D2 entry and the EX instruction register
     .i_bus(i_bus),
     .i(i),
@@ -2816,6 +2821,9 @@ data_unit data_unit_inst (
     .ea_index_value(ea_index_value),
     .forwarded_esp(forwarded_esp),
     .pend_write_mask(pend_write_mask),
+    .x87_reg_commit(uc_exec && i_first && x87_direct_reg_taken &&
+                    (i.ucode_action == RECIPE_ACTION_X87_OVERLAY)),
+    .x87_store_commit(x87_store_opr_commit),
     .ind(IND),
     .ea(ea_reg),
     // Segmentation and protection: selectors, descriptor and protection sources
@@ -2902,6 +2910,17 @@ x87_unit #(.ENABLE_X87(ENABLE_X87)) x87 (
     .direct_candidate(x87_direct_candidate),
     .direct_allowed(!CR0[3] && !CR0[2]),
     .direct_fop(i.fop),
+    .direct_reg(i_bus.modrm[7:6] == 2'b11),
+    .direct_store((i_bus.modrm[7:6] != 2'b11) && ((i_bus.opcode == 8'hD9) || (i_bus.opcode == 8'hDB)) &&
+                  ((i_bus.modrm[5:3] == 3'd2) || (i_bus.modrm[5:3] == 3'd3))),
+    .direct_data32(i_bus.data32),
+    .store_word(uc_active && (uc_dest == DEST_USTEP_X87_STORE)),
+    .store_go(uc_active && (uc_dest == DEST_USTEP_X87_STORE) && !stall_mem),
+    .store_opr_commit(x87_store_opr_commit),
+    .store_opr_data(x87_store_opr_data),
+    .store_hold(x87_store_hold),
+    .direct_taken(x87_direct_taken),
+    .direct_reg_taken(x87_direct_reg_taken),
     .direct_active(x87_direct_active),
     .direct_mem_req(x87_direct_mem_req),
     .direct_stall(stall_x87_direct),

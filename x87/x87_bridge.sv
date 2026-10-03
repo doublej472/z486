@@ -12,6 +12,7 @@ module x87_bridge (
     output logic        req_complete,
     output logic        req_read_complete,
     output logic [31:0] req_rdata,
+    output logic        posted_pending,     // a posted write still awaits dispatch
 
     output logic        cmd_valid,          // Registered command-stream request.
     output logic [10:0] cmd_fop,            // ESC opcode plus complete ModR/M FOP.
@@ -49,9 +50,14 @@ wire dispatch_ready = write_r ? (data_port_r ? word_in_ready : cmd_ready)
                               : read_req_ready;
 
 always_comb begin
+    // A write is posted: it completes on acceptance and dispatches from the
+    // bridge registers; the next port cycle waits for BR_IDLE, which keeps
+    // port order. A read completes when the x87 has answered.
     req_accepted = (state == BR_IDLE) && req_valid;
-    req_complete = (state == BR_COMPLETE);
-    req_read_complete = req_complete && !write_r;
+    req_complete = ((state == BR_IDLE) && req_valid && req_write) ||
+                   ((state == BR_COMPLETE) && !write_r);
+    req_read_complete = (state == BR_COMPLETE) && !write_r;
+    posted_pending = (state == BR_DISPATCH) && write_r;
     req_rdata = rdata_r;
 
     // Keep the command-stream exclusion seen by the direct m32 path behind
@@ -95,7 +101,7 @@ always_ff @(posedge clk) begin
             BR_DISPATCH: begin
                 if (dispatch_ready) begin
                     cmd_dispatch_r <= 1'b0;
-                    state <= write_r ? BR_COMPLETE : BR_READ_WAIT;
+                    state <= write_r ? BR_IDLE : BR_READ_WAIT;
                 end
             end
 
