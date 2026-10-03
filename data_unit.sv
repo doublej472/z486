@@ -330,6 +330,10 @@ wire [2:0] load_wb_widx = (load_wb_size == 2'd0)
 //   EX view  (operand reads)  plain-load WB data, then the ROM load commit
 //   EA view  (D2 base/index)  delay-slot write, else deferred shift, else
 //                             plain-load WB data
+//   capture view (direct-load destination base) the EX view, then a deferred
+//                             shift, then the delay-slot write, each merged
+//                             at its width: the capture edge is the edge these
+//                             commits land on
 // A plain load's WB value is already merged with its destination's prior
 // value; an M3 ALU result is not forwarded (its readers are interlocked).
 wire [7:0] pend_load_mask  = (load_wb_valid && !load_wb_is_alu) ? (8'h01 << load_wb_widx) : 8'h00;
@@ -339,8 +343,9 @@ wire [7:0] pend_dly_mask   = dly_gpr_forward.valid ? (8'h01 << dly_gpr_forward.d
 
 logic [31:0] gpr_ex_view [0:7];
 logic [31:0] gpr_ea_view [0:7];
+logic [31:0] gpr_capture_view [0:7];
 always_comb begin
-    logic [31:0] current, merged, dly_value, shift_value;
+    logic [31:0] current, merged, dly_value, shift_value, captured;
     for (int r = 0; r < 8; r++) begin
         current = read_gpr_value(3'(r), 2'd2);
 
@@ -371,6 +376,26 @@ always_comb begin
         gpr_ea_view[r] = pend_dly_mask[r]   ? dly_value :
                          pend_shift_mask[r] ? shift_value :
                          pend_load_mask[r]  ? load_wb_forward_data : current;
+
+        captured = merged;
+        if (pend_shift_mask[r]) begin
+            if (recipe_shift_write.size == 2'd0)
+                captured = recipe_shift_write.dst[2]
+                    ? {captured[31:16], recipe_shift_data[7:0], captured[7:0]}
+                    : {captured[31:8], recipe_shift_data[7:0]};
+            else if (recipe_shift_write.size == 2'd1)
+                captured = {captured[31:16], recipe_shift_data[15:0]};
+            else
+                captured = recipe_shift_data;
+        end
+        if (pend_dly_mask[r])
+            case (dly_gpr_forward.mode)
+                EA_FWD_BLO: captured = {captured[31:8], dly_gpr_forward.data[7:0]};
+                EA_FWD_BHI: captured = {captured[31:16], dly_gpr_forward.data[7:0], captured[7:0]};
+                EA_FWD_W:   captured = {captured[31:16], dly_gpr_forward.data[15:0]};
+                default:    captured = dly_gpr_forward.data;
+            endcase
+        gpr_capture_view[r] = captured;
     end
 end
 
@@ -404,15 +429,15 @@ function automatic logic [31:0] read_ea_gpr(
     read_ea_gpr = valid ? gpr_ea_view[idx] : 32'd0;
 endfunction
 
-// Every direct load reads its destination after older architectural writes
-// have settled but before cache data enters WB. Plain-load WB forwarding keeps
-// a chained older load visible at this capture edge. M3 uses the same value as
-// its private ALU destination.
+// Every direct load captures its destination's prior value before cache data
+// enters WB; a byte or word load merges into it. Older writes may still land
+// on this capture edge (a chained load's WB, a ROM load, a deferred shift, a
+// delay-slot write), so the base comes from the capture view. M3 uses the same
+// value as its private ALU destination.
 wire [2:0] load_capture_widx = (load_alu_dst_capture_size == 2'd0)
                              ? {1'b0, load_alu_dst_capture_dst[1:0]}
                              : load_alu_dst_capture_dst;
-wire [31:0] load_capture_base = read_gpr_load_forwarded(load_capture_widx,
-                                                        2'd2);
+wire [31:0] load_capture_base = gpr_capture_view[load_capture_widx];
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin

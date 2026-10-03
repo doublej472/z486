@@ -110,7 +110,16 @@ wire [WORD_OFFSET_BITS-1:0] vipt_probe_word =
     vipt_probe_offset[LINE_OFFSET_BITS-1:BYTE_OFFSET_BITS];
 wire [SET_BITS-1:0] snoop_set = snoop_addr[SET_MSB:SET_LSB];
 wire request_uncacheable = !cache_enable || cpu_uncacheable;
-wire cpu_protect_write = PROTECT_UMA_ROM && cpu_write && (cpu_addr[24:18] == 7'b000_0011);
+`ifdef VERILATOR
+// Simulation harness switch: a loaded snapshot whose BIOS keeps state in its
+// shadow (SeaBIOS runs interrupt handlers on a stack at 0xE0000-0xEFFFF)
+// needs the UMA ROM window writable.
+reg sim_uma_rom_writable /* verilator public_flat_rw */ = 1'b0;
+`else
+wire sim_uma_rom_writable = 1'b0;
+`endif
+wire cpu_protect_write = PROTECT_UMA_ROM && !sim_uma_rom_writable && cpu_write &&
+                         (cpu_addr[24:18] == 7'b000_0011);
 
 // Tag/data storage.
 // Keep validity in the otherwise under-filled tag RAM word. This removes four
@@ -829,10 +838,11 @@ always_ff @(posedge clk) begin
     // A VIPT probe sharing an accepted store's preread resolves while that
     // registered store is in S_LOOKUP. vipt_lookup_store_match forwards the
     // store payload over the preread result, so this is an intentional second
-    // legal finalize state rather than a cache ownership collision.
+    // legal finalize state rather than a cache ownership collision. A
+    // protected (ROM-window) store leaves S_LOOKUP without touching the RAM
+    // and is not forwarded, so the probe reads the unchanged data.
     if (!reset && vipt_resolve_valid && state != S_IDLE &&
-        !(state == S_LOOKUP && req_valid_r && req_write_r &&
-          !req_protect_write_r))
+        !(state == S_LOOKUP && req_valid_r && req_write_r))
         $fatal(1, "VIPT resolve while cache is not idle");
 end
 // synthesis translate_on

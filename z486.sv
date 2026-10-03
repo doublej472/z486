@@ -691,8 +691,12 @@ ea_dec_t    d2_agu_dec;       // EA decode for d2_entry
 // A fault or an event taken at the boundary holds the ROM output register.
 wire        rom_q_hold = interrupt_at_boundary || any_fault || any_fault_issue;
 // A replayed RMW preread holds the overlay entry word resident, like DLY.
+// An RMW store waiting in its RNI delay slot holds it too: otherwise the
+// next instruction's first word executes in the store's release cycle,
+// before its own first cycle and alongside the store.
 wire        microcode_rom_base_ce = !stall_mem && !stall_wio && !repeat_active &&
-                                    !stall_rmw_probe && !x87_store_hold;
+                                    !stall_rmw_probe && !x87_store_hold &&
+                                    !stall_fast_store;
 `Z486_NO_PRUNE reg [2:0] early_kind_probe_r;
 wire [5:0]  uc_source_shift;
 wire [3:0]  uc_shift_source_class;
@@ -1160,9 +1164,11 @@ always_ff @(posedge clk) begin
     end else begin
         if (q_flush || any_fault)
             d2_ea_split_done_r <= 1'b0;
-        else if (d2_ea_split_wait)
+        else if (d2_ea_split_wait || d2_ea_split_conflict)
             // A partial sum captured while its base or index is written is
-            // stale: capture again on the next cycle.
+            // stale: capture again on the next cycle. This holds after the
+            // first capture too, since D2 recaptures every resident cycle (a
+            // recipe's RNI commit can land on a later capture edge).
             d2_ea_split_done_r <= !d2_ea_split_conflict;
         else if (i_issue)
             d2_ea_split_done_r <= 1'b0;
@@ -2978,5 +2984,24 @@ cpu_throttle #(.CLOCK_RATE_MHZ(CLOCK_RATE_MHZ)) throttle (
     .full_speed(throttle_full)
 );
 
+// synthesis translate_off
+// Memory write watch: +watch_lo=<hex> +watch_hi=<hex> logs every external
+// memory write in [lo, hi) with the CS:EIP executing when it reaches the bus.
+// +watch2_lo/+watch2_hi add a second range.
+reg [31:0] watch_lo, watch_hi, watch2_lo, watch2_hi;
+reg        watch_en = 1'b0, watch2_en = 1'b0;
+initial begin
+    if ($value$plusargs("watch_lo=%h", watch_lo) &&
+        $value$plusargs("watch_hi=%h", watch_hi)) watch_en = 1'b1;
+    if ($value$plusargs("watch2_lo=%h", watch2_lo) &&
+        $value$plusargs("watch2_hi=%h", watch2_hi)) watch2_en = 1'b1;
+end
+always @(posedge clk)
+    if (valid && ready && write && !io &&
+        ((watch_en && ({addr, 2'b00} >= watch_lo) && ({addr, 2'b00} < watch_hi)) ||
+         (watch2_en && ({addr, 2'b00} >= watch2_lo) && ({addr, 2'b00} < watch2_hi))))
+        $display("%0t: WATCH wr %08h be=%b data=%08h CS:EIP=%04h:%08h vm=%b",
+                 $time, {addr, 2'b00}, be, dout, CS, EIP, EFLAGS[17]);
+// synthesis translate_on
 
 endmodule
