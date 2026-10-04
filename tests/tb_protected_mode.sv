@@ -61,9 +61,9 @@ module tb_protected_mode #(
         .inta(inta),
         .snoop_addr(32'h0),
         .snoop_valid(1'b0),
-        .cache_flush(1'b0),
-        .cache_flush_busy(),
-        .cache_flush_done(),
+        .cache_flush(cache_flush_platform),
+        .cache_flush_busy(cache_flush_busy),
+        .cache_flush_done(cache_flush_done),
         .a20_enable(1'b1),
         .win0_unmapped(1'b0),
         .ram_cache_top(32'hffff_ffff),
@@ -643,10 +643,106 @@ module tb_protected_mode #(
     reg rd_io_pending = 1'b0;
     wire rd_busy = (rd_wait_count != 0) || (rd_remaining != 0) || inta_resp_pending;
 
+    // Platform cache-flush and DMA model (PC-98 IOBus analog).
+    //   0xC0: write requests the native whole-L1 flush (cache_flush) and the
+    //         testbench reports the request-to-done latency; a read returns
+    //         bit0 = 1 once the last requested flush has completed.
+    //   0xC4: write latches the physical address of an external write.
+    //   0xC8: write performs that external write directly into the RAM model,
+    //         behind the caches and with NO snoop: the CPU must not observe it
+    //         until a cache flush.
+    reg         cache_flush_req = 1'b0;
+    wire        cache_flush_busy;
+    wire        cache_flush_done;
+    reg  [31:0] dma_poke_addr = 32'h0;
+    longint     platform_flushes = 0;
+    longint     platform_flush_cycles = 0;
+    longint     platform_flush_start = 0;
+    longint     platform_dma_pokes = 0;
+    reg         flush_complete = 1'b0;
+
+    // Count the issued native-flush instruction words (the INVD/WBINVD entry).
+    longint     cache_flush_insn_count = 0;
+    always @(posedge clk)
+        if (reset_n && dut.uc_active && (dut.uc_addr == 12'h9D9))
+            cache_flush_insn_count <= cache_flush_insn_count + 1;
+
+    // Latency from the flush going busy to done, which covers the posted-store
+    // drain plus both set walks.  cache_flush_busy rises for the platform
+    // input and for INVD/WBINVD alike.
+    reg         cache_flush_busy_r = 1'b0;
+    always @(posedge clk) begin
+        if (reset_n) begin
+            cache_flush_busy_r <= cache_flush_busy;
+            if (cache_flush_busy && !cache_flush_busy_r)
+                platform_flush_start <= cycle;
+            if (cache_flush_req)
+                flush_complete <= 1'b0;
+            if (cache_flush_done) begin
+                platform_flushes <= platform_flushes + 1;
+                if (platform_flush_start != 0)
+                    platform_flush_cycles <= cycle - platform_flush_start;
+                flush_complete <= 1'b1;
+            end
+        end
+    end
+
+    // ---- Optional platform flush stress ------------------------------------
+    // +cache_flush_stress drives the platform cache_flush input autonomously as
+    // repeated requests held for a long, LFSR-randomized window with randomized
+    // release gaps.  A held request spans its own done, so an INVD/WBINVD can
+    // begin in the window after a platform done while the platform level is
+    // still high.  A held request only needs to be released once to re-arm, so
+    // a dropped instruction request would stall the CPU on cache_flush_done and
+    // the run would time out.
+    localparam [15:0] FLUSH_STRESS_HOLD = 16'd700;
+    reg        flush_stress_en = 1'b0;
+    reg        flush_stress_level = 1'b0;
+    reg [15:0] flush_stress_timer = 16'd0;
+    reg [15:0] flush_stress_lfsr = 16'hC0DE;
+    longint    flush_overlap_cycles = 0;
+
+    initial flush_stress_en = $test$plusargs("cache_flush_stress");
+
+    wire cache_flush_platform = flush_stress_en ? flush_stress_level : cache_flush_req;
+
+    always @(posedge clk) begin
+        if (!reset_n) begin
+            flush_stress_level <= 1'b0;
+            flush_stress_timer <= 16'd0;
+            flush_stress_lfsr <= 16'hC0DE;
+        end else if (flush_stress_en) begin
+            flush_stress_lfsr <= {flush_stress_lfsr[14:0],
+                                  flush_stress_lfsr[15] ^ flush_stress_lfsr[13] ^
+                                  flush_stress_lfsr[12] ^ flush_stress_lfsr[10]};
+            if (flush_stress_timer == 16'd0) begin
+                flush_stress_level <= ~flush_stress_level;
+                // Going high: hold long.  Going low: a short randomized gap.
+                flush_stress_timer <= flush_stress_level
+                    ? ({10'd0, flush_stress_lfsr[5:0]} + 16'd1)
+                    : FLUSH_STRESS_HOLD;
+            end else begin
+                flush_stress_timer <= flush_stress_timer - 16'd1;
+            end
+        end
+    end
+
+    // Cycles in which a held platform request overlaps the INVD/WBINVD routine;
+    // +expect_flush_overlap requires at least one, so the test cannot pass
+    // without actually creating the overlap it is meant to cover.
+    always @(posedge clk)
+        if (reset_n && flush_stress_en && cache_flush_platform &&
+            dut.uc_active && (dut.uc_addr == 12'h9D9))
+            flush_overlap_cycles <= flush_overlap_cycles + 1;
+
     // Memory behavior with configurable latency (ready/valid protocol)
     // Note: din is held stable (not cleared) to allow paging unit to sample it
     // when pg_mem_ready is asserted (which has 1-cycle delay from bus ready)
     always @(posedge clk) begin
+        // A platform flush request is a one-cycle pulse; the 0xC0 write handler
+        // below re-asserts this assignment for the request cycle, and the cache
+        // unit latches it internally for the walk.
+        cache_flush_req <= 1'b0;
         if (ENABLE_X87 && reset_n && valid && io &&
             (dut.i.opcode >= 8'hd8) && (dut.i.opcode <= 8'hdf))
             $fatal(1, "x87 transaction escaped to external I/O: addr=%08x write=%b",
@@ -745,7 +841,9 @@ module tb_protected_mode #(
                     // Port 0xFC reads the testbench cycle counter so directed
                     // programs can assert instruction intervals.
                     resp_valid <= 1'b1;
-                    din <= ({addr[15:2], 2'b00} == 16'h00FC) ? cycle : 32'hFFFFFFFF;
+                    din <= ({addr[15:2], 2'b00} == 16'h00FC) ? cycle :
+                           ({addr[15:2], 2'b00} == 16'h00C0) ? {31'h0, flush_complete} :
+                           32'hFFFFFFFF;
                 end
                 rd_remaining <= (mem_latency <= 1 && burst_len > 8'd1) ?
                                 (burst_len - 8'd1) : burst_len;
@@ -767,13 +865,27 @@ module tb_protected_mode #(
                             ($test$plusargs("expect_vipt_store_replay") &&
                              ((vipt_store_wait_issues == 0) ||
                               (vipt_store_replays == 0))) ||
+                            ($test$plusargs("expect_cache_flush_insn") &&
+                             (cache_flush_insn_count == 0)) ||
+                            ($test$plusargs("expect_platform_flush") &&
+                             ((platform_flushes == 0) ||
+                              (platform_dma_pokes == 0))) ||
+                            ($test$plusargs("expect_flush_overlap") &&
+                             (flush_overlap_cycles == 0)) ||
                             ($test$plusargs("expect_stale_walk") &&
                              (stale_walk_events == 0))) begin
                             test_status <= 8'hFF;
                             $display("");
                             $display("========================================");
                             $display("  TEST FAILED!");
-                            if ($test$plusargs("expect_stale_walk") &&
+                            if ($test$plusargs("expect_cache_flush_insn")) begin
+                                $display("  INVD/WBINVD routine (0x9D9) never executed");
+                                $display("  INVD/WBINVD words issued: %0d", cache_flush_insn_count);
+                            end else if ($test$plusargs("expect_flush_overlap"))
+                                $display("  No platform level overlapped an INVD/WBINVD");
+                            else if ($test$plusargs("expect_platform_flush"))
+                                $display("  Platform flush/DMA poke was not exercised");
+                            else if ($test$plusargs("expect_stale_walk") &&
                                 (stale_walk_events == 0))
                                 $display("  no prefetch walk spanned a CR3 write");
                             else if (vipt_ea_interlock_cycles == 0)
@@ -795,6 +907,15 @@ module tb_protected_mode #(
                                 $display("  VIPT store waits/replays: %0d/%0d",
                                          vipt_store_wait_issues,
                                          vipt_store_replays);
+                            if (platform_flushes != 0)
+                                $display("  Flushes: %0d, last busy-to-done %0d cycles",
+                                         platform_flushes, platform_flush_cycles);
+                            if (cache_flush_insn_count != 0)
+                                $display("  INVD/WBINVD words issued: %0d",
+                                         cache_flush_insn_count);
+                            if (flush_overlap_cycles != 0)
+                                $display("  Platform level / INVD overlap cycles: %0d",
+                                         flush_overlap_cycles);
                             $display("========================================");
                             test_done <= 1;
                         end
@@ -808,6 +929,36 @@ module tb_protected_mode #(
                         $display("========================================");
                         test_done <= 1;
                     end
+                end
+
+                // Platform flush request (0xC0): request the native whole-L1
+                // flush through the top-level cache_flush input.  The level is
+                // held until the fabric pulses done and is released after it.
+                if (port == 16'h00C0) begin
+                    cache_flush_req <= 1'b1;
+                    if ($test$plusargs("trace_io"))
+                        $display("PLATFORM: cache flush requested");
+                end
+
+                // External-write address (0xC4)
+                if (port == 16'h00C4)
+                    dma_poke_addr <= dout;
+
+                // External write data (0xC8): DMA into the RAM model, behind
+                // the caches and with no snoop.
+                if (port == 16'h00C8) begin
+                    reg [31:0] poke;
+                    poke = dma_poke_addr;
+                    if (poke + 4 <= MEM_SIZE) begin
+                        if (be[0]) mem[poke+0] <= dout[7:0];
+                        if (be[1]) mem[poke+1] <= dout[15:8];
+                        if (be[2]) mem[poke+2] <= dout[23:16];
+                        if (be[3]) mem[poke+3] <= dout[31:24];
+                    end
+                    platform_dma_pokes <= platform_dma_pokes + 1;
+                    if ($test$plusargs("trace_io"))
+                        $display("PLATFORM DMA WRITE @%08x = %08x be=%b (no snoop)",
+                                 poke, dout, be);
                 end
 
                 // Data port (0xE4) - debug/verification data
