@@ -95,6 +95,10 @@ module tb_l1_cache;
         .snoop_addr(snoop_addr),
         .snoop_valid(snoop_valid),
         .store_patch_busy(1'b0),
+
+        .flush_req(1'b0),
+        .flush_busy(),
+        .flush_done(),
         .cache_enable(1'b1)
     );
 

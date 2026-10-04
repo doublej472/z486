@@ -78,6 +78,14 @@ module z486
     input      [31:0]  snoop_addr,
     input              snoop_valid,
 
+    // Native whole-L1 invalidate (486 INVD/WBINVD).  cache_flush is the
+    // platform's held-level request (one walk per release); busy is high for
+    // the whole walk and done pulses once when it completes.  Tie cache_flush
+    // to 0 when the platform does not drive it.
+    input              cache_flush,
+    output             cache_flush_busy,
+    output             cache_flush_done,
+
     input              a20_enable,  // A20 gate input
 
     // Architectural execution rate: 0=full, 1=15, 2=30, 3=56 MHz.
@@ -249,6 +257,10 @@ wire         rmw_fallback_delay_r;
 wire         rmw_fast_active_r;
 wire         stall_fast_store;
 wire         stall_rmw_probe;
+// Whole-L1 flush request from the INVD/WBINVD path and its stall; both are
+// assigned with the entry-action decode next to INVLPG's below.
+wire         cache_flush_insn_req;
+wire         stall_cache_flush;
 wire         stall_ucrd;
 wire         vipt_load_ex_probed_r;
 hardwired_load_token_t vipt_load_ex_r;
@@ -618,7 +630,8 @@ wire       stall_wio = uc_active && uc_is_wio &&
 wire       stall_x87_direct;
 wire       stall_invlpg;
 assign stall = stall_mem || stall_wio || stall_x87_direct ||
-               stall_invlpg || stall_fast_store || stall_rmw_probe;
+               stall_invlpg || stall_fast_store || stall_rmw_probe ||
+               stall_cache_flush;
 
 // Repeat
 wire       prot_result_now;
@@ -630,7 +643,7 @@ wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight)
 wire       uc_slot_live = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) &&
                  !stall_ucrd &&
                  !stall_wio && !stall_x87_direct && !stall_invlpg &&
-                 !stall_fast_store && !stall_rmw_probe &&
+                 !stall_fast_store && !stall_rmw_probe && !stall_cache_flush &&
                  !throttle_parked_r && !recipe_slot_stale && !rmw_fallback_delay_r;
 // A direct POP's first ROM word executes for its ESP write while the data
 // pipeline completes the load (the word's read is suppressed).
@@ -831,6 +844,11 @@ memory #(
     .snoop_addr(snoop_addr),
     .snoop_valid(snoop_valid),
 
+    .cache_flush(cache_flush),
+    .cache_flush_insn(cache_flush_insn_req),
+    .cache_flush_busy(cache_flush_busy),
+    .cache_flush_done(cache_flush_done),
+
     .addr(addr),
     .be(be),
     .burstcount(burstcount),
@@ -991,8 +1009,23 @@ always_ff @(posedge clk) begin
     else
         pf_snoop_kill_r <= snoop_valid;
 end
+// The native flush kills any buffered speculative line once, on the same
+// conservative policy as external coherence: the buffered line may hold code
+// fetched before the flush.  Keep it a one-cycle event like the other terms.
+reg         pf_flush_kill_r;
+reg         cache_flush_busy_prev_r;
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        pf_flush_kill_r <= 1'b0;
+        cache_flush_busy_prev_r <= 1'b0;
+    end else begin
+        cache_flush_busy_prev_r <= cache_flush_busy;
+        pf_flush_kill_r <= cache_flush_busy && !cache_flush_busy_prev_r;
+    end
+end
 assign pf_spec_global_kill = pf_snoop_kill_r || cr3_write ||
-                             (uc_exec && (uc_dest == DEST_CR0));
+                             (uc_exec && (uc_dest == DEST_CR0)) ||
+                             pf_flush_kill_r;
 
 //=============================================================================
 // Unit 2: Decode1 (structural decode)
@@ -1702,11 +1735,36 @@ wire invlpg_request = invlpg_active && !invlpg_priv_fault && !seg_gp_fault;
 wire invlpg_ack;
 // Waiting for an older page walk does not depend on seg_fault.
 assign stall_invlpg = invlpg_active && !invlpg_priv_fault && !invlpg_ack;
+
+// 486 INVD (0F 08) / WBINVD (0F 09): a native whole-L1 flush.  The decoder
+// registers the entry action like INVLPG's, so neither the entry address nor a
+// live ROM field reaches this cone.  Both instructions are privileged on 486:
+// CPL0 in protected mode (V86 is CPL3 and faults the same way), real mode
+// unaffected.  The request is a level held until the fabric pulses done, which
+// also keeps the request visible for the whole memory-fabric drain.
+wire cache_flush_active = uc_active && i_first &&
+    (i.ucode_action == RECIPE_ACTION_CACHE_FLUSH);
+wire cache_flush_priv_fault = cache_flush_active && pe && (cpl != 2'b00);
+// Latch the one-cycle cache_flush_done for the issuing instruction: uc_exec may
+// still be stalled in that cycle, and the request must drop after the walk.
+reg cache_flush_done_seen_r;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        cache_flush_done_seen_r <= 1'b0;
+    else if (i_issue || !cache_flush_active)
+        cache_flush_done_seen_r <= 1'b0;
+    else if (cache_flush_done)
+        cache_flush_done_seen_r <= 1'b1;
+end
+assign cache_flush_insn_req = cache_flush_active && !cache_flush_priv_fault &&
+                              !cache_flush_done_seen_r;
+assign stall_cache_flush = cache_flush_active && !cache_flush_priv_fault &&
+                           !cache_flush_done_seen_r;
 // RD_FAST uses the authoritative segment checker only as a qualifier. A
 // rejection re-enters the original routine, which owns precise fault delivery.
 assign gp_fault_trigger = (seg_gp_fault && !rd_fast_valid_r) ||
                           vipt_slow_seg_trigger ||
-                          invlpg_priv_fault;
+                          invlpg_priv_fault || cache_flush_priv_fault;
 
 // Deferred GPR commits cancel on any_fault_issue only: a divide overflow fires
 // deep inside DIV's microcode, never while a load or hardwired recipe commits.

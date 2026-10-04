@@ -144,6 +144,17 @@ module cache_unit
     // External coherence (snoop invalidation)
     input  logic [31:0] snoop_addr,
     input  logic snoop_valid,
+
+    // Native whole-L1 invalidate (486 INVD/WBINVD).  Two request sources are
+    // arbitrated here, not ORed at the z486 boundary: `cache_flush` is the
+    // platform's held level (one walk per release), `cache_flush_insn` is the
+    // instruction path's held level (latched, so a request during a walk is
+    // queued rather than dropped).  busy is high for the whole walk and done
+    // pulses once per completed walk.
+    input  logic cache_flush,
+    input  logic cache_flush_insn,
+    output logic cache_flush_busy,
+    output logic cache_flush_done,
     // Merged I-cache invalidation (external snoop + template DIRECT-write
     // invalidation), produced by the bus unit.
     input  logic [31:0] icache_invalidate_addr,
@@ -419,6 +430,133 @@ always_ff @(posedge clk) begin
     end
 end
 
+//=============================================================================
+// Native whole-L1 flush controller
+//=============================================================================
+// One walk covers both L1s.  Posted stores are drained first: a store the bus
+// has already accepted cannot fall behind the walk, so the drain completes as
+// soon as the queue empties, and a walk cannot be overtaken by an older store
+// draining during it.  Both caches then sweep their sets in parallel: the sweep
+// is independent of the cache's fill/lookup state and cancels (rather than
+// waits out) any fill in flight, so a walk always completes in a bounded number
+// of cycles no matter what the bus is doing.
+//
+// Both request paths are latched rather than dropped: the platform
+// `cache_flush` is armed while its input is low (so a held level is one walk)
+// and a request seen during a walk starts a following one; `cache_flush_insn`
+// has the same shape, so INVD/WBINVD can never be stranded by a platform walk
+// that happened to be running.
+localparam [1:0] CF_IDLE  = 2'd0;
+localparam [1:0] CF_DRAIN = 2'd1;
+localparam [1:0] CF_WALK  = 2'd2;
+
+wire         dcache_flush_busy;
+wire         dcache_flush_done;
+wire         icache_flush_busy;
+wire         icache_flush_done;
+
+reg  [1:0] cf_state;
+reg        cf_armed_r;        // platform request path re-armed (input seen low)
+reg        cf_plat_pending_r; // platform request latched, not yet walked
+reg        cf_insn_armed_r;   // instruction request path re-armed (input seen low)
+reg        cf_insn_pending_r; // instruction request latched, not yet walked
+reg        cf_d_done_r;
+reg        cf_i_done_r;
+reg        cache_flush_done_r;
+reg        cf_start_r;       // one-cycle request pulse to both caches
+
+// A held level counts once (re-armed only when released); a request seen while
+// a walk runs is latched and starts the following one.
+wire cf_insn_edge = cache_flush_insn && cf_insn_armed_r;
+wire cf_plat_req = cache_flush && cf_armed_r;
+wire cf_req = cf_plat_req || cf_plat_pending_r ||
+              cf_insn_edge || cf_insn_pending_r;
+wire cache_flush_start = cf_req && (cf_state == CF_IDLE);
+wire cf_drain_ready = dcache_stores_drained;
+// The cycle the caches actually begin their walk (the merge point for a request
+// that arrived during the drain).
+wire cf_launch = ((cf_state == CF_IDLE) && cache_flush_start && cf_drain_ready) ||
+                 ((cf_state == CF_DRAIN) && cf_drain_ready);
+
+assign cache_flush_busy = (cf_state != CF_IDLE);
+assign cache_flush_done = cache_flush_done_r;
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        cf_state <= CF_IDLE;
+        cf_armed_r <= 1'b1;
+        cf_plat_pending_r <= 1'b0;
+        cf_insn_armed_r <= 1'b1;
+        cf_insn_pending_r <= 1'b0;
+        cf_d_done_r <= 1'b0;
+        cf_i_done_r <= 1'b0;
+        cf_start_r <= 1'b0;
+        cache_flush_done_r <= 1'b0;
+    end else begin
+        cf_start_r <= cf_launch;
+        cache_flush_done_r <= 1'b0;
+
+        // A held platform request re-arms only when released.
+        if (!cache_flush)
+            cf_armed_r <= 1'b1;
+
+        // The platform path: a request seen before the walk starts is latched,
+        // so a one-cycle pulse during a walk starts a following walk instead of
+        // being lost.  Starting the walk consumes the latch and the level.
+        if (cf_plat_req && !cf_launch)
+            cf_plat_pending_r <= 1'b1;
+        if (cf_launch) begin
+            cf_plat_pending_r <= 1'b0;
+            if (cf_plat_req)
+                cf_armed_r <= 1'b0;
+        end
+
+        // The instruction path: release re-arms it; a request seen before the
+        // walk starts is latched (a pulse during a walk is not lost); starting
+        // the walk consumes both the pending latch and the held level.
+        if (!cache_flush_insn)
+            cf_insn_armed_r <= 1'b1;
+        if (cf_insn_edge && !cf_launch)
+            cf_insn_pending_r <= 1'b1;
+        if (cf_launch) begin
+            cf_insn_pending_r <= 1'b0;
+            if (cache_flush_insn)
+                cf_insn_armed_r <= 1'b0;
+        end
+
+        // Stores that are already accepted by the bus cannot fall behind the
+        // walk, so the drain completes as soon as the queue empties.
+        if (cf_launch)
+            cf_state <= CF_WALK;
+
+        unique case (cf_state)
+            CF_IDLE: begin
+                if (cache_flush_start) begin
+                    cf_d_done_r <= 1'b0;
+                    cf_i_done_r <= 1'b0;
+                    if (cf_plat_req)
+                        cf_armed_r <= 1'b0;
+                    if (!cf_drain_ready)
+                        cf_state <= CF_DRAIN;
+                end
+            end
+            CF_DRAIN: ;
+            CF_WALK: begin
+                if (dcache_flush_done)
+                    cf_d_done_r <= 1'b1;
+                if (icache_flush_done)
+                    cf_i_done_r <= 1'b1;
+                if ((cf_d_done_r || dcache_flush_done) &&
+                    (cf_i_done_r || icache_flush_done)) begin
+                    cache_flush_done_r <= 1'b1;
+                    cf_state <= CF_IDLE;
+                end
+            end
+            default: cf_state <= CF_IDLE;
+        endcase
+    end
+end
+
 l1_cache #(
     .PROTECT_UMA_ROM(PROTECT_UMA_ROM),
     .SET_BITS(DCACHE_SET_BITS)
@@ -440,6 +578,9 @@ l1_cache #(
     .cpu_ready(dcache_cpu_ready),
     .cpu_wr_ready(dcache_cpu_wr_ready),
     .store_patch_busy(snoop_valid || icache_write_snoop_pending),
+    .flush_req(cf_start_r),
+    .flush_busy(dcache_flush_busy),
+    .flush_done(dcache_flush_done),
     .cpu_resp_valid(dcache_cpu_resp_valid),
     .stores_drained(dcache_stores_drained),
     .store_patch_addr(dcache_store_patch_addr),
@@ -499,6 +640,9 @@ l1_icache #(
     .patch_valid(icache_write_patch_valid),
     .invalidate_addr(icache_invalidate_addr),
     .invalidate_valid(icache_invalidate_valid),
+    .flush_req(cf_start_r),
+    .flush_busy(icache_flush_busy),
+    .flush_done(icache_flush_done),
     .cache_enable(1'b1),
     .cpu_no_alloc(icache_req_is_no_alloc)
 );
