@@ -618,7 +618,7 @@ function automatic logic [31:0] read_protection_source(
         SRC_CR0:     read_protection_source = cr0;
         SRC_TMPH:    read_protection_source = tmph;
         SRC_TMP_TR:  read_protection_source = slctr;
-        SRC_COUNTR,
+        SRC_COUNTR:  read_protection_source = countr;
         SRC_PROTUN:  read_protection_source = protun;
         SRC_SIGMA:   read_protection_source = sigma;
         SRC_CS:      read_protection_source = {16'd0, cs};
@@ -702,6 +702,30 @@ always_comb begin
     ea_base_value = read_ea_gpr(ea_base.valid, ea_base.index);
     ea_index_value = read_ea_gpr(ea_index.valid, ea_index.index);
 end
+
+// synthesis translate_off
+// Each narrow arm must match read_source for its field (DSTREG/SRCREG are
+// intentionally factored and excluded).
+localparam int PROTECTION_EQUIV_COUNT = 12;
+localparam logic [5:0] PROTECTION_EQUIV_FIELDS [PROTECTION_EQUIV_COUNT] = '{
+    SRC_ZERO, SRC_NEG1, SRC_CR0, SRC_TMPH, SRC_TMP_TR, SRC_COUNTR,
+    SRC_PROTUN, SRC_SIGMA, SRC_CS, SRC_OPR_R, SRC_IRF2, SRC_TMPE
+};
+always @(posedge clk) begin
+    if (reset_n) begin
+        for (int i = 0; i < PROTECTION_EQUIV_COUNT; i++) begin
+            if (read_protection_source(PROTECTION_EQUIV_FIELDS[i],
+                                       read_source(PROTECTION_EQUIV_FIELDS[i])) !==
+                read_source(PROTECTION_EQUIV_FIELDS[i]))
+                $fatal(1, "PROTECTION SOURCE MUX MISMATCH: field=%0d narrow=%08x generic=%08x",
+                       PROTECTION_EQUIV_FIELDS[i],
+                       read_protection_source(PROTECTION_EQUIV_FIELDS[i],
+                                              read_source(PROTECTION_EQUIV_FIELDS[i])),
+                       read_source(PROTECTION_EQUIV_FIELDS[i]));
+        end
+    end
+end
+// synthesis translate_on
 
 //=============================================================================
 // Internal registers and architectural GPR writeback
