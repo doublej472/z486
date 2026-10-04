@@ -80,6 +80,7 @@ module data_unit
     input  logic [2:0]  load_alu_dst_capture_dst,
     input  logic [1:0]  load_alu_dst_capture_size,
     input  logic [31:0] load_alu_dst_capture_data,
+    input  logic        opr_fast_commit,        // A younger fast read replaces OPR_R
 
     // Shorters (US5142635): bypasses around the register file
     input  gpr_forward_t dly_gpr_forward,        // RNI-delay GPR bypass
@@ -178,6 +179,16 @@ logic [2:0] dst_reg_sel_r;
 logic [2:0] recipe_shift_widx;       // Byte-normalized deferred-shift GPR
 logic [7:0] recipe_memory_dst_onehot;// Byte-normalized deferred-load GPR
 logic [1:0] recipe_memory_mode;      // Byte-low/high, word, or dword merge
+// Deferred tokens stay valid until pipeline_advance and recommit every stalled
+// cycle, which is what delivers late OPR_R data (e.g. POP). Once a younger
+// producer has written the token's register, or a younger fast read has
+// replaced OPR_R, a recommit would overwrite newer state: "mov eax,[upper]; and
+// eax,[ebp-12]" kept the MOV value, and a following "inc [ebp-8]" leaked into
+// EAX. Hazard and EA-invalidation logic still see .valid; only commit and
+// forwarding stop. Suppressing such a write is safe by construction: a younger
+// write to the same bytes already made the older value architecturally dead.
+logic       recipe_memory_killed;
+logic       recipe_shift_killed;
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
@@ -316,8 +327,10 @@ wire [2:0] load_wb_widx = (load_wb_size == 2'd0)
 // A plain load's WB value is already merged with its destination's prior
 // value; an M3 ALU result is not forwarded (its readers are interlocked).
 wire [7:0] pend_load_mask  = (load_wb_valid && !load_wb_is_alu) ? (8'h01 << load_wb_widx) : 8'h00;
-wire [7:0] pend_mem_mask   = recipe_memory_write.valid ? recipe_memory_dst_onehot : 8'h00;
-wire [7:0] pend_shift_mask = recipe_shift_write.valid ? (8'h01 << recipe_shift_widx) : 8'h00;
+wire [7:0] pend_mem_mask   = (recipe_memory_write.valid && !recipe_memory_killed)
+                           ? recipe_memory_dst_onehot : 8'h00;
+wire [7:0] pend_shift_mask = (recipe_shift_write.valid && !recipe_shift_killed)
+                           ? (8'h01 << recipe_shift_widx) : 8'h00;
 wire [7:0] pend_dly_mask   = dly_gpr_forward.valid ? (8'h01 << dly_gpr_forward.dst) : 8'h00;
 
 logic [31:0] gpr_ex_view [0:7];
@@ -834,6 +847,27 @@ task automatic write_gpr(
     endcase
 endtask
 
+// A younger producer writing the same bytes as a still-valid deferred token
+// retires the token's commit (and its forwarding) for the rest of the stall.
+// opr_fast_commit needs no destination: once OPR_R is replaced, the token's
+// only data source is gone, so any later recommit would write foreign data.
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        recipe_memory_killed <= 1'b0;
+        recipe_shift_killed <= 1'b0;
+    end else if (!pipeline_advance) begin
+        if ((load_wb_valid && !recipe_commit_cancel &&
+             recipe_memory_dst_onehot[load_wb_widx]) || opr_fast_commit)
+            recipe_memory_killed <= 1'b1;
+        if (load_wb_valid && !recipe_commit_cancel &&
+            (recipe_shift_widx == load_wb_widx))
+            recipe_shift_killed <= 1'b1;
+    end else begin
+        recipe_memory_killed <= 1'b0;
+        recipe_shift_killed <= 1'b0;
+    end
+end
+
 // Deferred recipe commits are Data Unit writeback state. Chain control observes
 // the compact pending descriptors for dependency checks and D2 forwarding.
 always_ff @(posedge clk) begin
@@ -898,21 +932,21 @@ always_ff @(posedge clk) begin
         esi     <= 32'd0;
         edi     <= 32'd0;
     end else begin
-        if (recipe_shift_write.valid)
+        if (recipe_shift_write.valid && !recipe_shift_killed)
             write_gpr(recipe_shift_write.dst, recipe_shift_data,
                       recipe_shift_write.size);
 
         // A chained successor may own EX while an older hardwired load's
         // pending token retires. The token is already fully qualified.
-        if (recipe_memory_write.valid && !recipe_commit_cancel)
+        if (recipe_memory_write.valid && !recipe_memory_killed &&
+            !recipe_commit_cancel)
             write_gpr(recipe_memory_write.dst, opr_r,
                       recipe_memory_write.size);
 
-        // Committed after the token above so the younger producer wins the
-        // bytes it writes: a VIPT load WB belongs to the successor, so
-        // "mov r,[m]" followed by "add r,[m]" must keep the ADD. The memory
-        // token stays valid (and recommits) through stalled cycles until
-        // pipeline_advance.
+        // Committed after the token above so the younger producer wins the bytes
+        // it writes: a VIPT load WB belongs to the successor, so "mov r,[m]"
+        // followed by "add r,[m]" must keep the ADD. The memory token stays
+        // valid (and recommits) through stalled cycles until pipeline_advance.
         if (load_wb_valid && !recipe_commit_cancel)
             write_gpr(load_wb_dst, load_wb_commit_data, load_wb_size);
 

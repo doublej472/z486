@@ -2899,6 +2899,9 @@ data_unit data_unit_inst (
     .cs_source_value(cs_source_value),
     // Cache and bus unit: memory operand in (R bus) and write data out
     .opr_r(OPR_R),
+    // A younger fast read (or the x87 m32 store) replacing OPR_R invalidates a
+    // deferred load token: OPR_R is that token's only data source.
+    .opr_fast_commit(fast_opr_commit || x87_store_opr_commit),
     .opr_w(OPR_W),
     .memory_write_source_value(memory_write_source_value),
     // Control registers and restart state read as microcode sources

@@ -102,6 +102,8 @@ module tb_load_waw;
     z486_pkg::gpr_ref_t ea_index;
     z486_pkg::gpr_forward_t dly_gpr_forward;
     logic [7:0] pend_write_mask;
+    logic opr_fast_commit;
+    logic [31:0] shift_data_latched;
 
     wire [31:0] sigma;
     wire [31:0] countr;
@@ -236,6 +238,7 @@ module tb_load_waw;
         .memory_write_source_value(memory_write_source_value),
         .alu_source_value_live(alu_source_value_live),
         .pend_write_mask(pend_write_mask),
+        .opr_fast_commit(opr_fast_commit),
         .x87_reg_commit(1'b0),
         .x87_store_commit(1'b0),
         .dest_value(dest_value),
@@ -303,6 +306,7 @@ module tb_load_waw;
             load_alu_dst_capture_dst = 3'd0;
             load_alu_dst_capture_size = 2'd2;
             load_alu_dst_capture_data = 32'd0;
+            opr_fast_commit = 1'b0;
             opr_r = 32'd0;
             dest = 7'h7E;   // no EX GPR write
             op_size = 2'd2;
@@ -494,6 +498,123 @@ module tb_load_waw;
             $finish;
         end else begin
             $display("LOAD WAW S5 PASS eax=%08x", eax);
+        end
+
+        // --- Scenario 6: an older deferred token must not recommit over the
+        // younger write-back on a LATER stalled cycle.  The token stays valid
+        // until pipeline_advance, so after the single-cycle WB the next stalled
+        // cycle would rewrite the register from OPR_R, which a younger memory
+        // operation has since replaced.
+        idle_inputs();
+        reset_n = 1'b0;
+        repeat (2) @(posedge clk);
+        reset_n = 1'b1;
+        @(negedge clk);
+        prime_alu_base();
+        commit_old_token(3'd0, 2'd2, OLD_VALUE);
+        @(posedge clk);
+        #1;
+        idle_inputs();
+        opr_r = OLD_VALUE;
+        commit_young_load(3'd0, 2'd2, NEW_VALUE);
+        @(posedge clk);
+        #1;
+        if (eax !== NEW_VALUE) begin
+            $display("LOAD WAW TEST FAIL S6 wb edge eax=%08x expected=%08x",
+                     eax, NEW_VALUE);
+            test_failed = 1'b1; test_done = 1'b1; $finish;
+        end
+        // Stalled cycle with no write-back: OPR_R now holds a younger operand.
+        idle_inputs();
+        opr_r = 32'h5A5A_5A5A;
+        @(posedge clk);
+        #1;
+        if (eax !== NEW_VALUE) begin
+            $display("LOAD WAW TEST FAIL S6 stale token recommitted eax=%08x expected=%08x",
+                     eax, NEW_VALUE);
+            test_failed = 1'b1;
+            test_done = 1'b1;
+            $finish;
+        end else begin
+            $display("LOAD WAW S6 PASS eax=%08x", eax);
+        end
+
+        // --- Scenario 7: a younger fast read replacing OPR_R leaves the older
+        // token with no data source at all, so it must stop committing.
+        idle_inputs();
+        reset_n = 1'b0;
+        repeat (2) @(posedge clk);
+        reset_n = 1'b1;
+        @(negedge clk);
+        prime_alu_base();
+        commit_old_token(3'd0, 2'd2, OLD_VALUE);
+        @(posedge clk);
+        #1;
+        idle_inputs();
+        opr_r = OLD_VALUE;
+        opr_fast_commit = 1'b1;      // younger fast read wins OPR_R
+        @(posedge clk);
+        #1;
+        if (eax !== OLD_VALUE) begin
+            $display("LOAD WAW TEST FAIL S7 commit edge eax=%08x expected=%08x",
+                     eax, OLD_VALUE);
+            test_failed = 1'b1; test_done = 1'b1; $finish;
+        end
+        idle_inputs();
+        opr_r = NEW_VALUE;           // the younger fast read's data
+        @(posedge clk);
+        #1;
+        if (eax !== OLD_VALUE) begin
+            $display("LOAD WAW TEST FAIL S7 token recommitted replaced OPR_R eax=%08x expected=%08x",
+                     eax, OLD_VALUE);
+            test_failed = 1'b1;
+            test_done = 1'b1;
+            $finish;
+        end else begin
+            $display("LOAD WAW S7 PASS eax=%08x", eax);
+        end
+
+        // --- Scenario 8: same rule for the deferred SHIFT token, whose data is
+        // latched rather than read from OPR_R.
+        idle_inputs();
+        reset_n = 1'b0;
+        repeat (2) @(posedge clk);
+        reset_n = 1'b1;
+        @(negedge clk);
+        prime_alu_base();
+        exec = 1'b1;
+        instr_start = 1'b1;
+        recipe_rni = 1'b1;
+        pipeline_advance = 1'b1;
+        recipe_state = '0;
+        recipe_state.hardwired = 1'b1;
+        recipe_state.commit_sel = z486_pkg::RECIPE_COMMIT_SHIFT;
+        next_instr = '0;
+        next_instr.dst_reg_sel = 3'd0;
+        op_size = 2'd2;
+        @(posedge clk);
+        #1;
+        shift_data_latched = dut.recipe_shift_data;
+        idle_inputs();
+        commit_young_load(3'd0, 2'd2, NEW_VALUE);
+        @(posedge clk);
+        #1;
+        if (eax !== NEW_VALUE) begin
+            $display("LOAD WAW TEST FAIL S8 wb edge eax=%08x expected=%08x",
+                     eax, NEW_VALUE);
+            test_failed = 1'b1; test_done = 1'b1; $finish;
+        end
+        idle_inputs();
+        @(posedge clk);
+        #1;
+        if (eax !== NEW_VALUE) begin
+            $display("LOAD WAW TEST FAIL S8 stale shift token recommitted eax=%08x (shift data %08x) expected=%08x",
+                     eax, shift_data_latched, NEW_VALUE);
+            test_failed = 1'b1;
+            test_done = 1'b1;
+            $finish;
+        end else begin
+            $display("LOAD WAW S8 PASS eax=%08x", eax);
         end
 
         $display("LOAD WAW TEST PASS");
