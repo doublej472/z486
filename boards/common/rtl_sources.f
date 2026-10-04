@@ -11,6 +11,7 @@ event_control.sv
 hardwired_control.sv
 data_access.sv
 data_unit.sv
+gpr_write_merge.sv
 address_unit.sv
 shifter.sv
 mul_div.sv
