@@ -1073,6 +1073,13 @@ localparam [11:0] UADDR_INVALID_LOCK   = 12'h82B;  // #UD for invalid LOCK usage
 localparam [11:0] UADDR_BSWAP          = 12'h9C4;  // Optimizer-owned 486 BSWAP entry
 localparam [11:0] UADDR_CALL_GATE_386  = 12'h5BE;  // 386 call-gate handler
 localparam [11:0] UADDR_MORE_PRIVILEGE = 12'h5FB;  // Cross-privilege call path
+// Optimizer-owned 486 XADD/CMPXCHG routines (see scripts/ucode_optimize.py,
+// XADD_BASE).  Above the x87 direct overlays (0x9D1-0x9D8) and the INVD/WBINVD
+// flush (0x9D9-0x9DB).
+localparam [11:0] UADDR_XADD_R     = 12'h9DC;  // XADD r,r
+localparam [11:0] UADDR_XADD_M     = 12'h9DF;  // XADD m,r
+localparam [11:0] UADDR_CMPXCHG_R  = 12'h9E5;  // CMPXCHG r,r
+localparam [11:0] UADDR_CMPXCHG_M  = 12'h9EC;  // CMPXCHG m,r
 
 // Group 2 instructions
 localparam ROL = 3'b000;

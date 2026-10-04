@@ -218,15 +218,20 @@ recorded.
 
 | id | item | status | evidence |
 | --- | --- | --- | --- |
-| G1 | **`XADD` (0F C0/C1) and `CMPXCHG` (0F B0/B1) are not implemented**; both hang the core instead of executing (a 486-class title or a 486-aware DOS extender that uses them stops dead, and an unimplemented opcode should at worst #UD) | **proven, unfixed** | `min_xadd.asm` and `min_cmp.asm` (one instruction each, register form) time out with the core stuck inside the instruction; `xadd_cmpxchg.asm` covers the full 486 semantics (memory and register forms, flag results, LOCK-prefixed).  Run: `./test_protected_mode.py min_xadd` (or `min_cmp`, `xadd_cmpxchg`) |
+| G1 | **`XADD` (0F C0/C1) and `CMPXCHG` (0F B0/B1) were not implemented**; both hung the core instead of executing | **fixed** | `min_xadd.asm` and `min_cmp.asm` (one instruction each) timed out before and pass now; `xadd_cmpxchg.asm` covers the full 486 semantics (both forms, flags, LOCK, and the write-back of an unchanged destination).  Run: `./test_protected_mode.py min_xadd` (or `min_cmp`, `xadd_cmpxchg`).  Implementation and provenance: the `fix(decoder,ucode)` commit |
 
-`XADD`/`CMPXCHG` are absent upstream as well as in our pre-rebase fork (only
-`z486_pkg.sv`'s LOCK-validity tables mention the encodings), so this is a
-pre-existing gap rather than a rebase loss.  A sibling PC-98 port implemented
-exactly these - "D1 decodes them with the ADD/CMP reg,r/m skeletons and enters
-optimizer-owned microcode at 9D1-9EA" - so that port is the reference for a fix:
-a decoder entry pair plus the microcode routine, with a fail-first bench already
-in place.
+They were absent upstream as well as in our pre-rebase fork (only
+`z486_pkg.sv`'s LOCK-validity tables mention the encodings), so this was a
+pre-existing gap rather than a rebase loss.  The sibling PC-98 port is the
+reference and its implementation ported cleanly: the effective-opcode rewrite in
+the decoder (0F C0/C1 decode as the one-byte ADD r/m,r form, 0F B0/B1 as
+CMP r/m,r, with the entry address overridden and the Jcc condition set to E) plus
+26 microcode words built only from existing micro-ops.  Verified before relying
+on it: the word encoding is bit-identical (same 37-bit field layout), the base
+words the routines copy are identical in our `ucode_base.hex`, and the committed
+words match the reference's for all 26 entries.  Only the addresses moved -
+0x9DC-0x9F5, because upstream's x87 direct overlays own 0x9D1-0x9D8 and our
+INVD/WBINVD flush 0x9D9-0x9DB.
 
 ### Exclusions (bench exists, behaviour is correct)
 
