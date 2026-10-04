@@ -15,7 +15,8 @@ arbitrated once by `gpr_write_merge.sv`, and the commit path *and* all three
 forwarding views are built from that one answer, so they cannot disagree.  See
 *Structural fix 1 (done)* below; P2's retirement rules, P4's gate and P6's
 coherence checks are also in place.  P3 and P5 remain triage rules, and the
-unverified items (A6, A7, A8) still need a bench that can miss.
+unverified item (A7) still needs a bench that lands a delay-slot write and a
+pending token on one register.
 
 ## How each item was found
 
@@ -99,7 +100,7 @@ one red test in the suite turned out to be a bench artifact (see inventory).
 | A5 | an EX GPR write vs a token that outlives it | **unreachable** | `exec`/`uc_exec` is a held level while stalled, so the write re-fires every cycle and the token can never outlive it; `tb_gpr_hazard` H5 is kept as a boundary probe and shows the arbitration alone would clobber |
 | A6 | `vipt_load_ex_hit` is gated by the *global* `any_fault`, so a fault could cancel a live token's write-back | **checked sound** | reachability argument: a direct-load token is issued in D2 (one instruction *ahead* of EX), and a load that takes the slow path stalls its own instruction, so no live token can belong to an instruction *older* than the one whose microcode is executing - i.e. the faulting instruction is always older or equal, and cancelling the younger token's write-back is required for precise exceptions.  The fork's own fix here (evaluating the segment verdict in the token's stage) is present |
 | A7 | `dly_gpr_forward` (delay-slot write) vs a token, and its position in the views | **unverified** | the EA view ranks dly above shift above load WB, which is not the age order; a bench needs a DLY write with a pending token |
-| A8 | OPR_R has three writers (paging demand, `fast_opr_commit`, x87 m32 store); a younger fast read strands an older token's data | **documented** | Zet98's local change list, same base: a younger direct load must be routed to the slow path when an older token owns its destination and `mem_opt_wait` is set.  This tree has the same structure and no such gate |
+| A8 | OPR_R has three writers (paging demand, `fast_opr_commit`, x87 m32 store); a younger fast read strands an older token's data | **fixed** | Zet98's third Doom fix, ported: `vipt_load_ex_token_pending` suppresses `vipt_load_ex_hit` when the deferred memory token owns the same GPR (byte-normalized `gpr_wr_expand`) and `mem_opt_wait` is set, routing the younger direct load to the slow path, which captures after the fill.  Provenance: Zet98 `cc0032d` - "Route a VIPT EX op to the slow path while an optimistic (DLY grace) read feeding its destination is still in flight (mem_opt_wait); Doom I floors/ceilings were drawn from stale OPR_R."  Our tree already carried Zet98's two other Doom load fixes (`acb20c3`, `2d299ca`); this was the missing third |
 | A9 | flags: `flag2_*` (registered, one cycle old) vs `sh_flags_commit` (current cycle, per-field write enables) | **checked sound** | both the clocked update and `eflags_fwd` test the shifter commit *first* and it writes only the fields it enables, so the younger producer wins per field and the older one still fills the rest |
 
 ### B. Verdict and attribute staleness in decoupled stages
@@ -112,7 +113,7 @@ one red test in the suite turned out to be a bench artifact (see inventory).
 | B4 | ENTER's check-only crossing skipped the second page's lookup | **fixed** | `enter_check_cross_pf` program |
 | B5 | expand-down (ED) segments inverted the limit verdict | **fixed** | `ed_seg_limit_check` program |
 | B6 | the store-path translation sidecar caches a page across CR3/INVLPG | **checked benign** | `st_postable` requires a live `vipt_tlb_hit`, and the TLB (not the sidecar) supplies `st_phys`, so a stale sidecar only costs a skipped preread |
-| B7 | `mem_opt_wait` + stale `OPR_R` (Zet98's third item) | **documented, not benchable here** | see A8; `tb_protected_mode` cannot complete a cold-line fill |
+| B7 | `mem_opt_wait` + stale `OPR_R` (Zet98's third item) | **fixed** | see A8.  Directed bench still to port: `tb_protected_mode` can now complete a cold fill (`LINE_FILL`), and the suite reaches the token + `mem_opt_wait` pair in `vipt_load_interlocks`, but not yet with the direct-load EX token live in the same cycle; Zet98's differential fuzzer (`tests/run-z486-fuzz.sh`) and `z486_rmw_reload.asm` are the reference proofs |
 | B8 | `st_postable`'s unpaged arm uses a hard-coded VGA compare | **fixed** | disabled whenever any template window is enabled (`!memmap_windows`), so a device window is never posted into the L1 |
 
 ### C. Reset and startup state

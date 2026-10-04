@@ -60,20 +60,15 @@ still needed *after* upstream's rewrite, so:
 These are deliberate, recorded omissions - revisit them when a bench can prove
 or refute them:
 
-- **Zet98's stale-`OPR_R` gate for a younger direct load.** Zet98 (a parallel
-  PC-98 port the same upstream base) suppresses a direct-load EX hit when an
-  older deferred memory token targets the same register and its optimistic read
-  has already missed (`mem_opt_wait`), because our forwarding view merges
-  `opr_r` for the token's bytes and that value is stale until the data returns.
-  The structure is present here (`pend_mem_mask`/`gpr_ex_view` in `data_unit`,
-  `mem_opt_wait` in `paging_unit`), but `tb_protected_mode` cannot exercise it:
-  it ties `line_resp_valid`/`line_din` low, so a cold-line load never
-  completes (a minimal cold load times out). Port it together with a bench that
-  can miss.
 - **Zet98's "queue the D-cache store patches to the I$" (3-deep).** Superseded
   in the fork by the storeq-forwarding rewrite, and here by the DIRECT-write
   invalidate slot plus its hold; only revisit if a snoop-train regression
   reappears.
+
+The Zet98 stale-`OPR_R` gate for a younger direct load is now carried
+(`fix(z486,data_access): route a direct load around a stale OPR_R token`), with
+`tb_protected_mode`'s whole-line fill model as the bench; `docs/hazard-survey.md`
+records it as A8/B7.
 
 ## Rebase procedure
 
@@ -96,13 +91,15 @@ with `git rebase --skip` and re-run the gate it owns.
 
 ```
 cd tests
-make test-protected          # 105 directed programs (alljson in programs/)
+make test-protected          # 119 directed programs (alljson in programs/)
 make test-simple             # tb_z486
 make test-memmap-template    # z486_cache_map_pkg
 make test-cache-flush        # whole-L1 flush controller
 make test-paging-walker      # A/D write-back elision
 make test-l1-icache          # fill/snoop races
 make test-memory-order       # device/store ordering
+make test-load-waw           # deferred-token GPR write arbitration
+make test-gpr-merge          # shared GPR producer arbitration
 make test-interrupt-nmi      # NMI latch
 make dhrystone               # must PASS; cycles are a regression signal
 ```
