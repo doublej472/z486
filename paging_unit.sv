@@ -583,9 +583,19 @@ always_ff @(posedge clk or negedge reset_n) begin
         tlb_lookup_addr_r <= tlb_lookup_addr_next;
 end
 
+// The walker latches CR3 at walk start, so a walk that started on or across a
+// CR3 write used the old tables: never install its result or report its fault.
+reg walk_cr3_stale_r;
+always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n)          walk_cr3_stale_r <= 1'b0;
+    else if (walk_request) walk_cr3_stale_r <= cr3_write;
+    else if (cr3_write)    walk_cr3_stale_r <= 1'b1;
+end
+wire walk_stale = walk_cr3_stale_r || cr3_write;
+
 // TLB update on successful page walk
 always_comb begin
-    tlb_update_valid = walk_done && !walk_fault;
+    tlb_update_valid = walk_done && !walk_fault && !walk_stale;
     tlb_update_vpn = tlb_lookup_addr[31:12];
     tlb_update_pfn = walk_result_pfn;
     tlb_update_writable = walk_result_writable;
@@ -1040,6 +1050,12 @@ always_ff @(posedge clk or negedge reset_n) begin
                     if (pf_redirect_queued) begin
                         pf_ack_toggle_r <= ~pf_ack_toggle_r;
                         state <= PG_IDLE;
+                    end else if (walk_stale) begin
+                        // Walked the old CR3: drop the result (or fault) and
+                        // re-walk under the new CR3.
+                        req_is_write <= 1'b0;
+                        req_cpl <= cpl;
+                        walk_request <= 1'b1;
                     end else if (walk_fault) begin
                         // Prefetch page fault: silently ack with fault flag
                         ack_prefetch_fault(tlb_lookup_addr, walk_fault_code);
@@ -1059,6 +1075,12 @@ always_ff @(posedge clk or negedge reset_n) begin
                 if (pf_redirect_queued) begin
                     pf_ack_toggle_r <= ~pf_ack_toggle_r;
                     state <= PG_IDLE;
+                end else if (walk_stale) begin
+                    // CR3 changed while waiting for a lookup slot: re-walk.
+                    req_is_write <= 1'b0;
+                    req_cpl <= cpl;
+                    walk_request <= 1'b1;
+                    state <= PG_PF_WALKING;
                 end else if (cache_lookup_granted) begin
                     automatic logic [31:0] pf_phys = {walk_result_pfn, pf_linear_addr[11:0]};
                     emit_pf_biu_req(pf_phys);

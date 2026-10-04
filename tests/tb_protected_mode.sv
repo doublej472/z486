@@ -135,6 +135,22 @@ module tb_protected_mode #(
     logic cpu_current_load_direct;
     logic [1:0] cpu_current_load_path;
     logic cpu_current_load_addr32;
+
+    // Prefetch walks spanning a CR3 write; +expect_stale_walk requires one.
+    reg         walk_cr3_stale_r_d = 1'b0;
+    longint     stale_walk_events = 0;
+
+    always @(posedge clk) begin
+        if (!reset_n) begin
+            walk_cr3_stale_r_d <= 1'b0;
+            stale_walk_events <= 0;
+        end else begin
+            walk_cr3_stale_r_d <= dut.paging_inst.walk_cr3_stale_r;
+            if (!walk_cr3_stale_r_d && dut.paging_inst.walk_cr3_stale_r &&
+                (dut.paging_inst.state == 4'd10))  // PG_PF_WALKING
+                stale_walk_events <= stale_walk_events + 1;
+        end
+    end
     logic [1:0] cpu_current_load_size;
     logic [1:0] cpu_current_load_ea_class;
     logic [1:0] cpu_current_load_alignment;
@@ -747,12 +763,17 @@ module tb_protected_mode #(
                              (vipt_ea_interlock_cycles == 0)) ||
                             ($test$plusargs("expect_vipt_store_replay") &&
                              ((vipt_store_wait_issues == 0) ||
-                              (vipt_store_replays == 0)))) begin
+                              (vipt_store_replays == 0))) ||
+                            ($test$plusargs("expect_stale_walk") &&
+                             (stale_walk_events == 0))) begin
                             test_status <= 8'hFF;
                             $display("");
                             $display("========================================");
                             $display("  TEST FAILED!");
-                            if (vipt_ea_interlock_cycles == 0)
+                            if ($test$plusargs("expect_stale_walk") &&
+                                (stale_walk_events == 0))
+                                $display("  no prefetch walk spanned a CR3 write");
+                            else if (vipt_ea_interlock_cycles == 0)
                                 $display("  VIPT load-to-EA interlock was not exercised");
                             else
                                 $display("  VIPT older-store replay was not exercised");
