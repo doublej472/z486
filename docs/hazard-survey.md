@@ -219,6 +219,34 @@ recorded.
 | id | item | status | evidence |
 | --- | --- | --- | --- |
 | G1 | **`XADD` (0F C0/C1) and `CMPXCHG` (0F B0/B1) were not implemented**; both hung the core instead of executing | **fixed** | `min_xadd.asm` and `min_cmp.asm` (one instruction each) timed out before and pass now; `xadd_cmpxchg.asm` covers the full 486 semantics (both forms, flags, LOCK, and the write-back of an unchanged destination).  Run: `./test_protected_mode.py min_xadd` (or `min_cmp`, `xadd_cmpxchg`).  Implementation and provenance: the `fix(decoder,ucode)` commit |
+| G3 | the three recipe commits (`RECIPE_COMMIT_SIGSRC` MOVZX/MOVSX, `RECIPE_COMMIT_ESP` PUSH, and the `REP STOS` ECX count) were written by `write_gpr` *after* `commit_merged`, so they were not arbitrated with the other producers and their write logic was duplicated outside the merge | **consolidated, deliberately not forwarded** | They are now producers 5-7 of `gpr_write_merge` (youngest tier, order `stos < sigsrc < esp`, the original assignment order), applied by a second merged write after the deferred producers and the EX writes.  `tb_gpr_write_merge` cases 10-15 pin the commit arbitration (`pulse_value`/`pulse_wmask`, lane sizes, ESP youngest) and the hidden-view behaviour.  Exposing them in the forwarding views is logically correct but costs ~2.4 ns of setup slack (see the fit table below), so the CPU wiring keeps bits 7:5 of every `vis_*` mask clear. |
+
+G3 is the P1 pattern surviving its own structural fix: the merge covered the five
+producers named in `gpr_write_merge.sv`, but the recipe commits were added to the
+register file as separate pulses, so they were neither arbitrated with the other
+producers nor named by any view mask.  Consolidating them fixes that and removes
+the duplicate write logic (the fit even gets smaller).  The first attempt also
+exposed them in all three forwarding views; that is logically correct, but the
+fit showed it moved the critical path onto the merge's `ex_value`/`ea_value`
+muxes and cost 2.4 ns, so it was dropped in favour of the consolidation alone.
+
+Hiding them is **not a new assumption**: it restores the exact view visibility
+the core shipped with before this work.  A recipe commit is the retiring
+instruction's own write, and the only reader that can sample a view for its
+destination in the commit cycle is that same instruction's microcode, which must
+see the pre-commit value; a younger instruction's D2 EA latch is served by the
+register file on the next cycle or by the delay-slot bypass.  Rebuilding the
+pre-fix view relationship still passes 119/119, and a probe that forced
+`i_issue` together with a recipe commit never found a younger consumer (every
+hit was the current instruction's own stalled EA read, with the views already
+agreeing and the base equal to the committed value).  The integration guard that
+started this - comparing each recipe commit against the forwarding view for its
+destination - flagged 23 cycles where they differed (`instruction_timing` 18,
+`vipt_load_widths` 5); those were the same-instruction reads above, which is
+exactly why the "does any consumer sample it?" question had to be settled before
+trusting the guard.  (Measurement caveat worth repeating: the guard printed
+*zero* events until the suite was run with `-v`, because `test_protected_mode.py`
+captures simulator stdout.)
 
 They were absent upstream as well as in our pre-rebase fork (only
 `z486_pkg.sv`'s LOCK-validity tables mention the encodings), so this was a
@@ -255,7 +283,7 @@ That is the whole argument for the bench-first rule.
 
 | id | item | obstacle |
 | --- | --- | --- |
-| A7, A8 | delay-slot bypass vs a token; the stale-`OPR_R` gate when a DLY-grace optimistic read misses (`mem_opt_wait`) | needs a bench in which a cold line can actually complete a fill: `tb_protected_mode` ties `line_resp_valid`/`line_din` low, so any miss hangs.  Either add line responses to that bench's memory model or port the fork's PC-98 map bench |
+| A7, A8 | delay-slot bypass vs a token; the stale-`OPR_R` gate when a DLY-grace optimistic read misses (`mem_opt_wait`) | `tb_protected_mode` now answers `line_read` with a whole-line response (`LINE_FILL`, `+no_line_fill` to restore the old narrow-only model), so a cold line can complete a fill and 5.4k line fills run across the gate; these two still need a directed bench that lands a token and a bypass on one register |
 | G2 | instruction fetch from a NO_ALLOC/DIRECT window ("complete uncached instruction lines") | needs a CPU-level bench with the memory-map template enabled (unit coverage exists for `cpu_no_alloc` in `tb_l1_icache`, but not for execution from such a window) |
 | E2 | `tb_l1_cache` | the bench's own defects: it does not own its response and releases `valid` before `ready`; repairing those exposes a stale VIPT-probe model in the same bench, so it needs a bench update |
 | C6 | `TMPeIP`/`TMPeSP` never reset | latent only (the fault entry writes them before use), and an X-only hazard that a 2-state simulator cannot show |
@@ -283,6 +311,25 @@ the fit is routing-dominated, so most of the 1.77 ns is the area increase rather
 than merge depth.  The design was already short of its 85 MHz request before
 this change (about 55 MHz), and it is worth the slack here: the merge removes a
 proven wrong-value hazard that surfaced as spurious page faults in games.
+
+### G3 consolidation: forward or hide?
+
+Same OOC flow (Cyclone V 5CSEBA6U23I7, 85 MHz, x87 off, `boards/de10nano`
+`build_cpu.tcl 0 85`, default seed), before/after the G3 work:
+
+| build | ALMs | registers | setup slack @85 | Fmax |
+| --- | ---: | ---: | ---: | ---: |
+| before G3 (`186a30c`) | 19,346 | 8,076 | -8.200 ns | 50.1 MHz |
+| consolidate + forward in views | 18,016 | 7,914 | -10.647 ns | 44.6 MHz |
+| two-stage view restructure | 18,204 | 8,034 | -10.960 ns | 44.0 MHz |
+| **consolidate + hide (kept)** | **18,681** | **7,973** | **-8.003 ns** | **50.6 MHz** |
+
+Consolidation is a strict win on area and removes the duplicate write logic.  The
+forwarding variants move the critical path onto `gpr_merge|ex_value`/`ea_value`
+(the pulse decode and value routing on the forwarding cone); the two-stage
+restructure does not help because the fitter flattens it.  At the PC-9821
+`clk_sys` target of 50 MHz the before-G3 build is only +0.04 ns, the forwarding
+variant is -2.41 ns (a closure break), and the kept hide form is +0.23 ns.
 
 If that slack is ever unacceptable, the same correctness can be had with zero
 cost by keeping the age order in the (cheap, hand-written) view muxes and
