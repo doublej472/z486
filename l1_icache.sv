@@ -38,7 +38,10 @@ module l1_icache #(
     input  [31:0] invalidate_addr,
     input         invalidate_valid,
 
-    input         cache_enable
+    input         cache_enable,
+    // NO_ALLOC fill: answer the fetch but do not install a line, so an
+    // unmapped/uncached window never evicts or aliases a cacheable line.
+    input         cpu_no_alloc
 );
 
 localparam integer WORD_OFFSET_BITS = 2;
@@ -104,6 +107,7 @@ reg [2:0] rd_plru_r;
 reg        req_valid_r;
 reg [31:0] req_addr_r;
 reg        req_uncacheable_r;
+reg        req_no_alloc_r;
 reg [TAG_BITS-1:0] req_tag_r;
 reg [SET_BITS-1:0] req_set_r;
 
@@ -282,7 +286,8 @@ wire lookup_hit_usable = lookup_hit && !lookup_snoop_conflict;
 wire can_accept_cpu = (state == S_IDLE) && !reset;
 wire accept_cpu = cpu_valid && ready_r && can_accept_cpu;
 wire lookup_read_hit_now = (state == S_LOOKUP) && req_valid_r &&
-                           !req_uncacheable_r && lookup_hit_usable;
+                           !req_uncacheable_r && !req_no_alloc_r &&
+                           lookup_hit_usable;
 logic [PATCHQ_DEPTH-1:0] patchq_snoop_match;
 logic patchq_snoop_hit;
 logic [31:0] fill_word_next;
@@ -370,7 +375,7 @@ wire registered_snoop_fill_conflict = snoop_valid_r &&
 // both operations need the same way RAM for different lines, the fill may
 // win: replacing the old tag also invalidates the snooped line.  Only a snoop
 // targeting the line being filled must leave that fill uncached.
-wire fill_install_allowed = !live_snoop_fill_conflict &&
+wire fill_install_allowed = !req_no_alloc_r && !live_snoop_fill_conflict &&
                             !registered_snoop_fill_conflict;
 wire data_fill_write = tag_fill_write && fill_install_allowed;
 
@@ -536,6 +541,7 @@ always_ff @(posedge clk) begin
                     req_valid_r <= 1'b1;
                     req_addr_r <= cpu_addr;
                     req_uncacheable_r <= cpu_uncacheable;
+                    req_no_alloc_r <= cpu_no_alloc;
                     req_tag_r <= cpu_tag;
                     req_set_r <= cpu_set;
                     state <= S_LOOKUP;
@@ -552,6 +558,17 @@ always_ff @(posedge clk) begin
                         mem_burstcount_r <= 8'd1;
                         state <= S_BYPASS_WAIT;
                     end
+                end else if (req_no_alloc_r) begin
+                    // Pass-through fill: a normal S_FILL with the line install
+                    // held off, so the fetch is answered but nothing is cached.
+                    fill_set <= req_set_r;
+                    fill_tag <= req_tag_r;
+                    fill_way <= plru_victim(rd_plru_r);
+                    fill_plru_r <= rd_plru_r;
+                    fill_count <= {WORD_OFFSET_BITS{1'b0}};
+                    fill_line <= 128'h0;
+                    fill_requested <= 1'b0;
+                    state <= S_FILL;
                 end else if (lookup_hit_usable) begin
                     plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
                     state <= S_IDLE;
@@ -580,7 +597,8 @@ always_ff @(posedge clk) begin
                     fill_line <= wide_line_next;
                     line_r <= wide_line_next;
                     resp_valid_r <= 1'b1;
-                    plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                    if (fill_install_allowed)
+                        plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
                     state <= S_IDLE;
                     ready_r <= 1'b1;
                 end else if (mem_resp_valid) begin
@@ -592,7 +610,8 @@ always_ff @(posedge clk) begin
                         // Only the tag-RAM fill write sets valid for fill_way.
                         // Do not restore any other way from the fill-start
                         // snapshot: a snoop during this fill must survive.
-                        plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                        if (fill_install_allowed)
+                            plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
                         state <= S_IDLE;
                         ready_r <= 1'b1;
                     end

@@ -5,7 +5,13 @@
 
 `include "z486_platform.svh"
 module paging_unit
-    import z486_pkg::*;
+    import z486_pkg::*, z486_cache_map_pkg::*;
+#(
+    // VGA/device window, classified per 4 KB page in the TLB; the default
+    // reproduces upstream's hardcoded A0000-BFFFF.
+    parameter [31:0] VGA_BASE = 32'h000a_0000,
+    parameter [31:0] VGA_TOP  = 32'h000b_ffff
+)
 (
     input               clk,
     input               reset_n,
@@ -233,7 +239,7 @@ always_ff @(posedge clk) begin
 end
 wire idle_pf_req = s_idle && pf_pending && !fast_path_pending && !pf_fast_pending;
 
-paging_tlb tlb_inst (
+paging_tlb #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) tlb_inst (
     .clk            (clk),
     .reset_n        (reset_n),
     .linear_addr    (tlb_lookup_addr),
@@ -473,9 +479,9 @@ wire        early_idx_drive    = early_wr_idx_drive;
 wire [31:0] early_phys         = pg_enable ? {live_tlb_physical[31:12], linear_addr[11:0]}
                                           : linear_addr;
 wire        early_is_vga_mem   = pg_enable ? live_tlb_is_vga_mem
-                                           : (linear_addr[31:17] == 15'h5);
+                                           : z486_page_in_window(linear_addr[31:12], VGA_BASE, VGA_TOP);
 wire        req_is_vga_mem     = pg_enable ? tlb_is_vga_mem
-                                           : (req_linear[31:17] == 15'h5);
+                                           : z486_page_in_window(req_linear[31:12], VGA_BASE, VGA_TOP);
 wire        early_wr_accept    = early_wr_present && dcache_req_accepted;
 // A read whose probe-path resolve found a TLB hit but no line presents its
 // registered physical address directly: no translation cycle.
@@ -535,7 +541,7 @@ assign dcache_req_is_inta = (early_present || req_mem_present) ? 1'b0 : dcache_r
 assign dcache_req_is_x87 = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_x87_r;
 assign dcache_req_is_vga_mem = early_present ? early_is_vga_mem :
                                req_mem_present ? req_is_vga_mem :
-                               (dcache_req_phys_addr_r[31:17] == 15'h5);
+                               z486_page_in_window(dcache_req_phys_addr_r[31:12], VGA_BASE, VGA_TOP);
 assign icache_req_valid = icache_req_valid_r || fast_pf_candidate;
 assign icache_req_phys_addr = icache_req_valid_r ? icache_req_phys_addr_r : fast_pf_phys;
 

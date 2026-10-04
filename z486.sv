@@ -5,7 +5,7 @@
 
 `include "z486_platform.svh"
 module z486
-    import z486_pkg::*;
+    import z486_pkg::*, z486_cache_map_pkg::*;
 #(
     parameter PROTECT_UMA_ROM = 0,
     parameter DCACHE_SET_BITS = 7,   // dcache size: 7 = 8KB, 8 = 16KB
@@ -13,6 +13,37 @@ module z486
     parameter ENABLE_X87 = 0,
     parameter ENABLE_DEVICE_MMIO = 0,
     parameter [31:0] DEVICE_MMIO_MASK = 32'hff00_0000,
+
+    // Memory-map template (z486_cache_map_pkg); the defaults reproduce
+    // upstream's PC/AT map. See memory.sv for the per-window documentation.
+    parameter [31:0] A20_MASK_OFF = 32'hffef_ffff,
+    parameter [31:0] A20_MASK_ON  = 32'hffff_ffff,
+    parameter        VGA_ENABLE = 0,
+    parameter        VGA_PRE_WRAP = 1,
+    parameter [1:0]  VGA_CLASS = Z486_CACHE_DIRECT,
+    parameter [31:0] VGA_BASE = 32'h000a_0000,
+    parameter [31:0] VGA_TOP  = 32'h000b_ffff,
+    parameter        APERTURE_ENABLE = 0,
+    parameter [1:0]  APERTURE_CLASS = Z486_CACHE_DIRECT,
+    parameter [31:0] APERTURE_BASE = 32'h000a_0000,
+    parameter [31:0] APERTURE_TOP  = 32'h000f_ffff,
+    parameter        ALIAS_ENABLE = 0,
+    parameter [1:0]  ALIAS_CLASS = Z486_CACHE_DIRECT,
+    parameter [31:0] ALIAS0_BASE = 32'h00f0_0000,
+    parameter [31:0] ALIAS0_TOP  = 32'h00ff_ffff,
+    parameter [31:0] ALIAS1_BASE = 32'hfff0_0000,
+    parameter [31:0] ALIAS1_TOP  = 32'hfff7_ffff,
+    parameter [31:0] ALIAS2_BASE = 32'hffff_8000,
+    parameter [31:0] ALIAS2_TOP  = 32'hffff_ffff,
+    parameter        WIN0_ENABLE = 0,
+    parameter [1:0]  WIN0_CLASS = Z486_CACHE_NO_ALLOC,
+    parameter [31:0] WIN0_BASE = 32'h0008_0000,
+    parameter [31:0] WIN0_TOP  = 32'h0009_ffff,
+    parameter        NO_ALLOC_ENABLE = 0,
+    parameter [1:0]  NO_ALLOC_CLASS = Z486_CACHE_NO_ALLOC,
+    parameter [31:0] NO_ALLOC_BOUND = 32'h0800_0000,   // L1 tag reach (128 MiB)
+    parameter        RAM_BOUND_ENABLE = 0,
+
     parameter [6:0] CLOCK_RATE_MHZ = 7'd85
 )
 (
@@ -20,6 +51,8 @@ module z486
     input              reset_n,
     input              device_mmio_enable,
     input      [31:0]  device_mmio_base,
+    input              win0_unmapped,
+    input      [31:0]  ram_cache_top,
 
     // 32-bit bus interface (ready/valid handshake)
     output     [31:2]  addr,        // Physical address [31:2]
@@ -707,13 +740,42 @@ memory #(
     .ICACHE_SET_BITS(ICACHE_SET_BITS),
     .ENABLE_X87(ENABLE_X87),
     .ENABLE_DEVICE_MMIO(ENABLE_DEVICE_MMIO),
-    .DEVICE_MMIO_MASK(DEVICE_MMIO_MASK)
+    .DEVICE_MMIO_MASK(DEVICE_MMIO_MASK),
+    .A20_MASK_OFF(A20_MASK_OFF),
+    .A20_MASK_ON(A20_MASK_ON),
+    .VGA_ENABLE(VGA_ENABLE),
+    .VGA_PRE_WRAP(VGA_PRE_WRAP),
+    .VGA_CLASS(VGA_CLASS),
+    .VGA_BASE(VGA_BASE),
+    .VGA_TOP(VGA_TOP),
+    .APERTURE_ENABLE(APERTURE_ENABLE),
+    .APERTURE_CLASS(APERTURE_CLASS),
+    .APERTURE_BASE(APERTURE_BASE),
+    .APERTURE_TOP(APERTURE_TOP),
+    .ALIAS_ENABLE(ALIAS_ENABLE),
+    .ALIAS_CLASS(ALIAS_CLASS),
+    .ALIAS0_BASE(ALIAS0_BASE),
+    .ALIAS0_TOP(ALIAS0_TOP),
+    .ALIAS1_BASE(ALIAS1_BASE),
+    .ALIAS1_TOP(ALIAS1_TOP),
+    .ALIAS2_BASE(ALIAS2_BASE),
+    .ALIAS2_TOP(ALIAS2_TOP),
+    .WIN0_ENABLE(WIN0_ENABLE),
+    .WIN0_CLASS(WIN0_CLASS),
+    .WIN0_BASE(WIN0_BASE),
+    .WIN0_TOP(WIN0_TOP),
+    .NO_ALLOC_ENABLE(NO_ALLOC_ENABLE),
+    .NO_ALLOC_CLASS(NO_ALLOC_CLASS),
+    .NO_ALLOC_BOUND(NO_ALLOC_BOUND),
+    .RAM_BOUND_ENABLE(RAM_BOUND_ENABLE)
 ) memory_inst (
     .clk(clk),
     .reset_n(reset_n),
     .a20_enable(a20_enable),
     .device_mmio_enable(device_mmio_enable),
     .device_mmio_base(device_mmio_base),
+    .win0_unmapped(win0_unmapped),
+    .ram_cache_top(ram_cache_top),
 
     .dcache_req_valid(dcache_req_valid),
     .dcache_req_phys_addr_raw(dcache_req_phys_addr_raw),
@@ -1718,10 +1780,18 @@ wire        paging_is_write_access = !x87_direct_mem_req && !paging_owned_submit
                                       (uc_is_write || uc_is_check_write);
 
 
+// Any template memory-map window (z486_cache_map_pkg) enabled.  A constant, so
+// it folds away; when set, the posted-store path defers to the classifying
+// demand path in the memory unit (see data_access.sv).
+localparam bit Z486_TEMPLATE_WINDOWS = VGA_ENABLE | APERTURE_ENABLE |
+                                       ALIAS_ENABLE | WIN0_ENABLE |
+                                       NO_ALLOC_ENABLE;
+
 data_access data_access_inst (
     // Clock and reset
     .clk(clk),
     .reset_n(reset_n),
+    .memmap_windows(Z486_TEMPLATE_WINDOWS),
     // L1 data cache: probe/resolve port and direct store port
     .dcache_vipt_probe_accepted(dcache_vipt_probe_accepted),
     .dcache_vipt_probe_direct_accepted(dcache_vipt_probe_direct_accepted),
@@ -1864,7 +1934,7 @@ data_access data_access_inst (
 );
 
 // Paging unit instantiation
-paging_unit paging_inst (
+paging_unit #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) paging_inst (
     .clk                (clk),
     .reset_n            (reset_n),
     .cr0                (CR0),

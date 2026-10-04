@@ -61,3 +61,9 @@
 `endif
 
 `endif
+
+// L1 cache tag width in physical address bits (27 = 128 MiB); addresses that
+// differ only above it share a line and must never be cached.
+`ifndef Z486_L1_PHYS_ADDR_BITS
+`define Z486_L1_PHYS_ADDR_BITS 27
+`endif

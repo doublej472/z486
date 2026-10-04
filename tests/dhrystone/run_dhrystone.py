@@ -194,6 +194,10 @@ def build_memory_image(binary_file: Path) -> None:
 def rtl_sources(core: str, core_dir: Path) -> list[Path]:
     package_name, top_name = CORE_FILES[core]
     names = [package_name, *BASE_RTL, "decoder.sv", "prefetch.sv", top_name]
+    # The shared memory-map package; a core revision that has it must list it
+    # before the modules that import it.
+    if (core_dir / "z486_cache_map_pkg.sv").exists():
+        names.insert(1, "z486_cache_map_pkg.sv")
     for optional_name in (
         "cpu_throttle.sv",
         "interrupt_controller.sv",
