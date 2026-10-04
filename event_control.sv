@@ -387,6 +387,10 @@ always_ff @(posedge clk) begin
         interrupt_entry <= 1'b0;
         tf_active_r <= 1'b0;
         tf_trap_suppress_r <= 1'b0;
+        // Also reset state that is only ever assigned from its own feedback
+        // term below: without this it starts X in simulation and can only be
+        // cleared by the fault/stall path.
+        fault_suppress_delay_slot <= 1'b0;
     end else begin
         if (!stall)
             interrupt_entry <= 1'b0;

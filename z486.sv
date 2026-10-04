@@ -1216,6 +1216,8 @@ always_ff @(posedge clk) begin
         d2_ea_split_done_r <= 1'b0;
         throttle_parked_r <= 1'b0;
         stack_init_pending <= 1'b0;
+        // Pulse state: never reset, so it starts X in simulation.
+        i_first <= 1'b0;
     end else begin
         if (q_flush || any_fault)
             d2_ea_split_done_r <= 1'b0;
@@ -1796,7 +1798,10 @@ always @(posedge clk)
 assign any_fault_issue = gp_fault_trigger || page_fault;
 assign any_fault = any_fault_issue || div_overflow;
 // Registered any_fault is used for deferred SIGMA/TMPeSP writes.
-always_ff @(posedge clk) any_fault_r <= any_fault;
+always_ff @(posedge clk) begin
+    if (!reset_n) any_fault_r <= 1'b0;
+    else          any_fault_r <= any_fault;
+end
 wire        data_page_fault;
 wire [2:0]  data_fault_code;
 wire [31:0] data_cr2_out;
