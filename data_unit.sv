@@ -902,14 +902,19 @@ always_ff @(posedge clk) begin
             write_gpr(recipe_shift_write.dst, recipe_shift_data,
                       recipe_shift_write.size);
 
-        if (load_wb_valid && !recipe_commit_cancel)
-            write_gpr(load_wb_dst, load_wb_commit_data, load_wb_size);
-
         // A chained successor may own EX while an older hardwired load's
         // pending token retires. The token is already fully qualified.
         if (recipe_memory_write.valid && !recipe_commit_cancel)
             write_gpr(recipe_memory_write.dst, opr_r,
                       recipe_memory_write.size);
+
+        // Committed after the token above so the younger producer wins the
+        // bytes it writes: a VIPT load WB belongs to the successor, so
+        // "mov r,[m]" followed by "add r,[m]" must keep the ADD. The memory
+        // token stays valid (and recommits) through stalled cycles until
+        // pipeline_advance.
+        if (load_wb_valid && !recipe_commit_cancel)
+            write_gpr(load_wb_dst, load_wb_commit_data, load_wb_size);
 
         // A younger VIPT candidate can shadow the ROM writeback slot of a
         // hardwired load.  If an interrupt redirects that boundary, retire
