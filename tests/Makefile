@@ -128,7 +128,7 @@ CPP_PLA4_SRCS := sim_main_pla4.cpp
 PLA4_RTL := $(Z486_DIR)/protection.sv
 
 # Targets
-.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
+.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists check-pragmas check-rom-columns check-shift-ucode test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 all: build
 
@@ -383,6 +383,20 @@ test-load-waw: obj_dir/Vtb_load_waw
 	@echo "Running same-cycle load write-arbitration unit test..."
 	@./obj_dir/Vtb_load_waw | tee obj_dir/z486_load_waw.out | grep -q "LOAD WAW TEST PASS" \
 		|| (echo "load write-arbitration test FAIL"; exit 1)
+
+# Static checks revived from the fork: they guard the microcode/PLA images and
+# the synthesis pragmas, none of which any RTL bench covers.
+check-pragmas:
+	@echo "Checking synthesis translate_off/translate_on balance..."
+	@./check_pragmas.py $(Z486_DIR)
+
+check-rom-columns:
+	@echo "Scanning ROM images for constant (foldable) bit columns..."
+	@./check_rom_columns.py $(Z486_DIR)
+
+check-shift-ucode:
+	@echo "Scanning ucode.hex for unrecognized SHIFT source pairings..."
+	@./check_shift_ucode.py $(Z486_DIR)/ucode.hex
 
 # Static audit: an always_ff that assigns state its reset branch never resets.
 # Three live defects had this shape; new ones fail here.

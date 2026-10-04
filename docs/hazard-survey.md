@@ -206,6 +206,55 @@ one red test in the suite turned out to be a bench artifact (see inventory).
    row), but fixing those exposes a stale VIPT-probe model in the same bench, so
    this needs a bench update rather than a core change.
 
+## Survey round 2: feature and property tests
+
+Round 2 attacked the same question from the instruction side instead of the
+arbitration side: run a bench first, and only then consider an RTL change.  New
+benches live in `tests/programs/`; the ones that currently FAIL are deliberately
+not in the `test-protected` gate, so the gate stays green while the finding is
+recorded.
+
+### Proven defect
+
+| id | item | status | evidence |
+| --- | --- | --- | --- |
+| G1 | **`XADD` (0F C0/C1) and `CMPXCHG` (0F B0/B1) are not implemented**; both hang the core instead of executing (a 486-class title or a 486-aware DOS extender that uses them stops dead, and an unimplemented opcode should at worst #UD) | **proven, unfixed** | `min_xadd.asm` and `min_cmp.asm` (one instruction each, register form) time out with the core stuck inside the instruction; `xadd_cmpxchg.asm` covers the full 486 semantics (memory and register forms, flag results, LOCK-prefixed).  Run: `./test_protected_mode.py min_xadd` (or `min_cmp`, `xadd_cmpxchg`) |
+
+`XADD`/`CMPXCHG` are absent upstream as well as in our pre-rebase fork (only
+`z486_pkg.sv`'s LOCK-validity tables mention the encodings), so this is a
+pre-existing gap rather than a rebase loss.  A sibling PC-98 port implemented
+exactly these - "D1 decodes them with the ADD/CMP reg,r/m skeletons and enters
+optimizer-owned microcode at 9D1-9EA" - so that port is the reference for a fix:
+a decoder entry pair plus the microcode routine, with a fail-first bench already
+in place.
+
+### Exclusions (bench exists, behaviour is correct)
+
+| item | bench | result |
+| --- | --- | --- |
+| pragma balance of simulation-only blocks | `tests/check_pragmas.py` | 59 / 59 balanced in 20 files; no sim-only code reaches synthesis |
+| constant columns in the consumed part of the ROM images | `tests/check_rom_columns.py` | none; the constant columns sit outside the consumed slice |
+| SHIFT/ SHIFT1 / SHIFT2 / BITTST source pairings in `ucode.hex` | `tests/check_shift_ucode.py` | passed |
+| visible real-mode CS and its cached base across `CR0.PE`, in both directions | `pe_cs_visible.asm` | pass |
+| entry CPL0 tracked until a CS reload after `CR0.PE` (CR3 access, LGDT) | `pe_cpl0.asm` | pass |
+| fault delivery when the faulting instruction immediately follows an issued Jcc (not taken, taken forward, forwarded-flags, taken backward) | `jcc_then_fault.asm` | pass (also checks the #GP error code) |
+| OF for 1-bit shifts and rotates, including the SHR (original MSB) and SAR (cleared) rules and the fact that ROL/ROR leave SF/ZF/AF/PF unaffected | `shl1_overflow.asm` | pass |
+| the same 1-bit SHL with a DS operand, an ESP operand and a value pushed on the stack (the "chained stack op" case) | `of_stack_vs_ds.asm` | all three identical and correct |
+
+Two of these were nearly reported as bugs before the manual was consulted: the
+flags themselves were right, and the expectations were not (the rotates do not
+touch SF/ZF/PF, and the flags left by a preceding bench instruction matter).
+That is the whole argument for the bench-first rule.
+
+### Still open, and what each needs
+
+| id | item | obstacle |
+| --- | --- | --- |
+| A7, A8 | delay-slot bypass vs a token; the stale-`OPR_R` gate when a DLY-grace optimistic read misses (`mem_opt_wait`) | needs a bench in which a cold line can actually complete a fill: `tb_protected_mode` ties `line_resp_valid`/`line_din` low, so any miss hangs.  Either add line responses to that bench's memory model or port the fork's PC-98 map bench |
+| G2 | instruction fetch from a NO_ALLOC/DIRECT window ("complete uncached instruction lines") | needs a CPU-level bench with the memory-map template enabled (unit coverage exists for `cpu_no_alloc` in `tb_l1_icache`, but not for execution from such a window) |
+| E2 | `tb_l1_cache` | the bench's own defects: it does not own its response and releases `valid` before `ready`; repairing those exposes a stale VIPT-probe model in the same bench, so it needs a bench update |
+| C6 | `TMPeIP`/`TMPeSP` never reset | latent only (the fault entry writes them before use), and an X-only hazard that a 2-state simulator cannot show |
+
 ## Fit check for the shared merge
 
 DE10-Nano OOC CPU fit, 85 MHz, x87 off, 8 KB caches (Quartus 17.0.2 Lite,
