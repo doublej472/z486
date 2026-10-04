@@ -10,6 +10,13 @@ Everything below is either **proven** (a bench fails without the fix or observes
 the hazard), **checked** (read and found sound, with the reason), or
 **unverified** (suspected, with the obstacle to proving it).
 
+**Status: pattern P1 is now fixed structurally.**  The register producers are
+arbitrated once by `gpr_write_merge.sv`, and the commit path *and* all three
+forwarding views are built from that one answer, so they cannot disagree.  See
+*Structural fix 1 (done)* below; P2's retirement rules, P4's gate and P6's
+coherence checks are also in place.  P3 and P5 remain triage rules, and the
+unverified items (A6, A7, A8) still need a bench that can miss.
+
 ## How each item was found
 
 1. Root-causing the DOOM faults (`fix(data_unit)` commits).
@@ -87,10 +94,10 @@ one red test in the suite turned out to be a bench artifact (see inventory).
 | --- | --- | --- | --- |
 | A1 | commit block gave the write-back to the older deferred token | **fixed** | `tb_load_waw` S1-S5 fail before, pass after; this was the DOOM fault |
 | A2 | token recommitted over a younger pulse producer on the next stalled cycle (`load_wb`, replaced `OPR_R`) | **fixed** | `tb_load_waw` S6-S8 fail before, pass after |
-| A3 | `gpr_ex_view` / `gpr_capture_view` still give the older token precedence over the younger write-back in the same cycle | **HAZARD, proven** | `tb_gpr_hazard` H1/H2: commit reads `0000beef`, views read `aaaaaaaa` |
+| A3 | `gpr_ex_view` / `gpr_capture_view` gave the older token precedence over the younger write-back in the same cycle | **fixed** | `tb_gpr_hazard` H1/H2 fail before (`aaaaaaaa`, older token wins, while the commit read `0000beef`) and pass after; all three views and the commit now come from `gpr_write_merge` |
 | A4 | interrupt-entry ROM-slot write vs the token | **checked benign** | `tb_gpr_hazard` H4: both write `OPR_R` to the token's own destination (`recipe_rni`/`hardwired`/`commit_sel` guarantee the same instruction) |
 | A5 | an EX GPR write vs a token that outlives it | **unreachable** | `exec`/`uc_exec` is a held level while stalled, so the write re-fires every cycle and the token can never outlive it; `tb_gpr_hazard` H5 is kept as a boundary probe and shows the arbitration alone would clobber |
-| A6 | `vipt_load_ex_hit` is gated by the *global* `any_fault`, so a younger instruction's fault can cancel an older token's write-back | **unverified** | upstream `data_access.sv` `if (vipt_load_ex_hit && !any_fault)`; the fork fixed the segment half (evaluated per token) and that half is here.  Needs a two-token/fault overlap bench: `tb_protected_mode` can drive faults but cannot make a *fill* complete (see obstacles) |
+| A6 | `vipt_load_ex_hit` is gated by the *global* `any_fault`, so a fault could cancel a live token's write-back | **checked sound** | reachability argument: a direct-load token is issued in D2 (one instruction *ahead* of EX), and a load that takes the slow path stalls its own instruction, so no live token can belong to an instruction *older* than the one whose microcode is executing - i.e. the faulting instruction is always older or equal, and cancelling the younger token's write-back is required for precise exceptions.  The fork's own fix here (evaluating the segment verdict in the token's stage) is present |
 | A7 | `dly_gpr_forward` (delay-slot write) vs a token, and its position in the views | **unverified** | the EA view ranks dly above shift above load WB, which is not the age order; a bench needs a DLY write with a pending token |
 | A8 | OPR_R has three writers (paging demand, `fast_opr_commit`, x87 m32 store); a younger fast read strands an older token's data | **documented** | Zet98's local change list, same base: a younger direct load must be routed to the slow path when an older token owns its destination and `mem_opt_wait` is set.  This tree has the same structure and no such gate |
 | A9 | flags: `flag2_*` (registered, one cycle old) vs `sh_flags_commit` (current cycle, per-field write enables) | **checked sound** | both the clocked update and `eflags_fwd` test the shifter commit *first* and it writes only the fields it enables, so the younger producer wins per field and the older one still fills the rest |
@@ -131,7 +138,7 @@ one red test in the suite turned out to be a bench artifact (see inventory).
 | id | item | status | evidence |
 | --- | --- | --- | --- |
 | E1 | D-cache snoop does not invalidate the line | **checked sound** | `dut.tag_way0..3[4]` all zero three cycles after a snoop of `0x40` |
-| E2 | `make test-l1-cache` fails at `0x40` | **bench artifact, not a core bug** | identical on unmodified `origin/main`; the failing comparison reads `req_set_r=0`/`tag=0x1402` (the *previous* request) and the RTL trace proves the line was cleared, so the bench's response capture is what is broken.  `cpu_resp_valid` is a clean one-cycle pulse (`req_valid_r` clears as `S_LOOKUP` starts) |
+| E2 | `make test-l1-cache` fails at `0x40` | **bench artifact, not a core bug** | identical on unmodified `origin/main`; the failing comparison reads `req_set_r=0`/`tag=0x1402` (the *previous* request) and the RTL trace proves the line was cleared, so the bench's response capture is what is broken.  `cpu_resp_valid` is a clean one-cycle pulse (`req_valid_r` clears as `S_LOOKUP` starts).  Fixing the two handshake defects (drain a response the bench does not own; hold `valid` until `ready`, which the core's contract requires) removes the `0x40` failure, but the bench then hangs in a later task whose *VIPT probe* sequence no longer matches the evolved RTL - so recovering this gate means updating the bench's VIPT model, not the core |
 | E3 | I$ patch queue / fill merge / snoop conflict | **checked sound** | `patchq_*` matched into `fill_word_next`, `lookup_snoop_conflict`, `fill_line_snooped_r` all present (upstream design is equivalent to the fork's storeq rewrite) |
 | E4 | a snoop that cleared a line mid-fill was reinstated by the fill | **fixed** | `tb_l1_icache` flush-under-stalled-fill case (fails before, passes after) |
 | E5 | whole-L1 flush blocked behind an unaccepted direct transaction | **fixed** | independent per-set sweep; `tb_cache_flush`, and the Xe10 pack boot with zero freezes |
@@ -150,23 +157,35 @@ one red test in the suite turned out to be a bench artifact (see inventory).
 | bench | covers | state |
 | --- | --- | --- |
 | `make test-load-waw` | A1, A2 (commit arbitration, 8 scenarios) | **must pass** - release gate |
-| `make test-gpr-hazard` | A3 (H1/H2), A4 (H4), A5 (H5), H3 (EA view observation) | **expected to report 2 hazards** until P1 is fixed structurally; not a release gate |
+| `make test-gpr-hazard` | A4 (H4), A5 (H5), H3 (EA view observation, unchanged by design), and the H1/H2 regression for A3 | **passes** ("no hazards observed"); kept as the place where a new producer/consumer pair gets probed |
+| `make test-gpr-merge` | the shared arbitration itself: age order, partial lanes, AH/AL encoding, M3 commit-vs-forward, per-view visibility, commit byte mask | **must pass** - release gate |
 
 ## Recommended structural fixes
 
-1. **One age-ordered merge, shared by every path.**  Build the forwarded value
-   once per register, oldest producer first, and use that same value for the
-   commit and for all three views.  That removes P1 as a possibility rather than
-   patching H1/H2 individually.
-   A cheaper interim step in the current style: compute the retirement
-   *combinationally* (`retire_now = load_wb && dst overlap || opr_fast_commit`)
-   and use it — not the registered `recipe_*_killed` — in the commit, the masks
-   *and* the views, so the token disappears from every path in the same cycle.
-2. **Fuse the paths together in simulation.**  A `translate_off` equivalence
-   assertion that every view equals the arbitration the commit path performs
-   (the fork's "equivalence guard" style) turns P1 into a suite failure instead
-   of a game bug.  The views are already formed once, so this is a comparison on
-   live state, not new logic.
+1. **One age-ordered merge, shared by every path — DONE.**  `gpr_write_merge.sv`
+   takes the five in-flight producers (shift token, memory token, interrupt
+   writeback slot, direct-load write-back, delay-slot bypass) and produces the
+   commit value plus a byte mask, and the three forwarding views.  Design points
+   worth keeping:
+   * the age order is written down **once**, in the module's port order and in
+     `VIS_COMMIT`;
+   * a producer is `{lane enable, right-aligned value}` - the same description
+     `write_gpr` consumes - so partial-register widths (byte low/high, word,
+     dword, AH/AL) cannot drift between the commit and a view;
+   * the merge is **per byte**, an independent priority mux per lane, which keeps
+     the depth at one mux rather than a chain of word merges (a chain version
+     cost 2.8 ns of setup slack; this form does not);
+   * views differ only in *visibility*, never in order, and a `translate_off`
+     policy check fails the build if a visible producer is not committed or if
+     the write-back is ever hidden from a view;
+   * an M3 ALU result is committed but never forwarded, because it is derived
+     from these views - forwarding it would close a combinational loop.
+2. **Fuse the paths together in simulation — DONE.**  The module re-derives all
+   four outputs from an independent chain-form reference every cycle, and the
+   data-unit commit writes exactly the module's masked value, so a change to one
+   path only is a suite failure rather than a game bug.  `tb_gpr_write_merge`
+   pins the semantics directly (23 cases, including AH/AL lanes, disjoint lanes,
+   the M3 commit-vs-forward split and the commit byte mask).
 3. **Automate the reset audit (P4).**  Done: `make check-reset-lists`
    (`scripts/check_reset_lists.py`) fails on any new `always_ff` that assigns
    state its reset branch never resets; today's 19 findings are allow-listed
@@ -183,5 +202,35 @@ one red test in the suite turned out to be a bench artifact (see inventory).
    reached.  A bench with a real line-fill model, or the PC-98 map bench, unblocks
    A6/A7/A8 at once.
 6. **Fix the `tb_l1_cache` handshake (E2).**  It is the only red gate in the
-   suite; draining/owning the response before the next request should turn it
-   green and restore it as a real gate on the D-cache.
+   suite.  Its response capture is genuinely broken (two defects, see the E2
+   row), but fixing those exposes a stale VIPT-probe model in the same bench, so
+   this needs a bench update rather than a core change.
+
+## Fit check for the shared merge
+
+DE10-Nano OOC CPU fit, 85 MHz, x87 off, 8 KB caches (Quartus 17.0.2 Lite,
+`boards/de10nano`, `make cpu CPU_MHZ=85`):
+
+| build | ALMs | registers | setup slack |
+| --- | --- | --- | --- |
+| before the merge module | 18,882 (45%) | 8,327 | -6.066 ns |
+| chain-form merge (rejected) | 19,080 (46%) | 8,125 | **-8.914 ns** |
+| byte-priority merge (kept) | 19,037 (45%) | 8,053 | -7.836 ns |
+
+Cost of the kept form: **+155 ALMs (+0.8%)**, **-274 registers**, and 1.77 ns of
+setup slack.  The chain form was rejected on timing alone: one whole-word merge
+per producer in series added three logic levels to the operand-read and
+register-enable cones.  The kept form computes one aligned value and one lane
+enable per producer and then selects per byte, which is one mux per byte.
+
+The worst path in the kept fit is *not* in the merge: it is the pre-existing
+upstream cone `shifter|flags_cf -> eflags_fwd -> address adder -> esp[29]`, and
+the fit is routing-dominated, so most of the 1.77 ns is the area increase rather
+than merge depth.  The design was already short of its 85 MHz request before
+this change (about 55 MHz), and it is worth the slack here: the merge removes a
+proven wrong-value hazard that surfaced as spurious page faults in games.
+
+If that slack is ever unacceptable, the same correctness can be had with zero
+cost by keeping the age order in the (cheap, hand-written) view muxes and
+retaining this module purely as the simulation-time reference that the fuse
+compares against - the order is then still pinned, just not shared.
