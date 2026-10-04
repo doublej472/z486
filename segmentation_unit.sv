@@ -57,6 +57,10 @@ module segmentation_unit
     output             eff_mask_pending,   // Next (addr_size || is_dtable): 0 => mask offset to 16b
     output     [31:0]  seg_base_exec,      // Pending base excluding issue-only INIT_SEG
     output             eff_mask_exec,      // Pending mask excluding issue-only INIT_SEG
+    // Ungated direct-load limit verdict at an explicit width.
+    input      [1:0]   dir_access_size,    // 0=byte, 1=word, 3=dword
+    output             dir_seg_fault,
+    output             dir_rmw_fault,      // as above plus the write check (RD_FAST)
     output             seg_fault,          // Segment limit/protection fault
     output             is_stack_fault,     // Fault is on SS (→ #SS not #GP)
 
@@ -286,7 +290,9 @@ wire [31:0] ed_max = addr_size ? 32'hFFFF_FFFF : 32'h0000_FFFF;
 wire [31:0] ed_diff = ed_max - eff_offset;
 wire ed_start_fault = !base_diff[32];
 wire ed_size_fault = (ed_diff[31:3] == 29'd0) && (ed_diff[2:0] < access_size);
+wire dir_ed_size_fault = (ed_diff[31:3] == 29'd0) && (ed_diff[2:0] < dir_access_size);
 wire ed_limit_violated = ed_start_fault | ed_size_fault;
+wire dir_ed_limit_violated = ed_start_fault | dir_ed_size_fault;
 
 // Real mode: a boundary-crossing access always faults (even SS -> #SS, e.g.
 // POPAD at SP=0xFFFE); only start-out-of-bounds keeps the 16-bit-stack wrap.
@@ -304,6 +310,21 @@ wire seg_writable = (seg_sel == SEG_ES) ? (!desc_cache[SEG_ES].seg_type[3] && de
                     (seg_sel == SEG_GS) ? (!desc_cache[SEG_GS].seg_type[3] && desc_cache[SEG_GS].seg_type[1]) :
                     1'b1;  // TR/IDT/GDT/IO: no write check
 wire write_fault = pe && is_write && !seg_writable && !is_dtable;
+
+// Ungated direct-load verdict: the data-segment limit/protection verdict is a
+// property of the access (segment cache, effective offset, access width), not
+// of what the cache path later does with it. Used by the VIPT/RD_FAST paths,
+// which evaluate it where IND/seg_sel belong to the in-flight token.
+wire dir_size_fault = (diff_res[31:3] == 29'd0) && (diff_res[2:0] < dir_access_size);
+wire dir_rm_limit_fault = !pe && (dir_size_fault ||
+                          (start_out_of_bounds && !(is_stack_fault && !addr_size)));
+wire dir_pm_limit_fault = pe && !is_dtable &&
+                          (expand_down ? dir_ed_limit_violated
+                                       : (start_out_of_bounds | dir_size_fault));
+assign dir_seg_fault = (seg_sel != SEG_IO) && (dir_rm_limit_fault || dir_pm_limit_fault);
+// RD_FAST always writes, so its segment must also be writable.
+assign dir_rmw_fault = dir_seg_fault ||
+    ((seg_sel != SEG_IO) && pe && !seg_writable && !is_dtable);
 
 assign seg_fault = check_en && is_mem_op &&
                    (seg_sel != SEG_IO) &&
