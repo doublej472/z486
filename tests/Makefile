@@ -94,6 +94,8 @@ TB_L1I_SRCS := tb_l1_icache.sv
 CPP_L1I_SRCS := sim_main_l1_icache.cpp
 TB_MEMORY_ORDER_SRCS := tb_memory_order.sv
 CPP_MEMORY_ORDER_SRCS := sim_main_memory_order.cpp
+TB_MEMMAP_SRCS := tb_memmap_template.sv
+CPP_MEMMAP_SRCS := sim_main_memmap_template.cpp
 TB_X87_BRIDGE_SRCS := tb_x87_bridge.sv
 CPP_X87_BRIDGE_SRCS := sim_main_x87_bridge.cpp
 TB_X87_SEQ_SRCS := tb_x87_sequencer.sv
@@ -113,7 +115,7 @@ CPP_PLA4_SRCS := sim_main_pla4.cpp
 PLA4_RTL := $(Z486_DIR)/protection.sv
 
 # Targets
-.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
+.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-memmap-template test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 all: build
 
@@ -183,6 +185,12 @@ obj_dir/Vtb_memory_order: $(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_D
 	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_memory_order $(TB_MEMORY_ORDER_SRCS) \
 		$(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv $(CPP_MEMORY_ORDER_SRCS)
 	@echo "Build complete: obj_dir/Vtb_memory_order"
+
+obj_dir/Vtb_memmap_template: $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/z486_pc98_preset.svh $(TB_MEMMAP_SRCS) $(CPP_MEMMAP_SRCS)
+	@echo "Building memory-map template unit test with Verilator..."
+	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_memmap_template \
+		$(Z486_DIR)/z486_cache_map_pkg.sv $(TB_MEMMAP_SRCS) $(CPP_MEMMAP_SRCS)
+	@echo "Build complete: obj_dir/Vtb_memmap_template"
 
 obj_dir/Vtb_x87_bridge: $(X87_DIR)/x87_bridge.sv $(TB_X87_BRIDGE_SRCS) $(CPP_X87_BRIDGE_SRCS)
 	@echo "Building x87 bridge unit test with Verilator..."
@@ -312,6 +320,10 @@ test-memory-order: obj_dir/Vtb_memory_order
 	@echo "Running device/store ordering unit test..."
 	./obj_dir/Vtb_memory_order
 
+test-memmap-template: obj_dir/Vtb_memmap_template
+	@echo "Running memory-map template unit test..."
+	./obj_dir/Vtb_memmap_template
+
 test-x87-bridge: obj_dir/Vtb_x87_bridge
 	@echo "Running x87 bridge unit test..."
 	./obj_dir/Vtb_x87_bridge
@@ -378,6 +390,7 @@ help:
 	@echo "  make test-l1-cache  - Run PIPT L1 cache unit test"
 	@echo "  make test-l1-icache - Run PIPT L1 instruction cache unit test"
 	@echo "  make test-memory-order - Run device/store ordering unit test"
+	@echo "  make test-memmap-template - Run memory-map template unit test"
 	@echo "  make test-x87-bridge - Run x87 protocol bridge unit test"
 	@echo "  make test-x87-core - Run x87 state and transfer unit test"
 	@echo "  make test-x87-testfloat - Check arithmetic with Berkeley TestFloat"
