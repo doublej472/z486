@@ -400,6 +400,7 @@ module tb_gpr_hazard;
         idle_inputs();
         opr_r = OLD_VALUE;                 // the token's (older) data source
         commit_young_load(3'd0, 2'd2, NEW_VALUE);
+        load_wb_is_alu = 1'b0;             // a plain load write-back, not an M3 result
         #1;
         $display("H1 ex_view      : %08x %s", dut.gpr_ex_view[0],
                  (dut.gpr_ex_view[0] === NEW_VALUE) ? "OK (younger)" : "HAZARD (older token wins)");
