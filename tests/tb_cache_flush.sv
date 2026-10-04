@@ -289,6 +289,40 @@ module tb_cache_flush;
     settle(4);
     check(walks == 2 && dones == 2, "released instruction level re-arms");
 
+    // 6. A flush requested while a D-cache fill is stalled in flight.  The fill
+    //    may be blocked behind an unrelated bus transaction for an unbounded
+    //    time (and the platform may be waiting on the flush to release it), so
+    //    the flush must complete without waiting for the cache to fall idle;
+    //    the fill it swept must not install afterwards.
+    $display("== flush while a D-cache fill is stalled ==");
+    reset_dut();
+    req_addr = 32'h0000_0400;      // a miss: the cache requests the line
+    req_write = 1'b0;
+    req_be = 4'hF;
+    req_valid = 1'b1;
+    settle(1);
+    req_valid = 1'b0;
+    settle(8);                     // the responder never supplies the data
+    @(negedge clk); cache_flush = 1'b1;
+    wait_dones(1, "flush with a stalled D-cache fill");
+    @(negedge clk); cache_flush = 1'b0;
+    settle(4);
+    check(walks == 1 && dones == 1, "stalled D-cache fill did not block the flush");
+
+    // 7. A platform pulse that arrives while a walk is already running is
+    //    queued, not dropped: a platform that pulses rather than holds must not
+    //    lose a request just because a walk was in flight.
+    $display("== platform pulse during a walk is queued ==");
+    reset_dut();
+    @(negedge clk); cache_flush = 1'b1;
+    @(negedge clk); cache_flush = 1'b0;          // platform pulse: walk 1
+    while (!cache_flush_busy) @(negedge clk);
+    @(negedge clk); cache_flush = 1'b1;
+    @(negedge clk); cache_flush = 1'b0;          // one-cycle pulse mid-walk
+    wait_dones(2, "queued platform pulse");
+    settle(8);
+    check(walks == 2 && dones == 2, "platform pulse during a walk was queued, not dropped");
+
     if (errors == 0) begin
       $display("TB_CACHE_FLUSH: PASS");
       $finish;

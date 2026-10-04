@@ -37,17 +37,34 @@ the same controller.
 | `cache_flush_done` (out) | One-cycle pulse when the walk completes. |
 
 One walk covers **both** L1s. The controller first drains the posted store queue
-(a store the bus has already accepted cannot fall behind the walk), then walks
-both caches in parallel: each latches the request and starts only from idle, so
-an in-flight fill from before the flush completes first and its line is
-invalidated by the walk that follows. Because the walk is the existing
-reset-initialisation walk, no cache datapath or tag-write path changes.
+(a store the bus has already accepted cannot fall behind the walk), then sweeps
+both caches in parallel.
+
+Each cache's sweep is an **independent walk over its sets**, not a service of
+the cache's fill/lookup state machine, and it cancels rather than waits out any
+fill in flight: because a fill can be blocked indefinitely behind an unrelated
+bus transaction — and the platform asking for the flush may be holding that very
+transaction until the flush completes — waiting for the caches to fall idle
+would deadlock the machine. A fill that is in flight when the flush is armed is
+marked so its install is suppressed (the fetch is still answered; only the line
+install is dropped), and the sweep then runs concurrently with it. A walk
+therefore **always completes in a bounded number of cycles** regardless of bus
+state or cache activity, and no line fetched before the sweep can be installed
+after it. A registered snoop yields the sweep a cycle (its clear writes a
+different index through the same way RAMs) and the sweep re-issues that set; the
+post-reset walk clears everything and never touches the bus, so the sweep may
+simply wait for it.
+
+The store drain is the one part of a walk that needs the bus (the drained stores
+must be visible in memory before `done`). It cannot deadlock against the flush
+because a demand access is only presented after the queue drains, and memory
+accesses are served independently of the flush.
 
 The platform path and the instruction path are **separate inputs** and are
-arbitrated inside the core rather than ORed at the boundary. This matters when a
-platform holds `cache_flush` until after `cache_flush_done`: an `INVD`/`WBINVD`
-becoming active in the next cycle must still start and complete its own walk. A
-request seen while a walk is already running is queued, not dropped.
+arbitrated inside the core rather than ORed at the boundary. Both are latched, so
+a request that arrives while a walk is already running starts a following walk
+instead of being dropped; a held platform level still counts once and re-arms
+only when it is released.
 
 A flush also kills any buffered speculative prefetch line once, on the same
 conservative policy as external coherence.

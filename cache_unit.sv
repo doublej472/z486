@@ -436,14 +436,16 @@ end
 // One walk covers both L1s.  Posted stores are drained first: a store the bus
 // has already accepted cannot fall behind the walk, so the drain completes as
 // soon as the queue empties, and a walk cannot be overtaken by an older store
-// draining during it.  Both caches then walk their sets in parallel: each
-// latches the one-cycle request and starts from S_IDLE, so an in-flight fill
-// from before the flush completes first and its line is invalidated by the
-// walk that follows.
+// draining during it.  Both caches then sweep their sets in parallel: the sweep
+// is independent of the cache's fill/lookup state and cancels (rather than
+// waits out) any fill in flight, so a walk always completes in a bounded number
+// of cycles no matter what the bus is doing.
 //
-// The platform `cache_flush` is armed while its input is low, so a held level is
-// one walk.  `cache_flush_insn` has its own arm bit and a pending latch, so a
-// request during a walk starts a following one instead of being dropped.
+// Both request paths are latched rather than dropped: the platform
+// `cache_flush` is armed while its input is low (so a held level is one walk)
+// and a request seen during a walk starts a following one; `cache_flush_insn`
+// has the same shape, so INVD/WBINVD can never be stranded by a platform walk
+// that happened to be running.
 localparam [1:0] CF_IDLE  = 2'd0;
 localparam [1:0] CF_DRAIN = 2'd1;
 localparam [1:0] CF_WALK  = 2'd2;
@@ -455,6 +457,7 @@ wire         icache_flush_done;
 
 reg  [1:0] cf_state;
 reg        cf_armed_r;        // platform request path re-armed (input seen low)
+reg        cf_plat_pending_r; // platform request latched, not yet walked
 reg        cf_insn_armed_r;   // instruction request path re-armed (input seen low)
 reg        cf_insn_pending_r; // instruction request latched, not yet walked
 reg        cf_d_done_r;
@@ -462,10 +465,12 @@ reg        cf_i_done_r;
 reg        cache_flush_done_r;
 reg        cf_start_r;       // one-cycle request pulse to both caches
 
-// A held instruction level counts once (re-armed only when released).
+// A held level counts once (re-armed only when released); a request seen while
+// a walk runs is latched and starts the following one.
 wire cf_insn_edge = cache_flush_insn && cf_insn_armed_r;
 wire cf_plat_req = cache_flush && cf_armed_r;
-wire cf_req = cf_plat_req || cf_insn_edge || cf_insn_pending_r;
+wire cf_req = cf_plat_req || cf_plat_pending_r ||
+              cf_insn_edge || cf_insn_pending_r;
 wire cache_flush_start = cf_req && (cf_state == CF_IDLE);
 wire cf_drain_ready = dcache_stores_drained;
 // The cycle the caches actually begin their walk (the merge point for a request
@@ -480,6 +485,7 @@ always_ff @(posedge clk) begin
     if (!reset_n) begin
         cf_state <= CF_IDLE;
         cf_armed_r <= 1'b1;
+        cf_plat_pending_r <= 1'b0;
         cf_insn_armed_r <= 1'b1;
         cf_insn_pending_r <= 1'b0;
         cf_d_done_r <= 1'b0;
@@ -493,6 +499,17 @@ always_ff @(posedge clk) begin
         // A held platform request re-arms only when released.
         if (!cache_flush)
             cf_armed_r <= 1'b1;
+
+        // The platform path: a request seen before the walk starts is latched,
+        // so a one-cycle pulse during a walk starts a following walk instead of
+        // being lost.  Starting the walk consumes the latch and the level.
+        if (cf_plat_req && !cf_launch)
+            cf_plat_pending_r <= 1'b1;
+        if (cf_launch) begin
+            cf_plat_pending_r <= 1'b0;
+            if (cf_plat_req)
+                cf_armed_r <= 1'b0;
+        end
 
         // The instruction path: release re-arms it; a request seen before the
         // walk starts is latched (a pulse during a walk is not lost); starting

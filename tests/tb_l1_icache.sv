@@ -32,6 +32,14 @@ module tb_l1_icache;
     reg [31:0] invalidate_addr = 32'h0;
     reg invalidate_valid = 1'b0;
 
+    // Whole-L1 flush, and a memory stall switch so a fill can be left in flight.
+    reg  flush_req = 1'b0;
+    wire flush_busy;
+    wire flush_done;
+    reg  stall_mem = 1'b0;
+    integer flush_wait;
+    reg  flush_busy_seen = 1'b0;
+
     l1_icache #(.SET_BITS(3)) dut (
         .clk(clk),
         .reset(reset),
@@ -56,9 +64,9 @@ module tb_l1_icache;
         .patch_valid(patch_valid),
         .invalidate_addr(invalidate_addr),
         .invalidate_valid(invalidate_valid),
-        .flush_req(1'b0),
-        .flush_busy(),
-        .flush_done(),
+        .flush_req(flush_req),
+        .flush_busy(flush_busy),
+        .flush_done(flush_done),
         .cache_enable(1'b1),
         .cpu_no_alloc(1'b0)
     );
@@ -111,7 +119,11 @@ module tb_l1_icache;
         mem_resp_valid <= 1'b0;
         mem_line_resp_valid <= 1'b0;
 
-        if (wide_pending) begin
+        if (stall_mem) begin
+            // Freeze the memory model: an outstanding request is neither
+            // accepted nor served, so the cache stays in its fill state.
+            wide_pending <= wide_pending;
+        end else if (wide_pending) begin
             mem_line_dout <= {mem_get32(wide_addr + 32'd12),
                               mem_get32(wide_addr + 32'd8),
                               mem_get32(wide_addr + 32'd4),
@@ -121,14 +133,14 @@ module tb_l1_icache;
             line_response_count <= line_response_count + 1;
         end
 
-        if (rd_left != 8'd0) begin
+        if (!stall_mem && rd_left != 8'd0) begin
             mem_resp_valid <= 1'b1;
             mem_dout <= mem_get32(rd_addr);
             rd_addr <= rd_addr + 32'd4;
             rd_left <= rd_left - 8'd1;
         end
 
-        if (mem_valid && !mem_ready && rd_left == 8'd0 && !wide_pending) begin
+        if (!stall_mem && mem_valid && !mem_ready && rd_left == 8'd0 && !wide_pending) begin
             mem_ready <= 1'b1;
             if (wide_mode && mem_burstcount == 8'd4) begin
                 wide_addr <= mem_addr;
@@ -446,6 +458,61 @@ module tb_l1_icache;
         cache_read(32'h180, 128'h7777_6666_5555_4444_3333_2222_BEEF_F00D);
         if (mem_request_count == mem_request_before) begin
             $display("L1 ICACHE MID-FILL SNOOP EXPOSED: fill re-installed the invalidated line (no re-fetch)");
+            $fatal(1);
+        end
+
+        // A whole-L1 flush requested while a line fill is stalled in flight.
+        // The fill can be blocked indefinitely behind an unrelated bus
+        // transaction, so the flush must complete without waiting for the cache
+        // to fall idle; and the fill it swept must not install a line after the
+        // sweep, or the next read would hit stale data.
+        reset = 1'b1;
+        wide_mode = 1'b0;
+        stall_mem = 1'b0;
+        flush_req = 1'b0;
+        repeat (5) @(posedge clk);
+        reset = 1'b0;
+        repeat (20) @(posedge clk);
+        mem_put32(32'h2C0, 32'hA000_0001);
+        mem_put32(32'h2C4, 32'hA000_0002);
+        mem_put32(32'h2C8, 32'hA000_0003);
+        mem_put32(32'h2CC, 32'hA000_0004);
+        stall_mem = 1'b1;                       // freeze memory first
+        do @(negedge clk); while (!cpu_ready);
+        cpu_addr = 32'h2C0;
+        cpu_valid = 1'b1;
+        @(negedge clk);
+        cpu_valid = 1'b0;
+        do @(negedge clk); while (!(dut.state == 3'd3 && mem_valid));
+        flush_req = 1'b1;
+        @(negedge clk);
+        flush_req = 1'b0;
+        flush_wait = 0;
+        while (!flush_done && flush_wait < 400) begin
+            if (flush_busy) flush_busy_seen = 1'b1;
+            @(negedge clk);
+            flush_wait = flush_wait + 1;
+        end
+        if (!flush_done) begin
+            $display("L1 ICACHE FLUSH UNDER STALL FAIL: no flush_done in %0d cycles (state=%0d mem_valid=%b)",
+                     flush_wait, dut.state, mem_valid);
+            $fatal(1);
+        end
+        if (!flush_busy_seen) begin
+            $display("L1 ICACHE FLUSH UNDER STALL FAIL: flush_busy never asserted");
+            $fatal(1);
+        end
+        // Release the stalled fill: the swept line must not be installed.
+        stall_mem = 1'b0;
+        repeat (60) @(negedge clk);
+        mem_put32(32'h2C0, 32'hB000_0001);
+        mem_put32(32'h2C4, 32'hB000_0002);
+        mem_put32(32'h2C8, 32'hB000_0003);
+        mem_put32(32'h2CC, 32'hB000_0004);
+        mem_request_before = mem_request_count;
+        cache_read(32'h2C0, 128'hB000_0004_B000_0003_B000_0002_B000_0001);
+        if (mem_request_count == mem_request_before) begin
+            $display("L1 ICACHE FLUSH UNDER STALL EXPOSED: the swept fill installed a stale line");
             $fatal(1);
         end
 
