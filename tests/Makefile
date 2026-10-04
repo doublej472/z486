@@ -458,6 +458,7 @@ help:
 	@echo "  make test-l1-cache  - Run PIPT L1 cache unit test"
 	@echo "  make test-l1-icache - Run PIPT L1 instruction cache unit test"
 	@echo "  make test-memory-order - Run device/store ordering unit test"
+	@echo "  make test-load-waw  - Run same-cycle GPR write-arbitration unit test"
 	@echo "  make test-memmap-template - Run memory-map template unit test"
 	@echo "  make test-interrupt-nmi - Run interrupt-controller NMI deferred-delivery bench"
 	@echo "  make test-x87-bridge - Run x87 protocol bridge unit test"
