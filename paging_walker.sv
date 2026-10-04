@@ -99,6 +99,16 @@ wire write_access_ok = !saved_is_write ||
                        combined_writable ||
                        (!is_user_mode && !saved_wp);
 
+// A/D write-back elision.  The 486 only needs the CPU to set A before the
+// access and D before a write; re-storing an entry whose bits are already set
+// writes the identical dword, which is unobservable in RAM but issues a
+// spurious store when the page table lives in an uncached/DIRECT device
+// window or in read-only memory.  Skip a write-back whose bits are unchanged.
+// A-set/D-clear on a write access is the one case that still needs the entry
+// written (D must be set).
+wire pde_update_required = !pde[PTE_A];
+wire pte_update_required = !pte[PTE_A] || (saved_is_write && !pte[PTE_D]);
+
 // State machine
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
@@ -174,8 +184,12 @@ always_comb begin
             // Permission check: only write back A/D bits if access is permitted
             if (!user_access_ok || !write_access_ok)
                 next_state = PW_FAULT;          // Protection fault, no write-back
+            else if (pde_update_required)
+                next_state = PW_WRITE_PDE;      // Permissions OK, write back A bit
+            else if (pte_update_required)
+                next_state = PW_WRITE_PTE;      // PDE unchanged, write back PTE A/D
             else
-                next_state = PW_WRITE_PDE;      // Permissions OK, write back A/D bits
+                next_state = PW_DONE;           // Nothing to update
         end
 
         PW_WRITE_PDE: begin
@@ -184,7 +198,7 @@ always_comb begin
 
         PW_WAIT_WR_PDE: begin
             if (mem_ready)
-                next_state = PW_WRITE_PTE;
+                next_state = pte_update_required ? PW_WRITE_PTE : PW_DONE;
         end
 
         PW_WRITE_PTE: begin
