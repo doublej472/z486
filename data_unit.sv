@@ -335,7 +335,37 @@ wire        pr_mem_valid   = recipe_memory_write.valid && !recipe_memory_killed;
 wire        pr_rom_valid   = interrupt_entry && recipe_rni && recipe_state.hardwired &&
                              (recipe_state.commit_sel == RECIPE_COMMIT_MEM);
 
+// The three recipe commits retire at the RNI cycle.  They are consolidated into
+// gpr_write_merge for the *register-file write* only, not as forwarding
+// producers: the original separate write_gpr pulses are gone, so the pulse
+// decode and lane mask are computed once, in the same age-ordered module as
+// every other producer, and applied by a second merged write after the deferred
+// producers and the ordinary EX writes.  Their relative order
+// (stos < sigsrc < esp) and their enable conditions are exactly the original
+// assignment order and guards of the register file - note the REP STOS count is
+// deliberately *not* gated by recipe_commit_cancel, because a faulting store
+// must still publish the remaining count so the REP restarts from the right
+// element.
+//
+// They are deliberately hidden from the three forwarding views (the vis_* bits
+// 7:5 stay clear below).  A recipe commit is the instruction's own retiring
+// write: the only reader that can sample it in the commit cycle is that same
+// instruction's microcode, which must see the pre-commit value.  A younger
+// instruction's D2 EA latch is served by the register file on the next cycle or
+// by the delay-slot bypass, never by these pulses.  Forwarding them was tried
+// and is correct, but it puts the pulse decode on the EA/ALU forwarding cone
+// and costs ~2.4 ns of setup slack; see the fit table in docs/hazard-survey.md.
+wire pr_stos_valid = exec && !instr.has_0f &&
+                     ((instr.opcode == 8'hAA) || (instr.opcode == 8'hAB)) &&
+                     (instr.rep_lock == PREFIX_REP) &&
+                     (dest == DEST_eDI) && (source_field == SRC_SIGMA);
+wire pr_sigsrc_valid = exec && recipe_rni && !recipe_commit_cancel &&
+                       (recipe_state.commit_sel == RECIPE_COMMIT_SIGSRC);
+wire pr_esp_valid = exec && recipe_rni && !recipe_commit_cancel &&
+                    (recipe_state.commit_sel == RECIPE_COMMIT_ESP);
+
 logic [255:0] pr_commit_value, pr_commit_wmask, pr_ex_value, pr_ea_value, pr_cap_value;
+logic [255:0] pr_pulse_value, pr_pulse_wmask;
 
 gpr_write_merge gpr_merge (
     .cur({edi, esi, ebp, esp, ebx, edx, ecx, eax}),
@@ -366,12 +396,31 @@ gpr_write_merge gpr_merge (
     .mode_dly(dly_gpr_forward.mode),
     .data_dly(dly_gpr_forward.data),
 
-    .vis_ex(5'b0_1010),
-    .vis_ea(5'b1_1001),
-    .vis_cap(5'b1_1011),
+    .v_stos(pr_stos_valid),
+    .size_stos(instr.addr32 ? 2'd2 : 2'd1),
+    .data_stos(countr),
+
+    .v_sigsrc(pr_sigsrc_valid),
+    .dst_sigsrc(src_reg_sel_r),
+    .size_sigsrc(aluop == ALUJMP_BITS32 ? 2'd2 : 2'd1),
+    .data_sigsrc(sigma),
+
+    .v_esp(pr_esp_valid),
+    .data_esp(sigma),
+
+    // Recipe commits stay out of the forwarding views (bits 7:5 clear in all
+    // three).  They retire at the RNI edge and are never sampled by a younger
+    // consumer in that cycle, so forwarding them buys no correctness and puts
+    // their decode on the EA/ALU cone (~2.4 ns of setup slack); the register
+    // file still commits them through pulse_value/pulse_wmask below.
+    .vis_ex(8'b0000_1010),      // mem, wb
+    .vis_ea(8'b0001_1001),      // shift, wb, dly
+    .vis_cap(8'b0001_1011),     // shift, mem, wb, dly
 
     .commit_value(pr_commit_value),
     .commit_wmask(pr_commit_wmask),
+    .pulse_value(pr_pulse_value),
+    .pulse_wmask(pr_pulse_wmask),
     .ex_value(pr_ex_value),
     .ea_value(pr_ea_value),
     .cap_value(pr_cap_value)
@@ -1034,20 +1083,14 @@ always_ff @(posedge clk) begin
             // store has cleared DLY. The loop can then bypass its redundant
             // COUNTR->eCX word without exposing a decremented count on a
             // faulting store.
-            if (!instr.has_0f &&
-                ((instr.opcode == 8'hAA) || (instr.opcode == 8'hAB)) &&
-                (instr.rep_lock == PREFIX_REP) &&
-                (dest == DEST_eDI) && (source_field == SRC_SIGMA))
-                write_gpr(3'd1, countr, instr.addr32 ? 2'd2 : 2'd1);
-
-            if (recipe_rni && !recipe_commit_cancel &&
-                recipe_state.commit_sel == RECIPE_COMMIT_SIGSRC)
-                write_gpr(src_reg_sel_r, sigma,
-                          aluop == ALUJMP_BITS32 ? 2'd2 : 2'd1);
-
-            if (recipe_rni && !recipe_commit_cancel &&
-                recipe_state.commit_sel == RECIPE_COMMIT_ESP)
-                esp <= sigma;
+            //
+            // The three recipe commits (REP STOS count, SIGSRC, ESP) are merged
+            // here rather than written one at a time: gpr_write_merge has
+            // already arbitrated them, so this single write keeps the register
+            // file on the one canonical age order.  They are not forwarded to
+            // the views (see the vis_* comment at the merge instantiation).
+            if (exec)
+                commit_merged(pr_pulse_value, pr_pulse_wmask);
 
         end
     end
