@@ -630,6 +630,18 @@ task automatic build_struct_work(
 );
     logic [11:0] ctl_bits;
     logic [15:0] entry_first;
+    // 486 XADD (0F C0/C1) and CMPXCHG (0F B0/B1) have no 80386 PLA rows.
+    // Decode their structure as the matching one-byte ALU r/m,r form (ADD
+    // 00/01, CMP 38/39: ModRM.reg = source, r/m = destination, W bit, no
+    // immediate), so every structural decode below - widths, register fields,
+    // EA, boundary action - comes from that row, and enter the optimizer-owned
+    // routine.  The raw 0F byte is still counted for the instruction length
+    // and still governs LOCK validity.
+    logic        instr_xadd;
+    logic        instr_cmpxchg;
+    logic        instr_mem;
+    logic [7:0]  op_e;
+    logic        p0f_e;
     logic [15:0] entry_final;
     logic [6:0]  group_dec;
     logic        entry_group;
@@ -652,10 +664,21 @@ task automatic build_struct_work(
     begin
         w = '0;
         s_len = 3'd1;
-        ctl_bits = pla_control_opcode_lookup(prefix_0f, opcode);
+        // Effective decode first: XADD/CMPXCHG decode as ADD/CMP r/m,r with
+        // no 0F prefix, so every structural decode below sees that row.
+        instr_xadd    = prefix_0f && (opcode[7:1] == 7'b1100000);
+        instr_cmpxchg = prefix_0f && (opcode[7:1] == 7'b1011000);
+        // The 0F C0/C1/B0/B1 opcodes always carry a ModR/M byte, so the form
+        // comes straight from its mod field (a register form has mod=11).
+        instr_mem     = modrm[7:6] != 2'b11;
+        op_e = instr_xadd    ? {7'b0000000, opcode[0]} :
+               instr_cmpxchg ? {7'b0011100, opcode[0]} : opcode;
+        p0f_e = (instr_xadd || instr_cmpxchg) ? 1'b0 : prefix_0f;
 
-        w.entry.opcode = opcode;
-        w.entry.has_0f = prefix_0f;
+        ctl_bits = pla_control_opcode_lookup(p0f_e, op_e);
+
+        w.entry.opcode = op_e;
+        w.entry.has_0f = p0f_e;
         w.entry.has_rep = prefix_rep;
         w.entry.prefix_count = prefix_count;
         w.entry.data32 = data32;
@@ -679,7 +702,7 @@ task automatic build_struct_work(
         entry_first = entry_rom_sel;
         // Decode group validity and row in parallel with entry_first. This
         // keeps the group select off the first-level entry PLA result.
-        group_dec = pla_group_lookup({data32, opcode, pe_enable, prefix_0f});
+        group_dec = pla_group_lookup({data32, op_e, pe_enable, p0f_e});
         group_code = group_dec[5:0];
         entry_group = group_dec[6] && has_modrm;
         entry_final = entry_group ?
@@ -688,75 +711,82 @@ task automatic build_struct_work(
             entry_first;
         invalid_lock = check_lock_invalid(prefix_rep_lock, prefix_0f, opcode,
                                           has_modrm, modrm);
-        instr_bswap = prefix_0f && (opcode[7:3] == 5'b11001);
+        instr_bswap = p0f_e && (op_e[7:3] == 5'b11001);
         w.entry.boundary_action = invalid_lock ? BOUNDARY_ACTION_NONE :
-            decode_boundary_action(prefix_0f, opcode, has_modrm, modrm);
-        w.entry.seg_reg_sel = decode_segment_register(prefix_0f, opcode,
+            decode_boundary_action(p0f_e, op_e, has_modrm, modrm);
+        w.entry.seg_reg_sel = decode_segment_register(p0f_e, op_e,
                                                        has_modrm, modrm);
-        w.entry.cmptest_is_cmp = (opcode[7:2] == 6'b100000) ||
-                                 (opcode[7:3] == 5'b00111);
-        w.entry.decoded_alu_op = decode_instruction_alu_op(prefix_0f, opcode,
+        w.entry.cmptest_is_cmp = (op_e[7:2] == 6'b100000) ||
+                                 (op_e[7:3] == 5'b00111);
+        w.entry.decoded_alu_op = decode_instruction_alu_op(p0f_e, op_e,
                                                            has_modrm, modrm);
-        w.entry.mul_signed = (!prefix_0f &&
-                              (opcode == 8'h69 || opcode == 8'h6B)) ||
-                             (prefix_0f && opcode == 8'hAF) ||
-                             (!prefix_0f && has_modrm &&
-                              (opcode == 8'hF6 || opcode == 8'hF7) &&
+        w.entry.mul_signed = (!p0f_e &&
+                              (op_e == 8'h69 || op_e == 8'h6B)) ||
+                             (p0f_e && op_e == 8'hAF) ||
+                             (!p0f_e && has_modrm &&
+                              (op_e == 8'hF6 || op_e == 8'hF7) &&
                               modrm[5:3] == 3'd5);
-        w.entry.div_quotient_zf = !prefix_0f && has_modrm &&
-                                  (opcode == 8'hF6 || opcode == 8'hF7) &&
+        w.entry.div_quotient_zf = !p0f_e && has_modrm &&
+                                  (op_e == 8'hF6 || op_e == 8'hF7) &&
                                   modrm[5:3] == 3'd6;
-        w.entry.flag_op = decode_flag_op(prefix_0f, opcode);
-        if (!prefix_0f && opcode[7:3] == 5'b11011)
-            w.entry.fop = {opcode[2:0], modrm};
-        w.entry.shift_is_double = prefix_0f &&
-            ((opcode == 8'hA4) || (opcode == 8'hA5) ||
-             (opcode == 8'hAC) || (opcode == 8'hAD));
-        w.entry.shift_right = opcode[3];
+        w.entry.flag_op = decode_flag_op(p0f_e, op_e);
+        if (!p0f_e && op_e[7:3] == 5'b11011)
+            w.entry.fop = {op_e[2:0], modrm};
+        w.entry.shift_is_double = p0f_e &&
+            ((op_e == 8'hA4) || (op_e == 8'hA5) ||
+             (op_e == 8'hAC) || (op_e == 8'hAD));
+        w.entry.shift_right = op_e[3];
         w.entry.shift_operation = modrm[5:3];
-        w.entry.port_io = !prefix_0f &&
-            ((opcode[7:2] == 6'b011011) ||  // 6C-6F: INS/OUTS
-             (opcode[7:2] == 6'b111001) ||  // E4-E7: IN/OUT imm8
-             (opcode[7:2] == 6'b111011));   // EC-EF: IN/OUT DX
-        if ((!prefix_0f && (opcode[7:4] == 4'h7)) ||
-            ( prefix_0f && (opcode[7:4] == 4'h8)))
+        w.entry.port_io = !p0f_e &&
+            ((op_e[7:2] == 6'b011011) ||  // 6C-6F: INS/OUTS
+             (op_e[7:2] == 6'b111001) ||  // E4-E7: IN/OUT imm8
+             (op_e[7:2] == 6'b111011));   // EC-EF: IN/OUT DX
+        if ((!p0f_e && (op_e[7:4] == 4'h7)) ||
+            ( p0f_e && (op_e[7:4] == 4'h8)))
             w.entry.rel_branch_kind = REL_BRANCH_JCC;
-        else if (!prefix_0f && ((opcode == 8'hEB) || (opcode == 8'hE9)))
+        else if (!p0f_e && ((op_e == 8'hEB) || (op_e == 8'hE9)))
             w.entry.rel_branch_kind = REL_BRANCH_JMP;
-        else if (!prefix_0f && (opcode == 8'hE8))
+        else if (!p0f_e && (op_e == 8'hE8))
             w.entry.rel_branch_kind = REL_BRANCH_CALL;
-        w.entry.branch_rel8 = !prefix_0f &&
-                              ((opcode[7:4] == 4'h7) || (opcode == 8'hEB));
-        w.entry.branch_condition = opcode[3:0];
-        if (!prefix_0f && (opcode[7:1] == 7'b1110000))
-            w.entry.repeat_kind = opcode[0] ? REPEAT_KIND_LOOPE
+        w.entry.branch_rel8 = !p0f_e &&
+                              ((op_e[7:4] == 4'h7) || (op_e == 8'hEB));
+        // CMPXCHG branches on ZF in microcode: JNcond with condition E.
+        w.entry.branch_condition = instr_cmpxchg ? 4'h4 : op_e[3:0];
+        if (!p0f_e && (op_e[7:1] == 7'b1110000))
+            w.entry.repeat_kind = op_e[0] ? REPEAT_KIND_LOOPE
                                              : REPEAT_KIND_LOOPNE;
         w.entry.entry_point = invalid_lock ? UADDR_INVALID_LOCK :
-                              instr_bswap ? UADDR_BSWAP : entry_final[11:0];
-        w.entry.stack_op = (invalid_lock || instr_bswap) ? 1'b0 : entry_final[13];
-        w.entry.stack_dir = (invalid_lock || instr_bswap) ? 1'b0 : entry_final[12];
+                              instr_bswap ? UADDR_BSWAP :
+                              instr_xadd ? (instr_mem ? UADDR_XADD_M : UADDR_XADD_R) :
+                              instr_cmpxchg ? (instr_mem ? UADDR_CMPXCHG_M
+                                                         : UADDR_CMPXCHG_R) :
+                              entry_final[11:0];
+        w.entry.stack_op = (invalid_lock || instr_bswap || instr_xadd ||
+                            instr_cmpxchg) ? 1'b0 : entry_final[13];
+        w.entry.stack_dir = (invalid_lock || instr_bswap || instr_xadd ||
+                             instr_cmpxchg) ? 1'b0 : entry_final[12];
         // BSWAP has a fixed r32 operand even in a 16-bit code segment.
         if (instr_bswap)
             w.entry.data32 = 1'b1;
 
         // Resolve architectural widths once in D1. These exceptions are the
         // same ones that cannot be represented by the generic W-bit rule.
-        is_setcc = prefix_0f && (opcode[7:4] == 4'b1001);
-        is_movzx_movsx = prefix_0f && (opcode[7:4] == 4'b1011) &&
-                          (opcode[2:1] == 2'b11);
-        is_movzx_word = is_movzx_movsx && opcode[0];
-        is_xlat = !prefix_0f && (opcode == 8'hD7);
+        is_setcc = p0f_e && (op_e[7:4] == 4'b1001);
+        is_movzx_movsx = p0f_e && (op_e[7:4] == 4'b1011) &&
+                          (op_e[2:1] == 2'b11);
+        is_movzx_word = is_movzx_movsx && op_e[0];
+        is_xlat = !p0f_e && (op_e == 8'hD7);
         is_byte_operand = is_setcc ? 1'b1 :
                           is_movzx_movsx ? 1'b0 :
                           is_xlat ? 1'b1 :
                           (w.entry.has_embedded_register && w.entry.has_w_bit)
-                              ? ~opcode[3] :
-                          w.entry.has_w_bit ? ~opcode[0] : 1'b0;
+                              ? ~op_e[3] :
+                          w.entry.has_w_bit ? ~op_e[0] : 1'b0;
         w.entry.operand_size = is_byte_operand ? 2'd0 :
                                is_movzx_word ? 2'd2 :
                                w.entry.data32 ? 2'd2 : 2'd1;
         w.entry.source_size = is_movzx_movsx
-                            ? (opcode[0] ? 2'd1 : 2'd0)
+                            ? (op_e[0] ? 2'd1 : 2'd0)
                             : w.entry.operand_size;
 
         if (has_modrm) begin
@@ -774,7 +804,7 @@ task automatic build_struct_work(
                 end
             endcase
 
-            if ((opcode[7:1] == 7'b1111011) && (modrm[5:3] >= 3'd2))
+            if ((op_e[7:1] == 7'b1111011) && (modrm[5:3] >= 3'd2))
                 imm_total_size = 3'd0;
 
             w.entry.has_modrm = 1'b1;
@@ -785,7 +815,7 @@ task automatic build_struct_work(
             w.need_sib = has_sib;
             w.pending_imm_size = has_sib ? imm_total_size : 3'd0;
             w.pending_imm_sign_extend = has_sib ? imm_sign_extend : 1'b0;
-            select_register_fields(prefix_0f, opcode, 1'b1, modrm,
+            select_register_fields(p0f_e, op_e, 1'b1, modrm,
                                    w.entry.src_reg_sel, w.entry.dst_reg_sel);
 
             if (!has_sib) begin
@@ -811,10 +841,10 @@ task automatic build_struct_work(
         end else begin
             has_sib = 1'b0;
             disp_size = 3'd0;
-            select_register_fields(prefix_0f, opcode, 1'b0, 8'h00,
+            select_register_fields(p0f_e, op_e, 1'b0, 8'h00,
                                    w.entry.src_reg_sel, w.entry.dst_reg_sel);
 
-            if (!prefix_0f && opcode[7:2] == 6'b101000) begin
+            if (!p0f_e && op_e[7:2] == 6'b101000) begin
                 // MOV AL/eAX,moffs and MOV moffs,AL/eAX.
                 w.entry.has_moffs = 1'b1;
                 imm_total_size = addr32 ? 3'd4 : 3'd2;
@@ -873,7 +903,7 @@ task automatic build_struct_work(
         // from one flat table and the displacement from the raw ModR/M bits,
         // in parallel, then add once. entry.length keeps the serial terms;
         // the handoff check ties the two in simulation.
-        len_opc = d1_length_lookup(prefix_0f, opcode, data32, addr32,
+        len_opc = d1_length_lookup(p0f_e, op_e, data32, addr32,
                                    modrm[5] | modrm[4]);
         len_disp = (addr32 && (modrm[7:6] != 2'b11) && (modrm[2:0] == 3'b100))
                  ? 3'd0 : modrm_disp_size(addr32, modrm, 8'h00, 1'b0);

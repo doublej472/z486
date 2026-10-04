@@ -22,6 +22,10 @@ from pathlib import Path
 
 ROM_DEPTH = 2560
 UCODE_BITS = 37
+# Base of the 486 XADD/CMPXCHG routines.  0x9D1-0x9D8 is upstream's x87 direct
+# overlay and 0x9D9-0x9DB is the INVD/WBINVD flush, so the routines sit above
+# them; everything internal to the block is expressed relative to this address.
+XADD_BASE = 0x9DC
 ROM_BITS = 40
 SRC_TMPC = 0x0C            # Canonical CROM source encoding.
 DEST_SRCREG = 0x3E         # Canonical CROM destination encoding.
@@ -53,6 +57,74 @@ def set_fields(word: int, **kw: int) -> int:
         mask = ((1 << width) - 1) << shift
         word = (word & ~mask) | ((val << shift) & mask)
     return word
+
+# Field values used by the 486 XADD/CMPXCHG routines.
+SRC_DSTREG = 0x3D
+SRC_SRCREG = 0x3E
+SRC_SIGMA = 0x1E
+SRC_OPR_R = 0x2D
+SRC_COUNTR = 0x14
+SRC_EFLAGS = 0x09
+SRC_EAX_AL = 0x28          # Size-aware accumulator (AL/AX/EAX).
+DEST_DSTREG = 0x3D
+DEST_COUNTR = 0x32
+DEST_OPR_W = 0x2D
+DEST_FLAGSB = 0x10
+DEST_EAX_AL = 0x28
+ALUSRC_SRCREG = 0x3E
+ALUSRC_DSTREG = 0x3D
+ALUSRC_OPR_R = 0x0F
+ALUJMP_ALU = 0x00          # Decoded operation (XADD decodes as ADD 00/01).
+ALUJMP_CMP = 0x0F          # Explicit SUB-flags compare, retires EFLAGS.
+ALUJMP_FLGSBA = 0x38
+ALUJMP_JNCOND = 0x41       # Jump if the decoded condition is false.
+BUSOP_RD = 0x16
+BUSOP_WR = 0x12
+OP_RNI = 0
+SUB_DLY = 0
+SUB_UNL = 1
+
+
+def uword(*, alusrc: int = 0x3F, dst: int = 0x7F, src: int = 0x3F,
+          aluop: int = 0x7F, bus: int = 0x3F, op: int = 7, sub: int = 3) -> int:
+    """Compose a native word; omitted fields keep the blank-word encoding."""
+    return set_fields((1 << UCODE_BITS) - 1, alusrc=alusrc, dst=dst, src=src,
+                      aluop=aluop, bus=bus, op=op, sub=sub)
+
+
+# Field values used by the 486 XADD/CMPXCHG routines.
+SRC_DSTREG = 0x3D
+SRC_SRCREG = 0x3E
+SRC_SIGMA = 0x1E
+SRC_OPR_R = 0x2D
+SRC_COUNTR = 0x14
+SRC_EFLAGS = 0x09
+SRC_EAX_AL = 0x28          # Size-aware accumulator (AL/AX/EAX).
+DEST_DSTREG = 0x3D
+DEST_COUNTR = 0x32
+DEST_OPR_W = 0x2D
+DEST_FLAGSB = 0x10
+DEST_EAX_AL = 0x28
+ALUSRC_SRCREG = 0x3E
+ALUSRC_DSTREG = 0x3D
+ALUSRC_OPR_R = 0x0F
+ALUJMP_ALU = 0x00          # Decoded operation (XADD decodes as ADD 00/01).
+ALUJMP_CMP = 0x0F          # Explicit SUB-flags compare, retires EFLAGS.
+ALUJMP_FLGSBA = 0x38
+ALUJMP_JNCOND = 0x41       # Jump if the decoded condition is false.
+BUSOP_RD = 0x16
+BUSOP_WR = 0x12
+OP_RNI = 0
+SUB_DLY = 0
+SUB_UNL = 1
+
+def reljump(src_addr: int, target: int) -> int:
+    """Six-bit relative micro-jump offset (target = word + 1 + offset)."""
+    off = target - (src_addr + 1)
+    if not -32 <= off <= 31:
+        raise ValueError(f"micro-jump 0x{src_addr:03X}->0x{target:03X} out of range")
+    return off & 0x3F
+
 
 
 @dataclass
@@ -392,6 +464,79 @@ PATCHES = [
           fields=dict(aluop=0x5A, alusrc=0x0B)),
     Patch(0x03B, "ALU m,i 6->4: 03B = OPR_R,IMM +-&|^ in jump delay slot (03C unreached)",
           copy_from=0x03C, fields=dict(src=0x2D)),
+    # 0F C0/C1 XADD r/m,r. D1 decodes the structure as ADD r/m,r (00/01),
+    # so ALU selects ADD and flags follow ADD; reg = SRCREG, r/m = DSTREG.
+    # Register form: the old destination is parked in COUNTR (the XCHG r,r
+    # routine 0B6 uses the same scratch), SRCREG takes it at RNI and DSTREG
+    # takes the sum in the delay slot, so XADD r,r with one register leaves
+    # the sum (the architectural DEST <- TEMP is last).
+    Patch((XADD_BASE + 0x00), "XADD r,r: COUNTR <- DSTREG; SIGMA = DSTREG + SRCREG (flags)",
+          word=uword(src=SRC_DSTREG, dst=DEST_COUNTR, aluop=ALUJMP_ALU,
+                     alusrc=ALUSRC_SRCREG)),
+    Patch((XADD_BASE + 0x01), "XADD r,r: SRCREG <- old DSTREG + RNI",
+          word=uword(src=SRC_COUNTR, dst=0x3E, op=OP_RNI)),
+    Patch((XADD_BASE + 0x02), "XADD r,r: delay slot DSTREG <- SIGMA",
+          word=uword(src=SRC_SIGMA, dst=DEST_DSTREG)),
+    # Memory form: the ALU m,r read/modify/write shape (04A/04B/04C/046)
+    # followed by the XCHG m,r tail (0B3/0B4/0B5): SRCREG receives the old
+    # memory value (still in OPR_R) only in the RNI delay slot, after the
+    # write's DLY has completed, so a faulting write restarts with every
+    # register intact (EFLAGS from the FLGSBA backup).
+    Patch((XADD_BASE + 0x03), "XADD m,r: FLGSBA + RD destination",
+          copy_from=0x04A),
+    Patch((XADD_BASE + 0x04), "XADD m,r: DLY for read data",
+          word=uword(sub=SUB_DLY)),
+    Patch((XADD_BASE + 0x05), "XADD m,r: SIGMA = OPR_R + SRCREG (flags)",
+          word=uword(src=SRC_OPR_R, aluop=ALUJMP_ALU, alusrc=ALUSRC_SRCREG)),
+    Patch((XADD_BASE + 0x06), "XADD m,r: OPR_W <- SIGMA + WR",
+          word=uword(src=SRC_SIGMA, dst=DEST_OPR_W, bus=BUSOP_WR)),
+    Patch((XADD_BASE + 0x07), "XADD m,r: DLY for the write + RNI",
+          word=uword(sub=SUB_DLY, op=OP_RNI)),
+    Patch((XADD_BASE + 0x08), "XADD m,r: delay slot SRCREG <- old memory value (OPR_R)",
+          word=uword(src=SRC_OPR_R, dst=0x3E, sub=SUB_UNL)),
+
+    # 0F B0/B1 CMPXCHG r/m,r. D1 decodes the structure as CMP r/m,r (38/39)
+    # and sets the Jcc condition to E, so JNcond (taken when the condition
+    # is false) branches on ZF=0 from the preceding CMP through the
+    # registered flag forwarding. CMP computes accumulator - destination.
+    Patch((XADD_BASE + 0x09), "CMPXCHG r,r: flags = eAX - DSTREG",
+          word=uword(src=SRC_EAX_AL, aluop=ALUJMP_CMP, alusrc=ALUSRC_DSTREG)),
+    Patch((XADD_BASE + 0x0A), "CMPXCHG r,r: jump to the not-equal path if ZF=0",
+          word=uword(aluop=ALUJMP_JNCOND, alusrc=reljump((XADD_BASE + 0x0A), (XADD_BASE + 0x0E)))),
+    Patch((XADD_BASE + 0x0B), "CMPXCHG r,r: blank jump delay slot",
+          copy_from=0x030),
+    Patch((XADD_BASE + 0x0C), "CMPXCHG r,r equal: DSTREG <- SRCREG + RNI",
+          word=uword(src=SRC_SRCREG, dst=DEST_DSTREG, op=OP_RNI)),
+    Patch((XADD_BASE + 0x0D), "CMPXCHG r,r equal: blank RNI delay slot",
+          copy_from=0x030),
+    Patch((XADD_BASE + 0x0E), "CMPXCHG r,r not equal: eAX <- DSTREG + RNI",
+          word=uword(src=SRC_DSTREG, dst=DEST_EAX_AL, op=OP_RNI)),
+    Patch((XADD_BASE + 0x0F), "CMPXCHG r,r not equal: blank RNI delay slot",
+          copy_from=0x030),
+    # Memory form: the destination is always written, like the 486 (the
+    # old value when not equal). The accumulator changes only in the RNI
+    # delay slot after the write completed (XCHG m,r tail), so both paths
+    # restart cleanly from a faulting write.
+    Patch((XADD_BASE + 0x10), "CMPXCHG m,r: FLGSBA + RD destination",
+          copy_from=0x04A),
+    Patch((XADD_BASE + 0x11), "CMPXCHG m,r: DLY for read data",
+          word=uword(sub=SUB_DLY)),
+    Patch((XADD_BASE + 0x12), "CMPXCHG m,r: flags = eAX - OPR_R",
+          word=uword(src=SRC_EAX_AL, aluop=ALUJMP_CMP, alusrc=ALUSRC_OPR_R)),
+    Patch((XADD_BASE + 0x13), "CMPXCHG m,r: jump to the not-equal path if ZF=0",
+          word=uword(aluop=ALUJMP_JNCOND, alusrc=reljump((XADD_BASE + 0x13), (XADD_BASE + 0x17)))),
+    Patch((XADD_BASE + 0x14), "CMPXCHG m,r: blank jump delay slot",
+          copy_from=0x030),
+    Patch((XADD_BASE + 0x15), "CMPXCHG m,r equal: OPR_W <- SRCREG + WR + RNI",
+          word=uword(src=SRC_SRCREG, dst=DEST_OPR_W, bus=BUSOP_WR, op=OP_RNI)),
+    Patch((XADD_BASE + 0x16), "CMPXCHG m,r equal: DLY for the write in the delay slot",
+          word=uword(sub=SUB_DLY)),
+    Patch((XADD_BASE + 0x17), "CMPXCHG m,r not equal: OPR_W <- OPR_R (write back) + WR",
+          word=uword(src=SRC_OPR_R, dst=DEST_OPR_W, bus=BUSOP_WR)),
+    Patch((XADD_BASE + 0x18), "CMPXCHG m,r not equal: DLY for the write + RNI",
+          word=uword(sub=SUB_DLY, op=OP_RNI)),
+    Patch((XADD_BASE + 0x19), "CMPXCHG m,r not equal: delay slot eAX <- OPR_R",
+          word=uword(src=SRC_OPR_R, dst=DEST_EAX_AL, sub=SUB_UNL)),
 ]
 
 
