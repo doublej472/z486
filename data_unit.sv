@@ -170,7 +170,6 @@ logic        load_wb_alu_commit;
 logic [31:0] load_wb_alu_result;
 logic [31:0] load_wb_alu_flags;
 logic [31:0] load_wb_dst_base_r;
-logic [31:0] load_wb_forward_data_r;
 
 logic [31:0] tmpb, tmpd, tmpe, tmpf, tmph;
 logic [31:0] csopcd, fsveip, oproff;
@@ -284,32 +283,13 @@ function automatic logic [31:0] read_gpr_value(
     endcase
 endfunction
 
-localparam logic [1:0] EA_FWD_BLO = 2'd0;
-localparam logic [1:0] EA_FWD_BHI = 2'd1;
-localparam logic [1:0] EA_FWD_W   = 2'd2;
-localparam logic [1:0] EA_FWD_D   = 2'd3;
+// EA_FWD_* now lives in z486_pkg so gpr_write_merge shares the encoding.
 
 // Form the plain-load architectural value once at WB.  The destination's
 // prior full-width value was captured from the EX token one cycle earlier, so
 // byte/word merging does not select the GPR bank from the live WB destination
 // on the timing-critical successor-EA path.
-function automatic logic [31:0] merge_load_forward(
-    input logic [31:0] base,
-    input logic [31:0] data,
-    input logic [2:0]  dst,
-    input logic [1:0]  size
-);
-    if (size == 2'd0)
-        merge_load_forward = dst[2]
-            ? {base[31:16], data[7:0], base[7:0]}
-            : {base[31:8], data[7:0]};
-    else if (size == 2'd1)
-        merge_load_forward = {base[31:16], data[15:0]};
-    else
-        merge_load_forward = data;
-endfunction
 
-wire [31:0] load_wb_forward_data = load_wb_forward_data_r;
 wire [2:0] load_wb_widx = (load_wb_size == 2'd0)
                          ? {1'b0, load_wb_dst[1:0]} : load_wb_dst;
 
@@ -326,70 +306,86 @@ wire [2:0] load_wb_widx = (load_wb_size == 2'd0)
 //                             commits land on
 // A plain load's WB value is already merged with its destination's prior
 // value; an M3 ALU result is not forwarded (its readers are interlocked).
-wire [7:0] pend_load_mask  = (load_wb_valid && !load_wb_is_alu) ? (8'h01 << load_wb_widx) : 8'h00;
-wire [7:0] pend_mem_mask   = (recipe_memory_write.valid && !recipe_memory_killed)
-                           ? recipe_memory_dst_onehot : 8'h00;
 wire [7:0] pend_shift_mask = (recipe_shift_write.valid && !recipe_shift_killed)
                            ? (8'h01 << recipe_shift_widx) : 8'h00;
 wire [7:0] pend_dly_mask   = dly_gpr_forward.valid ? (8'h01 << dly_gpr_forward.dst) : 8'h00;
 
-logic [31:0] gpr_ex_view [0:7];
-logic [31:0] gpr_ea_view [0:7];
-logic [31:0] gpr_capture_view [0:7];
-always_comb begin
-    logic [31:0] current, merged, dly_value, shift_value, captured;
-    for (int r = 0; r < 8; r++) begin
-        current = read_gpr_value(3'(r), 2'd2);
+// Producer arbitration.  Every deferred or in-flight register producer is
+// merged once, in architectural age order, by gpr_write_merge, and both the
+// register commit and the forwarding views are built from that single answer.
+// Pattern P1 in docs/hazard-survey.md: an older deferred token used to win the
+// forwarding views while the commit awarded the same bytes to the younger
+// write-back, so a consumer could read a value the register never received.
+//
+// Views differ only in VISIBILITY, never in order:
+//   EX view  (operand reads)  sees the memory token and the write-back
+//   EA view  (D2 base/index)  sees the shift token, write-back and bypass; a D2
+//                             consumer of a still-pending load is interlocked
+//                             rather than bypassed, so it must not see the
+//                             memory token's stale OPR_R
+//   capture view (direct-load base) the EX set plus the shift token and bypass
+wire [31:0] gpr_ex_view [0:7];
+wire [31:0] gpr_ea_view [0:7];
+wire [31:0] gpr_capture_view [0:7];
 
-        merged = pend_load_mask[r] ? load_wb_forward_data : current;
-        if (pend_mem_mask[r])
-            case (recipe_memory_mode)
-                EA_FWD_BLO: merged = {merged[31:8], opr_r[7:0]};
-                EA_FWD_BHI: merged = {merged[31:16], opr_r[7:0], merged[7:0]};
-                EA_FWD_W:   merged = {merged[31:16], opr_r[15:0]};
-                default:    merged = opr_r;
-            endcase
-        gpr_ex_view[r] = merged;
+wire        pr_shift_valid = recipe_shift_write.valid && !recipe_shift_killed;
+wire        pr_mem_valid   = recipe_memory_write.valid && !recipe_memory_killed;
+// The interrupt-entry writeback slot is the same write as the memory token: it
+// retires OPR_R for the hardwired load whose RNI the interrupt displaced.
+wire        pr_rom_valid   = interrupt_entry && recipe_rni && recipe_state.hardwired &&
+                             (recipe_state.commit_sel == RECIPE_COMMIT_MEM);
 
-        case (dly_gpr_forward.mode)
-            EA_FWD_BLO: dly_value = {current[31:8], dly_gpr_forward.data[7:0]};
-            EA_FWD_BHI: dly_value = {current[31:16], dly_gpr_forward.data[7:0], current[7:0]};
-            EA_FWD_W:   dly_value = {current[31:16], dly_gpr_forward.data[15:0]};
-            default:    dly_value = dly_gpr_forward.data;
-        endcase
-        if (recipe_shift_write.size == 2'd0)
-            shift_value = recipe_shift_write.dst[2]
-                ? {current[31:16], recipe_shift_data[7:0], current[7:0]}
-                : {current[31:8], recipe_shift_data[7:0]};
-        else if (recipe_shift_write.size == 2'd1)
-            shift_value = {current[31:16], recipe_shift_data[15:0]};
-        else
-            shift_value = recipe_shift_data;
-        gpr_ea_view[r] = pend_dly_mask[r]   ? dly_value :
-                         pend_shift_mask[r] ? shift_value :
-                         pend_load_mask[r]  ? load_wb_forward_data : current;
+logic [255:0] pr_commit_value, pr_commit_wmask, pr_ex_value, pr_ea_value, pr_cap_value;
 
-        captured = merged;
-        if (pend_shift_mask[r]) begin
-            if (recipe_shift_write.size == 2'd0)
-                captured = recipe_shift_write.dst[2]
-                    ? {captured[31:16], recipe_shift_data[7:0], captured[7:0]}
-                    : {captured[31:8], recipe_shift_data[7:0]};
-            else if (recipe_shift_write.size == 2'd1)
-                captured = {captured[31:16], recipe_shift_data[15:0]};
-            else
-                captured = recipe_shift_data;
-        end
-        if (pend_dly_mask[r])
-            case (dly_gpr_forward.mode)
-                EA_FWD_BLO: captured = {captured[31:8], dly_gpr_forward.data[7:0]};
-                EA_FWD_BHI: captured = {captured[31:16], dly_gpr_forward.data[7:0], captured[7:0]};
-                EA_FWD_W:   captured = {captured[31:16], dly_gpr_forward.data[15:0]};
-                default:    captured = dly_gpr_forward.data;
-            endcase
-        gpr_capture_view[r] = captured;
-    end
+gpr_write_merge gpr_merge (
+    .cur({edi, esi, ebp, esp, ebx, edx, ecx, eax}),
+
+    .v_shift(pr_shift_valid),
+    .dst_shift(recipe_shift_write.dst),
+    .size_shift(recipe_shift_write.size),
+    .data_shift(recipe_shift_data),
+
+    .v_mem(pr_mem_valid),
+    .dst_mem(recipe_memory_write.dst),
+    .mode_mem(recipe_memory_mode),
+    .data_mem(opr_r),
+
+    .v_rom(pr_rom_valid),
+    .dst_rom(dst_reg_sel_r),
+    .size_rom(op_size),
+    .data_rom(opr_r),
+
+    .v_wb(load_wb_valid),
+    .dst_wb(load_wb_dst),
+    .size_wb(load_wb_size),
+    .wb_is_alu(load_wb_is_alu),
+    .data_wb(load_wb_commit_data),
+
+    .v_dly(dly_gpr_forward.valid),
+    .dst_dly(dly_gpr_forward.dst),
+    .mode_dly(dly_gpr_forward.mode),
+    .data_dly(dly_gpr_forward.data),
+
+    .vis_ex(5'b0_1010),
+    .vis_ea(5'b1_1001),
+    .vis_cap(5'b1_1011),
+
+    .commit_value(pr_commit_value),
+    .commit_wmask(pr_commit_wmask),
+    .ex_value(pr_ex_value),
+    .ea_value(pr_ea_value),
+    .cap_value(pr_cap_value)
+);
+
+
+genvar gv;
+generate
+for (gv = 0; gv < 8; gv++) begin : g_view
+    assign gpr_ex_view[gv]      = pr_ex_value[gv*32 +: 32];
+    assign gpr_ea_view[gv]      = pr_ea_value[gv*32 +: 32];
+    assign gpr_capture_view[gv] = pr_cap_value[gv*32 +: 32];
 end
+endgenerate
 
 // An EX operand read, formatted to its size.
 function automatic logic [31:0] read_gpr_load_forwarded(
@@ -434,12 +430,8 @@ wire [31:0] load_capture_base = gpr_capture_view[load_capture_widx];
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         load_wb_dst_base_r <= 32'd0;
-        load_wb_forward_data_r <= 32'd0;
     end else if (load_alu_dst_capture) begin
         load_wb_dst_base_r <= load_capture_base;
-        load_wb_forward_data_r <= merge_load_forward(
-            load_capture_base, load_alu_dst_capture_data,
-            load_alu_dst_capture_dst, load_alu_dst_capture_size);
     end
 end
 
@@ -868,6 +860,65 @@ always_ff @(posedge clk) begin
     end
 end
 
+// Commit the merged producer arbitration: exactly the byte lanes the winning
+// producers own, taken from the same value the forwarding views are built from.
+task automatic commit_merged(input logic [255:0] value, input logic [255:0] wmask);
+    for (int r = 0; r < 8; r++) begin
+        automatic logic [31:0] rv = value[r*32 +: 32];
+        automatic logic [31:0] rm = wmask[r*32 +: 32];
+        case (r)
+            3'd0: begin
+                if (rm[0])  eax[7:0]   <= rv[7:0];
+                if (rm[8]) eax[15:8]  <= rv[15:8];
+                if (rm[16]) eax[23:16] <= rv[23:16];
+                if (rm[24]) eax[31:24] <= rv[31:24];
+            end
+            3'd1: begin
+                if (rm[0])  ecx[7:0]   <= rv[7:0];
+                if (rm[8]) ecx[15:8]  <= rv[15:8];
+                if (rm[16]) ecx[23:16] <= rv[23:16];
+                if (rm[24]) ecx[31:24] <= rv[31:24];
+            end
+            3'd2: begin
+                if (rm[0])  edx[7:0]   <= rv[7:0];
+                if (rm[8]) edx[15:8]  <= rv[15:8];
+                if (rm[16]) edx[23:16] <= rv[23:16];
+                if (rm[24]) edx[31:24] <= rv[31:24];
+            end
+            3'd3: begin
+                if (rm[0])  ebx[7:0]   <= rv[7:0];
+                if (rm[8]) ebx[15:8]  <= rv[15:8];
+                if (rm[16]) ebx[23:16] <= rv[23:16];
+                if (rm[24]) ebx[31:24] <= rv[31:24];
+            end
+            3'd4: begin
+                if (rm[0])  esp[7:0]   <= rv[7:0];
+                if (rm[8]) esp[15:8]  <= rv[15:8];
+                if (rm[16]) esp[23:16] <= rv[23:16];
+                if (rm[24]) esp[31:24] <= rv[31:24];
+            end
+            3'd5: begin
+                if (rm[0])  ebp[7:0]   <= rv[7:0];
+                if (rm[8]) ebp[15:8]  <= rv[15:8];
+                if (rm[16]) ebp[23:16] <= rv[23:16];
+                if (rm[24]) ebp[31:24] <= rv[31:24];
+            end
+            3'd6: begin
+                if (rm[0])  esi[7:0]   <= rv[7:0];
+                if (rm[8]) esi[15:8]  <= rv[15:8];
+                if (rm[16]) esi[23:16] <= rv[23:16];
+                if (rm[24]) esi[31:24] <= rv[31:24];
+            end
+            default: begin
+                if (rm[0])  edi[7:0]   <= rv[7:0];
+                if (rm[8]) edi[15:8]  <= rv[15:8];
+                if (rm[16]) edi[23:16] <= rv[23:16];
+                if (rm[24]) edi[31:24] <= rv[31:24];
+            end
+        endcase
+    end
+endtask
+
 // Deferred recipe commits are Data Unit writeback state. Chain control observes
 // the compact pending descriptors for dependency checks and D2 forwarding.
 always_ff @(posedge clk) begin
@@ -932,31 +983,10 @@ always_ff @(posedge clk) begin
         esi     <= 32'd0;
         edi     <= 32'd0;
     end else begin
-        if (recipe_shift_write.valid && !recipe_shift_killed)
-            write_gpr(recipe_shift_write.dst, recipe_shift_data,
-                      recipe_shift_write.size);
-
-        // A chained successor may own EX while an older hardwired load's
-        // pending token retires. The token is already fully qualified.
-        if (recipe_memory_write.valid && !recipe_memory_killed &&
-            !recipe_commit_cancel)
-            write_gpr(recipe_memory_write.dst, opr_r,
-                      recipe_memory_write.size);
-
-        // Committed after the token above so the younger producer wins the bytes
-        // it writes: a VIPT load WB belongs to the successor, so "mov r,[m]"
-        // followed by "add r,[m]" must keep the ADD. The memory token stays
-        // valid (and recommits) through stalled cycles until pipeline_advance.
-        if (load_wb_valid && !recipe_commit_cancel)
-            write_gpr(load_wb_dst, load_wb_commit_data, load_wb_size);
-
-        // A younger VIPT candidate can shadow the ROM writeback slot of a
-        // hardwired load.  If an interrupt redirects that boundary, retire
-        // the completed OPR_R value before the handler starts using OPR_R.
-        if (interrupt_entry && recipe_rni && recipe_state.hardwired &&
-            (recipe_state.commit_sel == RECIPE_COMMIT_MEM) &&
-            !recipe_commit_cancel)
-            write_gpr(dst_reg_sel_r, opr_r, op_size);
+        // One merged write for every deferred/in-flight producer, in canonical
+        // age order (gpr_write_merge).  A fault cancels the deferred commits.
+        if (!recipe_commit_cancel)
+            commit_merged(pr_commit_value, pr_commit_wmask);
 
         if (exec) begin
             case (dest)
