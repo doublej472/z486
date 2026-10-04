@@ -276,12 +276,25 @@ wire [31:0] diff_res = base_diff[31:0];
 wire size_fault = (diff_res[31:3] == 29'd0) && (diff_res[2:0] < access_size);
 wire limit_violated = start_out_of_bounds | size_fault;
 
+// Expand-down data/stack segment (code/data bit clear, ED bit set): the valid
+// offsets are limit+1 .. segment max, so the start verdict inverts (fault iff
+// offset <= limit) and the size check is bounded by the max, not the limit.
+wire [3:0] seg_type_sel = (seg_sel <= SEG_GS) ? desc_cache[seg_sel[2:0]].seg_type
+                                             : 4'h0;
+wire expand_down = !seg_type_sel[3] && seg_type_sel[2];
+wire [31:0] ed_max = addr_size ? 32'hFFFF_FFFF : 32'h0000_FFFF;
+wire [31:0] ed_diff = ed_max - eff_offset;
+wire ed_start_fault = !base_diff[32];
+wire ed_size_fault = (ed_diff[31:3] == 29'd0) && (ed_diff[2:0] < access_size);
+wire ed_limit_violated = ed_start_fault | ed_size_fault;
+
 // Real mode: a boundary-crossing access always faults (even SS -> #SS, e.g.
 // POPAD at SP=0xFFFE); only start-out-of-bounds keeps the 16-bit-stack wrap.
 wire rm_limit_fault = !pe && (size_fault ||
                       (start_out_of_bounds && !(is_stack_fault && !addr_size)));
 
-wire pm_limit_fault = pe && limit_violated && !is_dtable;
+wire pm_limit_fault = pe && !is_dtable &&
+                      (expand_down ? ed_limit_violated : limit_violated);
 
 wire seg_writable = (seg_sel == SEG_ES) ? (!desc_cache[SEG_ES].seg_type[3] && desc_cache[SEG_ES].seg_type[1]) :
                     (seg_sel == SEG_CS) ? vm :
