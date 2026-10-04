@@ -98,6 +98,7 @@ TB_MEMMAP_SRCS := tb_memmap_template.sv
 CPP_MEMMAP_SRCS := sim_main_memmap_template.cpp
 TB_INTERRUPT_NMI_SRCS := tb_interrupt_nmi.sv
 TB_PAGING_WALKER_SRCS := tb_paging_walker.sv
+TB_CACHE_FLUSH_SRCS := tb_cache_flush.sv
 TB_X87_BRIDGE_SRCS := tb_x87_bridge.sv
 CPP_X87_BRIDGE_SRCS := sim_main_x87_bridge.cpp
 TB_X87_SEQ_SRCS := tb_x87_sequencer.sv
@@ -117,7 +118,7 @@ CPP_PLA4_SRCS := sim_main_pla4.cpp
 PLA4_RTL := $(Z486_DIR)/protection.sv
 
 # Targets
-.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-memmap-template test-interrupt-nmi test-paging-walker test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
+.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-memmap-template test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 all: build
 
@@ -211,6 +212,14 @@ obj_dir/Vtb_paging_walker: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/paging_walker.sv 
 		$(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/paging_walker.sv \
 		$(TB_PAGING_WALKER_SRCS)
 	@echo "Build complete: obj_dir/Vtb_paging_walker"
+
+obj_dir/Vtb_cache_flush: $(RTL_SRCS) $(RTL_DEPS) $(TB_CACHE_FLUSH_SRCS)
+	@echo "Building cache-flush controller bench with Verilator..."
+	$(VERILATOR) --timing -Wall -Wno-fatal -Wno-UNOPTFLAT -Wno-SYNCASYNCNET \
+		--binary -O3 -j 0 -I$(Z486_DIR) -I$(X87_DIR) -I$(X87_REF_DIR) \
+		-CFLAGS "-std=c++14 -O3" --top-module tb_cache_flush \
+		$(RTL_SRCS) $(TB_CACHE_FLUSH_SRCS)
+	@echo "Build complete: obj_dir/Vtb_cache_flush"
 
 obj_dir/Vtb_x87_bridge: $(X87_DIR)/x87_bridge.sv $(TB_X87_BRIDGE_SRCS) $(CPP_X87_BRIDGE_SRCS)
 	@echo "Building x87 bridge unit test with Verilator..."
@@ -357,6 +366,12 @@ test-paging-walker: obj_dir/Vtb_paging_walker
 	@./obj_dir/Vtb_paging_walker | tee obj_dir/z486_paging_walker.out \
 		| grep -q "PAGING WALKER TEST PASS" \
 		|| (echo "page-walker A/D write-back bench FAIL"; exit 1)
+
+test-cache-flush: obj_dir/Vtb_cache_flush
+	@echo "Running whole-L1 flush controller bench..."
+	@./obj_dir/Vtb_cache_flush | tee obj_dir/z486_cache_flush.out \
+		| grep -q "TB_CACHE_FLUSH: PASS" \
+		|| (echo "cache-flush controller bench FAIL"; exit 1)
 
 test-x87-bridge: obj_dir/Vtb_x87_bridge
 	@echo "Running x87 bridge unit test..."
