@@ -863,7 +863,9 @@ always_ff @(posedge clk) begin
     if (!reset_n) begin
         eax     <= 32'd0;
         ecx     <= 32'd0;
-        edx     <= 32'h0000_0303;
+        // 486SX-class signature (family 4 / model 2, no FPU/CPUID): the old
+        // 0x0303 was a 386 ID.  PC-98 firmware dispatches on this at reset.
+        edx     <= 32'h0000_0420;
         ebx     <= 32'd0;
         esp     <= 32'd0;
         ebp     <= 32'd0;
