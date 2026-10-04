@@ -16,6 +16,7 @@ module event_control
 
     // Microsequencer and E-stage lifecycle (current microword and its enables)
     input  logic [11:0] uc_addr,
+    input  logic [11:0] uaddr,          // registered port-A fetch address
     input  logic [6:0] uc_aluop,
     input  logic [5:0] uc_buscode,
     input  logic [6:0] uc_dest,
@@ -127,6 +128,34 @@ reg        gp_fault_double_r;
 wire       fault_start = any_fault && !fault_seen_r;
 assign double_fault_start = (fault_delivery_state == FAULT_DELIVERING) &&
                                 fault_combine_active;
+// The microcode can re-enter the exception-entry cluster on its own while a
+// delivery is already in progress: the delivery body's "this IDT entry is not
+// a usable gate" redirect (uc=0x8BE) lands at uc=0x865, inside the cluster,
+// and the segment-load routine's default LJUMP (uc=0x5D1) lands there too. A
+// fault raised while delivering a fault is a double fault, which the RTL
+// answers that way for its own faults (seq_fault_redirect / div_redirect_target
+// select UADDR_DOUBLE_FAULT under double_fault_start). Without this term a
+// microcode-started delivery only *counted* its re-entry and the state machine
+// escalated to a processor reset, while a real 486 delivers #DF through the #DF
+// gate (vector 8) and only resets when that gate is unusable too. The redirect
+// must be held until the fetch actually leaves the cluster: the word behind the
+// re-entry (uc=0x866) is a relative JMP that lands back on uc=0x865 while the
+// #DF entry is still in the fetch pipeline, so a one-cycle pulse is bounced
+// straight back into the cluster. See tests/programs/gp_double_fault_deliver.asm.
+wire       microcode_fault_entry = uc_exec &&
+                                   (uc_addr >= UADDR_FAULT_ENTRY_FIRST) &&
+                                   (uc_addr <= UADDR_FAULT_ENTRY_LAST);
+wire       microcode_fault_reentry = microcode_fault_entry && double_fault_start;
+reg        microcode_double_fault_r;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        microcode_double_fault_r <= 1'b0;
+    else if (uc_exec && microcode_fault_reentry)
+        microcode_double_fault_r <= 1'b1;
+    else if (uaddr < UADDR_FAULT_ENTRY_FIRST || uaddr > UADDR_FAULT_ENTRY_LAST)
+        microcode_double_fault_r <= 1'b0;
+end
+wire       microcode_double_fault = microcode_fault_reentry || microcode_double_fault_r;
 
 wire [31:0] countr_masked = i.addr32 ? COUNTR : {16'h0, COUNTR[15:0]};
 
@@ -248,6 +277,12 @@ always_comb begin
         seq_fault_redirect.target = double_fault_start
                                   ? UADDR_DOUBLE_FAULT : UADDR_PAGE_FAULT;
     end
+    // A microcode-started delivery that re-enters the entry cluster while its
+    // contributory-fault flag is set is a double fault, not another #GP.
+    if (microcode_double_fault) begin
+        seq_fault_redirect.valid = 1'b1;
+        seq_fault_redirect.target = UADDR_DOUBLE_FAULT;
+    end
 end
 
 // Interrupt dispatch is a macro-instruction boundary redirect. The explicit
@@ -294,7 +329,7 @@ always_ff @(posedge clk) begin
         if (uc_exec && uc_aluop == ALUJMP_SCNTFF)
             fault_combine_active <= 1'b1;
 
-        if (fault_start) begin
+        if (fault_start || (microcode_fault_entry && !microcode_double_fault_r)) begin
             case (fault_delivery_state)
                 FAULT_IDLE: begin
                     fault_delivery_state <= FAULT_DELIVERING;
