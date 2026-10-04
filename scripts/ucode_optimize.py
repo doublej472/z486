@@ -29,6 +29,7 @@ DEST_USTEP_RPTI_EIP = 0x6D # Optimizer-owned: restart EIP write.
 DEST_USTEP_TASK_CS = 0x6E  # Optimizer-owned: task load establishes CS RPL.
 DEST_USTEP_FAULT_DONE = 0x6F # Optimizer-owned: fault delivery completion.
 DEST_USTEP_INVLPG = 0x70   # Optimizer-owned: invalidate one TLB page.
+DEST_USTEP_CACHE_FLUSH = 0x72 # Optimizer-owned: invalidate both L1 caches.
 DEST_USTEP_X87_STORE = 0x71 # Optimizer-owned: x87 store command and result read.
 DEST_USTEP_ALU = 0x7E       # Optimizer-owned: commit this word's ALU result to DSTREG.
 DEST_USTEP_BSWAP = 0x7C     # Optimizer-owned: byte-swap SRCREG into itself.
@@ -94,6 +95,7 @@ class RecipeAction(IntEnum):
     X87_OVERLAY = 1
     INVLPG = 2
     RMW_FAST = 3
+    CACHE_FLUSH = 4
 
 
 @dataclass(frozen=True)
@@ -155,6 +157,22 @@ PATCHES = [
     Patch(0x9C9, "NOP extension: blank hardwired RNI word",
           copy_from=0x030, fields=dict(op=0)),
     Patch(0x9CA, "NOP extension: blank RNI delay slot",
+          copy_from=0x030),
+
+    # 486 INVD (0F 08) / WBINVD (0F 09).  Both are a native whole-L1 flush:
+    # the CPU sidecar drains the posted store queue and then invalidates every
+    # set of both L1s, so the microcode only has to hold the instruction until
+    # the fabric pulses done and then retire.  The first word is a hold (op is
+    # left non-RNI) carrying the DEST_USTEP_CACHE_FLUSH marker the validator
+    # and the entry-action table agree on; the second retires; the third is its
+    # blank architectural delay slot.  These three words sit in ROM space no
+    # other entry references (the old x87-register overlay at 0x9D1 is left
+    # untouched, unlike the fork's layout).
+    Patch(0x9D9, "INVD/WBINVD extension: native whole-L1 invalidate, hold",
+          fields=dict(dst=DEST_USTEP_CACHE_FLUSH)),
+    Patch(0x9DA, "INVD/WBINVD extension: blank RNI word after the flush",
+          copy_from=0x030, fields=dict(op=0)),
+    Patch(0x9DB, "INVD/WBINVD extension: blank RNI delay slot",
           copy_from=0x030),
 
     # D8 m32 arithmetic and D9 /0 FLD use a paging-owned demand read and post
@@ -510,6 +528,7 @@ OVERLAY_RECIPES = [
 # and consumes only the action.
 ENTRY_ACTIONS = {
     0x9C7: RecipeAction.INVLPG,
+    0x9D9: RecipeAction.CACHE_FLUSH,
 }
 
 
@@ -654,6 +673,11 @@ def validate_recipes(words: list[int]) -> None:
             raise ValueError(
                 f"entry action 0x{entry:03X}: INVLPG marker is missing from microcode"
             )
+        if (action == RecipeAction.CACHE_FLUSH and
+                get_field(words[entry], "dst") != DEST_USTEP_CACHE_FLUSH):
+            raise ValueError(
+                f"entry action 0x{entry:03X}: CACHE_FLUSH marker is missing from microcode"
+            )
 
 
 def render_recipe_manifest(words: list[int]) -> str:
@@ -736,12 +760,12 @@ def render_recipe_svh(words: list[int]) -> str:
         "localparam logic [2:0] RECIPE_EARLY_BRANCH = 3'd6;",
         "localparam logic [2:0] RECIPE_EARLY_STACK  = 3'd7;",
         "",
-        f"localparam logic [1:0] RECIPE_ACTION_NONE = 2'd{int(RecipeAction.NONE)};",
+        f"localparam logic [2:0] RECIPE_ACTION_NONE = 3'd{int(RecipeAction.NONE)};",
     ]
     for action in RecipeAction:
         if action != RecipeAction.NONE:
             lines.append(
-                f"localparam logic [1:0] RECIPE_ACTION_{action.name} = 2'd{int(action)};"
+                f"localparam logic [2:0] RECIPE_ACTION_{action.name} = 3'd{int(action)};"
             )
     lines += [
         "",
@@ -784,7 +808,7 @@ def render_recipe_svh(words: list[int]) -> str:
         "    endcase",
         "endfunction",
         "",
-        "function automatic logic [1:0] recipe_action(input logic [11:0] entry);",
+        "function automatic logic [2:0] recipe_action(input logic [11:0] entry);",
         "    unique case (entry)",
     ]
     for recipe in OVERLAY_RECIPES:

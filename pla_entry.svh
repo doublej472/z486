@@ -497,7 +497,12 @@ function automatic logic [15:0] pla_entry_lookup(
         13'b?11001100??10: pla_entry_lookup = 16'b0000100000010110;
         13'b?11001110??10: pla_entry_lookup = 16'b0000100000100111;
         13'b?0000010???11: pla_entry_lookup = 16'b0000100000101011;
-        13'b?00001000??11: pla_entry_lookup = 16'b0000100000101011;
+        // INVD/WBINVD.  Both are more specific than the 0F09/0F29 row further
+        // down (bit 5 is fixed), so first-match gives WBINVD the flush entry and
+        // leaves MOVAPS on the generic 2-byte path.  (Verilator reports the
+        // deliberate overlap as CASEOVERLAP against the older row.)
+        13'b?00001000??11: pla_entry_lookup = 16'b0000100111011001;
+        13'b?00001001??11: pla_entry_lookup = 16'b0000100111011001;
         13'b?000011????11: pla_entry_lookup = 16'b0000100000101011;
         13'b?00101?00??11: pla_entry_lookup = 16'b0000100000101011;
         13'b?0010?1?1??11: pla_entry_lookup = 16'b0000100000101011;
