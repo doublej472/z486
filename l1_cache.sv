@@ -72,6 +72,13 @@ module l1_cache #(
     input  [31:0] snoop_addr,
     input         snoop_valid,
 
+    // Native whole-L1 invalidate.  flush_req is a one-cycle request (a held
+    // level is also accepted: one walk per release); flush_busy is high for the
+    // walk and flush_done pulses once when it completes.
+    input         flush_req,
+    output        flush_busy,
+    output        flush_done,
+
     input         cache_enable
 );
 
@@ -225,6 +232,23 @@ reg wide_fill_install;
 reg [31:0] dout_r;
 reg resp_valid_r;
 reg ready_r;
+
+// Whole-L1 invalidate state.  A request is consumed once (a held level is
+// re-armed only after it is released), then latched so a flush that arrives
+// while a fill or bypass is in flight starts from a later S_IDLE instead of
+// racing the walk.  flush_block holds new requests off from the cycle the
+// request is first observed, which is what makes "start only from S_IDLE"
+// sufficient: no demand request accepted before the flush can still be filling
+// when the walk reaches its set, so no post-walk install is possible.
+reg  flush_req_seen_r;
+reg  flush_pending_r;
+reg  flush_busy_r;
+reg  flush_done_r;
+wire flush_req_new = flush_req & ~flush_req_seen_r;
+wire flush_block = flush_req_new | flush_pending_r | flush_busy_r;
+
+assign flush_busy = flush_busy_r;
+assign flush_done = flush_done_r;
 
 assign cpu_ready = ready_r;
 assign store_patch_addr = req_addr_r;
@@ -397,13 +421,21 @@ assign vipt_resolve_hit = vipt_resolve_valid && cache_enable &&
                           (|vipt_hit_vec);
 wire [BRAM_ADDR_BITS-1:0] req_bram_addr = {req_set_r, req_word_r};
 wire can_accept_cpu = (state == S_IDLE) && !reset && (!cpu_write || cpu_protect_write || storeq_can_accept);
-wire ready_when_idle = !reset && storeq_can_accept;
+wire ready_when_idle = !reset && !flush_block && storeq_can_accept;
 // Store pipelining, like the i486 write buffer taking one store per clock:
 // while a store enqueues in S_LOOKUP, accept the next store and preread its
 // set on the free RAM read port. lookup_wr_room_r holds the queue capacity for
 // that store, computed when the current store was accepted. The opening is
 // registered state only: requesters see it through cpu_wr_ready without any
 // address, TLB or request-type term.
+// The walk starts one cycle after the request is observed, when ready_r has
+// already been forced low: a low ready_r means no demand request can be
+// accepted this cycle, and it also disables the preread/probe arms, so the
+// launch cannot collide with an accept or a VIPT probe resolve.  Testing
+// ready_r (a register) instead of accept_cpu keeps the request-classification
+// cone behind cpu_valid out of this decision.
+wire flush_launch = (flush_req_new | flush_pending_r) && (state == S_IDLE) &&
+                    !ready_r;
 reg  lookup_wr_room_r;
 wire lookup_store_busy = (state == S_LOOKUP) && req_valid_r &&
                          req_write_r && !req_protect_write_r;
@@ -625,9 +657,19 @@ always_ff @(posedge clk) begin
         snoop_valid_r <= 1'b0;
         for (integer i = 0; i < STOREQ_DEPTH; i = i + 1)
             storeq_valid[i] <= 1'b0;
+        flush_req_seen_r <= 1'b0;
+        flush_pending_r <= 1'b0;
+        flush_busy_r <= 1'b0;
+        flush_done_r <= 1'b0;
     end else begin
         ready_r <= (state == S_IDLE) && ready_when_idle;
         resp_valid_r <= 1'b0;
+        flush_done_r <= 1'b0;
+        flush_req_seen_r <= flush_req;
+        if (flush_launch)
+            flush_pending_r <= 1'b0;
+        else if (flush_req_new)
+            flush_pending_r <= 1'b1;
         snoop_valid_r <= snoop_valid;
         if (snoop_valid)
             snoop_set_r <= snoop_set;
@@ -665,12 +707,26 @@ always_ff @(posedge clk) begin
                 if (init_set == LAST_SET) begin
                     state <= S_IDLE;
                     ready_r <= ready_when_idle;
+                    // A flush walk reports completion after the last set's tag
+                    // and replacement-bits write; the reset walk does not.
+                    if (flush_busy_r) begin
+                        flush_busy_r <= 1'b0;
+                        flush_done_r <= 1'b1;
+                    end
                 end else begin
                     init_set <= init_set + 1'b1;
                 end
             end
 
             S_IDLE: begin
+                // A launch is mutually exclusive with accept_cpu (flush_launch
+                // requires ready_r low), and the capture below is inert unless
+                // S_LOOKUP consumes it.
+                if (flush_launch) begin
+                    init_set <= {SET_BITS{1'b0}};
+                    flush_busy_r <= 1'b1;
+                    state <= S_RESET_INIT;
+                end
                 // Wide request captures run on every ready cycle, with no
                 // cpu_valid/TLB gating: garbage is captured when nothing is
                 // accepted, but S_LOOKUP (the only consumer) is entered on
@@ -824,6 +880,12 @@ always_ff @(posedge clk) begin
 
             default: state <= S_IDLE;
         endcase
+
+        // Hold cpu_ready low for the whole flush window.  The state-transition
+        // arms above restore readiness for their next state; a request must
+        // never see a ready cache while a walk is pending.
+        if (flush_block)
+            ready_r <= 1'b0;
     end
 end
 

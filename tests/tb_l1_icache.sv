@@ -56,6 +56,9 @@ module tb_l1_icache;
         .patch_valid(patch_valid),
         .invalidate_addr(invalidate_addr),
         .invalidate_valid(invalidate_valid),
+        .flush_req(1'b0),
+        .flush_busy(),
+        .flush_done(),
         .cache_enable(1'b1),
         .cpu_no_alloc(1'b0)
     );

@@ -38,6 +38,13 @@ module l1_icache #(
     input  [31:0] invalidate_addr,
     input         invalidate_valid,
 
+    // Native whole-L1 invalidate.  flush_req is a one-cycle request (a held
+    // level is also accepted: one walk per release); flush_busy is high for the
+    // walk and flush_done pulses once when it completes.
+    input         flush_req,
+    output        flush_busy,
+    output        flush_done,
+
     input         cache_enable,
     // NO_ALLOC fill: answer the fetch but do not install a line, so an
     // unmapped/uncached window never evicts or aliases a cacheable line.
@@ -154,6 +161,22 @@ reg fill_tag_wait_r;
 // A snoop that cleared this fill's line, held for the rest of the fill so the
 // tag write cannot reinstate it (the live and registered snoops alone miss it).
 reg fill_line_snooped_r;
+
+// Whole-L1 invalidate state; see l1_cache.sv for the contract.  The request is
+// consumed once (a held level is re-armed only after it is released), then
+// latched so a fetch that is already filling completes first, and flush_block
+// holds new fetches off from the cycle the request is observed: starting the
+// walk only from S_IDLE then guarantees no in-flight fill can install after
+// the walk cleared its set.
+reg  flush_req_seen_r;
+reg  flush_pending_r;
+reg  flush_busy_r;
+reg  flush_done_r;
+wire flush_req_new = flush_req & ~flush_req_seen_r;
+wire flush_block = flush_req_new | flush_pending_r | flush_busy_r;
+
+assign flush_busy = flush_busy_r;
+assign flush_done = flush_done_r;
 
 reg [127:0] line_r;
 reg resp_valid_r;
@@ -291,6 +314,10 @@ wire lookup_snoop_conflict =
 wire lookup_hit_usable = lookup_hit && !lookup_snoop_conflict;
 wire can_accept_cpu = (state == S_IDLE) && !reset;
 wire accept_cpu = cpu_valid && ready_r && can_accept_cpu;
+// The walk starts one cycle after the request is observed, when ready_r has
+// already been forced low, so no fetch can be accepted in the same cycle.
+wire flush_launch = (flush_req_new | flush_pending_r) && (state == S_IDLE) &&
+                    !reset && !ready_r;
 wire lookup_read_hit_now = (state == S_LOOKUP) && req_valid_r &&
                            !req_uncacheable_r && !req_no_alloc_r &&
                            lookup_hit_usable;
@@ -489,9 +516,19 @@ always_ff @(posedge clk) begin
         patchq_head <= {PATCHQ_IDX_BITS{1'b0}};
         for (integer p = 0; p < PATCHQ_DEPTH; p = p + 1)
             patchq_valid[p] <= 1'b0;
+        flush_req_seen_r <= 1'b0;
+        flush_pending_r <= 1'b0;
+        flush_busy_r <= 1'b0;
+        flush_done_r <= 1'b0;
     end else begin
-        ready_r <= (state == S_IDLE);
+        ready_r <= (state == S_IDLE) && !flush_block;
         resp_valid_r <= 1'b0;
+        flush_done_r <= 1'b0;
+        flush_req_seen_r <= flush_req;
+        if (flush_launch)
+            flush_pending_r <= 1'b0;
+        else if (flush_req_new)
+            flush_pending_r <= 1'b1;
         snoop_valid_r <= invalidate_valid || patch_valid;
         if (invalidate_valid) begin
             snoop_tag_r <= invalidate_addr[TAG_MSB:TAG_LSB];
@@ -554,13 +591,23 @@ always_ff @(posedge clk) begin
                 if (init_set == LAST_SET) begin
                     state <= S_IDLE;
                     ready_r <= 1'b1;
+                    // A flush walk reports completion after the last set's tag
+                    // write; the reset walk does not.
+                    if (flush_busy_r) begin
+                        flush_busy_r <= 1'b0;
+                        flush_done_r <= 1'b1;
+                    end
                 end else begin
                     init_set <= init_set + 1'b1;
                 end
             end
 
             S_IDLE: begin
-                if (accept_cpu) begin
+                if (flush_launch) begin
+                    init_set <= {SET_BITS{1'b0}};
+                    flush_busy_r <= 1'b1;
+                    state <= S_RESET_INIT;
+                end else if (accept_cpu) begin
                     ready_r <= 1'b0;
                     req_valid_r <= 1'b1;
                     req_addr_r <= cpu_addr;
@@ -676,6 +723,12 @@ always_ff @(posedge clk) begin
 
             default: state <= S_IDLE;
         endcase
+
+        // Hold cpu_ready low for the whole flush window.  The state-transition
+        // arms above restore readiness for their next state; a request must
+        // never see a ready cache while a walk is pending.
+        if (flush_block)
+            ready_r <= 1'b0;
     end
 end
 
