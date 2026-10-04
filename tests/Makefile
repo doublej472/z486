@@ -126,7 +126,7 @@ CPP_PLA4_SRCS := sim_main_pla4.cpp
 PLA4_RTL := $(Z486_DIR)/protection.sv
 
 # Targets
-.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-hazard test-memmap-template test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
+.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-hazard test-memmap-template check-reset-lists test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 all: build
 
@@ -376,6 +376,12 @@ test-load-waw: obj_dir/Vtb_load_waw
 	@./obj_dir/Vtb_load_waw | tee obj_dir/z486_load_waw.out | grep -q "LOAD WAW TEST PASS" \
 		|| (echo "load write-arbitration test FAIL"; exit 1)
 
+# Static audit: an always_ff that assigns state its reset branch never resets.
+# Three live defects had this shape; new ones fail here.
+check-reset-lists:
+	@echo "Running reset-list audit..."
+	@python3 $(Z486_DIR)/scripts/check_reset_lists.py
+
 # SURVEY BENCH: reports hazards the core still has, and is expected to fail
 # until the age-order arbitration is made structural.  Not a release gate.
 test-gpr-hazard: obj_dir/Vtb_gpr_hazard
@@ -473,6 +479,8 @@ help:
 	@echo "  make test-l1-icache - Run PIPT L1 instruction cache unit test"
 	@echo "  make test-memory-order - Run device/store ordering unit test"
 	@echo "  make test-load-waw  - Run same-cycle GPR write-arbitration unit test"
+	@echo "  make test-gpr-hazard - Survey the GPR hazard class (expected findings)"
+	@echo "  make check-reset-lists - Audit always_ff reset branches"
 	@echo "  make test-memmap-template - Run memory-map template unit test"
 	@echo "  make test-interrupt-nmi - Run interrupt-controller NMI deferred-delivery bench"
 	@echo "  make test-x87-bridge - Run x87 protocol bridge unit test"
