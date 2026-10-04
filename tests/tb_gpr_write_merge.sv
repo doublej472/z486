@@ -9,9 +9,12 @@
 module tb_gpr_write_merge;
     import z486_pkg::*;
 
-    localparam logic [4:0] VIS_EX  = 5'b01010;   // mem, wb
-    localparam logic [4:0] VIS_EA  = 5'b11001;   // shift, wb, dly
-    localparam logic [4:0] VIS_CAP = 5'b11011;   // shift, mem, wb, dly
+    // Must match the masks data_unit wires.  The recipe commits (bits 7:5) are
+    // consolidated for the register-file write (pulse_value/pulse_wmask) but are
+    // deliberately NOT forwarded, so no view mask sets them.
+    localparam logic [7:0] VIS_EX  = 8'b0000_1010;   // mem, wb
+    localparam logic [7:0] VIS_EA  = 8'b0001_1001;   // shift, wb, dly
+    localparam logic [7:0] VIS_CAP = 8'b0001_1011;   // shift, mem, wb, dly
 
     logic [255:0] cur;
     logic         v_shift, v_mem, v_rom, v_wb, v_dly;
@@ -19,7 +22,12 @@ module tb_gpr_write_merge;
     logic [1:0]   size_shift, mode_mem, size_rom, size_wb, mode_dly;
     logic [31:0]  data_shift, data_mem, data_rom, data_wb, data_dly;
     logic         wb_is_alu;
-    logic [255:0] commit_value, commit_wmask, ex_value, ea_value, cap_value;
+    logic         v_stos, v_sigsrc, v_esp;
+    logic [2:0]   dst_sigsrc;
+    logic [1:0]   size_stos, size_sigsrc;
+    logic [31:0]  data_stos, data_sigsrc, data_esp;
+    logic [255:0] commit_value, commit_wmask, pulse_value, pulse_wmask;
+    logic [255:0] ex_value, ea_value, cap_value;
 
     integer failures = 0;
 
@@ -30,8 +38,13 @@ module tb_gpr_write_merge;
         .v_rom(v_rom), .dst_rom(dst_rom), .size_rom(size_rom), .data_rom(data_rom),
         .v_wb(v_wb), .dst_wb(dst_wb), .size_wb(size_wb), .wb_is_alu(wb_is_alu), .data_wb(data_wb),
         .v_dly(v_dly), .dst_dly(dst_dly), .mode_dly(mode_dly), .data_dly(data_dly),
+        .v_stos(v_stos), .size_stos(size_stos), .data_stos(data_stos),
+        .v_sigsrc(v_sigsrc), .dst_sigsrc(dst_sigsrc), .size_sigsrc(size_sigsrc),
+        .data_sigsrc(data_sigsrc),
+        .v_esp(v_esp), .data_esp(data_esp),
         .vis_ex(VIS_EX), .vis_ea(VIS_EA), .vis_cap(VIS_CAP),
         .commit_value(commit_value), .commit_wmask(commit_wmask),
+        .pulse_value(pulse_value), .pulse_wmask(pulse_wmask),
         .ex_value(ex_value), .ea_value(ea_value), .cap_value(cap_value)
     );
 
@@ -58,6 +71,9 @@ module tb_gpr_write_merge;
         v_wb    = 1'b0; dst_wb    = 3'd0; size_wb    = 2'd2; wb_is_alu = 1'b0;
         data_wb = 32'd0;
         v_dly   = 1'b0; dst_dly   = 3'd0; mode_dly   = EA_FWD_D; data_dly = 32'd0;
+        v_stos  = 1'b0; size_stos  = 2'd2; data_stos  = 32'd0;
+        v_sigsrc= 1'b0; dst_sigsrc = 3'd0; size_sigsrc= 2'd2; data_sigsrc = 32'd0;
+        v_esp   = 1'b0;                    data_esp   = 32'd0;
     end
     endtask
 
@@ -176,6 +192,83 @@ module tb_gpr_write_merge;
         check("9 reg0 keeps token", regval(ex_value, 0), 32'h1111_1111);
         check("9 reg2 gets wb",     regval(ex_value, 2), 32'h2222_2222);
         check("9 reg1 untouched",   regval(ex_value, 1), 32'h0000_0000);
+
+        // 10. A deferred-load token owns EAX while a SIGSRC recipe commit
+        //     (MOVZX/MOVSX) writes EAX in the same cycle.  The commit path
+        //     arbitrates them: the token is committed first and the younger
+        //     recipe commit is applied on top.  The views deliberately do NOT
+        //     forward the recipe commit (no younger consumer samples it in that
+        //     cycle), so they show the token where mem is visible and cur where
+        //     it is not.
+        idle();
+        cur = 256'd0;
+        v_mem = 1'b1; dst_mem = 3'd0; mode_mem = EA_FWD_D; data_mem = 32'h0000_0044;
+        v_sigsrc = 1'b1; dst_sigsrc = 3'd0; size_sigsrc = 2'd2; data_sigsrc = 32'h0000_0200;
+        #1;
+        check("10 pulse value",      regval(pulse_value, 0), 32'h0000_0200);
+        check("10 pulse wmask",      pulse_wmask[31:0],      32'hFFFF_FFFF);
+        check("10 token committed",  regval(commit_value, 0), 32'h0000_0044);
+        check("10 ex hides commit",  regval(ex_value, 0),    32'h0000_0044);
+        check("10 ea hides token",   regval(ea_value, 0),    32'h0000_0000);
+        check("10 cap hides commit", regval(cap_value, 0),   32'h0000_0044);
+
+        // 11. Lane granularity: a word SIGSRC writes only its two lanes.  The
+        //     register file composes it over the committed token; the view shows
+        //     the token unchanged.
+        idle();
+        cur = 256'd0;
+        v_mem = 1'b1; dst_mem = 3'd0; mode_mem = EA_FWD_D; data_mem = 32'hAAAA_AAAA;
+        v_sigsrc = 1'b1; dst_sigsrc = 3'd0; size_sigsrc = 2'd1; data_sigsrc = 32'hDDDD_CCCC;
+        #1;
+        check("11 pulse wmask word",    pulse_wmask[31:0],       32'h0000_FFFF);
+        check("11 pulse word merge",    regval(pulse_value, 0),  32'h0000_CCCC);
+        check("11 token committed",     regval(commit_value, 0), 32'hAAAA_AAAA);
+        check("11 ex hides word commit",regval(ex_value, 0),     32'hAAAA_AAAA);
+
+        // 12. The ESP recipe commit is the youngest producer of all, and the
+        //     commit path applies it after the token, the write-back and the
+        //     delay-slot bypass.  The views keep the base tier.
+        idle();
+        cur = 256'd0;
+        v_mem  = 1'b1; dst_mem = 3'd4; mode_mem = EA_FWD_D; data_mem = 32'h1111_1111;
+        v_wb   = 1'b1; dst_wb  = 3'd4; size_wb  = 2'd2;     data_wb  = 32'h2222_2222;
+        v_dly  = 1'b1; dst_dly = 3'd4; mode_dly = EA_FWD_D; data_dly = 32'h3333_3333;
+        v_esp  = 1'b1;                    data_esp = 32'h4444_4444;
+        #1;
+        check("12 esp commit value",  regval(pulse_value, 4), 32'h4444_4444);
+        check("12 esp commit mask",   pulse_wmask[159:128],  32'hFFFF_FFFF);
+        check("12 ex base wins wb",   regval(ex_value, 4),    32'h2222_2222);
+        check("12 ea base wins dly",  regval(ea_value, 4),    32'h3333_3333);
+        check("12 cap base wins dly", regval(cap_value, 4),   32'h3333_3333);
+
+        // 13. Order among the recipe commits: SIGSRC (6) is younger than the REP
+        //     STOS count (5), so it wins when both target ECX.
+        idle();
+        cur = 256'd0;
+        v_stos = 1'b1; size_stos = 2'd2; data_stos = 32'h5555_5555;
+        v_sigsrc = 1'b1; dst_sigsrc = 3'd1; size_sigsrc = 2'd2; data_sigsrc = 32'h6666_6666;
+        #1;
+        check("13 sigsrc younger than stos", regval(pulse_value, 1), 32'h6666_6666);
+
+        // 14. A lone REP STOS count is a word write to ECX (reg 1): it merges
+        //     into the current value and does not appear in the deferred commit.
+        idle();
+        cur = {192'd0, 32'h9999_9999, 32'h0000_0000};
+        v_stos = 1'b1; size_stos = 2'd1; data_stos = 32'hEEEE_1234;
+        #1;
+        check("14 stos word merge",    regval(pulse_value, 1), 32'h9999_1234);
+        check("14 stos wmask",         pulse_wmask[63:32],    32'h0000_FFFF);
+        check("14 stos not in commit", commit_wmask[63:32],   32'h0000_0000);
+
+        // 15. A recipe commit must not disturb other registers.
+        idle();
+        cur = 256'd0;
+        v_sigsrc = 1'b1; dst_sigsrc = 3'd3; size_sigsrc = 2'd2; data_sigsrc = 32'h7777_7777;
+        #1;
+        check("15 target commit",    regval(pulse_value, 3), 32'h7777_7777);
+        check("15 target mask only", pulse_wmask[127:96],    32'hFFFF_FFFF);
+        check("15 others clean",     regval(pulse_value, 0), 32'h0000_0000);
+        check("15 others clean",     regval(pulse_value, 7), 32'h0000_0000);
 
         $display("");
         if (failures == 0) begin

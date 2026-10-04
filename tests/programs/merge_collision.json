@@ -1,0 +1,49 @@
+{
+ "asm": "merge_collision.asm",
+ "start_mode": "protected",
+ "cr0": "0x80000001",
+ "cr3": 0,
+ "eip": 0,
+ "mem_latency": 5,
+ "page_tables": [
+  [
+   0,
+   0,
+   96,
+   "RW"
+  ]
+ ],
+ "seg_cache": {
+  "CS": {
+   "base": "0x10000",
+   "limit": "0xfffff",
+   "flags": "0xa9e0"
+  },
+  "DS": {
+   "base": 0,
+   "limit": "0xfffff",
+   "flags": "0x29e0"
+  },
+  "SS": {
+   "base": 0,
+   "limit": "0xfffff",
+   "flags": "0x29e0"
+  },
+  "ES": {
+   "base": 0,
+   "limit": "0xfffff",
+   "flags": "0x29e0"
+  },
+  "FS": {
+   "base": 0,
+   "limit": "0xfffff",
+   "flags": "0x29e0"
+  },
+  "GS": {
+   "base": 0,
+   "limit": "0xfffff",
+   "flags": "0x29e0"
+  }
+ },
+ "cycles": 2000000
+}
