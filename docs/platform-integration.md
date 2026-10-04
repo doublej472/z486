@@ -72,6 +72,17 @@ inert — and folded away — when no template window is enabled.
 | `dbg_CS` / `dbg_EIP` / `dbg_CS_base` | 16 / 32 / 32 | Architectural `CS` / `EIP` / `CS` base mirrors |
 | `dbg_pe` / `dbg_vm` | 1 each | `CR0.PE` / `EFLAGS.VM` (protected / v86 mode) |
 | `dbg_x87_state` | 32 | x87 command/executor progress packing |
+| `dbg_gate_read` / `dbg_gate_addr` | 1 / 32 | One pulse per accepted IDT/IVT gate read, with its linear address |
+| `dbg_pf_code` / `dbg_pf_addr` | 3 / 32 | Latched page-fault error code and faulting linear address |
+| `dbg_page_fault` | 1 | Page-fault event |
+| `dbg_walk_pde` / `dbg_walk_pte` | 32 / 32 | Page walker's last PDE/PTE read |
+| `dbg_cr3` / `dbg_eflags` / `dbg_SP` | 32 / 32 / 16 | `CR3`, `EFLAGS` and `SP[15:0]` mirrors |
+| `dbg_issue` / `dbg_issue_eip` | 1 / 32 | Instruction-issue pulse and the IP that will execute next |
+
+These taps are **pure observation**: wires for the PC-98 crash recorder, its OSD
+debug view and its snapshot window (the IDT/IVT gate address can also select a
+memory window for a snapshot). A design that leaves them unconnected loses
+nothing — the fitter drops the unused wires — so they cost no area and no pins.
 
 ## `cpu_speed_sel`
 
