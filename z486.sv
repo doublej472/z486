@@ -101,6 +101,24 @@ module z486
     output             dbg_vm,
     output     [31:0]  dbg_x87_state,
 
+    // PC-98 crash-recorder / probe taps.  Pure observation of existing state:
+    // the IDT/IVT gate reads with their linear address, the latched page-fault
+    // code and address, the page-walk entries and CR3, the issue pulse with the
+    // IP that will execute next, EFLAGS and SP.  A core that leaves them
+    // unconnected loses nothing: they are wires, so the fitter drops them.
+    output             dbg_gate_read,   // one pulse per accepted IDT/IVT gate read
+    output     [31:0]  dbg_gate_addr,   // its linear address
+    output     [2:0]   dbg_pf_code,     // latched page-fault error code
+    output     [31:0]  dbg_pf_addr,     // latched faulting linear address
+    output     [31:0]  dbg_eflags,
+    output             dbg_page_fault,
+    output     [31:0]  dbg_walk_pde,    // page walker: last PDE read
+    output     [31:0]  dbg_walk_pte,    // page walker: last PTE read
+    output     [31:0]  dbg_cr3,
+    output     [15:0]  dbg_SP,
+    output             dbg_issue,       // instruction issue pulse
+    output     [31:0]  dbg_issue_eip,   // and the IP that will execute next
+
     // A fault while delivering #DF shuts down the 386 and requests reset.
     output triple_fault_reset
 );
@@ -2010,6 +2028,8 @@ data_access data_access_inst (
 
 // Paging unit instantiation
 paging_unit #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) paging_inst (
+    .dbg_walk_pde       (dbg_walk_pde),
+    .dbg_walk_pte       (dbg_walk_pte),
     .clk                (clk),
     .reset_n            (reset_n),
     .cr0                (CR0),
@@ -3030,5 +3050,24 @@ always @(posedge clk)
         $display("%0t: WATCH wr %08h be=%b data=%08h CS:EIP=%04h:%08h vm=%b",
                  $time, {addr, 2'b00}, be, dout, CS, EIP, EFLAGS[17]);
 // synthesis translate_on
+
+//=============================================================================
+// PC-98 crash-recorder / probe taps
+//=============================================================================
+// Observation only, for the PC-98 crash recorder, its OSD debug view and its
+// snapshot window; see docs/platform-integration.md.
+assign dbg_gate_read  = mem_req_to_paging && mem_accepted && (mem_seg_sel == SEG_IDT);
+assign dbg_gate_addr  = paging_linear_addr;
+assign dbg_pf_code    = latched_pf_code;
+assign dbg_pf_addr    = latched_pf_addr;
+assign dbg_eflags     = EFLAGS;
+assign dbg_page_fault = page_fault;
+assign dbg_cr3        = CR3;
+assign dbg_SP         = ESP[15:0];
+assign dbg_issue      = i_issue;
+// At an issue, the IP that will execute next: while a control transfer retires
+// in this same cycle it is the committed target, otherwise the current EIP.
+assign dbg_issue_eip  = (uc_exec && recipe_rni && (uc_dest == DEST_eIP))
+    ? (is_dword ? eip_source_value : {16'h0, eip_source_value[15:0]}) : EIP;
 
 endmodule
