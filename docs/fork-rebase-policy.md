@@ -41,10 +41,39 @@ still needed *after* upstream's rewrite, so:
 2. **Upstream rewrote the implementation** -> drop the fix and assume upstream
    fixed it, *unless* a fail-first test still fails without our change. Do not
    port a fix on the strength of the fork's success alone; reproduce it first.
+   **Carry the fork's testbenches forward with the same rule, and triage them
+   before the RTL.** A dropped bench hides a live defect: the fork's
+   `tests/tb_load_waw.sv` and its two-line `data_unit` write-arbitration fix
+   were both dropped as "area-campaign" material, and the result was a
+   regression that only showed up as spurious page faults in DOS/4KB-extended
+   PC-98 games. A dropped *fix* is recoverable; a dropped *proof* is not, so
+   when a fork commit mixes area work with a correctness fix, split it and
+   re-run the fork's bench from the pre-rebase tag
+   (`git show backup/fork-main-before-rebase:tests/<bench>.sv`).
 3. **PC-98 product features** (`pc98(...)`) are ours to maintain: the memory-map
    template and the whole-L1 flush. They are ported onto upstream's structure
    rather than copied from the fork, because upstream split `memory.sv` into
    `cache_unit.sv`/`bus_unit.sv` and rewrote most of the core.
+
+## Known hardenings not carried
+
+These are deliberate, recorded omissions - revisit them when a bench can prove
+or refute them:
+
+- **Zet98's stale-`OPR_R` gate for a younger direct load.** Zet98 (a parallel
+  PC-98 port the same upstream base) suppresses a direct-load EX hit when an
+  older deferred memory token targets the same register and its optimistic read
+  has already missed (`mem_opt_wait`), because our forwarding view merges
+  `opr_r` for the token's bytes and that value is stale until the data returns.
+  The structure is present here (`pend_mem_mask`/`gpr_ex_view` in `data_unit`,
+  `mem_opt_wait` in `paging_unit`), but `tb_protected_mode` cannot exercise it:
+  it ties `line_resp_valid`/`line_din` low, so a cold-line load never
+  completes (a minimal cold load times out). Port it together with a bench that
+  can miss.
+- **Zet98's "queue the D-cache store patches to the I$" (3-deep).** Superseded
+  in the fork by the storeq-forwarding rewrite, and here by the DIRECT-write
+  invalidate slot plus its hold; only revisit if a snoop-train regression
+  reappears.
 
 ## Rebase procedure
 
