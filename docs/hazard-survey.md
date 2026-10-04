@@ -167,10 +167,11 @@ one red test in the suite turned out to be a bench artifact (see inventory).
    (the fork's "equivalence guard" style) turns P1 into a suite failure instead
    of a game bug.  The views are already formed once, so this is a comparison on
    live state, not new logic.
-3. **Automate the reset audit (P4).**  The scan is ~40 lines; wire it into the
-   test build so a new `always_ff` that forgets the reset branch fails.  Add a
-   reset-X sweep (`tb_reset_sweep` in the fork) to catch the X cases that only
-   simulation sees.
+3. **Automate the reset audit (P4).**  Done: `make check-reset-lists`
+   (`scripts/check_reset_lists.py`) fails on any new `always_ff` that assigns
+   state its reset branch never resets; today's 19 findings are allow-listed
+   with the reason each is safe.  Still worth adding a reset-X sweep
+   (`tb_reset_sweep` in the fork) to catch cases only simulation sees.
 4. **State the verdict rule once (P3).**  For every verdict consumed by a
    decoupled stage, require (i) evaluation in the stage that owns its inputs and
    (ii) qualification by the token's own `valid`, then assert that no consumer
