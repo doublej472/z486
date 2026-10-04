@@ -250,6 +250,16 @@ reg  flush_busy_r;
 reg  flush_done_r;
 reg  [SET_BITS-1:0] flush_set_r;
 reg  fill_killed_r;
+// A registered snoop cleared this fill's whole set; hold it for the rest of the
+// fill so the tag install cannot reinstate the line (mirrors the I$'s
+// fill_line_snooped_r).
+reg  fill_set_snooped_r;
+// Same-cycle form: the fill install and the snoop clear share the way write
+// port, and the clear loses that arbitration for the fill's own way, so the
+// install must be blocked in the cycle the snoop is registered as well as after
+// (fill_set_snooped_r keeps it blocked for the rest of the fill).
+wire fill_set_snooped_now = (state == S_FILL) && snoop_valid_r &&
+                            (snoop_set_r == fill_set);
 wire flush_req_new = flush_req & ~flush_req_seen_r;
 wire flush_block = flush_req_new | flush_pending_r | flush_busy_r;
 
@@ -382,7 +392,12 @@ wire [3:0] lookup_hit_vec = {
     rd_valid1_r && (rd_tag1_r == req_tag_r),
     rd_valid0_r && (rd_tag0_r == req_tag_r)
 };
-wire lookup_hit = |lookup_hit_vec;
+// A registered snoop clears the whole set in this cycle, but the synchronous
+// RAM lookup captured its tag a cycle earlier, so that hit is stale.  Reject it
+// (the I$ already does this in l1_icache.sv): the demand misses, refetches, and
+// the external write is observed instead of the pre-snoop line.
+wire lookup_snoop_conflict = snoop_valid_r && (snoop_set_r == req_set_r);
+wire lookup_hit = |lookup_hit_vec && !lookup_snoop_conflict;
 wire [1:0] lookup_way = way_encode(lookup_hit_vec);
 wire [31:0] lookup_way_ram_data = way_data_mux(lookup_way, rd_data0_r, rd_data1_r, rd_data2_r, rd_data3_r);
 // A read may preread its dword in the cycle a store patches the data RAM (a
@@ -552,6 +567,7 @@ wire data_store_write = (state == S_LOOKUP) && req_valid_r && req_write_r &&
                         !req_protect_write_r && lookup_hit &&
                         !req_uncacheable_r;
 wire data_fill_write = (state == S_FILL) && !fill_killed_r &&
+                       !fill_set_snooped_r && !fill_set_snooped_now &&
                        (mem_resp_valid || wide_fill_install);
 wire [1:0] data_write_way = data_store_write ? lookup_way : fill_way;
 
@@ -585,6 +601,7 @@ wire [31:0] data_write_value = data_store_write ?
 // process. Quartus 17 will not infer a block RAM when the packed valid bit is
 // written from the snoop, reset-init, and fill branches of the cache FSM.
 wire tag_fill_write = (state == S_FILL) && !fill_killed_r &&
+                      !fill_set_snooped_r && !fill_set_snooped_now &&
                       (mem_resp_valid || wide_fill_install) &&
                       (fill_count == {WORD_OFFSET_BITS{1'b1}});
 // The clear port serves three owners, one per cycle: the internal reset walk, a
@@ -666,6 +683,7 @@ always_ff @(posedge clk) begin
         wide_fill_install <= 1'b0;
         snoop_set_r <= {SET_BITS{1'b0}};
         snoop_valid_r <= 1'b0;
+        fill_set_snooped_r <= 1'b0;
         for (integer i = 0; i < STOREQ_DEPTH; i = i + 1)
             storeq_valid[i] <= 1'b0;
         flush_req_seen_r <= 1'b0;
@@ -689,10 +707,18 @@ always_ff @(posedge clk) begin
         // sweep: the sweep runs concurrently with it (it may be blocked on the
         // bus), so the install is suppressed rather than waited out.  The mark
         // sticks until the fill ends.
-        if (state != S_FILL)
+        if (state != S_FILL) begin
             fill_killed_r <= 1'b0;
-        else if (flush_req_new || flush_pending_r || flush_busy_r)
-            fill_killed_r <= 1'b1;
+            fill_set_snooped_r <= 1'b0;
+        end else begin
+            // A snoop clears the whole set; any fill in that set is invalid.
+            // The mark sticks until the fill ends so a later word of the same
+            // fill cannot reinstate the tag either.
+            if (snoop_valid_r && (snoop_set_r == fill_set))
+                fill_set_snooped_r <= 1'b1;
+            if (flush_req_new || flush_pending_r || flush_busy_r)
+                fill_killed_r <= 1'b1;
+        end
 
         if (storeq_draining && mem_ready) begin
             storeq_valid[storeq_tail] <= 1'b0;
