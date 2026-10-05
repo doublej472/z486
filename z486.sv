@@ -2370,6 +2370,7 @@ wire       uc_jump_taken_prev;          // Jump taken last cycle (for RNi: termi
 
 reg [31:0] TMPeIP;                  // Saved EIP for RPTI (repeat instruction)
 reg [31:0] wr_restart_eip;          // TMPeIP at each demand-write issue, for late write faults
+reg [31:0] wr_restart_esp;          // the same store's pre-instruction ESP
 reg [31:0] TMPeSP;                  // Saved ESP for fault handling
 
 // Hardwired relative-branch target and microcode PREF restart (from IND).
@@ -2757,10 +2758,17 @@ always_ff @(posedge clk) begin
         TMPeSP <= ESP;  // instruction-start ESP for a restartable fault frame
 
     // Chained-store fault attribution: capture the restart IP at every demand WRITE issue
-    if (mem_req_to_paging && mem_write_now && mem_accepted)
+    if (mem_req_to_paging && mem_write_now && mem_accepted) begin
         wr_restart_eip <= TMPeIP;
-    if (page_fault && pg_fault_code[1])
+        // A CALL hands off its stack write on the same edge that captures
+        // TMPeSP, so take the current pre-instruction ESP on that first cycle.
+        wr_restart_esp <= i_first ? ESP : TMPeSP;
+    end
+    if (page_fault && pg_fault_code[1]) begin
         TMPeIP <= wr_restart_eip;
+        // Retry the faulting store with its own ESP, or a PUSH decrements twice.
+        TMPeSP <= wr_restart_esp;
+    end
     else if (data_page_fault && vipt_load_slow_wait_r) begin
         TMPeIP <= vipt_load_slow_r.restart_eip;
         // A direct POP has already written ESP; its fault restarts from the
