@@ -336,3 +336,27 @@ If that slack is ever unacceptable, the same correctness can be had with zero
 cost by keeping the age order in the (cheap, hand-written) view muxes and
 retaining this module purely as the simulation-time reference that the fuse
 compares against - the order is then still pinned, just not shared.
+
+### Deferred-writer guards: ported, then narrowed
+
+The sibling core carries lane-overlap assertions over its deferred writers.  We
+ported them and then narrowed the set, because two of them encode a *different*
+core's invariant:
+
+- **kept** `du_shift_load_kill_due`: a shift token that a younger direct-load
+  write-back overlaps on the same register must be killed; otherwise assignment
+  order cannot resolve it.
+- **kept** shift/mem lane overlap: two deferred producers with no age ordering
+  between them must never target overlapping bytes of one register.
+- **dropped** the `intr`/{load,mem,shift} overlap checks.  Our core deliberately
+  allows the interrupt-entry ROM-slot write to commit in the same cycle as a
+  memory token on the same register: it writes `OPR_R`, the token's own value,
+  so the two agree and there is nothing to arbitrate.  `tb_gpr_hazard` H4 pins
+  that.  Asserting the sibling's invariant is a false positive here, and the
+  bench caught the literal port immediately (`DUP GPR WRITER intr/mem reg 0`).
+
+Lesson for any further sibling port: a guard is only portable together with the
+invariant it encodes, and both cores' invariants differ where their pipelines do.
+
+All kept guards pass the full protected suite, `tb_gpr_hazard`, `tb_load_waw`,
+`tb_gpr_write_merge` and cycle-exact Dhrystone (253,183) unchanged.

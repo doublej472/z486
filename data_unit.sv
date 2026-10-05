@@ -1012,12 +1012,63 @@ always_ff @(posedge clk) begin
 end
 
 // synthesis translate_off
+// Deferred-writer checks. Lane = {valid, normalized_reg[2:0], byte_enable[3:0]}.
+// A successor load may overlap an older memory or shift token: the younger load
+// wins by assignment order. A stalled shift must then stay suppressed.
+logic du_shift_load_kill_due;
+always_ff @(posedge clk) begin
+    du_shift_load_kill_due <= reset_n && !recipe_commit_cancel &&
+        recipe_shift_write.valid && !recipe_shift_killed && load_wb_valid &&
+        (recipe_shift_widx == load_wb_widx) && !pipeline_advance;
+    if (reset_n && du_shift_load_kill_due && !recipe_shift_killed)
+        $fatal(1, "Deferred shift remained live after younger load writeback");
+end
+function automatic logic [3:0] du_lane_be(input logic [2:0] sel,
+                                         input logic [1:0] size);
+    du_lane_be = (size == 2'd0) ? (sel[2] ? 4'b0010 : 4'b0001)
+               : (size == 2'd1) ? 4'b0011
+               :                  4'b1111;
+endfunction
+
+function automatic logic [2:0] du_lane_reg(input logic [2:0] sel,
+                                           input logic [1:0] size);
+    du_lane_reg = (size == 2'd0) ? {1'b0, sel[1:0]} : sel;
+endfunction
+
+// Reports "1" when two {valid, reg, be} lanes overlap on a byte.
+function automatic logic du_lane_overlap(input logic [7:0] a,
+                                         input logic [7:0] b);
+    du_lane_overlap = a[7] && b[7] && (a[6:4] == b[6:4]) &&
+                      (|(a[3:0] & b[3:0]));
+endfunction
+
 always_ff @(posedge clk) begin
     if (reset_n && recipe_shift_write.valid &&
         (recipe_shift_widx !== ((recipe_shift_write.size == 2'd0)
                               ? {1'b0, recipe_shift_write.dst[1:0]}
                               : recipe_shift_write.dst)))
         $fatal(1, "Deferred shift normalized destination mismatch");
+end
+
+// A shift token and a memory token must never target overlapping bytes of one
+// register: they are independent deferred producers with no age ordering
+// between them, so an overlap could not be resolved by assignment order.
+always_ff @(posedge clk) begin
+    logic [7:0] shift_lane, mem_lane;
+    if (reset_n && !recipe_commit_cancel) begin
+        shift_lane = recipe_shift_write.valid && !recipe_shift_killed
+            ? {1'b1, recipe_shift_widx,
+               du_lane_be(recipe_shift_write.dst, recipe_shift_write.size)}
+            : 8'h00;
+        mem_lane = recipe_memory_write.valid && !recipe_memory_killed
+            ? {1'b1, du_lane_reg(recipe_memory_write.dst,
+                                 recipe_memory_write.size),
+               du_lane_be(recipe_memory_write.dst, recipe_memory_write.size)}
+            : 8'h00;
+
+        if (du_lane_overlap(shift_lane, mem_lane))
+            $fatal(1, "DUP GPR WRITER shift/mem reg %0d", mem_lane[6:4]);
+    end
 end
 // synthesis translate_on
 
