@@ -151,6 +151,10 @@ reg [2:0] plru_set [0:NUM_SETS-1];
 // arrays in logic.
 reg [TAG_RAM_BITS-1:0] rd_tag_entry0_r, rd_tag_entry1_r;
 reg [TAG_RAM_BITS-1:0] rd_tag_entry2_r, rd_tag_entry3_r;
+// Ways whose tag was captured on an edge that also cleared their set.  The tag
+// RAM read is synchronous and returns the OLD entry, so without this the very
+// next lookup can hit a line that this clear just invalidated.
+reg [3:0] rd_invalidated_r;
 wire [TAG_BITS-1:0] rd_tag0_r = rd_tag_entry0_r[TAG_BITS-1:0];
 wire [TAG_BITS-1:0] rd_tag1_r = rd_tag_entry1_r[TAG_BITS-1:0];
 wire [TAG_BITS-1:0] rd_tag2_r = rd_tag_entry2_r[TAG_BITS-1:0];
@@ -387,10 +391,10 @@ end
 endfunction
 
 wire [3:0] lookup_hit_vec = {
-    rd_valid3_r && (rd_tag3_r == req_tag_r),
-    rd_valid2_r && (rd_tag2_r == req_tag_r),
-    rd_valid1_r && (rd_tag1_r == req_tag_r),
-    rd_valid0_r && (rd_tag0_r == req_tag_r)
+    rd_valid3_r && !rd_invalidated_r[3] && (rd_tag3_r == req_tag_r),
+    rd_valid2_r && !rd_invalidated_r[2] && (rd_tag2_r == req_tag_r),
+    rd_valid1_r && !rd_invalidated_r[1] && (rd_tag1_r == req_tag_r),
+    rd_valid0_r && !rd_invalidated_r[0] && (rd_tag0_r == req_tag_r)
 };
 // A registered snoop clears the whole set in this cycle, but the synchronous
 // RAM lookup captured its tag a cycle earlier, so that hit is stale.  Reject it
@@ -414,10 +418,10 @@ wire [31:0] lookup_way_data = patch_fwd_hit ? patch_fwd_data_r : lookup_way_ram_
 wire [TAG_BITS-1:0] vipt_resolve_tag =
     vipt_resolve_phys_addr[TAG_MSB:TAG_LSB];
 wire [3:0] vipt_hit_vec = {
-    rd_valid3_r && (rd_tag3_r == vipt_resolve_tag),
-    rd_valid2_r && (rd_tag2_r == vipt_resolve_tag),
-    rd_valid1_r && (rd_tag1_r == vipt_resolve_tag),
-    rd_valid0_r && (rd_tag0_r == vipt_resolve_tag)
+    rd_valid3_r && !rd_invalidated_r[3] && (rd_tag3_r == vipt_resolve_tag),
+    rd_valid2_r && !rd_invalidated_r[2] && (rd_tag2_r == vipt_resolve_tag),
+    rd_valid1_r && !rd_invalidated_r[1] && (rd_tag1_r == vipt_resolve_tag),
+    rd_valid0_r && !rd_invalidated_r[0] && (rd_tag0_r == vipt_resolve_tag)
 };
 wire [1:0] vipt_hit_way = way_encode(vipt_hit_vec);
 wire [31:0] vipt_way_ram_data = way_data_mux(
@@ -630,6 +634,10 @@ always_ff @(posedge clk) begin
         rd_data2_r <= data_way2[preread_bram_addr];
         rd_data3_r <= data_way3[preread_bram_addr];
         rd_plru_r <= plru_set[preread_set];
+        // The clear is set-wide, so a read launched on the same edge returns
+        // valid entries for every way of that set.  Mask them next cycle.
+        rd_invalidated_r <= (tag_clear_all && (tag_clear_set == preread_set))
+                            ? 4'b1111 : 4'b0000;
     end
 
     // A single process for both ports is recognized as simple dual-port RAM

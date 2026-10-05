@@ -72,6 +72,40 @@ Fit (OOC CPU, 85 MHz, x87 off, `boards/de10nano` `build_cpu.tcl 0 85`, default
 seed): **19,268 ALMs / 8,055 registers / -8.065 ns** vs the committed
 `18,681 / 7,973 / -8.003`. Timing is unchanged; area +587 ALMs.
 
+## C1 residual: the read-during-clear collision (both caches)
+
+Mirroring the I$ guard into the D$ (above) was **incomplete**, and this is the
+part the earlier audit missed twice.
+
+`lookup_snoop_conflict` rejects a hit only in the cycle the *registered* snoop
+(`snoop_valid_r`) is active. But the tag read that feeds the lookup is
+synchronous: a read **launched on the clearing edge** returns the OLD (valid)
+entry, and that stale tag is consumed one cycle later, when `snoop_valid_r` has
+already fallen and the conflict mask no longer applies. The result is a hit on a
+line the clear just removed. Both caches had it:
+
+- `l1_cache.sv`: the tag preread (`rd_tag_entry*_r <= tag_way*[preread_set]`) can
+  run on the edge that clears the set. `tb_l1_cache.sv`'s "snoop invalidated
+  line" case failed for exactly this reason. It had been recorded as a *bench*
+  self-defect; it was not - it is a correct fail-first bench for an incomplete
+  fix, and the "adding a delay passes" observation was the tell that the clear
+  works but the collision is not carried forward.
+- `l1_icache.sv`: a demand accepted (`accept_cpu`) on the edge that clears a
+  tag-matched snoop captures the pre-clear entry, and the lookup then hits it.
+
+Fix (both): carry the collision into the lookup. `rd_invalidated_r` records the
+ways the clear removed on the read's own edge and the hit vectors mask them. The
+D$ clear is whole-set, so all four ways are masked; the I$ clear is tag-matched
+(plus a whole-set flush sweep), so `tag_clear_ways` selects per way.
+
+Benches, verified fail-first in both directions:
+
+- `tb_l1_cache.sv` "snoop invalidated line" - failed before, passes now.
+- `tb_l1_icache.sv` "REGISTERED SNOOP RACE" - added. It drives the port directly
+  so the accept lands in the snoop's registered cycle (`cache_read`'s ready wait
+  would push it one cycle later, past the clear). Without the I$ masking it
+  reports `exposed stale hit`; with it, the demand misses and refetches.
+
 ## The 2026-10-04 MiSTer freeze (`debug/boot-stuck.txt`)
 
 `debug/boot-stuck.txt` is a crash-recorder capture from the full PC-98 platform,
@@ -98,8 +132,10 @@ fixing, but they are not yet proven to be this freeze. Next step is to run
 
 ## What "provable" still needs
 
-1. C1/C2: a directed `l1_cache` bench that accepts a load, then snoops the same
-   set in the lookup cycle, and checks the reload (fail-first).
+1. ~~C1/C2: a directed `l1_cache` bench that accepts a load, then snoops the same
+   set in the lookup cycle, and checks the reload (fail-first).~~ **Closed**: the
+   bench existed and was correct; the fix it exposed was incomplete. See "C1
+   residual" above and the `tb_l1_icache` REGISTERED SNOOP RACE case.
 2. C14: a directed bench that writes a PTE through the D$ and then walks it.
 3. C9: a directed bench where a store patch and an external invalidate collide.
 4. C16: the A/D elision is proven, but the D$ eviction path has no directed
