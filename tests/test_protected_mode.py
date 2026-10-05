@@ -96,7 +96,7 @@ def generate_page_tables(mappings, page_dir_addr=0x0000):
                     memory[pt_base + j*4] = struct.pack('<I', 0)
 
                 # Create PDE pointing to this page table
-                pde = generate_page_table_entry(page_tables[pde_idx], 'RW')
+                pde = generate_page_table_entry(page_tables[pde_idx], 'RWU')  # permissive PDE; the PTE still restricts
                 page_dir[pde_idx] = pde
 
             # Create PTE
@@ -392,10 +392,16 @@ def run_test(test_name, verbose=False, trace=False, keep_files=False, cycles=20_
         )
 
         if passed:
+            if test_config.get('expect_fail'):
+                return False, "XPASS - expected to fail but passed"
             return True, "PASS"
         elif failed:
+            if test_config.get('expect_fail'):
+                return True, "XFAIL - expected failure (unported fix)"
             return False, "FAIL - test reported failure"
         elif timeout:
+            if test_config.get('expect_fail'):
+                return True, "XFAIL - expected timeout (unported fix)"
             return False, "TIMEOUT"
         else:
             return False, "Unknown result"
