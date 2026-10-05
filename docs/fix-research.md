@@ -322,16 +322,19 @@ map-and-IRET retry passes for a ring-3 **load** (`cpl3_retry`), a near **CALL**
 32-bit `PUSH r32` restart loses the pre-decrement ESP, so the fix should be
 justified against that path rather than the whole store class.
 
-**`mem_req_to_paging && !page_fault` is ported as a guard.**  It does not
-reproduce in our probes: the four-PUSH sequence reports exactly one #PF, and
-`pf_store_held` (store then younger read, both absent) already delivers the
-store's fault first with its data intact.  But the hazard is structural:
-`raise_perm_fault`/`raise_walk_fault` call `complete_mem_request`, which returns
-the paging unit to `PG_IDLE` in the same cycle it raises the registered
-`page_fault` pulse, so a demand presented in that cycle would be accepted and
-could replace `cr2_reg`/`fault_code` before the microcode redirects.  Our
-microcode does not present one there today, so the gate is a guard rather than a
-reproduced fix, and it matches the sibling form exactly.
+**`mem_req_to_paging && !page_fault` is ported as a guard, and the window is
+now reproduced.**  The directed page-fault probes do not show a wrong
+exception: `cpl3_push_retry` reports one #PF and `pf_store_held` gets the
+ordering right.  But an RTL probe on the existing `vipt_rmw_fault` (a crossing
+memory-destination ALU op) shows the window directly.  At the fault pulse
+`page_fault` is high *and* the microcode presents a demand (`uc_data_busreq`),
+because `raise_perm_fault`/`raise_walk_fault` call `complete_mem_request`,
+returning the FSM to `PG_IDLE` in the same cycle it raises the pulse.  Without
+the gate the demand is accepted, the unit re-walks and raises a second
+`page_fault` pulse; with the gate there is one.  The second pulse does not reach
+the handler twice (`fault_seen_r` absorbs it) and the latched `cr2_reg`/
+`fault_code` are identical, so the effect is a redundant walk rather than a
+wrong exception - hence a guard, not a reproduced correctness failure.
           Cost: +139 ALMs (+0.7%) and +78 registers in the 85 MHz OOC fit, with
 setup slack improving from -8.390 to -8.114 ns.  An in-unit variant
 (`idle_data_req && !page_fault`, keeping `page_fault` local) was cheaper in area
