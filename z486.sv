@@ -1852,7 +1852,8 @@ wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || d2_resident);
 // Implicit supervisor access: descriptor table and TSS reads, cross-privilege
 // stack writes use CPL=0 for paging regardless of current CPL.
 wire implicit_supervisor = mem_is_dtable || (mem_seg_sel == SEG_TR) ||
-                           descsw_mode || (vm && CS[1:0] == 2'b00);
+                           descsw_mode ||
+                           (vm && desc_cache[SEG_CS].DPL == 2'b00);
 assign pg_cpl = implicit_supervisor ? 2'b00 : cpl;
 
 // Registered fault redirect state.
