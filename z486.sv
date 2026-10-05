@@ -1860,10 +1860,16 @@ assign pg_cpl = implicit_supervisor ? 2'b00 : cpl;
 reg         gp_fault_r;
 reg         ss_fault_r;
 
-wire        mem_req_to_paging = (mem_op_eligible &&
-                                 (uc_data_busreq || x87_direct_mem_req) &&
-                                 !gp_fault_trigger && !ucrd_route_pre && !st_route) ||
-                                vipt_slow_submit || ucrd_slow_submit;
+// The paging unit returns to idle on its (registered, one-cycle) fault pulse
+// (raise_perm_fault/raise_walk_fault call complete_mem_request).  A demand
+// presented in that cycle would be accepted and could replace the older store's
+// cr2/fault_code before exception delivery redirects the microcode, so hold new
+// requests off for the pulse.
+wire        mem_req_demand = (mem_op_eligible &&
+                               (uc_data_busreq || x87_direct_mem_req) &&
+                               !gp_fault_trigger && !ucrd_route_pre && !st_route) ||
+                              vipt_slow_submit || ucrd_slow_submit;
+wire        mem_req_to_paging = mem_req_demand && !page_fault;
 
 wire        iack_req_to_paging = mem_op_eligible && iack_busop && !gp_fault_trigger;
 wire        mem_write_now = (x87_direct_mem_req || vipt_slow_submit || ucrd_slow_submit) ? 1'b0 :

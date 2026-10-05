@@ -322,15 +322,20 @@ map-and-IRET retry passes for a ring-3 **load** (`cpl3_retry`), a near **CALL**
 32-bit `PUSH r32` restart loses the pre-decrement ESP, so the fix should be
 justified against that path rather than the whole store class.
 
-**`mem_req_to_paging && !page_fault` does not reproduce here.**  The probe
-reports exactly one #PF for the four-PUSH sequence, and `pf_store_held` (store
-then younger read, both absent) already gets the ordering right: the store's
-fault is delivered first and its data survives.  Applying only the
-`!page_fault` gate to `mem_req_to_paging` does not change `cpl3_push_retry`, so
-in our structure a chained successor does not consume the paging unit's
-post-fault idle slot.  This stays recorded as a sibling fix we currently have
-no evidence we need; if a PC-98/Windows workload later shows a wrong store CR2,
-the gate is the first place to look.
+**`mem_req_to_paging && !page_fault` is ported as a guard.**  It does not
+reproduce in our probes: the four-PUSH sequence reports exactly one #PF, and
+`pf_store_held` (store then younger read, both absent) already delivers the
+store's fault first with its data intact.  But the hazard is structural:
+`raise_perm_fault`/`raise_walk_fault` call `complete_mem_request`, which returns
+the paging unit to `PG_IDLE` in the same cycle it raises the registered
+`page_fault` pulse, so a demand presented in that cycle would be accepted and
+could replace `cr2_reg`/`fault_code` before the microcode redirects.  Our
+microcode does not present one there today, so the gate is a guard rather than a
+reproduced fix, and it matches the sibling form exactly.
+          Cost: +139 ALMs (+0.7%) and +78 registers in the 85 MHz OOC fit, with
+setup slack improving from -8.390 to -8.114 ns.  An in-unit variant
+(`idle_data_req && !page_fault`, keeping `page_fault` local) was cheaper in area
+(+46 ALMs) but regressed slack to -9.470 ns, so the input-side form is used.
 
 ## Harness fix found along the way
 
