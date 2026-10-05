@@ -119,6 +119,13 @@ module z486
     output             dbg_issue,       // instruction issue pulse
     output     [31:0]  dbg_issue_eip,   // and the IP that will execute next
 
+    // Grouped observation bundle: microcode cursor and control, the latched
+    // instruction, fault restart state, privilege, the registered segment
+    // limit, paging, deferred tokens, flow and the shared datapath.  Named
+    // fields, so a consumer reads `dbg.priv.cpl` instead of slicing a vector.
+    // Pure wires; unconnected bits cost nothing.
+    output     z486_dbg_t dbg,
+
     // A fault while delivering #DF shuts down the 386 and requests reset.
     output triple_fault_reset
 );
@@ -1587,6 +1594,9 @@ segmentation_unit seg_unit (
     .slctr            (SLCTR[15:0]),
     .transition       (prot_transition),
     .desc_cache       (desc_cache),
+    .dbg_limit        (seg_dbg_limit),
+    .dbg_ed           (seg_dbg_ed),
+    .dbg_big          (seg_dbg_big),
     .idt_base         (idt_base),
     .idt_limit        (idt_limit),
     .gdt_base         (gdt_base),
@@ -2062,6 +2072,7 @@ paging_unit #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) paging_inst (
     .reset_n            (reset_n),
     .cr0                (CR0),
     .cr3                (CR3),
+    .dbg_state          (pg_dbg_state),
     .cr3_write          (cr3_write),
     .invlpg_req         (invlpg_request),
     .invlpg_linear      (ind_linear),
@@ -2961,6 +2972,8 @@ data_unit data_unit_inst (
     .dr7(DR7),
     .tmpeip(TMPeIP),
     .tmpesp(TMPeSP),
+    .dbg_recipe_mem_killed(recipe_mem_killed_dbg),
+    .dbg_recipe_shift_killed(recipe_shift_killed_dbg),
     // Register file, internal registers and flags (datapath state)
     .eax(EAX),
     .ecx(ECX),
@@ -3121,5 +3134,71 @@ assign dbg_issue      = i_issue;
 // in this same cycle it is the committed target, otherwise the current EIP.
 assign dbg_issue_eip  = (uc_exec && recipe_rni && (uc_dest == DEST_eIP))
     ? (is_dword ? eip_source_value : {16'h0, eip_source_value[15:0]}) : EIP;
+
+//=============================================================================
+// Grouped observation bundle (see z486_dbg_t).  Every arm is a wire into state
+// the core already keeps, so leaving `dbg` unconnected costs nothing.
+//=============================================================================
+wire [31:0] seg_dbg_limit;
+wire        seg_dbg_ed;
+wire        seg_dbg_big;
+wire [3:0]  pg_dbg_state;
+wire        recipe_mem_killed_dbg;
+wire        recipe_shift_killed_dbg;
+
+assign dbg.uc.addr     = uc_addr;
+assign dbg.uc.exec     = uc_exec;
+assign dbg.uc.dest     = uc_dest;
+assign dbg.uc.source   = uc_source;
+assign dbg.uc.buscode  = uc_buscode;
+assign dbg.uc.aluop    = uc_aluop;
+
+assign dbg.instr.opcode          = i.opcode;
+assign dbg.instr.modrm           = i.modrm;
+assign dbg.instr.entry_point     = i.entry_point;
+assign dbg.instr.rel_branch_kind = i.rel_branch_kind;
+assign dbg.instr.addr32          = i.addr32;
+assign dbg.instr.data32          = i.data32;
+
+assign dbg.restart.tmpeip      = TMPeIP;
+assign dbg.restart.tmpesp      = TMPeSP;
+assign dbg.restart.restart_eip = wr_restart_eip;
+assign dbg.restart.restart_esp = wr_restart_esp;
+
+assign dbg.priv.cpl                 = cpl;
+assign dbg.priv.entry_cpl_zero      = pe_entry_cpl_zero;
+assign dbg.priv.implicit_supervisor = implicit_supervisor;
+assign dbg.priv.pg_cpl              = pg_cpl;
+
+assign dbg.seg.limit = seg_dbg_limit;
+assign dbg.seg.ed    = seg_dbg_ed;
+assign dbg.seg.big   = seg_dbg_big;
+
+assign dbg.mem.servicing = mem_servicing;
+assign dbg.mem.opt_wait  = mem_opt_wait;
+assign dbg.mem.req       = mem_req_to_paging;
+assign dbg.mem.accepted  = mem_accepted;
+assign dbg.mem.fault     = page_fault;
+assign dbg.mem.pg_state  = pg_dbg_state;
+
+assign dbg.tokens.recipe_mem_valid    = recipe_mem_write.valid;
+assign dbg.tokens.recipe_mem_killed   = recipe_mem_killed_dbg;
+assign dbg.tokens.recipe_shift_killed = recipe_shift_killed_dbg;
+assign dbg.tokens.vipt_ex_valid       = vipt_load_ex_r.valid;
+assign dbg.tokens.vipt_ex_alu         = vipt_load_ex_r.is_alu;
+assign dbg.tokens.d2_vipt_ea_hazard   = d2_vipt_ea_hazard;
+
+assign dbg.flow.stall           = stall;
+assign dbg.flow.halted          = halted;
+assign dbg.flow.q_flush         = q_flush;
+assign dbg.flow.rni_delay       = i_rni_delay;
+assign dbg.flow.eip_write       = eip_write_now;
+assign dbg.flow.any_fault       = any_fault;
+assign dbg.flow.any_fault_r     = any_fault_r;
+assign dbg.flow.interrupt_entry = interrupt_entry;
+
+assign dbg.data.sigma = SIGMA;
+assign dbg.data.opr_r = OPR_R;
+assign dbg.data.opr_w = OPR_W;
 
 endmodule

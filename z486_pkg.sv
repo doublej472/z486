@@ -1545,4 +1545,97 @@ function automatic [3:0] resolve_seg_target(input [6:0] dest, input [2:0] seg_se
     endcase
 endfunction
 
+//=============================================================================
+// Debug tap bundle
+//=============================================================================
+// Pure observation of state the core already keeps, grouped so a crash
+// recorder or a testbench can name a field instead of unpacking an opaque
+// vector.  Every member is a wire into an existing signal, so a core that
+// leaves `dbg` unconnected loses nothing: the fitter drops it.
+
+typedef struct packed {
+    logic [11:0] addr;
+    logic        exec;
+    logic [6:0]  dest;
+    logic [5:0]  source;
+    logic [5:0]  buscode;
+    logic [6:0]  aluop;
+} z486_dbg_uc_t;
+
+typedef struct packed {
+    logic [7:0]       opcode;
+    logic [7:0]       modrm;
+    logic [11:0]      entry_point;
+    rel_branch_kind_t rel_branch_kind;
+    logic             addr32;
+    logic             data32;
+} z486_dbg_instr_t;
+
+typedef struct packed {
+    logic [31:0] tmpeip;
+    logic [31:0] tmpesp;
+    logic [31:0] restart_eip;
+    logic [31:0] restart_esp;
+} z486_dbg_restart_t;
+
+typedef struct packed {
+    logic [1:0] cpl;
+    logic       entry_cpl_zero;
+    logic       implicit_supervisor;
+    logic [1:0] pg_cpl;
+} z486_dbg_priv_t;
+
+typedef struct packed {
+    logic [31:0] limit;
+    logic        ed;      // expand-down data/stack segment
+    logic        big;     // D/B upper-bound select
+} z486_dbg_seg_t;
+
+typedef struct packed {
+    logic       servicing;
+    logic       opt_wait;
+    logic       req;
+    logic       accepted;
+    logic       fault;
+    logic [3:0] pg_state;
+} z486_dbg_mem_t;
+
+typedef struct packed {
+    logic recipe_mem_valid;
+    logic recipe_mem_killed;
+    logic recipe_shift_killed;
+    logic vipt_ex_valid;
+    logic vipt_ex_alu;
+    logic d2_vipt_ea_hazard;
+} z486_dbg_tokens_t;
+
+typedef struct packed {
+    logic stall;
+    logic halted;
+    logic q_flush;
+    logic rni_delay;
+    logic eip_write;
+    logic any_fault;
+    logic any_fault_r;
+    logic interrupt_entry;
+} z486_dbg_flow_t;
+
+typedef struct packed {
+    logic [31:0] sigma;
+    logic [31:0] opr_r;
+    logic [31:0] opr_w;
+} z486_dbg_data_t;
+
+typedef struct packed {
+    z486_dbg_uc_t      uc;
+    z486_dbg_instr_t   instr;
+    z486_dbg_restart_t restart;
+    z486_dbg_priv_t    priv;
+    z486_dbg_seg_t     seg;
+    z486_dbg_mem_t     mem;
+    z486_dbg_tokens_t  tokens;
+    z486_dbg_flow_t    flow;
+    z486_dbg_data_t    data;
+} z486_dbg_t;
+
 endpackage

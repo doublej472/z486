@@ -161,7 +161,7 @@ module tb_protected_mode #(
         end else begin
             walk_cr3_stale_r_d <= dut.paging_inst.walk_cr3_stale_r;
             if (!walk_cr3_stale_r_d && dut.paging_inst.walk_cr3_stale_r &&
-                (dut.paging_inst.state == 4'd10))  // PG_PF_WALKING
+                (dut.dbg.mem.pg_state == 4'd10))  // PG_PF_WALKING, via the dbg tap
                 stale_walk_events <= stale_walk_events + 1;
         end
     end

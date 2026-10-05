@@ -26,6 +26,9 @@ module segmentation_unit
     input prot_transition_t transition,    // Protection-driven descriptor updates
 
     output seg_desc_t  desc_cache [0:7],   // ES..GS, TR, and LDTR hidden descriptors
+    output logic [31:0] dbg_limit,         // registered segment limit
+    output logic        dbg_ed,            // expand-down data/stack segment
+    output logic        dbg_big,           // its D/B upper-bound select
     output logic [31:0] idt_base,
     output logic [19:0] idt_limit,
     output logic [31:0] gdt_base,
@@ -123,6 +126,9 @@ reg [31:0]  seg_base_r;         // Registered segment base
 reg [31:0]  seg_limit_r;        // Registered segment limit
 reg         seg_ed_r;           // Registered: expand-down data/stack segment
 reg         seg_big_r;          // and its D/B (upper bound FFFFFFFF vs FFFF)
+assign dbg_limit = seg_limit_r;
+assign dbg_ed    = seg_ed_r;
+assign dbg_big   = seg_big_r;
 
 // Full hidden descriptors exist only for the six architectural segment
 // registers, TR, and LDTR. GDTR/IDTR contain only base+limit, and SEG_IO is a

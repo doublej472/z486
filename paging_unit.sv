@@ -138,7 +138,8 @@ module paging_unit
 
     // PC-98 debug taps: the page walker's last PDE/PTE reads
     output       [31:0] dbg_walk_pde,
-    output       [31:0] dbg_walk_pte
+    output       [31:0] dbg_walk_pte,
+    output       [3:0]  dbg_state            // current FSM state (PG_*)
 );
 
 reg                 rd_ind_active;     // BUSOP_RD_IND active (internal; demoted from output)
@@ -210,6 +211,7 @@ typedef enum logic [3:0] {
 } pg_state_t;
 
 pg_state_t state;
+assign dbg_state = state;
 
 // TLB lookup address for prefetch/walker and other registered slow paths.
 wire [31:0] tlb_lookup_addr;

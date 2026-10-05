@@ -158,7 +158,9 @@ module data_unit
     output logic [31:0] alu_src_hold,             // Registered ALU source operand
     output logic [31:0] source_value_live,        // Selected microcode source value
     output logic [31:0] alu_source_value_live,    // Selected ALU-source value
-    output logic [31:0] dest_value
+    output logic [31:0] dest_value,
+    output logic        dbg_recipe_mem_killed,
+    output logic        dbg_recipe_shift_killed
 );
 
 logic [31:0] alu_dst;
@@ -188,6 +190,8 @@ logic [1:0] recipe_memory_mode;      // Byte-low/high, word, or dword merge
 // write to the same bytes already made the older value architecturally dead.
 logic       recipe_memory_killed;
 logic       recipe_shift_killed;
+assign dbg_recipe_mem_killed   = recipe_memory_killed;
+assign dbg_recipe_shift_killed = recipe_shift_killed;
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
