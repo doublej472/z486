@@ -358,8 +358,8 @@ assign seg_fault = check_en && is_mem_op &&
 // neither do the pushes of a transfer to a more privileged level: CPL is
 // still 3 while interrupt/gate microcode writes the new stack, which is
 // either addressed through the stack switch (descsw_mode) or already loaded
-// into SS with DPL < 3.  (V86 SS caches carry DPL 0, so only the switch
-// qualifies there.)
+// into SS with DPL < 3.  (V86 SS caches carry DPL 3, so V86 stack accesses
+// stay checked.)
 wire [1:0] align_linear_low = seg_base_r[1:0] + eff_offset[1:0];
 wire       align_misaligned = (align_size == 2'd1) ? align_linear_low[0] :
                               (align_size == 2'd2) ? (align_linear_low != 2'd0) :
@@ -368,7 +368,7 @@ assign access_linear = seg_base_r + eff_offset;
 wire [31:0] access_linear_p4 = seg_base_r + eff_offset + 32'd4;
 assign access_dw_next = access_linear_p4[31:2];
 wire       align_priv_stack = (seg_sel == SEG_SS) &&
-                              (descsw_mode || (!vm && (desc_cache[SEG_SS].DPL != 2'd3)));
+                              (descsw_mode || (desc_cache[SEG_SS].DPL != 2'd3));
 assign align_violation = ac_check && !is_dtable && (seg_sel != SEG_TR) &&
                          (seg_sel != SEG_LDT) && !align_priv_stack &&
                          align_misaligned;
