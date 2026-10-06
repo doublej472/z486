@@ -379,6 +379,21 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False):
     is_pushfd = (cpu_mode == '486' and opcode == 0x9C and data32 and
                  completed)
     is_popfd = cpu_mode == '486' and opcode == 0x9D and data32
+    # IN from I/O ports 22h/23h: the capture CPU is a 386EX, whose on-chip
+    # REMAPCFG register occupies those addresses (Intel386 EX User's Manual,
+    # REMAPCFG at 0022H) and answers the read itself.  A 486 has no on-chip
+    # I/O registers; its bus read returns the system's value (the bench
+    # returns FFh).  Those EAX bytes are a property of the capture board.
+    in_port_mask = 0xFFFFFFFF
+    if opcode in (0xE4, 0xE5, 0xEC, 0xED):
+        oi = decode_opcode_and_width(nbytes, init_regs)[0]
+        port = (nbytes[oi + 1] if opcode in (0xE4, 0xE5)
+                else init_regs.get('edx', 0) & 0xFFFF)
+        width = 1 if opcode in (0xE4, 0xEC) else (4 if data32 else 2)
+        for k in range(width):
+            if (port + k) & 0xFFFF in (0x22, 0x23):
+                in_port_mask &= ~(0xFF << (8 * k)) & 0xFFFFFFFF
+
     # The final state is an interrupt/exception handler entry.
     delivered = (not completed and opcode is not None and
                  (is_fault_test(test) or opcode in (0xCC, 0xCD, 0xCE)))
@@ -578,6 +593,10 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False):
             if all(a in init_mem for a in addrs):
                 popped = sum(init_mem[a] << (8 * k) for k, a in enumerate(addrs))
                 expected_val = (expected_val & ~0x00040000) | (popped & 0x00040000)
+
+        if reg == 'eax' and in_port_mask != 0xFFFFFFFF:
+            expected_val &= in_port_mask
+            got_val &= in_port_mask
 
         # A real-mode interrupt or exception delivery clears AC with IF and TF
         # (Intel SDM, INT n/INTO/INT3 Operation, REAL-ADDRESS-MODE: "AC <- 0";
