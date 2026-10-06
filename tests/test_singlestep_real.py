@@ -526,7 +526,7 @@ def idiv_overflow_final(test):
     return new_fin
 
 
-def run_test(test, global_mask, cpu_mode='486', notrace=False):
+def run_test(test, global_mask, cpu_mode='486', notrace=False, _repeat=0):
     """
     Run a single test case through the testbench.
 
@@ -713,6 +713,27 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False):
             m = re.search(r'pf_flush_addr=([0-9a-fA-F]+)', line)
             if m:
                 flush_addrs.append(int(m.group(1), 16))
+
+    # A return whose target is the RET itself: the capture runs "RET; HLT"
+    # until the HLT, so the 386 executed the RET again from the state the
+    # first one left (C2 idx 1489: ret BC90h pops its own IP 9658h, then pops
+    # C7ABh from the wrapped SP 18D8h and halts there).  The bench reports
+    # after the first instruction, so step the RET again from the core's own
+    # state and compare that.  RET only reads memory, so the initial RAM
+    # still describes it.
+    ret_op = decode_opcode_and_width(nbytes, init_regs)[1] if nbytes else None
+    if (ret_op in (0xC2, 0xC3, 0xCA, 0xCB) and _repeat < 4 and
+            'eip' in result_regs and
+            result_regs['eip'] == init_regs.get('eip', 0) and
+            result_regs.get('cs') == init_regs.get('cs', 0)):
+        regs2 = dict(init_regs)
+        for k in regs2:
+            if k in result_regs and k not in ('cr0', 'cr3', 'dr6', 'dr7'):
+                regs2[k] = result_regs[k]
+        test2 = dict(test, initial=dict(init, regs=regs2))
+        if VERBOSE:
+            print("RET returned to itself: stepping it again")
+        return run_test(test2, global_mask, cpu_mode, notrace, _repeat + 1)
 
     # Determine masks to use
     # Priority: test-specific mask > global mask
