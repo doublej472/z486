@@ -350,6 +350,27 @@ def is_div_fault(nbytes, init_regs, final_regs):
     return final_regs.get('cs', init_cs) != init_cs
 
 
+# AAM with a zero immediate raises #DE.  The Intel486 PRM documents AAM only
+# as D4 0A ("Real Address Mode Exceptions: None"; Interrupt 0 lists only DIV
+# and IDIV, section 9.9.1), and its flags only as "SF, ZF and PF set according
+# to the result; OF, AF and CF undefined" - a faulting AAM produces no result,
+# so all six status flags are undefined in the EFLAGS it leaves and in the
+# FLAGS image its #DE pushes.  DF, IF, TF and the system flags still compare.
+AAM_FAULT_FLAGS_MASK = 0xFFFFF72A  # clear OF, SF, ZF, AF, PF, CF
+
+
+def is_aam_fault(nbytes, init_regs, final_regs):
+    """AAM imm8=0 (D4 00) that raised a divide error (CS changed)."""
+    prefixes = {0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3}
+    idx = 0
+    while idx < len(nbytes) and nbytes[idx] in prefixes:
+        idx += 1
+    if idx + 1 >= len(nbytes) or nbytes[idx] != 0xD4 or nbytes[idx + 1] != 0:
+        return False
+    init_cs = init_regs.get('cs', 0)
+    return final_regs.get('cs', init_cs) != init_cs
+
+
 def run_test(test, global_mask, cpu_mode='486', notrace=False):
     """
     Run a single test case through the testbench.
@@ -631,6 +652,12 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False):
             if is_div_fault(nbytes, init_regs, final_regs):
                 expected_val = got_val  # Force match
 
+            if cpu_mode == '486' and is_aam_fault(nbytes, init_regs, final_regs):
+                expected_val &= AAM_FAULT_FLAGS_MASK
+                got_val &= AAM_FAULT_FLAGS_MASK
+                mask_val = (AAM_FAULT_FLAGS_MASK if mask_val is None
+                            else mask_val & AAM_FAULT_FLAGS_MASK)
+
         if got_val != expected_val:
             if mask_val is not None:
                 errors.append(
@@ -690,6 +717,16 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False):
             if pushed_ip != (init_regs.get('eip', 0) & 0xFFFF):
                 frame_flags_mask = {fl_addrs[0]: undef & 0xFF,
                                     fl_addrs[1]: (undef >> 8) & 0xFF}
+
+    # An AAM #DE frame holds FLAGS as the faulting AAM left them.
+    if (cpu_mode == '486' and nbytes and 'esp' in final_regs and
+            is_aam_fault(nbytes, init_regs, final_regs)):
+        ss_base = final_regs.get('ss', init_regs.get('ss', 0)) << 4
+        fsp = final_regs['esp'] & 0xFFFF
+        fl_addrs = [(ss_base + ((fsp + 4 + k) & 0xFFFF)) for k in range(2)]
+        for k, a in enumerate(fl_addrs):
+            frame_flags_mask[a] = (frame_flags_mask.get(a, 0xFF) &
+                                   (AAM_FAULT_FLAGS_MASK >> (8 * k)) & 0xFF)
 
     for addr, expected_val in final_ram:
         # Skip FLAGS bytes for divide error (undefined per Intel)
