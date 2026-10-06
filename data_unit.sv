@@ -432,6 +432,25 @@ gpr_write_merge gpr_merge (
     .cap_value(pr_cap_value)
 );
 
+// synthesis translate_off
+// Hazard-inventory monitor (A7, +monitor_hazards): a delay-slot bypass and a
+// live deferred token or load write-back naming one architectural register
+// in the same cycle.  Not an assertion: the merge order may make it legal.
+function automatic [2:0] a7_reg(input [2:0] dst, input [1:0] mode);
+    a7_reg = (mode == 2'd0 || mode == 2'd1) ? {1'b0, dst[1:0]} : dst;
+endfunction
+bit monitor_hazards;
+initial monitor_hazards = $test$plusargs("monitor_hazards");
+always @(posedge clk)
+    if (reset_n && monitor_hazards && dly_gpr_forward.valid &&
+        ((pr_mem_valid && a7_reg(recipe_memory_write.dst, recipe_memory_mode) ==
+                          a7_reg(dly_gpr_forward.dst, dly_gpr_forward.mode)) ||
+         (pr_shift_valid && recipe_shift_write.dst == dly_gpr_forward.dst) ||
+         (load_wb_valid && load_wb_dst == dly_gpr_forward.dst)))
+        $display("HAZARD A7: delay-slot bypass and token/WB on register %0d",
+                 dly_gpr_forward.dst);
+// synthesis translate_on
+
 
 genvar gv;
 generate

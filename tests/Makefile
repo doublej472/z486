@@ -137,7 +137,7 @@ PLA4_RTL := $(Z486_DIR)/protection.sv
 # Targets
 .PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists check-pragmas check-rom-columns check-shift-ucode test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
-.PHONY: test-release test-pc98-map test-protected-narrow check-generators test-data-access check-runner test-l1-tags-wide test-reset-restart
+.PHONY: test-release test-pc98-map test-protected-narrow check-generators test-data-access check-runner test-l1-tags-wide test-reset-restart test-fuzz
 
 all: build
 
@@ -147,13 +147,19 @@ all: build
 test-release:
 	$(MAKE) -j1 check-reset-lists check-pragmas check-rom-columns check-shift-ucode check-generators check-runner
 	$(MAKE) -j1 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-merge test-gpr-hazard test-data-access test-memmap-template test-interrupt-nmi test-paging-walker test-cache-flush test-reset-restart
-	$(MAKE) -j1 test-protected test-protected-narrow test-simple test-pc98-map test-l1-tags-wide
+	$(MAKE) -j1 test-protected test-protected-narrow test-simple test-pc98-map test-l1-tags-wide test-fuzz
 	$(MAKE) -j1 obj_dir_x87/Vtb_protected_mode
 	Z486_ENABLE_X87=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_x87/Vtb_protected_mode ./test_protected_mode.py --strict
 	$(MAKE) -j1 dhrystone
 
 check-runner:
 	python3 test_runner_contract.py
+
+# Seeded differential stress of the integer pipeline (self-checking programs,
+# three memory latencies each).  FUZZ_COUNT=200 for a longer soak.
+FUZZ_COUNT ?= 12
+test-fuzz: obj_dir/Vtb_protected_mode
+	./fuzz_gpr_pipeline.py --count $(FUZZ_COUNT)
 
 check-generators:
 	python3 $(Z486_DIR)/scripts/ucode_optimize.py --check
