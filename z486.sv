@@ -2198,10 +2198,15 @@ wire        paging_live_valid  = paging_owned_submit ? 1'b1 : ind_linear_valid;
 // latched on the same edge), so no opcode decode sits in the UCRD cone.
 reg  lock_insn;
 always_ff @(posedge clk) begin
-    if (!reset_n || any_fault)          // fault delivery is not locked
+    // Fault and interrupt delivery is not locked: a locked instruction's
+    // lock_insn must not survive into the IDT/GDT/stack accesses of a fault
+    // it raises or of an interrupt taken at its boundary.  An invalid LOCK
+    // (#UD, UADDR_INVALID_LOCK) runs no locked cycle at all.
+    if (!reset_n || any_fault || interrupt_entry)
         lock_insn <= 1'b0;
     else if (i_issue)
-        lock_insn <= (i_bus.rep_lock == PREFIX_LOCK) ||
+        lock_insn <= ((i_bus.rep_lock == PREFIX_LOCK) &&
+                      (i_bus.entry_point != UADDR_INVALID_LOCK)) ||
                      (!i_bus.has_0f && (i_bus.opcode[7:1] == 7'b1000011) &&
                       i_bus.has_modrm && (i_bus.modrm[7:6] != 2'b11));
 end
