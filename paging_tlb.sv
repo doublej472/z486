@@ -68,6 +68,7 @@ module paging_tlb
     input               update_user,
     input               update_dirty,
     input               update_pcd,
+    input               update_pwt,     // PTE.PWT, for the TR7 readback only
 
     // Invalidate all entries (on CR3 write)
     input               invalidate_all,
@@ -456,7 +457,7 @@ always_ff @(posedge clk or negedge reset_n) begin
             dirty_q[write_set][write_way]    <= tlbt_write ? tlbt_tr6_r[10] : update_dirty;
             vga_mem[write_set][write_way]    <= z486_page_in_window(write_pfn, VGA_BASE, VGA_TOP);
             pcd_q[write_set][write_way]      <= tlbt_write ? tlbt_tr7_r[11] : update_pcd;
-            pwt_q[write_set][write_way]      <= tlbt_write && tlbt_tr7_r[10];
+            pwt_q[write_set][write_way]      <= tlbt_write ? tlbt_tr7_r[10] : update_pwt;
             case (write_way)
                 2'd0: begin plru[write_set][0] <= 1'b1; plru[write_set][1] <= 1'b1; end
                 2'd1: begin plru[write_set][0] <= 1'b1; plru[write_set][1] <= 1'b0; end
