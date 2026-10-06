@@ -700,7 +700,12 @@ assign stall = stall_mem || stall_wio || stall_x87_direct ||
 
 // Repeat
 wire       prot_result_now;
-wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight) && !prot_result_now
+// Only an executing word repeats.  The ROM read-ahead can latch a RPT word
+// (e.g. ARPL's 6B7h) while the sequencer is idle; with a stale nonzero
+// COUNTR the hold would freeze the ROM output and the next instruction
+// would execute that frozen word forever.
+wire       repeat_active = uc_active && uc_is_rpt &&
+                           (COUNTR[4:0] != 0 || prot_test_inflight) && !prot_result_now
                            && !(uc_is_wio && interrupt_pending);
 
 // uc_exec: master enable for microcode execution
