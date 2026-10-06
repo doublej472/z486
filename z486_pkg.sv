@@ -1064,6 +1064,7 @@ localparam [11:0] UADDR_STACK_FAULT    = 12'h863;  // #SS(0) - sets SIGMA=3, err
 localparam [11:0] UADDR_DIVIDE_ERROR   = 12'h824;  // #DE(0) - divide error (vector 0)
 localparam [11:0] UADDR_DOUBLE_FAULT   = 12'h83F;  // #DF - vector 8, zero error code
 localparam [11:0] UADDR_ALIGN_FAULT    = 12'h9F6;  // #AC(0) - vector 17 (optimizer-owned entry)
+localparam [11:0] UADDR_CALL_STACK_FAULT = 12'h9F8; // #SS(new SS selector) for a CALL gate's new stack (optimizer-owned)
 // Fault-class delivery word that sets EFLAGS.RF (EFLAGS <- EFLAGS | 10000h);
 // interrupts and traps enter the common body after it.
 localparam [11:0] UADDR_FAULT_SET_RF   = 12'h899;

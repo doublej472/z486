@@ -2156,6 +2156,7 @@ assign pg_cpl = implicit_supervisor ? 2'b00 : cpl;
 // Registered fault redirect state.
 reg         gp_fault_r;
 reg         ss_fault_r;
+reg         ss_fault_newstack_r;   // the #SS hit the new stack of a privilege switch
 
 // The paging unit returns to idle on its (registered, one-cycle) fault pulse
 // (raise_perm_fault/raise_walk_fault call complete_mem_request).  A demand
@@ -2563,6 +2564,7 @@ always_ff @(posedge clk) begin
     if (!reset_n) begin
         gp_fault_r <= 1'b0;
         ss_fault_r <= 1'b0;
+        ss_fault_newstack_r <= 1'b0;
         ac_fault_r <= 1'b0;
     end else begin
         gp_fault_r <= gp_fault_trigger;
@@ -2577,6 +2579,7 @@ always_ff @(posedge clk) begin
         ss_fault_r <= vipt_slow_seg_trigger ? vipt_load_slow_ssf_r
                                             : (ss_segment_fault && seg_gp_fault &&
                                                !rd_fast_valid_r);
+        ss_fault_newstack_r <= descsw_mode;
     end
 end
 
@@ -2723,6 +2726,7 @@ event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
     .ac_fault_r(ac_fault_r),
     .ss_segment_fault(ss_segment_fault),
     .ss_fault_r(ss_fault_r),
+    .ss_fault_newstack_r(ss_fault_newstack_r),
     .page_fault(page_fault),
     .pg_fault_code(pg_fault_code),
     .pg_cr2_out(pg_cr2_out),
