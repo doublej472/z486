@@ -105,3 +105,6 @@ fits, and adds hardware at decoded points instead of rewriting them:
 | 9F6/9F7 (optimizer-owned) | #AC entry: copy of the #GP(0) entry with SIGMA = 17 - 9 | the 80386 has no #AC |
 | 0F 07 | decoder routes to the #UD entry | the CROM's LOADALL is not a 486 instruction |
 | 0F 24/26 reg 3-5 | decoder routes to the TR6/TR7 routines | the 80386 PLA rejected TR3-TR5 |
+| descriptor-load tails 5D5 / 5DA | the protection PLA sends a descriptor whose A bit is set, or a system descriptor, to copies of the tails without the write (8F8 / 8FA); otherwise the tail calls 8FC-903: locked read of the high dword, OR the new `ALUSRC_CONST_100` (alusrc 0x0A), write, re-read the low dword the callers expect in OPR_R | the 80386 rewrote the high dword on every load, unlocked; a 486 writes only to set a clear A bit, with a locked read-modify-write |
+| null selector in a task switch, word 7E6 | no longer writes OPR_R back to GDT[0]+4 | a 486 does not touch GDT[0] |
+| 8F8-931 (optimizer-owned) | free words: the 80386 LOADALL routine, unreachable since 0F 07 raises #UD | room for the 486 additions above |

@@ -28,7 +28,25 @@ UCODE_BITS = 37
 XADD_BASE = 0x9DC
 # Free words after the XADD/CMPXCHG block.
 ALIGN_FAULT_ENTRY = 0x9F6     # 486 #AC fault entry (two words)
+# The 80386 LOADALL routine (entry 0x8F6, words 0x8F7-0x931) is reached only
+# from 0F 07, which the decoder sends to #UD on the 486, and nothing else
+# jumps into it, so the words after its entry pair are free.
+LOADALL_FREE = 0x8F8
+DESC_SKIP_DATA = LOADALL_FREE + 0x00     # descriptor-load tail without the write
+DESC_SKIP_CS = LOADALL_FREE + 0x02       # CS-type tail without the write
+DESC_SET_ACCESSED = LOADALL_FREE + 0x04  # locked Accessed-bit RMW (8 words)
 ALUSRC_CONST_8 = 0x19
+ALUSRC_CONST_4 = 0x33
+ALUSRC_CONST_NEG4 = 0x37
+ALUSRC_CONST_100 = 0x0A    # z486 addition: 0x100, the descriptor Accessed bit
+ALUJMP_OR = 0x09
+ALUJMP_LCALL = 0x70
+ALUJMP_LJUMP = 0x71
+ALUJMP_RETURN = 0x7C
+BUSOP_RD_OPR_WORD = 0x05   # locked read (served from memory)
+BUSOP_RD_D = 0x07
+BUSOP_WR_WORD = 0x11
+BUSOP_IND_PLUS = 0x1F
 ROM_BITS = 40
 SRC_TMPC = 0x0C            # Canonical CROM source encoding.
 DEST_SRCREG = 0x3E         # Canonical CROM destination encoding.
@@ -120,6 +138,11 @@ BUSOP_WR = 0x12
 OP_RNI = 0
 SUB_DLY = 0
 SUB_UNL = 1
+
+def longjump(target: int, aluop: int = ALUJMP_LJUMP) -> dict:
+    """Fields of an absolute LJUMP/LCALL: the target is {src, alusrc}."""
+    return dict(aluop=aluop, src=(target >> 6) & 0x3F, alusrc=target & 0x3F)
+
 
 def reljump(src_addr: int, target: int) -> int:
     """Six-bit relative micro-jump offset (target = word + 1 + offset)."""
@@ -327,6 +350,54 @@ PATCHES = [
     # original routine address in the sequencer path.
     Patch(0x5D3, "LD_DESCRIPTOR: jump when descriptor Accessed bit is already set",
           fields=dict(aluop=ALUJMP_JDESCA)),
+
+    # The descriptor-load tails 5D5 (data/stack) and 5DA (code, new SS) wrote
+    # the descriptor's high dword back unconditionally, as an unlocked write
+    # of the value read earlier.  A 486 writes a descriptor only to set a
+    # clear Accessed bit of a code/data descriptor, and does so with a locked
+    # read-modify-write.  The protection PLA now sends a descriptor that needs
+    # no write (A already set, or a system descriptor) to a copy of each tail
+    # without the write; the tails themselves call a locked RMW subroutine.
+    Patch(DESC_SKIP_DATA, "descriptor load, no A-bit write: continue at 5D7",
+          word=uword(**longjump(0x5D7))),
+    Patch(DESC_SKIP_DATA + 1, "descriptor load, no A-bit write: delay slot = 5D5",
+          copy_from=0x5D5),
+    Patch(DESC_SKIP_CS, "CS-type descriptor load, no A-bit write: continue at 5DC",
+          word=uword(**longjump(0x5DC))),
+    Patch(DESC_SKIP_CS + 1, "CS-type descriptor load, no A-bit write: delay slot = 5DA",
+          copy_from=0x5DA),
+    Patch(0x5D5, "descriptor load, A clear: call the locked A-bit RMW",
+          word=uword(**longjump(DESC_SET_ACCESSED, ALUJMP_LCALL))),
+    Patch(0x5D6, "descriptor load, A clear: delay slot = 5D5 (TMPC, IND -> high dword)",
+          copy_from=0x5D5),
+    Patch(0x5DA, "CS-type descriptor load, A clear: call the locked A-bit RMW",
+          word=uword(**longjump(DESC_SET_ACCESSED, ALUJMP_LCALL))),
+    Patch(0x5DB, "CS-type descriptor load, A clear: delay slot = 5DA (TMPC, IND -> high dword)",
+          copy_from=0x5DA),
+    # IND addresses the high dword.  The locked read replaces OPR_R, which the
+    # callers' return delay slots (5D9/5DE/5DF) still read as the descriptor's
+    # low dword, so the low dword is read again before returning.
+    Patch(DESC_SET_ACCESSED + 0, "A-bit RMW: locked read of the high dword",
+          word=uword(bus=BUSOP_RD_OPR_WORD)),
+    Patch(DESC_SET_ACCESSED + 1, "A-bit RMW: DLY for the read data",
+          word=uword(sub=SUB_DLY)),
+    Patch(DESC_SET_ACCESSED + 2, "A-bit RMW: SIGMA = OPR_R | 0x100",
+          word=uword(src=SRC_OPR_R, aluop=ALUJMP_OR, alusrc=ALUSRC_CONST_100)),
+    Patch(DESC_SET_ACCESSED + 3, "A-bit RMW: write the high dword back (unlocks at RNI)",
+          word=uword(src=SRC_SIGMA, dst=DEST_OPR_W, bus=BUSOP_WR_WORD)),
+    Patch(DESC_SET_ACCESSED + 4, "A-bit RMW: IND -> low dword",
+          word=uword(bus=BUSOP_IND_PLUS, alusrc=ALUSRC_CONST_NEG4)),
+    Patch(DESC_SET_ACCESSED + 5, "A-bit RMW: read the low dword into OPR_R again",
+          word=uword(bus=BUSOP_RD_D)),
+    Patch(DESC_SET_ACCESSED + 6, "A-bit RMW: DLY for the read, IND -> high dword, return",
+          word=uword(bus=BUSOP_IND_PLUS, alusrc=ALUSRC_CONST_4, aluop=ALUJMP_RETURN,
+                     sub=SUB_DLY)),
+    Patch(DESC_SET_ACCESSED + 7, "A-bit RMW: blank return delay slot",
+          word=uword()),
+    # A null selector loaded by a task switch reaches 7E5 after reading GDT[0];
+    # 7E6 wrote that dword back to GDT[0]+4.  A 486 does not touch GDT[0].
+    Patch(0x7E6, "null selector in a task switch: no write-back to GDT[0]",
+          fields=dict(bus=0x3F)),
 
     # Fault delivery has three completion paths with different useful fields.
     # Mark the two NOPMOVE words through ALU/JMP and the task-gate OR word

@@ -521,6 +521,7 @@ function automatic logic [31:0] read_alu_source(input logic [5:0] field);
         ALUSRC_EDI: read_alu_source = read_gpr_load_forwarded(3'd7, 2'd2);
         ALUSRC_IMM8: read_alu_source = instr.has_modrm ? instr.immediate : instr.displacement;
         ALUSRC_IMM: read_alu_source = instr.immediate;
+        ALUSRC_CONST_100: read_alu_source = 32'h100;
         ALUSRC_TMPB: read_alu_source = tmpb;
         ALUSRC_TMPC: read_alu_source = tmpc;
         ALUSRC_TMPD: read_alu_source = tmpd;

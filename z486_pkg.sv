@@ -886,6 +886,7 @@ localparam ALUSRC_ESI = 6'h06;
 localparam ALUSRC_EDI = 6'h07;
 localparam ALUSRC_IMM8 = 6'h08;       // Sign-extended 8-bit immediate
 localparam ALUSRC_IMM = 6'h09;        // Full immediate
+localparam ALUSRC_CONST_100 = 6'h0A;  // 0x100, descriptor Accessed bit (z486 addition)
 localparam ALUSRC_TMPB = 6'h0B;
 localparam ALUSRC_TMPC = 6'h0C;
 localparam ALUSRC_TMPD = 6'h0D;
@@ -1078,6 +1079,10 @@ localparam [11:0] UADDR_SINGLE_STEP    = 12'h93F;  // #DB(1) - TF single-step tr
 // #DB body after the TF entry's DR6.BS update; the task-switch T-bit trap
 // also enters here.  Hardware breakpoints record DR6.Bn themselves.
 localparam [11:0] UADDR_DEBUG_TRAP     = 12'h941;
+// Optimizer-owned descriptor-load tails without the Accessed-bit write
+// (scripts/ucode_optimize.py DESC_SKIP_DATA / DESC_SKIP_CS).
+localparam [11:0] UADDR_DESC_SKIP_DATA = 12'h8F8;
+localparam [11:0] UADDR_DESC_SKIP_CS   = 12'h8FA;
 localparam [11:0] UADDR_TSS_PROBLEM    = 12'h85D;  // #TS path used by protected-mode descriptor checks
 localparam [11:0] UADDR_FPU_STORE_TAIL = 12'h57B;  // Final 16-bit word of an m80 store
 localparam [11:0] UADDR_RPTI_RNI       = 12'h20F;  // REP interrupt restart boundary
