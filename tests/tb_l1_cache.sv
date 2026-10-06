@@ -13,6 +13,8 @@ module tb_l1_cache;
     reg         cpu_valid = 1'b0;
     reg         cpu_write = 1'b0;
     wire        cpu_ready;
+    wire        cpu_wr_ready;
+    reg         store_patch_busy = 0;
     wire        cpu_resp_valid;
     wire        stores_drained;
     reg  [11:0] vipt_probe_offset = 12'd0;
@@ -67,7 +69,7 @@ module tb_l1_cache;
         .cpu_write(cpu_write),
         .cpu_uncacheable(cpu_addr[31:17] == 15'h5),
         .cpu_ready(cpu_ready),
-        .cpu_wr_ready(),
+        .cpu_wr_ready(cpu_wr_ready),
         .cpu_resp_valid(cpu_resp_valid),
         .stores_drained(stores_drained),
         .vipt_probe_offset(vipt_probe_offset),
@@ -94,7 +96,7 @@ module tb_l1_cache;
 
         .snoop_addr(snoop_addr),
         .snoop_valid(snoop_valid),
-        .store_patch_busy(1'b0),
+        .store_patch_busy(store_patch_busy),
 
         .flush_req(1'b0),
         .flush_busy(),
@@ -229,7 +231,7 @@ module tb_l1_cache;
 
     task automatic cache_write(input [31:0] addr, input [3:0] be, input [31:0] data);
     begin
-        do @(negedge clk); while (!cpu_ready);
+        do @(negedge clk); while (!cpu_wr_ready);
         cpu_addr = addr;
         cpu_be = be;
         cpu_din = data;
@@ -437,6 +439,26 @@ module tb_l1_cache;
         fill_snoop_collision(1'b1, 1'b0);
         fill_snoop_collision(1'b0, 1'b1);
         fill_snoop_collision(1'b1, 1'b1);
+
+        // An unconsumed I-cache patch blocks idle stores as well as pipelined
+        // stores. Otherwise a new store overwrites the one-entry patch slot.
+        do @(negedge clk); while (!cpu_ready);
+        store_patch_busy = 1;
+        cpu_addr = 32'h1C0;
+        cpu_write = 1;
+        cpu_din = 32'h8765_4321;
+        cpu_valid = 1;
+        repeat (3) begin
+            #1;
+            if (cpu_wr_ready || dut.state != 3'd1)
+                $fatal(1, "idle store accepted while an older I-cache patch is held");
+            @(negedge clk);
+        end
+        store_patch_busy = 0;
+        @(negedge clk);
+        cpu_valid = 0;
+        cpu_write = 0;
+        cache_read(32'h1C0, 4'hF, 32'h8765_4321);
 
         $display("L1 PIPT cache unit test PASS");
         $finish;
