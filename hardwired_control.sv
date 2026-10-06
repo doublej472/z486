@@ -242,7 +242,8 @@ endfunction
 // register fields alone, so it does not wait for the D1 entry point (the
 // group entry table would otherwise set the cycle). A superset of
 // recipe_gpr_read_mask for every hardwired recipe (checked in simulation):
-//   source field      two-operand ALU/CMP/TEST (not r,m), MOV r,r and stores, SHLD/SHRD
+//   source field      two-operand ALU/CMP/TEST (not r,m), MOV/UMOV r,r and stores,
+//                     SHLD/SHRD
 //   destination field all but the MOV family (88-8B, A0-A3, B0-BF, C6/C7),
 //                     LEA, POP, RET and relative branches
 //   ECX               shifts and SHLD/SHRD by CL; ESP for a stack operation.
@@ -259,7 +260,10 @@ function automatic logic [7:0] pb_read_mask(input dec_entry_t e);
         else
             op_byte = !o[0];
         src_read = e.has_0f
-            ? ((o == 8'hA4) || (o == 8'hA5) || (o == 8'hAC) || (o == 8'hAD))
+            ? ((o == 8'hA4) || (o == 8'hA5) || (o == 8'hAC) || (o == 8'hAD) ||
+               // UMOV (0F 10-13) runs the MOV 88-8B recipes: stores and
+               // register forms read the source field.
+               ((o[7:2] == 6'b000100) && !(o[1] && (e.modrm[7:6] != 2'b11))))
             : (((o[7:6] == 2'b00) && !o[2] && !(o[1] && (e.modrm[7:6] != 2'b11))) ||
                (o == 8'h84) || (o == 8'h85) ||
                (o == 8'h88) || (o == 8'h89) || (o == 8'hA2) || (o == 8'hA3) ||
