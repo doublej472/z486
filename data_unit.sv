@@ -796,6 +796,8 @@ always_ff @(posedge clk) begin
         tmpd   <= 32'd0;
         tmpe   <= 32'd0;
         tmpf   <= 32'd0;
+        tmpg   <= 32'd0;
+        tmph   <= 32'd0;
         csopcd <= 32'd0;
         fsveip <= 32'd0;
         oproff <= 32'd0;

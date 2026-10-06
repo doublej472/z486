@@ -430,6 +430,7 @@ check-shift-ucode:
 # Three live defects had this shape; new ones fail here.
 check-reset-lists:
 	@echo "Running reset-list audit..."
+	@python3 test_reset_lists.py
 	@python3 $(Z486_DIR)/scripts/check_reset_lists.py
 
 # SURVEY BENCH: reports hazards the core still has, and is expected to fail

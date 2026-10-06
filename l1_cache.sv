@@ -707,6 +707,7 @@ always_ff @(posedge clk) begin
         wide_fill_line <= 128'd0;
         wide_fill_install <= 1'b0;
         fill_tag_wait_r <= 1'b0;
+        fill_killed_r <= 1'b0;
         snoop_set_r <= {SET_BITS{1'b0}};
         snoop_valid_r <= 1'b0;
         fill_set_snooped_r <= 1'b0;

@@ -2619,6 +2619,10 @@ always_ff @(posedge clk) begin
         srcreg_size <= 2'd1;
         op_size_src <= 2'd1;
         srcreg_size_src <= 2'd1;
+        op_size_decode <= 2'd1;
+        op_size_src_decode <= 2'd1;
+        srcreg_size_decode <= 2'd1;
+        srcreg_size_src_decode <= 2'd1;
     end else if (i_issue && !halted) begin
         // Instruction start: widths have already been resolved in D1.
         op_size <= i_bus.operand_size;

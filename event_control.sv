@@ -391,6 +391,8 @@ always_ff @(posedge clk) begin
         // term below: without this it starts X in simulation and can only be
         // cleared by the fault/stall path.
         fault_suppress_delay_slot <= 1'b0;
+        latched_pf_addr <= 32'd0;
+        latched_pf_code <= 3'd0;
     end else begin
         if (!stall)
             interrupt_entry <= 1'b0;

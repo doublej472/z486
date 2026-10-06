@@ -543,6 +543,7 @@ always_ff @(posedge clk) begin
         fill_requested <= 1'b0;
         fill_tag_wait_r <= 1'b0;
         fill_line_snooped_r <= 1'b0;
+        fill_killed_r <= 1'b0;
         snoop_tag_r <= {TAG_BITS{1'b0}};
         snoop_set_r <= {SET_BITS{1'b0}};
         snoop_word_r <= {WORD_OFFSET_BITS{1'b0}};
