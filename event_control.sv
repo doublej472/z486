@@ -167,6 +167,10 @@ reg        misc1_flag;              // Set by SMISC1 {-33-}, tested by JMISC1 {-
 // misc2_flag: port
 reg        error_code_flag;         // Set by SERRCF {-36-}, tested by JNERRC {-56-}
 reg        interrupt_hw;            // Set for hardware interrupts, tested by JINTSW {-52-}
+// EXT for error codes (JEXTFT).  Every SINTHW sets interrupt_hw, including the
+// far CALL dispatch at 5B9h, which only marks the transfer as nesting for a
+// task switch (JSTSKL); a fault later in that CALL must not report EXT=1.
+reg        external_event;
 reg        task_saved_flag;         // STSKS/CTSKS latch: outgoing TSS has been saved during this switch
 reg        no_fault_flag;           // SNOFLT/JNOFLT: descriptor probes fail by clearing ZF, not raising #GP
 reg        rep_fault_flag;          // SREPF/CREPF/JREP: interrupted REP MOVS needs index/count correction
@@ -213,6 +217,7 @@ always_comb begin
     seq_conditions.flags_backup_inactive = !flags_backup_active;
     seq_conditions.tss_access = tss_access_flag;
     seq_conditions.interrupt_hw = interrupt_hw;
+    seq_conditions.external_event = external_event;
     seq_conditions.misc1 = misc1_flag;
     seq_conditions.task_unsaved = !task_saved_flag;
     seq_conditions.misc2 = misc2_flag;
@@ -534,12 +539,14 @@ always_ff @(posedge clk) begin
         misc2_flag <= 1'b0;
         error_code_flag <= 1'b0;
         interrupt_hw <= 1'b0;
+        external_event <= 1'b0;
     end else begin
         if (i_issue && !halted) begin
             misc1_flag <= 1'b0;
             misc2_flag <= 1'b0;
             error_code_flag <= 1'b0;
             interrupt_hw <= 1'b0;
+            external_event <= 1'b0;
         end
         if (uc_exec) begin
             case (uc_aluop)
@@ -547,7 +554,11 @@ always_ff @(posedge clk) begin
                 ALUJMP_SMISC2: misc2_flag <= 1'b1;
                 ALUJMP_CMISC2: misc2_flag <= 1'b0;
                 ALUJMP_SERRCF: error_code_flag <= 1'b1;
-                ALUJMP_SINTHW: interrupt_hw <= 1'b1;
+                ALUJMP_SINTHW: begin
+                    interrupt_hw <= 1'b1;
+                    if (uc_addr != UADDR_CALL_GATE_SINTHW)
+                        external_event <= 1'b1;
+                end
                 default: ;
             endcase
         end
