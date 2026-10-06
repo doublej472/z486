@@ -1976,7 +1976,22 @@ generate for (dbi = 0; dbi < 4; dbi = dbi + 1) begin : g_dr_fields
 end endgenerate
 wire [3:0] dr_exec_en = dr_enable & {dr_rw[3] == 2'b00, dr_rw[2] == 2'b00,
                                      dr_rw[1] == 2'b00, dr_rw[0] == 2'b00};
-assign db_mode_next = ENABLE_HW_BREAKPOINTS && |dr_enable;
+// DR6.B0-B3 report every breakpoint whose DR/RW/LEN condition matched when a
+// #DB is generated, enabled by L/G or not (Intel486 PRM 11.2.3), and any #DB
+// source (TF single-step, an enabled breakpoint, a task-switch T-bit trap)
+// reports them.  The comparators sit on the microcode data path, so matching
+// needs breakpoint mode (direct load/RMW paths held off).  The mode is on
+// while any breakpoint is enabled or any DRn is programmed as a data
+// breakpoint (RWn = 01 or 11, RWn[0] set), enabled or not.  It is set by MOV
+// DR7 like an enable, so it is already on for the instruction after it.
+// Ordinary code (DR7 RW fields zero, the reset value) never pays for it; code
+// pays only while a debugger leaves a data breakpoint programmed but
+// disabled.  Qualifying it by TF instead would be cheaper still but racy: an
+// instruction stepped right after POPF sets TF can already be on a direct
+// path when the registered mode turns on.  Unenabled instruction breakpoints
+// (RWn = 00) are not reported.
+wire       dr_data_armed = DR7[28] | DR7[24] | DR7[20] | DR7[16];   // some RWn[0]
+assign db_mode_next = ENABLE_HW_BREAKPOINTS && (|dr_enable || dr_data_armed);
 always_ff @(posedge clk) begin
     if (!reset_n)
         db_mode_r <= 1'b0;
