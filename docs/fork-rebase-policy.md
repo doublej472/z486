@@ -4,6 +4,13 @@ This branch is `doublej472/z486` tracking `nand2mario/z486`. It is **rebased**
 onto upstream, never merged into it, so the history must stay a linear series of
 small, single-purpose commits on top of `origin/main`.
 
+Review the branch as a **set of logical changes**, not as authority inherited
+from a commit. Our objective is i486 RTL correctness, missing 486 instruction
+support and PC-98 interface compatibility. A change called `fix` can itself
+need correction; an unchanged upstream path can still contain a defect. Preserve
+proofs, refresh incorrect conclusions, and do not confuse a passing unit model
+with a whole-PC-98 firmware or hardware validation.
+
 ## Commit convention
 
 Prefixes:
@@ -91,7 +98,12 @@ with `git rebase --skip` and re-run the gate it owns.
 
 ```
 cd tests
-make test-protected          # 119 directed programs (alljson in programs/)
+make test-release            # preferred: all self-contained gates, serialized
+# Individual gates for triage:
+make test-protected          # strict directed programs, x87/PC-98 profiles separate
+make test-protected-narrow   # same programs with narrow responses
+make test-pc98-map           # actual PC-98 windows, both response widths
+make test-l1-cache           # D$ snoop/fill/VIPT/patch-backpressure
 make test-simple             # tb_z486
 make test-memmap-template    # z486_cache_map_pkg
 make test-cache-flush        # whole-L1 flush controller
@@ -100,14 +112,24 @@ make test-l1-icache          # fill/snoop races
 make test-memory-order       # device/store ordering
 make test-load-waw           # deferred-token GPR write arbitration
 make test-gpr-merge          # shared GPR producer arbitration
+make test-gpr-hazard         # no new survey findings allowed
+make test-data-access        # stale-token slow-path contract
+make check-reset-lists       # checker self-tests plus named reset exceptions
+make check-generators        # microcode/recipes and committed PLA equivalence
 make test-interrupt-nmi      # NMI latch
 make dhrystone               # must PASS; cycles are a regression signal
 ```
 
 Notes:
 
-- `make test-l1-cache` fails identically on unmodified `origin/main`; it is not
-  one of our gates.
+- `test-l1-cache` **is a release gate**. Its earlier exclusion was incorrect:
+  the synchronous tag read could hit an entry cleared on the same edge. The
+  bench was a correct fail-first proof, not a broken response model.
+- The external SingleStepTests datasets and `test386.asm/test386.bin` are not
+  bundled. Their absence is a missing validation, not a passing/skipped release
+  result. Vendor timing and real PC-98 boot are also separate gates.
+- `--strict` rejects expected failures and a PASS banner requires a zero
+  simulator exit status. Do not make the release gate green by adding XFAILs.
 - Dhrystone is a cycle-exact reference run: a change in its cycle count is a
   behaviour change, so re-baseline it deliberately, never accidentally.
 - The microcode and PLA images are generated. After touching

@@ -8,7 +8,7 @@ added to before trusting it.
 
 ## The model
 
-- **The D-cache is write-through.** A store posts to a 3-entry store queue and
+- **The D-cache is write-through.** A store posts to the default 4-entry queue and
   drains to memory (`l1_cache.sv`); memory therefore holds every committed store
   once the queue is drained. There are no dirty D-lines to write back.
 - **The I-cache holds code lines.** On a D-cache store, `cache_unit.sv` forwards
@@ -32,20 +32,20 @@ added to before trusting it.
 
 | # | path | invariant | status | evidence |
 | --- | --- | --- | --- | --- |
-| C1 | D$ load vs registered external snoop | a load whose tag was captured before a same-set snoop clears it must miss, not hit | **fixed** | this change: `lookup_snoop_conflict` in `l1_cache.sv`; mirrors the I$ `eb6f9c4`. Directed bench still to add |
-| C2 | D$ fill vs registered external snoop | a fill in flight when its set is snooped must not install the line, and the mark must stick for the rest of the fill | **fixed** | this change: `fill_set_snooped_r`, gating `data_fill_write`/`tag_fill_write` |
+| C1 | D$ load vs registered external snoop | a load whose tag was captured before a same-set snoop clears it must miss, not hit | **fixed** | `tb_l1_cache`: read-during-clear and registered VIPT snoop races; demand and VIPT hits both masked |
+| C2 | D$ fill vs registered external snoop | a fill in flight when its set is snooped must not install the line, and the mark must stick for the rest of the fill | **fixed** | sticky same-set mark plus deferred tag install for different-set port conflicts; narrow/wide cancellation and snoop-train tests |
 | C3 | D$ load vs pipelined store patch | a read that prereads the data RAM in the cycle a store patches it takes the registered patch value | checked | `patch_fwd_hit` (`l1_cache.sv`) |
-| C4 | D$ store→load forwarding | a younger store to the same dword is merged over an older one, oldest→youngest | proven | store-queue reference fuse (`l1_cache.sv`) |
-| C5 | D$ store queue vs uncacheable/IO ordering | an uncacheable/IO/direct access waits for every older posted store | proven | `tb_memory_order` |
+| C4 | D$ store→load forwarding | a younger store to the same dword is merged over an older one, oldest→youngest | guarded | ordered merge in `l1_cache.sv`; `store_fwd_word*` and `tb_l1_cache` |
+| C5 | D$ store queue vs uncacheable/IO ordering | IO/INTA/device accesses drain older stores; direct VGA transactions remain mutually ordered but may bypass unrelated RAM stores | guarded | `tb_memory_order` checks both drain and intentional VGA bypass |
 | C6 | I$ lookup vs snoop/patch | a fetch whose tag was captured before a same-line snoop or pending patch must miss | proven | `lookup_snoop_conflict` (`l1_icache.sv`, `eb6f9c4`) |
 | C7 | I$ fill vs snoop | a snoop that clears the fill's line cannot be reinstated; a snoop that owns the way port defers the install instead of dropping it | proven | `fill_line_snooped_r`, `fill_tag_wait_r`; `tb_l1_icache` |
 | C8 | I$ fill vs in-flight D$ stores | a fill merges the D$ store queue and the live store over the gathered line | proven | `l1_icache.sv` fill merge; `storeq_fwd` |
-| C9 | D$→I$ store patch delivery | a store patch is not dropped when it collides with an external invalidate; invalidate has priority | checked | `cache_unit.sv` one-entry pending slot (`icache_write_snoop_pending`) |
+| C9 | D$→I$ store patch delivery | a store patch is not dropped when it collides with an external invalidate; invalidate has priority | guarded | `tb_memory_order` strands a patch behind external then queued DIRECT invalidates; `tb_l1_cache` checks idle store backpressure |
 | C10 | external snoop fan-out | one snoop reaches both caches with the same address | checked | `cache_unit.sv` wiring; `tb_l1_icache`, `tb_l1_cache` |
 | C11 | whole-L1 flush | a sweep completes bounded regardless of in-flight fills, and a request during a walk is queued | proven | `8c5a832`; `tb_cache_flush` |
 | C12 | TLB invalidate | CR3 write invalidates all; INVLPG invalidates the page | checked | `paging_tlb.sv` `invalidate_all`/`invalidate_page`; `ini` programs |
 | C13 | page walk vs CR3 write | a walk that spans a CR3 write neither installs nor faults from the old tables | proven | `walk_cr3_stale_r`; `cr3_walk_race*` |
-| C14 | page-walker cache coherency | PDE/PTE reads and A/D write-backs observe and update the D$ | checked | `emit_walker_biu_req` uses `dcache_req_*`; needs a directed bench |
+| C14 | page-walker cache coherency | PDE/PTE reads and A/D write-backs observe and update the D$ | guarded | `pte_cache_coherence`: cached PTE update, INVLPG, new-frame read/write and old-frame preservation |
 | C15 | VIPT probe races | a speculative probe never beats a demand, and a probe that races a patch takes the patch | proven | `vipt_hit_vec`, `vipt_probe_share`, replay; `tb_l1_icache`/`tb_l1_cache` |
 | C16 | page-table A/D write-back elision | a write-back that would change no bit is skipped | proven | `paging_walker.sv`; `tb_paging_walker` |
 
@@ -68,7 +68,7 @@ missed it. `l1_cache.sv` now mirrors the I$: the snoop is whole-set, so the
 lookup conflict is `snoop_valid_r && (snoop_set_r == req_set_r)`, and a matching
 fill is held off until the fill ends.
 
-Fit (OOC CPU, 85 MHz, x87 off, `boards/de10nano` `build_cpu.tcl 0 85`, default
+Historical fit before this hardening pass (OOC CPU, 85 MHz, x87 off, `boards/de10nano` `build_cpu.tcl 0 85`, default
 seed): **19,268 ALMs / 8,055 registers / -8.065 ns** vs the committed
 `18,681 / 7,973 / -8.003`. Timing is unchanged; area +587 ALMs.
 
@@ -130,13 +130,61 @@ from an upstream bug, not at a stale-cache hit. C1/C2 are still real and worth
 fixing, but they are not yet proven to be this freeze. Next step is to run
 `scratch/tb_pc9821_realboot.sv` on the platform with and without the C1/C2 fix.
 
-## What "provable" still needs
+## Additional port-arbitration defects found and fixed
+
+A D$ final fill and a snoop to **different sets** could need the same way's
+single tag-RAM write port. The fill won and the snooped set retained a stale
+valid line. The D$ now defers only the tag install while staying in S_FILL,
+keeping requests out until the victim's new data and tag are coherent. The
+snoop always clears its set; a later snoop of the deferred fill's own set or a
+flush cancels that install. `tb_l1_cache` covers narrow/wide final beats, a train
+of snoops to other sets, and later cancellation of the deferred fill. The old
+code returned 11223344 after memory had been changed to DEADBEEF.
+
+The VIPT path also lacked the demand path's **registered-cycle** conflict mask.
+Carrying read-during-clear into the next cycle did not protect a probe resolving
+in the current clear cycle. A separate registered-snoop qualifier now closes
+that window, with a fail-first probe in the D$ bench.
+
+The I$ held snoop-tag read could keep `tag_snoop_match*` asserted after the event,
+re-clearing a later refill. Matches now include `snoop_valid_r`. A residency
+regression fills four congruent lines, invalidates one, refills it, waits, and
+requires the next read to hit with no additional memory request.
+
+For patch delivery, external `snoop_valid` was not the whole port owner:
+`bus_unit` can keep a DIRECT invalidate queued after the external level falls.
+`cache_unit` now arbitrates against **icache_invalidate_valid**, the actual merged
+input. Otherwise a collided D-store patch was cleared as consumed while the I$
+was taking the queued invalidate. A one-entry patch slot also needs backpressure
+on idle stores, not only pipelined LOOKUP stores. Both defects have fail-first
+bench checks; a simulation fuse rejects an unconsumed-slot overwrite.
+
+The flush arm also now closes the independent pipelined-write and VIPT
+openings, not merely the registered idle ready flag. Previously a store could
+still be accepted through LOOKUP's write opening, or a shared probe could hit
+while a flush was armed. `tb_l1_cache` accepts the older store/probe, arms the
+flush, requires all new openings/resolve hits to close, and then checks the
+older store survives. Both caches mask read acceptance at the arm boundary.
+
+## Evidence scope and remaining integration work
+
+`make test-pc98-map` executes and modifies code in the PC-98 DIRECT aperture and
+NO_ALLOC window-0 overlay with both fill response widths. A separate high-ROM
+alias case executes above the tag reach, verifies no I-line is installed, and
+models ignored ROM writes. These are CPU-interface guards, not a NEC firmware
+or SoC boot test. The tag-width macro now controls the actual L1 tags as well as
+the classification bound, instead of allowing a wider bound over fixed 27-bit
+tags. The default remains 27 bits / 128 MiB.
+
 
 1. ~~C1/C2: a directed `l1_cache` bench that accepts a load, then snoops the same
    set in the lookup cycle, and checks the reload (fail-first).~~ **Closed**: the
    bench existed and was correct; the fix it exposed was incomplete. See "C1
    residual" above and the `tb_l1_icache` REGISTERED SNOOP RACE case.
-2. C14: a directed bench that writes a PTE through the D$ and then walks it.
-3. C9: a directed bench where a store patch and an external invalidate collide.
-4. C16: the A/D elision is proven, but the D$ eviction path has no directed
-   dirty-line test (write-through makes it moot today; record why it stays moot).
+2. C14 now has `pte_cache_coherence`; C9 now has the collision/backpressure
+   benches above. They are guards of the exercised path, not exhaustive proofs.
+3. There is no dirty-line eviction test because these L1s are write-through;
+   there are no dirty D-lines to evict. Revisit this if the cache policy changes.
+4. The recorded boot-stuck capture is still a downstream admission observation,
+   not proof that a CPU coherence fix resolves that workload. Real platform
+   inputs and current FPGA timing remain separate validation requirements.

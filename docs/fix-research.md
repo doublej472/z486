@@ -1,5 +1,12 @@
 # Fix research: the five confirmed z486 defects
 
+Historical design/research record. Current status and release evidence are in
+[`hazard-survey.md`](hazard-survey.md) and
+[`rtl-hardening-status.md`](rtl-hardening-status.md); the release gate rejects
+XFAILs rather than counting them as passes. The omissions discovered by the
+corrected reset audit and the additional cache/privilege fixes supersede any
+older broad claim that the core's hazard class was completely closed.
+
 This note records, for each defect that `tb_protected_mode` now proves with a
 fail-first `XFAIL` bench, the root cause in our RTL, the robust fix we intend
 (not the minimal one), the alternatives rejected, and the expected timing/area

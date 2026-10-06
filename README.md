@@ -82,7 +82,13 @@ evaluation.
 
 ## Build and test
 
-The regression tests use Verilator and Python:
+The regression tests use Verilator, NASM and Python. The fork's self-contained
+release gate is `make -C tests test-release`; it includes both memory-response
+widths, the PC-98 map profiles, generator checks and checker self-tests.
+[Current RTL status and evidence limits](docs/rtl-hardening-status.md) distinguish
+this gate from architectural reference datasets, FPGA timing and real boot.
+
+Individual targets for triage:
 
 ```bash
 cd tests

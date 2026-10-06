@@ -75,9 +75,9 @@ different, and only microcode decode shows that:
 | item | question | evidence | outcome |
 | --- | --- | --- | --- |
 | P1 `pf_store_held` | can a younger read's fault overwrite an older store's latched code/CR2? | 19 `page_fault` pulses across 133 tests, **0** while a previous fault is undelivered; `pf_store_held.asm` already pins the property | not reachable; no bench; sibling's guard targets their different fault-latch structure |
-| P2 I$ same-way fill/snoop | is a snoop invalidation dropped by a same-way fill? | our `tag_fill_write` requires `!snoop_valid_r` and defers via `fill_tag_wait_r`, so a fill cannot race a live clear; a stale `tag_snoop_match` one cycle later only duplicates an already-performed clear | design already correct; new regression assertion added to `tb_l1_icache.sv` |
+| P2 I$ same-way fill/snoop | is a snoop invalidation dropped by a same-way fill? | `tag_fill_write` requires `!snoop_valid_r` and defers via `fill_tag_wait_r`; `tag_snoop_match` must also be event-qualified, or an old match re-clears a newly refilled line. Both collision and post-refill residency are now tested | design already correct; new regression assertion added to `tb_l1_icache.sv` |
 | P3 `conform_dpl_value` | should the conforming-transition CPL come from `cpl` rather than `cs_selector_rpl`? | substituting `cpl` leaves `conforming_cpl` passing | **not demonstrated**; open question |
-| P4 `copy_stack_dpl` | can the `CS[1:0]` copy run with entry-CPL0 still set? | `copy_stack_dpl` fires at `0x891`/`0x92B`, a different microword from every `DEST_CS` write (`0x2F3`, `0x65B`, `0x6A5`, `0x8E3`); invariant probe `CS[1:0] == cpl` shows 0 divergences | consistent |
+| P4 `copy_stack_dpl` | can the internal CPL transition run with entry-CPL0 still set? | **Yes**: `pe_entry_iret` enters PE without a far CS reload, then returns to CPL3. COPY_STACK_DPL updates CS.RPL before final DEST_CS, while the old override still forced CPL0 and rejected the new SS. The earlier zero-divergence probe missed this path. | **fixed, fail-first**: clear entry-CPL0 at COPY_STACK_DPL |
 | P5 `i.addr32` | can a younger instruction corrupt the delivery address? | decode (no `DESSEG` word in the delivery) + traces of both branches + forcing `au_exec_addr32` to 0 or 1 changes no test | not reachable |
 
 ## Notes
