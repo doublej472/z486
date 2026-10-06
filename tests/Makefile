@@ -161,6 +161,11 @@ obj_dir/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(TB_PROT_DE
 	$(VERILATOR) $(VFLAGS) --top-module tb_protected_mode $(TB_PROT_SRCS) $(RTL_SRCS) $(CPP_PROT_SRCS)
 	@echo "Build complete: obj_dir/Vtb_protected_mode"
 
+obj_dir_pc98/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(TB_PROT_DEPS) $(CPP_PROT_SRCS)
+	cp -f ../*.hex .
+	$(VERILATOR) $(VFLAGS) --Mdir obj_dir_pc98 -GPC98_MAP=1 -GMEM_SIZE=1048576 --top-module tb_protected_mode \
+		$(TB_PROT_SRCS) $(RTL_SRCS) $(CPP_PROT_SRCS)
+
 obj_dir_x87/Vtb_protected_mode: $(RTL_SRCS) $(RTL_DEPS) $(TB_PROT_SRCS) $(TB_PROT_DEPS) $(CPP_PROT_SRCS)
 	@echo "Building x87-enabled protected mode testbench with Verilator..."
 	cp -f ../*.hex .
@@ -396,6 +401,10 @@ test-protected: obj_dir/Vtb_protected_mode
 	@echo "Running protected mode tests..."
 	./test_protected_mode.py --strict
 
+test-pc98-map: obj_dir_pc98/Vtb_protected_mode
+	Z486_PC98_MAP=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_pc98/Vtb_protected_mode ./test_protected_mode.py --strict pc98_direct_code pc98_noalloc_code pc98_high_alias
+	SIM_PLUSARGS=+no_line_fill Z486_PC98_MAP=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_pc98/Vtb_protected_mode ./test_protected_mode.py --strict pc98_direct_code pc98_noalloc_code pc98_high_alias
+
 test-386: obj_dir/Vtb_test386
 	@echo "Running test386.asm..."
 	./test386.py
@@ -528,6 +537,7 @@ dhrystone:
 # Clean build artifacts
 clean:
 	rm -rf obj_dir_tags32
+	rm -rf obj_dir_pc98
 	rm -rf obj_dir_x87_testfloat
 	rm -rf obj_dir_x87_fifo
 	rm -rf obj_dir_x87_core
@@ -552,6 +562,7 @@ help:
 	@echo "  make test-memory-order - Run device/store ordering unit test"
 	@echo "  make test-load-waw  - Run same-cycle GPR write-arbitration unit test"
 	@echo "  make test-gpr-hazard - Survey the GPR hazard class (expected findings)"
+	@echo "  make test-pc98-map - Execute/modify code in PC-98 DIRECT/NO_ALLOC windows"
 	@echo "  make check-reset-lists - Audit always_ff reset branches"
 	@echo "  make test-memmap-template - Run memory-map template unit test"
 	@echo "  make test-interrupt-nmi - Run interrupt-controller NMI deferred-delivery bench"
