@@ -256,6 +256,14 @@ obj_dir/Vtb_cache_flush: $(RTL_SRCS) $(RTL_DEPS) $(TB_CACHE_FLUSH_SRCS)
 		$(RTL_SRCS) $(TB_CACHE_FLUSH_SRCS)
 	@echo "Build complete: obj_dir/Vtb_cache_flush"
 
+obj_dir/Vtb_reset_restart: $(RTL_SRCS) $(RTL_DEPS) tb_reset_restart.sv
+	cp -f ../*.hex .
+	$(VERILATOR) --binary --timing -Wno-fatal -Wno-UNOPTFLAT -j $(JOBS) -I$(Z486_DIR) -I$(X87_DIR) \
+		--top-module tb_reset_restart $(RTL_SRCS) tb_reset_restart.sv
+
+test-reset-restart: obj_dir/Vtb_reset_restart
+	./obj_dir/Vtb_reset_restart
+
 obj_dir/Vtb_x87_bridge: $(X87_DIR)/x87_bridge.sv $(TB_X87_BRIDGE_SRCS) $(CPP_X87_BRIDGE_SRCS)
 	@echo "Building x87 bridge unit test with Verilator..."
 	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_x87_bridge $(TB_X87_BRIDGE_SRCS) $(X87_DIR)/x87_bridge.sv $(CPP_X87_BRIDGE_SRCS)
