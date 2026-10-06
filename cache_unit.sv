@@ -372,12 +372,10 @@ logic       icache_write_snoop_pending;
 logic [31:0] icache_write_snoop_addr_r;
 logic [31:0] icache_write_snoop_data_r;
 logic  [3:0] icache_write_snoop_be_r;
-// Normally the I-cache consumes the D-cache's registered S_LOOKUP store
-// directly.  The one-entry pending slot only resolves an external invalidate
-// collision (or holds the following store while an older pending patch is
-// consumed), preserving invalidate priority without returning to live paging
-// request signals.
-wire icache_write_patch_valid = !snoop_valid &&
+// Both external and queued DIRECT invalidates own the single-address port.
+// Keep a collided D-store patch until the MERGED invalidate input falls;
+// looking only at snoop_valid drops the patch behind a DIRECT invalidate.
+wire icache_write_patch_valid = !icache_invalidate_valid &&
                                 (icache_write_snoop_pending ||
                                  dcache_store_patch_valid);
 wire [31:0] icache_write_patch_addr = icache_write_snoop_pending
@@ -407,14 +405,14 @@ always_ff @(posedge clk) begin
         icache_write_snoop_be_r <= 4'h0;
     end else begin
         if (dcache_store_patch_valid &&
-            (snoop_valid || icache_write_snoop_pending)) begin
+            (icache_invalidate_valid || icache_write_snoop_pending)) begin
             // The pending patch, when present, is consumed on this edge. Keep
             // the newly accepted store for the following cycle.
             icache_write_snoop_pending <= 1'b1;
             icache_write_snoop_addr_r <= dcache_store_patch_addr;
             icache_write_snoop_data_r <= dcache_store_patch_data;
             icache_write_snoop_be_r <= dcache_store_patch_be;
-        end else if (icache_write_snoop_pending && !snoop_valid) begin
+        end else if (icache_write_snoop_pending && !icache_invalidate_valid) begin
             icache_write_snoop_pending <= 1'b0;
         end
 
@@ -429,6 +427,13 @@ always_ff @(posedge clk) begin
             icache_cpu_rd_pending <= 1'b0;
     end
 end
+
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && dcache_store_patch_valid && icache_write_snoop_pending &&
+        icache_invalidate_valid)
+        $fatal(1, "Unconsumed I-cache patch overwritten while invalidate owns port");
+// synthesis translate_on
 
 //=============================================================================
 // Native whole-L1 flush controller
@@ -577,7 +582,7 @@ l1_cache #(
     .cpu_uncacheable(1'b0),
     .cpu_ready(dcache_cpu_ready),
     .cpu_wr_ready(dcache_cpu_wr_ready),
-    .store_patch_busy(snoop_valid || icache_write_snoop_pending),
+    .store_patch_busy(icache_invalidate_valid || icache_write_snoop_pending),
     .flush_req(cf_start_r),
     .flush_busy(dcache_flush_busy),
     .flush_done(dcache_flush_done),
