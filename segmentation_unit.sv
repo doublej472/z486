@@ -72,6 +72,8 @@ module segmentation_unit
     input              ac_check,
     input      [1:0]   align_size,
     output             align_fault,
+    output     [31:0]  access_linear,      // linear address of the checked access (debug breakpoints)
+    output     [31:2]  access_dw_next,     // the dword after it (a crossing access's second half)
     output             is_stack_fault,     // Fault is on SS (→ #SS not #GP)
 
     // Decoder D2: issuing instruction, EA recipe, displacement and D2 segment base (ISLA/IESSEG, K2Q)
@@ -357,6 +359,9 @@ wire [1:0] align_linear_low = seg_base_r[1:0] + eff_offset[1:0];
 wire       align_misaligned = (align_size == 2'd1) ? align_linear_low[0] :
                               (align_size == 2'd2) ? (align_linear_low != 2'd0) :
                                                      1'b0;
+assign access_linear = seg_base_r + eff_offset;
+wire [31:0] access_linear_p4 = seg_base_r + eff_offset + 32'd4;
+assign access_dw_next = access_linear_p4[31:2];
 assign align_violation = ac_check && !is_dtable && (seg_sel != SEG_TR) &&
                          (seg_sel != SEG_LDT) && align_misaligned;
 // A limit or write fault on the same access has priority over #AC.

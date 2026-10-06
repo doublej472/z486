@@ -50,6 +50,12 @@ module z486
     // performance.  Set 1 for the architectural 60000010h.
     parameter        RESET_CACHE_DISABLED = 0,
 
+    // 486 feature blocks that cost area but are rarely exercised: hardware
+    // breakpoints (DR0-DR3 matching; GD/BS/BT and the registers themselves
+    // remain) and the TR6/TR7 TLB test port (TR3-TR7 remain readable and
+    // writable).  Both default on for the 486SX feature level.
+    parameter        ENABLE_HW_BREAKPOINTS = 1,
+
     parameter [6:0] CLOCK_RATE_MHZ = 7'd85
 )
 (
@@ -603,7 +609,16 @@ wire       pb_issue_b23 = pb_valid && (i_rni_delay || ~uc_active) &&
                           !interrupt_entry && !any_fault_issue;
 
 // D2 -> EX readiness.
-wire       tf_trap_pending = tf_active_r && !tf_trap_suppress_r;
+// Debug traps at an instruction boundary: the TF single-step trap and the
+// 486 data-breakpoint trap share the boundary; only TF sets DR6.BS.  MOV SS
+// and software-interrupt suppression applies to both.
+wire       db_data_trap;           // an enabled data breakpoint matched this instruction
+wire       ibp_fault_now;          // instruction breakpoint fault in place of the D2 issue
+wire       ibp_issue_hold;         // instruction-breakpoint mode: issue only from a settled idle
+reg        db_mode_r;              // a DR7 breakpoint is enabled (registered)
+wire       db_mode_next;
+wire       tf_single_step_trap = tf_active_r && !tf_trap_suppress_r;
+wire       tf_trap_pending = (tf_active_r || db_data_trap) && !tf_trap_suppress_r;
 wire       interrupt_deliverable = tf_trap_pending || nmi_request_active ||
                                    (intr_pending && EFLAGS[9] && !inhibit_interrupts);
 wire       interrupt_at_boundary = i_rni_delay && interrupt_deliverable && !single_step;
@@ -632,7 +647,7 @@ wire       d2_ready_base = d2_payload_ready && !stall &&
                        throttle_release_cycle) && !any_fault_issue &&
                       !(i_rni && tf_trap_pending && !single_step) &&
                       !interrupt_at_boundary && !q_flush &&
-                      !d2_vipt_ea_hazard;
+                      !d2_vipt_ea_hazard && !ibp_issue_hold;
 assign     d2_ready = d2_ready_base &&
                       !vipt_load_replay_r.valid && !vipt_load_slow_busy &&
                       (!d2_vipt_candidate || d2_vipt_load) &&
@@ -1217,7 +1232,7 @@ hardwired_control hardwired_control_inst (
     .q_flush(q_flush),
     .interrupt_entry(interrupt_entry),
     .interrupt_pending(interrupt_pending),
-    .trap_active(tf_active_r),
+    .trap_active(tf_active_r || db_mode_r),
     .single_step(single_step),
     .any_fault(any_fault),
     .any_fault_r(any_fault_r),
@@ -1638,9 +1653,11 @@ always_ff @(posedge clk) begin
     if (!reset_n)
         direct_hold_r <= 1'b0;
     else
-        direct_hold_r <= ac_check_mode;
+        direct_hold_r <= ac_check_mode || db_mode_next;
 end
 wire        seg_align_fault;
+wire [31:0] seg_access_linear;
+wire [31:2] seg_access_dw_next;
 wire [1:0]  mem_eff_size;            // data access width (0 byte, 1 word, 2 dword)
 reg         ac_fault_r;
 prot_transition_t prot_transition;
@@ -1700,6 +1717,8 @@ segmentation_unit seg_unit (
     .seg_base_exec    (seg_base_exec),
     .eff_mask_exec    (eff_mask_exec),
     .seg_fault        (seg_gp_fault),
+    .access_linear    (seg_access_linear),
+    .access_dw_next   (seg_access_dw_next),
     .ac_check         (ac_check_mode),
     .align_size       (mem_eff_size),
     .align_fault      (seg_align_fault),
@@ -1886,6 +1905,125 @@ assign stall_cache_flush = cache_flush_active && !cache_flush_priv_fault &&
 assign gp_fault_trigger = (seg_gp_fault && !rd_fast_valid_r) ||
                           vipt_slow_seg_trigger ||
                           invlpg_priv_fault || cache_flush_priv_fault;
+
+//=============================================================================
+// 486 debug breakpoints (DR0-DR3, DR7)
+//=============================================================================
+// Any enabled breakpoint turns on a slow mode, as the 486 does: the direct
+// load/RMW pipelines and dead-slot issue are held off, so every data access
+// is a microcode bus operation checked here and every instruction ends at an
+// architectural boundary.  Data breakpoints are traps reported at that
+// boundary; instruction breakpoints are faults taken from a settled idle
+// sequencer, where EIP and the CS base name the instruction about to issue.
+wire [3:0] dr_enable = {DR7[7] | DR7[6], DR7[5] | DR7[4],
+                        DR7[3] | DR7[2], DR7[1] | DR7[0]};
+wire [1:0] dr_rw  [4];
+wire [1:0] dr_len [4];
+wire [31:0] dr_addr [4];
+assign dr_addr[0] = DR0;
+assign dr_addr[1] = DR1;
+assign dr_addr[2] = DR2;
+assign dr_addr[3] = DR3;
+genvar dbi;
+generate for (dbi = 0; dbi < 4; dbi = dbi + 1) begin : g_dr_fields
+    assign dr_rw[dbi]  = DR7[17 + 4*dbi -: 2];
+    assign dr_len[dbi] = DR7[19 + 4*dbi -: 2];
+end endgenerate
+wire [3:0] dr_exec_en = dr_enable & {dr_rw[3] == 2'b00, dr_rw[2] == 2'b00,
+                                     dr_rw[1] == 2'b00, dr_rw[0] == 2'b00};
+assign db_mode_next = ENABLE_HW_BREAKPOINTS && |dr_enable;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        db_mode_r <= 1'b0;
+    else
+        db_mode_r <= db_mode_next;
+end
+
+// The LEN field masks the low address bits: a breakpoint covers 1, 2 or 4
+// aligned bytes.  A data access matches if any byte it touches is covered.
+function automatic [3:0] dr_byte_mask(input [1:0] low, input [1:0] len);
+    case (len)
+        2'b01:   dr_byte_mask = low[1] ? 4'b1100 : 4'b0011;
+        2'b11:   dr_byte_mask = 4'b1111;
+        default: dr_byte_mask = 4'b0001 << low;
+    endcase
+endfunction
+wire [7:0] db_access_bytes = ((mem_eff_size == 2'd0) ? 8'h01 :
+                              (mem_eff_size == 2'd1) ? 8'h03 : 8'h0F)
+                             << seg_access_linear[1:0];
+logic [3:0] db_data_match;
+always_comb begin
+    for (int n = 0; n < 4; n++) begin
+        automatic logic [3:0] bm = dr_byte_mask(dr_addr[n][1:0], dr_len[n]);
+        automatic logic type_ok = (dr_rw[n] == 2'b11) ||
+                                  ((dr_rw[n] == 2'b01) && uc_is_write);
+        db_data_match[n] = type_ok &&
+            (((seg_access_linear[31:2] == dr_addr[n][31:2]) &&
+              |(db_access_bytes[3:0] & bm)) ||
+             ((seg_access_dw_next == dr_addr[n][31:2]) &&
+              |(db_access_bytes[7:4] & bm)));
+    end
+end
+// A data operation that reaches the segment check this cycle.  Retries of a
+// stalled operation only re-set the same sticky bits.
+wire db_data_access = mem_op_eligible && uc_data_busreq && uc_is_mem_busop &&
+                      !mem_is_io && !uc_is_check_write;
+// B0-B3 for every matching breakpoint, enabled or not (486 DR6 semantics);
+// the trap needs an enabled one.  Cleared when the next instruction issues,
+// on a fault (the instruction did not complete) and when the trap is taken.
+reg  [3:0] db_data_hit_r;
+reg        db_data_trap_r;        // registered: keeps the trap off the issue cone
+assign db_data_trap = db_data_trap_r;
+wire db_trap_taken = i_rni_delay && !stall && !page_fault && tf_trap_pending &&
+                     !single_step;
+wire [3:0] db_data_hit_next = (!db_mode_r || any_fault || db_trap_taken) ? 4'd0 :
+                              ((i_issue ? 4'd0 : db_data_hit_r) |
+                               (db_data_access ? db_data_match : 4'd0));
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        db_data_hit_r <= 4'd0;
+        db_data_trap_r <= 1'b0;
+    end else begin
+        db_data_hit_r <= db_data_hit_next;
+        db_data_trap_r <= ENABLE_HW_BREAKPOINTS &&
+                          |(db_data_hit_next & dr_enable & ~dr_exec_en);
+    end
+end
+
+// Instruction breakpoints compare the linear address of the next
+// instruction's first byte (its first prefix).  In this mode an instruction
+// issues only from an idle sequencer, after a cycle in which nothing ran or
+// issued: EIP and the CS base were then stable, so the compare made in that
+// cycle is current.  The decision is registered, keeping the comparator and
+// its adder off the issue cone.
+reg  [3:0] ibp_match_r;
+reg        ibp_ok_r;              // issue may proceed (no breakpoint, or RF)
+reg        ibp_fault_ready_r;     // a code breakpoint is due at the idle issue
+wire [31:0] ibp_linear = CS_base + EIP;
+logic [3:0] ibp_match_now;
+always_comb
+    for (int n = 0; n < 4; n++)
+        ibp_match_now[n] = (dr_rw[n] == 2'b00) && (ibp_linear == dr_addr[n]);
+wire ibp_settled = !uc_active && !i_issue;
+wire ibp_due = |(ibp_match_now & dr_exec_en) && !EFLAGS[16];
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        ibp_match_r <= 4'd0;
+        ibp_ok_r <= 1'b1;
+        ibp_fault_ready_r <= 1'b0;
+    end else begin
+        ibp_match_r <= ibp_match_now;
+        ibp_ok_r <= !ENABLE_HW_BREAKPOINTS || !(|dr_exec_en) ||
+                    (ibp_settled && !ibp_due);
+        ibp_fault_ready_r <= ENABLE_HW_BREAKPOINTS && (|dr_exec_en) &&
+                             ibp_settled && ibp_due;
+    end
+end
+assign ibp_issue_hold = !ibp_ok_r;
+// RF=1 (set by IRET from the debug handler) lets the instruction run once.
+assign ibp_fault_now = ibp_fault_ready_r && pb_valid && !uc_active && !halted &&
+                       !interrupt_entry && !fault_suppress_delay_slot;
+wire ibp_fault_taken = ibp_fault_now && !stall && !page_fault;
 
 // Deferred GPR commits cancel on any_fault_issue only: a divide overflow fires
 // deep inside DIV's microcode, never while a load or hardwired recipe commits.
@@ -2418,9 +2556,12 @@ event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
     // Interrupt controller and debug traps
     .intr_pending(intr_pending),
     .nmi_request_active(nmi_request_active),
-    .interrupt_pending(interrupt_pending),
+    // A data breakpoint ends a REP iteration like an interrupt request.
+    .interrupt_pending(interrupt_pending || db_data_trap),
     .inhibit_interrupts(inhibit_interrupts),
     .tf_trap_pending(tf_trap_pending),
+    .trap_single_step(tf_single_step_trap),
+    .ibp_fault_now(ibp_fault_now),
     .single_step(single_step),
     // FPU handshake
     .x87_pereq(x87_pereq),
@@ -2901,6 +3042,13 @@ always_ff @(posedge clk) begin
             default: TR7 <= IND & 32'hFFFF_FC1C;
         endcase
 
+    // Hardware breakpoint status: the #DB redirect edge records B0-B3 before
+    // the delivery microcode reads DR6 (the TF entry ORs in BS next).
+    if (db_trap_taken && |db_data_hit_r)
+        DR6[3:0] <= DR6[3:0] | db_data_hit_r;
+    else if (ibp_fault_taken)
+        DR6[3:0] <= DR6[3:0] | ibp_match_r;
+
     // Keep captures in the non-reset arm: old i_first/page_fault levels can
     // otherwise override reset on the very edge that clears those levels.
     // TMPeIP/TMPeSP: save EIP/ESP at instruction start and fault entry
@@ -3026,6 +3174,7 @@ data_unit data_unit_inst (
     .interrupt_entry(interrupt_entry),
     .any_fault(any_fault_r),
     .clear_rf(clear_rf),
+    .set_rf(ibp_fault_taken),
     .gate_detect(gate_detect_now),
     .flags_backup_active(flags_backup_active),
     // Decoder: EX and D2 instruction, operand sizes, stack-operation class (ispval)

@@ -1066,6 +1066,9 @@ localparam [11:0] UADDR_FAULT_ENTRY_LAST  = 12'h873;
 localparam [11:0] UADDR_HARDWARE_IRQ   = 12'h82D;  // INTR handler entry point
 localparam [11:0] UADDR_NMI            = 12'h836;  // NMI handler entry point
 localparam [11:0] UADDR_SINGLE_STEP    = 12'h93F;  // #DB(1) - TF single-step trap
+// #DB body after the TF entry's DR6.BS update; the task-switch T-bit trap
+// also enters here.  Hardware breakpoints record DR6.Bn themselves.
+localparam [11:0] UADDR_DEBUG_TRAP     = 12'h941;
 localparam [11:0] UADDR_TSS_PROBLEM    = 12'h85D;  // #TS path used by protected-mode descriptor checks
 localparam [11:0] UADDR_FPU_STORE_TAIL = 12'h57B;  // Final 16-bit word of an m80 store
 localparam [11:0] UADDR_RPTI_RNI       = 12'h20F;  // REP interrupt restart boundary
