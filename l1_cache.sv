@@ -273,7 +273,7 @@ wire flush_block = flush_req_new | flush_pending_r | flush_busy_r;
 assign flush_busy = flush_busy_r;
 assign flush_done = flush_done_r;
 
-assign cpu_ready = ready_r;
+assign cpu_ready = ready_r && !flush_block;
 assign store_patch_addr = req_addr_r;
 assign store_patch_data = req_din_r;
 assign store_patch_be = req_be_r;
@@ -444,7 +444,7 @@ wire vipt_lookup_store_match = (state == S_LOOKUP) && req_valid_r &&
 assign vipt_resolve_data = vipt_lookup_store_match
                          ? merge32(vipt_way_data, req_din_r, req_be_r)
                          : vipt_way_data;
-assign vipt_resolve_hit = vipt_resolve_valid && cache_enable &&
+assign vipt_resolve_hit = vipt_resolve_valid && cache_enable && !flush_block &&
                           (vipt_resolve_phys_addr[31:17] != 15'h5) &&
                           !(snoop_valid_r && (snoop_set_r ==
                             vipt_resolve_phys_addr[SET_MSB:SET_LSB])) &&
@@ -470,12 +470,13 @@ wire flush_launch = (flush_req_new | flush_pending_r) &&
 reg  lookup_wr_room_r;
 wire lookup_store_busy = (state == S_LOOKUP) && req_valid_r &&
                          req_write_r && !req_protect_write_r;
-wire lookup_wr_open = lookup_store_busy && lookup_wr_room_r && !store_patch_busy;
+wire lookup_wr_open = lookup_store_busy && lookup_wr_room_r &&
+                      !store_patch_busy && !flush_block;
 // The one-entry downstream patch slot can stay stranded across idle cycles.
 // Hold ALL stores, not just the pipelined LOOKUP opening, until it can drain.
 assign cpu_wr_ready = (cpu_ready && !store_patch_busy) || lookup_wr_open;
 wire lookup_wr_accept = cpu_valid && cpu_write && lookup_wr_open;
-wire accept_cpu = (cpu_valid && ready_r && can_accept_cpu) || lookup_wr_accept;
+wire accept_cpu = (cpu_valid && cpu_ready && can_accept_cpu) || lookup_wr_accept;
 wire [29:0] req_addr_dw = req_addr_r[31:2];
 wire [29:0] fill_addr_dw = {req_addr_r[31:4], fill_count};
 logic [31:0] lookup_forward_data;
@@ -538,7 +539,7 @@ end
 // no request is accepted the preread results are garbage that S_LOOKUP never
 // sees (it is only entered on accept_cpu).  This keeps the TLB-hit cone off
 // the wide rd_*_r register enables.
-wire idle_preread = (state == S_IDLE) && ready_r;
+wire idle_preread = (state == S_IDLE) && cpu_ready;
 // The store-pipelining preread, likewise ungated by the late accept.
 wire lookup_wr_preread = lookup_wr_open;
 // A posted store patches at most one data way during S_LOOKUP.  The inferred
@@ -548,7 +549,7 @@ wire lookup_wr_preread = lookup_wr_open;
 // tag, and a probe that misses falls back to the paging path, which chooses
 // any victim from current PLRU state.
 wire store_lookup_preread = (state == S_LOOKUP) && req_valid_r &&
-                            req_write_r && !req_protect_write_r;
+                            req_write_r && !req_protect_write_r && !flush_block;
 // Store hits patch the cache before it can accept another probe; store misses
 // have no matching line, and later fills are patched before the tag is valid.
 // Capacity is a registered-state fact. Demand arbitration must not feed back

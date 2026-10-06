@@ -191,7 +191,7 @@ reg [127:0] line_r;
 reg resp_valid_r;
 reg ready_r;
 
-assign cpu_ready = ready_r;
+assign cpu_ready = ready_r && !flush_block;
 
 function automatic [1:0] way_encode(input [3:0] hit_vec);
 begin
@@ -323,7 +323,7 @@ wire lookup_snoop_conflict =
 wire lookup_hit_usable = lookup_hit && !lookup_snoop_conflict;
 
 wire can_accept_cpu = (state == S_IDLE) && !reset;
-wire accept_cpu = cpu_valid && ready_r && can_accept_cpu;
+wire accept_cpu = cpu_valid && cpu_ready && can_accept_cpu;
 // The sweep starts one cycle after the request is observed, when ready_r has
 // already been forced low so no fetch can be accepted in the same cycle.  It
 // waits only for the internal reset walk, which never touches the bus.
