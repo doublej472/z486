@@ -81,6 +81,7 @@ module cache_unit
     input  logic dcache_req_is_inta,
     input  logic dcache_req_is_vga_mem,
     input  logic dcache_req_is_pcd,
+    input  logic dcache_req_is_locked,
     input  logic cache_cd,
     input  logic cache_nw,
 
@@ -586,6 +587,7 @@ l1_cache #(
     // or any read while CR0.CD=1, may hit but does not allocate.  Writes never
     // allocate in this write-through cache.
     .cpu_uncacheable(!dcache_cpu_write && (dcache_req_is_pcd || cache_cd)),
+    .cpu_force_bus(!fast_store_valid && !dcache_cpu_write && dcache_req_is_locked),
     .cache_nw(cache_nw),
     .cpu_ready(dcache_cpu_ready),
     .cpu_wr_ready(dcache_cpu_wr_ready),

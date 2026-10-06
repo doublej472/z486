@@ -139,7 +139,13 @@ module z486
     output     z486_dbg_t dbg,
 
     // A fault while delivering #DF shuts down the 386 and requests reset.
-    output triple_fault_reset
+    output triple_fault_reset,
+
+    // 486 LOCK#: other bus masters must not take the memory bus while high.
+    // Asserted from a locked read (LOCK prefix, XCHG with memory, the TSS
+    // busy-bit update) until the instruction's writes have left the CPU, and
+    // across an interrupt-acknowledge pair.
+    output             lock
 );
 
 //=============================================================================
@@ -448,6 +454,8 @@ wire        dcache_req_is_inta;
 wire        dcache_req_is_x87;
 wire        dcache_req_is_vga_mem;
 wire        dcache_req_is_pcd;
+wire        dcache_req_is_locked;
+wire        dcache_stores_drained_top;
 wire        icache_req_is_pcd;
 wire        dcache_req_accepted;
 wire        dcache_req_complete;
@@ -878,6 +886,8 @@ memory #(
     .dcache_req_is_x87(dcache_req_is_x87),
     .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
     .dcache_req_is_pcd(dcache_req_is_pcd),
+    .dcache_req_is_locked(dcache_req_is_locked),
+    .dcache_stores_drained_out(dcache_stores_drained_top),
     .cache_cd(CR0[30]),
     .cache_nw(CR0[29]),
     .dcache_req_accepted(dcache_req_accepted),
@@ -2112,6 +2122,57 @@ assign pf_spec_store = (mem_req_to_paging && mem_write_now && mem_accepted) || s
 assign pf_spec_store_linear = paging_linear_addr;
 wire        paging_owned_submit = vipt_slow_submit || ucrd_slow_submit;
 wire        paging_live_valid  = paging_owned_submit ? 1'b1 : ind_linear_valid;
+
+//=============================================================================
+// 486 bus locking (LOCK#)
+//=============================================================================
+// A LOCK-prefixed read-modify-write and XCHG with a memory operand lock the
+// bus for the whole instruction; the TSS busy-bit update locks from its read.
+// A locked read is never served by the L1 (it waits for the store queue and
+// reads memory); its write updates a valid line as usual.  The lock drops once
+// the instruction has ended and its stores have left the CPU.
+// Registered at issue from the D2 entry (the EX instruction register is
+// latched on the same edge), so no opcode decode sits in the UCRD cone.
+reg  lock_insn;
+always_ff @(posedge clk) begin
+    if (!reset_n || any_fault)          // fault delivery is not locked
+        lock_insn <= 1'b0;
+    else if (i_issue)
+        lock_insn <= (i_bus.rep_lock == PREFIX_LOCK) ||
+                     (!i_bus.has_0f && (i_bus.opcode[7:1] == 7'b1000011) &&
+                      i_bus.has_modrm && (i_bus.modrm[7:6] != 2'b11));
+end
+wire lock_read_uop = (lock_insn || (uc_buscode == BUSOP_RD_OPR_WORD)) && !uc_is_write;
+reg  bus_lock_r;
+reg  bus_lock_end_r;
+reg  [1:0] inta_lock_r;      // 0 idle, 1 after the first INTA, 2 after the second
+wire lock_read_accept = mem_req_to_paging && mem_accepted && !mem_write_now &&
+                        lock_read_uop && !paging_owned_submit;
+wire iack_accept = iack_req_to_paging && mem_accepted;
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        bus_lock_r <= 1'b0;
+        bus_lock_end_r <= 1'b0;
+        inta_lock_r <= 2'd0;
+    end else begin
+        if (lock_read_accept)
+            bus_lock_r <= 1'b1;
+        if (bus_lock_r && ((i_rni_delay && !stall) || any_fault || interrupt_entry))
+            bus_lock_end_r <= 1'b1;
+        if (bus_lock_end_r && !mem_servicing && dcache_stores_drained_top &&
+            !lock_read_accept) begin
+            bus_lock_r <= 1'b0;
+            bus_lock_end_r <= 1'b0;
+        end
+        case (inta_lock_r)
+            2'd0: if (iack_accept) inta_lock_r <= 2'd1;
+            2'd1: if (iack_accept) inta_lock_r <= 2'd2;
+            default: if (!mem_servicing) inta_lock_r <= 2'd0;
+        endcase
+    end
+end
+assign lock = bus_lock_r || (inta_lock_r != 2'd0);
+
 wire        paging_mem_rd_ind = !x87_direct_mem_req && !paging_owned_submit &&
                                 (uc_buscode == BUSOP_RD_IND);
 wire        paging_is_write_access = !x87_direct_mem_req && !paging_owned_submit &&
@@ -2226,6 +2287,7 @@ data_access data_access_inst (
     .i_issue(i_issue),
     .single_step(single_step),
     .direct_hold(direct_hold_r),
+    .locked_insn(lock_insn),
     .d2_plain_load_overlap_ready(d2_plain_load_overlap_ready),
     .d2_vipt_candidate(d2_vipt_candidate),
     .d2_vipt_load(d2_vipt_load),
@@ -2319,6 +2381,7 @@ paging_unit #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) paging_inst (
     .mem_rd_ind         (paging_mem_rd_ind),
     .is_write_access    (paging_is_write_access),
     .mem_check_only     (paging_owned_submit ? 1'b0 : uc_is_check_write),
+    .mem_locked         (!paging_owned_submit && lock_read_uop),
     .pretrans_valid     ((ucrd_slow_submit && ucrd_phys_ok_r) ||
                          (vipt_slow_submit && vipt_slow_phys_ok_r)),
     .pretrans_phys      (ucrd_slow_submit ? ucrd_phys_r : vipt_slow_phys_r),
@@ -2364,6 +2427,7 @@ paging_unit #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) paging_inst (
     .dcache_req_is_x87  (dcache_req_is_x87),
     .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
     .dcache_req_is_pcd(dcache_req_is_pcd),
+    .dcache_req_is_locked(dcache_req_is_locked),
     .dcache_req_accepted(dcache_req_accepted),
     .dcache_req_complete(dcache_req_complete),
     .dcache_read_complete(dcache_read_complete),

@@ -80,6 +80,8 @@ module memory
     input              dcache_req_is_x87,
     input              dcache_req_is_vga_mem,
     input              dcache_req_is_pcd,    // page-level cache disable: a read miss does not allocate
+    input              dcache_req_is_locked, // locked read: memory, never the L1
+    output             dcache_stores_drained_out, // no posted store remains in the CPU
     // CR0.CD: no line allocates.  CR0.NW: write hits stay in the L1 and
     // external invalidations are ignored (486 cache operating modes).
     input              cache_cd,
@@ -177,6 +179,7 @@ wire dcache_req_is_uncached;
 wire dcache_req_is_direct;
 wire [31:0] dcache_req_phys_addr;
 wire dcache_stores_drained;
+assign dcache_stores_drained_out = dcache_stores_drained;
 wire [31:0] icache_mem_addr;
 wire [3:0] icache_mem_be;
 wire [7:0] icache_mem_burstcount;
@@ -245,6 +248,7 @@ cache_unit #(
     .dcache_req_is_inta(dcache_req_is_inta),
     .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
     .dcache_req_is_pcd(dcache_req_is_pcd),
+    .dcache_req_is_locked(dcache_req_is_locked),
     .cache_cd(cache_cd),
     .cache_nw(cache_nw),
     // Execution core: WR_FAST store and VIPT load/RMW preread

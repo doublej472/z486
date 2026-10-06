@@ -13,5 +13,8 @@
   },
   "d_init": 0,
   "page_tables": [],
-  "continue_on_hlt": true
+  "continue_on_hlt": true,
+  "sim_plusargs": [
+    "expect_inta_lock"
+  ]
 }

@@ -115,6 +115,7 @@ module data_access
     // Alignment checking or a debug breakpoint needs every data access on
     // the microcode path: hold the direct load and RMW pipelines off.
     input  logic                    direct_hold,
+    input  logic                    locked_insn,      // the executing instruction locks the bus
     output logic                    d2_plain_load_overlap_ready,
     output logic                    d2_vipt_candidate,
     output logic                    d2_vipt_load,
@@ -724,8 +725,10 @@ assign vipt_slow_addr_owned = vipt_load_slow_req_r;
 // A cacheable, non-crossing first-uStep EA read (or x87 direct operand read)
 // with paging idle probes the cache instead of entering paging; a missed one
 // enters paging from its token.
+// A locked read (LOCK prefix, XCHG with memory) must read memory, so it never
+// takes the cache-probing microcode-read path.
 wire        ucrd_uc_read = uc_data_busreq && uc_is_mem_busop &&
-    !uc_is_write && !uc_is_check_write && !mem_is_io &&
+    !uc_is_write && !uc_is_check_write && !mem_is_io && !locked_insn &&
     (uc_buscode != BUSOP_RD_IND) && i_first && i_ex.ind_is_ea && !x87_direct_mem_req;
 wire [1:0]  ucrd_size_now = x87_direct_mem_req ? 2'd2 : mem_eff_size;
 assign ucrd_route_pre = mem_op_eligible && (ucrd_uc_read || x87_direct_mem_req) &&
