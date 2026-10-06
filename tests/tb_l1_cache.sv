@@ -269,6 +269,52 @@ module tb_l1_cache;
     end
     endtask
 
+    // Two sets can occupy the same way RAM. Its single write port must not
+    // lose a snoop clear when an unrelated fill completes on that edge.
+    task automatic fill_snoop_collision(input bit wide, input bit cancel_fill);
+    begin
+        do @(negedge clk); while (!cpu_ready);
+        reset = 1'b1;
+        wide_mode = wide;
+        repeat (5) @(negedge clk);
+        reset = 1'b0;
+        repeat (20) @(negedge clk);
+        mem_put32(32'h40, 32'h1122_3344);
+        mem_put32(32'h10, 32'h5566_7788);
+        cache_read(32'h40, 4'hF, 32'h1122_3344);
+        do @(negedge clk); while (!cpu_ready);
+        mem_put32(32'h40, 32'hDEAD_BEEF);
+        fork
+            cache_read(32'h10, 4'hF, 32'h5566_7788);
+            begin
+                do @(negedge clk); while (!(dut.fill_count == 2'd2 &&
+                    (wide ? dut.wide_fill_install : mem_resp_valid)));
+                snoop_addr = 32'h40;
+                snoop_valid = 1'b1;
+                @(negedge clk);
+                if (dut.fill_way != 0 || dut.fill_set != 1 ||
+                    dut.snoop_set_r != 4 || !dut.snoop_valid_r)
+                    $fatal(1, "D-cache fill/snoop collision was not exercised");
+                // Keep the port busy with OTHER sets after this one-cycle
+                // event: repeating 0x40 would hide a dropped first clear.
+                snoop_addr = cancel_fill ? 32'h10 : 32'h80;
+                if (cancel_fill) mem_put32(32'h10, 32'h8765_4321);
+                repeat (3) @(negedge clk);
+                snoop_valid = 1'b0;
+            end
+        join
+        do @(negedge clk); while (!cpu_ready);
+        mem_request_before = mem_request_count;
+        cache_read(32'h10, 4'hF, cancel_fill ? 32'h8765_4321 : 32'h5566_7788);
+        if (!cancel_fill && mem_request_count != mem_request_before)
+            $fatal(1, "D-cache fill/snoop collision lost the unrelated fill");
+        if (cancel_fill && mem_request_count == mem_request_before)
+            $fatal(1, "D-cache deferred fill reinstated a later-snooped line");
+        cache_read(32'h40, 4'hF, 32'hDEAD_BEEF);
+        $display("D-cache different-set fill/snoop PASS wide=%0b cancel=%0b", wide, cancel_fill);
+    end
+    endtask
+
     initial begin
         fork
             begin
@@ -368,6 +414,11 @@ module tb_l1_cache;
             $display("L1 WIDE FILL was not installed after one line response");
             $fatal(1);
         end
+
+        fill_snoop_collision(1'b0, 1'b0);
+        fill_snoop_collision(1'b1, 1'b0);
+        fill_snoop_collision(1'b0, 1'b1);
+        fill_snoop_collision(1'b1, 1'b1);
 
         $display("L1 PIPT cache unit test PASS");
         $finish;
