@@ -456,6 +456,7 @@ wire        dcache_req_is_x87;
 wire        dcache_req_is_vga_mem;
 wire        dcache_req_is_pcd;
 wire        dcache_req_is_locked;
+reg         bus_lock_r;             // LOCK# from a locked read until its stores drain
 wire        dcache_stores_drained_top;
 wire        icache_req_is_pcd;
 wire        dcache_req_accepted;
@@ -911,6 +912,7 @@ memory #(
     .dcache_stores_drained_out(dcache_stores_drained_top),
     .cache_cd(CR0[30]),
     .cache_nw(CR0[29]),
+    .bus_locked(bus_lock_r),
     .dcache_req_accepted(dcache_req_accepted),
     .dcache_req_complete(dcache_req_complete),
     .dcache_read_complete(dcache_read_complete),
@@ -2204,7 +2206,6 @@ always_ff @(posedge clk) begin
                       i_bus.has_modrm && (i_bus.modrm[7:6] != 2'b11));
 end
 wire lock_read_uop = (lock_insn || (uc_buscode == BUSOP_RD_OPR_WORD)) && !uc_is_write;
-reg  bus_lock_r;
 reg  bus_lock_end_r;
 reg  [1:0] inta_lock_r;      // 0 idle, 1 after the first INTA, 2 after the second
 wire lock_read_accept = mem_req_to_paging && mem_accepted && !mem_write_now &&
