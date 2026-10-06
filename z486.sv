@@ -1093,19 +1093,18 @@ always_ff @(posedge clk) begin
     else
         pf_snoop_kill_r <= snoop_valid;
 end
-// The native flush kills any buffered speculative line once, on the same
+// The native flush kills the buffered speculative line on the same
 // conservative policy as external coherence: the buffered line may hold code
-// fetched before the flush.  Keep it a one-cycle event like the other terms.
+// fetched before the flush.  The kill is held for the whole busy window (and
+// the registered cycle after it): the I-cache keeps serving its pre-flush
+// lines while the posted stores drain, so a branch-target fetch launched
+// then is poisoned rather than buffered past the sweep.
 reg         pf_flush_kill_r;
-reg         cache_flush_busy_prev_r;
 always_ff @(posedge clk) begin
-    if (!reset_n) begin
+    if (!reset_n)
         pf_flush_kill_r <= 1'b0;
-        cache_flush_busy_prev_r <= 1'b0;
-    end else begin
-        cache_flush_busy_prev_r <= cache_flush_busy;
-        pf_flush_kill_r <= cache_flush_busy && !cache_flush_busy_prev_r;
-    end
+    else
+        pf_flush_kill_r <= cache_flush_busy;
 end
 assign pf_spec_global_kill = pf_snoop_kill_r || cr3_write ||
                              (uc_exec && (uc_dest == DEST_CR0)) ||
