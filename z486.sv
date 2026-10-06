@@ -603,7 +603,7 @@ wire [31:0] spec_target_lin;
 wire        pf_spec_req;
 reg         pf_spec_owner_r;
 wire        pf_spec_store;
-wire [31:0] pf_spec_store_linear;
+wire [11:4] pf_spec_store_line;
 wire        pf_spec_global_kill;
 wire        prot_redirect_prev;
 wire        prot_redirect_taken;
@@ -992,7 +992,7 @@ prefetch prefetch_inst (
     .spec_linear(spec_target_lin),
     .spec_owner(pf_spec_owner_r),
     .spec_store_valid(pf_spec_store),
-    .spec_store_linear(pf_spec_store_linear),
+    .spec_store_line(pf_spec_store_line),
     .spec_global_kill(pf_spec_global_kill)
 );
 
@@ -2142,8 +2142,23 @@ wire [31:0] paging_linear_addr = vipt_slow_addr_owned
 wire [3:0]  mem_be_now = iack_busop ? 4'b1111 :
                           calc_be(paging_mem_eff_size,
                                   paging_linear_addr[1:0]);
-assign pf_spec_store = (mem_req_to_paging && mem_write_now && mem_accepted) || st_take;
-assign pf_spec_store_linear = paging_linear_addr;
+// Every store reports its line to the branch-target buffer: the paging-path
+// writes, and both direct store ports (WR_FAST st_take and the RMW_FAST write
+// of ADD/SUB/AND/OR/XOR m,r and INC/DEC/NOT/NEG m).  Only the page-offset line
+// bits are reported: they are equal in the linear and physical address, so a
+// store through another linear alias of the code page still matches.
+wire        pf_rmw_store = fast_store_valid && !st_take;
+wire        pf_paging_store = mem_req_to_paging && mem_write_now && mem_accepted;
+assign pf_spec_store = pf_paging_store || fast_store_valid;
+assign pf_spec_store_line = pf_rmw_store ? rmw_fast_phys_r[11:4]
+                                         : paging_linear_addr[11:4];
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && pf_paging_store && pf_rmw_store &&
+        (paging_linear_addr[11:4] != rmw_fast_phys_r[11:4]))
+        $fatal(1, "spec store report: paging write %08x and RMW_FAST write %08x in one cycle",
+               paging_linear_addr, rmw_fast_phys_r);
+// synthesis translate_on
 wire        paging_owned_submit = vipt_slow_submit || ucrd_slow_submit;
 wire        paging_live_valid  = paging_owned_submit ? 1'b1 : ind_linear_valid;
 
