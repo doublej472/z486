@@ -73,6 +73,7 @@ module event_control
     input  logic ss_fault_r,
     input  logic ss_fault_newstack_r, // that #SS hit the new stack of a privilege switch
     input  logic page_fault,
+    input  logic ifetch_limit_fault,  // fetch past the CS limit: #GP(0) for the next instruction
     input  logic [2:0] pg_fault_code,
     input  logic [31:0] pg_cr2_out,
     input  logic div_overflow,
@@ -131,6 +132,8 @@ reg        fault_seen_r;
 reg        fault_combine_active;
 reg        gp_fault_double_r;
 wire       fault_start = any_fault && !fault_seen_r;
+// Either fetch-side fault replaces the next instruction at its boundary.
+wire       frontend_fault = page_fault || ifetch_limit_fault;
 assign double_fault_start = (fault_delivery_state == FAULT_DELIVERING) &&
                                 fault_combine_active;
 // The microcode can re-enter the exception-entry cluster on its own while a
@@ -303,6 +306,11 @@ always_comb begin
                                                                     : UADDR_STACK_FAULT) :
                                                   UADDR_GENERAL_FAULT1);
     end
+    if (ifetch_limit_fault) begin
+        seq_fault_redirect.valid = 1'b1;
+        seq_fault_redirect.target = double_fault_start
+                                  ? UADDR_DOUBLE_FAULT : UADDR_GENERAL_FAULT1;
+    end
     if (page_fault) begin
         seq_fault_redirect.valid = 1'b1;
         seq_fault_redirect.target = double_fault_start
@@ -321,7 +329,7 @@ end
 // into demand-memory control.
 always_comb begin
     seq_boundary_redirect = '0;
-    if (i_rni_delay && !stall && !page_fault) begin
+    if (i_rni_delay && !stall && !frontend_fault) begin
         if (tf_trap_pending && !single_step) begin
             seq_boundary_redirect.valid = 1'b1;
             seq_boundary_redirect.target = trap_single_step ? UADDR_SINGLE_STEP
@@ -334,7 +342,7 @@ always_comb begin
             seq_boundary_redirect.valid = 1'b1;
             seq_boundary_redirect.target = UADDR_HARDWARE_IRQ;
         end
-    end else if (ibp_fault_now && !stall && !page_fault) begin
+    end else if (ibp_fault_now && !stall && !frontend_fault) begin
         // A code breakpoint is a fault before the instruction: EIP still
         // names it, and the shared #DB body takes it from there.
         seq_boundary_redirect.valid = 1'b1;
@@ -441,7 +449,7 @@ always_ff @(posedge clk) begin
         if (interrupt_entry)
             instr_eip_written <= 1'b0;
 
-        if (i_rni_delay && !stall && !page_fault) begin
+        if (i_rni_delay && !stall && !frontend_fault) begin
             dbg_first_done <= 1'b1;
             if (single_step)
                 halted <= 1'b1;
@@ -498,14 +506,16 @@ always_ff @(posedge clk) begin
             latched_pf_code <= pg_fault_code;
             latched_pf_addr <= pg_cr2_out;
         end
+        if (ifetch_limit_fault)
+            uc_active <= 1'b1;
 
-        if (ibp_fault_now && !stall && !page_fault) begin
+        if (ibp_fault_now && !stall && !frontend_fault) begin
             uc_active <= 1'b1;
             interrupt_entry <= 1'b1;
         end
 
         // Interrupt recognition is last so it overrides speculative successor state.
-        if (i_rni_delay && !stall && !page_fault) begin
+        if (i_rni_delay && !stall && !frontend_fault) begin
             if (tf_trap_pending && !single_step) begin
                 uc_active <= 1'b1;
                 interrupt_entry <= 1'b1;
