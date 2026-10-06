@@ -248,6 +248,10 @@ function automatic [8:0] ind_ctrl_predecode(input [36:0] w);
             BUSOP_LPCR:         op = 4'd9;
             default:            op = 4'd0;
         endcase
+        // MOV r,TRn's LPCR names the IRF (the TR file), not a page-cache
+        // register: read it through the LBAS path, where z486 supplies it.
+        if ((buscode == BUSOP_LPCR) && (dest == DEST_IRF))
+            op = 4'd8;
         if (dest == DEST_DESSTK)
             dest_class = 3'd1;
         else if (dest == DEST_DESCOD)

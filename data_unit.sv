@@ -1130,7 +1130,7 @@ always_ff @(posedge clk) begin
                         write_gpr(dst_reg_sel_r, alu_result, op_size);
 
                 DEST_IRF:
-                    if (countr[5:3] != 3'b100)
+                    if (irf_is_gpr(countr))
                         write_gpr(countr[2:0], dest_value,
                                   is_dword ? 2'd2 : 2'd1);
                 default: ;
