@@ -2217,15 +2217,24 @@ always_ff @(posedge clk) begin
         bus_lock_end_r <= 1'b0;
         inta_lock_r <= 2'd0;
     end else begin
-        if (lock_read_accept)
-            bus_lock_r <= 1'b1;
         if (bus_lock_r && ((i_rni_delay && !stall) || any_fault || interrupt_entry))
             bus_lock_end_r <= 1'b1;
-        if (bus_lock_end_r && !mem_servicing && dcache_stores_drained_top &&
-            !lock_read_accept) begin
+        if (bus_lock_end_r && !mem_servicing && dcache_stores_drained_top) begin
             bus_lock_r <= 1'b0;
             bus_lock_end_r <= 1'b0;
         end
+        // A locked read accepted while the previous locked instruction's lock
+        // is still draining starts a new locked sequence: the pending end
+        // belongs to the older instruction and must not drop LOCK# between
+        // this read and its write.
+        if (lock_read_accept) begin
+            bus_lock_r <= 1'b1;
+            bus_lock_end_r <= 1'b0;
+        end
+        // synthesis translate_off
+        if (lock_read_accept && i_rni_delay && !stall)
+            $fatal(1, "locked read accepted in an RNI delay slot: its lock end would be lost");
+        // synthesis translate_on
         case (inta_lock_r)
             2'd0: if (iack_accept) inta_lock_r <= 2'd1;
             2'd1: if (iack_accept) inta_lock_r <= 2'd2;
