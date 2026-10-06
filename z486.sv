@@ -1893,7 +1893,9 @@ end
 wire invlpg_active = uc_active && i_first &&
     (i.ucode_action == RECIPE_ACTION_INVLPG);
 wire invlpg_priv_fault = invlpg_active && pe && (cpl != 2'b00);
-wire invlpg_request = invlpg_active && !invlpg_priv_fault && !seg_gp_fault;
+// INVLPG accesses no memory, so it is not segment-checked: its only faults
+// are #GP(0) above CPL0 and #UD for a register operand (i486 PRM).
+wire invlpg_request = invlpg_active && !invlpg_priv_fault;
 wire invlpg_ack;
 // Waiting for an older page walk does not depend on seg_fault.
 assign stall_invlpg = invlpg_active && !invlpg_priv_fault && !invlpg_ack;
@@ -2756,7 +2758,7 @@ assign uc_is_wio = uc_p_wio;  // WIO: wait for interrupt/IO (HLT, only with RPT)
 assign uc_is_rpt = uc_p_rpt;
 
 // GP Fault Detection — handled by segmentation_unit
-assign gp_fault_mem_op = invlpg_active || x87_direct_mem_req ||
+assign gp_fault_mem_op = x87_direct_mem_req ||
                          rd_fast_valid_r ||
                          (uc_is_mem_busop && (uc_buscode != BUSOP_RD_D));
 assign gp_fault_wr_op = rd_fast_valid_r || uc_is_write ||
