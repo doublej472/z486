@@ -373,8 +373,20 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False):
     # Calculate expected number of reads (for timeout)
     nbytes = test.get('bytes', [])
     _, opcode, data32 = decode_opcode_and_width(nbytes, init_regs)
-    is_pushfd = cpu_mode == '486' and opcode == 0x9C and data32
+    fin_regs0 = test['final'].get('regs', {})
+    # The instruction itself completed: no exception moved CS.
+    completed = fin_regs0.get('cs', init_regs.get('cs', 0)) == init_regs.get('cs', 0)
+    is_pushfd = (cpu_mode == '486' and opcode == 0x9C and data32 and
+                 completed)
     is_popfd = cpu_mode == '486' and opcode == 0x9D and data32
+    # The final state is an interrupt/exception handler entry.
+    delivered = (not completed and opcode is not None and
+                 (is_fault_test(test) or opcode in (0xCC, 0xCD, 0xCE)))
+
+    # Real-mode IRETD loads all of EFLAGS from the popped image (Intel486 PRM,
+    # IRET/IRETD Operation: "EFLAGS <- Pop()"), including the 486's AC.
+    is_iretd = (cpu_mode == '486' and opcode == 0xCF and data32 and
+                not (init_regs.get('cr0', 0) & 1))
     reads = 0
     if nbytes:
         reads = (len(nbytes) + 3) // 4  # Round up to 32-bit reads
@@ -555,6 +567,31 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False):
                 popped = sum(init_mem[stack_addr + offset] << (8 * offset)
                              for offset in range(4))
                 expected_val = (expected_val & ~0x00040000) | (popped & 0x00040000)
+
+        # IRETD: AC comes from the EFLAGS dword at SS:SP+8 (SP wraps at 64K).
+        if reg == 'eflags' and is_iretd:
+            init_mem = dict(init.get('ram', []))
+            sp16 = init_regs.get('esp', 0) & 0xFFFF
+            ss_base = init_regs.get('ss', 0) << 4
+            addrs = [(ss_base + ((sp16 + 8 + k) & 0xFFFF)) & 0xFFFFFFFF
+                     for k in range(4)]
+            if all(a in init_mem for a in addrs):
+                popped = sum(init_mem[a] << (8 * k) for k, a in enumerate(addrs))
+                expected_val = (expected_val & ~0x00040000) | (popped & 0x00040000)
+
+        # A real-mode interrupt or exception delivery clears AC with IF and TF
+        # (Intel SDM, INT n/INTO/INT3 Operation, REAL-ADDRESS-MODE: "AC <- 0";
+        # the core's CROM masks EFLAGS to its low word).  The 386 has no AC, so
+        # its bit 18 is not a 486 result.
+        if reg == 'eflags' and cpu_mode == '486' and delivered:
+            expected_val &= ~0x00040000
+
+        # EFLAGS bits 31:19 are reserved on the Intel486 and read as 0
+        # (Intel486 PRM Figure 2-9); the 386 capture reports its own value
+        # there, which a 486 cannot reproduce.  Compare bits 18:0 only.
+        if reg == 'eflags' and cpu_mode == '486':
+            expected_val &= 0x0007FFFF
+            got_val &= 0x0007FFFF
 
         # Apply mask if available
         mask_val = None
