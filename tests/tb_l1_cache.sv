@@ -342,6 +342,24 @@ module tb_l1_cache;
         cache_read(32'h40, 4'hF, 32'h4433_2211);       // miss + fill
         cache_read(32'h40, 4'hF, 32'h4433_2211);       // hit
         demand_over_vipt(32'h40, 32'h4433_2211);
+        // The probe's tag read and snoop capture share this edge. Resolve in
+        // the registered clearing cycle must miss just like a demand lookup.
+        do @(negedge clk); while (!vipt_probe_ready);
+        vipt_probe_offset = 12'h040;
+        vipt_probe_valid = 1'b1;
+        snoop_addr = 32'h40;
+        snoop_valid = 1'b1;
+        @(negedge clk);
+        vipt_probe_valid = 1'b0;
+        snoop_valid = 1'b0;
+        vipt_resolve_phys_addr = 32'h40;
+        vipt_resolve_valid = 1'b1;
+        #1;
+        if (vipt_resolve_hit)
+            $fatal(1, "D-cache VIPT resolve hit in the registered snoop clear cycle");
+        @(negedge clk);
+        vipt_resolve_valid = 1'b0;
+        cache_read(32'h40, 4'hF, 32'h4433_2211);
         vipt_read(32'h0000_0040, 32'h0000_0040, 1'b1, 32'h4433_2211);
         vipt_read(32'h0000_0040, 32'h0100_0040, 1'b0, 32'd0);
         // Complete physical tags distinguish lines separated by 32MB.

@@ -446,6 +446,8 @@ assign vipt_resolve_data = vipt_lookup_store_match
                          : vipt_way_data;
 assign vipt_resolve_hit = vipt_resolve_valid && cache_enable &&
                           (vipt_resolve_phys_addr[31:17] != 15'h5) &&
+                          !(snoop_valid_r && (snoop_set_r ==
+                            vipt_resolve_phys_addr[SET_MSB:SET_LSB])) &&
                           (|vipt_hit_vec);
 wire [BRAM_ADDR_BITS-1:0] req_bram_addr = {req_set_r, req_word_r};
 wire can_accept_cpu = (state == S_IDLE) && !reset && (!cpu_write || cpu_protect_write || storeq_can_accept);
