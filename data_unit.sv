@@ -1532,8 +1532,11 @@ always_ff @(posedge clk) begin
             flags_backup <= eflags;
         end
     end else if (exec && dest == DEST_FLAGSB) begin
-        if (!flags_backup_active)
-            flags_backup <= dest_value;
+        // Words combining FLGSBA with FLAGSB <- EFLAGS (the instruction-start
+        // backup idiom) take the branch above.  The words reaching here load
+        // FLAGSB on purpose -- the task switch's new-task image at 788/789,
+        // after which a fault belongs to the new task -- so always write.
+        flags_backup <= dest_value;
     end else if (fault_set_rf) begin
         // Fault-class delivery: the CROM sets EFLAGS.RF (MASK16 + 1) before
         // it pushes the FLAGSB image; a 486 pushes RF=1 for every fault so
