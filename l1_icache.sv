@@ -37,6 +37,10 @@ module l1_icache #(
     input         patch_valid,
     input  [31:0] invalidate_addr,
     input         invalidate_valid,
+    // A CPU store patch exists but cannot be presented on patch_* because an
+    // invalidate owns the port (its address is not visible here): every
+    // lookup is treated as a conflict until it is delivered.
+    input         patch_held,
 
     // Native whole-L1 invalidate.  flush_req is a one-cycle request (a held
     // level is also accepted: one walk per release); flush_busy is high for the
@@ -331,7 +335,8 @@ wire [127:0] lookup_way_line = way_line_mux(lookup_way, rd_line0_r, rd_line1_r, 
 // it out of this hit cone avoids a system-to-prefetch timing path.
 wire lookup_snoop_conflict =
     (snoop_valid_r && (snoop_tag_r == req_tag_r) && (snoop_set_r == req_set_r)) ||
-    (patch_valid && (patch_tag == req_tag_r) && (patch_set == req_set_r));
+    (patch_valid && (patch_tag == req_tag_r) && (patch_set == req_set_r)) ||
+    patch_held;
 wire lookup_hit_usable = lookup_hit && !lookup_snoop_conflict;
 
 wire can_accept_cpu = (state == S_IDLE) && !reset;
