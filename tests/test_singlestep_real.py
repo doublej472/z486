@@ -274,6 +274,82 @@ def get_shxd_count_width(nbytes, init_regs):
     return count, width
 
 
+def undefined_flags_mask(nbytes, init_regs, shxd_count):
+    """AND-mask of the EFLAGS bits the instruction leaves defined.
+
+    MUL/IMUL: SF/ZF/AF/PF undefined.  BT/BTS/BTR/BTC: only CF defined.
+    BSF/BSR: only ZF defined.  SHLD/SHRD: AF undefined, OF undefined for a
+    count other than 1.  Shifts/rotates: OF undefined for a count above 1, and
+    for SHL/SHR/SAL/SAR CF is undefined when the count reaches the width.
+    """
+    prefixes = {0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3}
+    idx = 0
+    while idx < len(nbytes) and nbytes[idx] in prefixes:
+        idx += 1
+    if idx >= len(nbytes):
+        return 0xFFFFFFFF
+    mask = 0xFFFFFFFF
+    opcode = nbytes[idx]
+    op2 = nbytes[idx + 1] if idx + 1 < len(nbytes) else None
+    modrm_reg = (op2 >> 3) & 7 if op2 is not None else None
+
+    if opcode == 0x0F and op2 == 0xAF:
+        mask &= 0xFFFFFF2B  # IMUL r,r/m
+    elif opcode in (0x69, 0x6B):
+        mask &= 0xFFFFFF2B  # IMUL r,r/m,imm
+    elif opcode in (0xF6, 0xF7) and modrm_reg in (4, 5):
+        mask &= 0xFFFFFF2B  # MUL/IMUL r/m
+
+    if opcode == 0x0F and op2 is not None:
+        if op2 in (0xA3, 0xAB, 0xB3, 0xBB):
+            mask &= 0xFFFFF72B  # BT/BTS/BTR/BTC Ev,Gv
+        elif op2 == 0xBA and idx + 2 < len(nbytes) and ((nbytes[idx + 2] >> 3) & 7) >= 4:
+            mask &= 0xFFFFF72B  # BT/BTS/BTR/BTC Ev,Ib
+        elif op2 in (0xBC, 0xBD):
+            mask &= 0xFFFFF76A  # BSF/BSR
+
+    if shxd_count is not None:
+        mask &= 0xFFFFFFEF  # SHLD/SHRD: AF
+        if shxd_count != 1:
+            mask &= 0xFFFFF7FF  # OF
+
+    grp2_count = None
+    if opcode in (0xC0, 0xC1):
+        grp2_count = nbytes[-1] & 0x1F
+    elif opcode in (0xD0, 0xD1):
+        grp2_count = 1
+    elif opcode in (0xD2, 0xD3):
+        grp2_count = init_regs.get('ecx', 0) & 0x1F
+    if grp2_count is not None and modrm_reg is not None:
+        if opcode in (0xC0, 0xD0, 0xD2):
+            width = 8
+        else:
+            has_66 = 0x66 in nbytes[:idx]
+            if init_regs.get('d', 0):
+                width = 16 if has_66 else 32
+            else:
+                width = 32 if has_66 else 16
+        if grp2_count > 1:
+            mask &= 0xFFFFF7FF  # OF
+        if modrm_reg in (4, 5, 6, 7) and grp2_count >= width:
+            mask &= 0xFFFFFFFE  # CF
+    return mask
+
+
+def is_div_fault(nbytes, init_regs, final_regs):
+    """DIV/IDIV (F6/F7 /6,/7) that raised a divide error (CS changed)."""
+    prefixes = {0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3}
+    idx = 0
+    while idx < len(nbytes) and nbytes[idx] in prefixes:
+        idx += 1
+    if idx + 1 >= len(nbytes) or nbytes[idx] not in (0xF6, 0xF7):
+        return False
+    if ((nbytes[idx + 1] >> 3) & 7) not in (6, 7):
+        return False
+    init_cs = init_regs.get('cs', 0)
+    return final_regs.get('cs', init_cs) != init_cs
+
+
 def run_test(test, global_mask, cpu_mode='486', notrace=False):
     """
     Run a single test case through the testbench.
@@ -487,158 +563,17 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False):
             expected_val = apply_mask(expected_val, mask_val)
             got_val = apply_mask(got_val, mask_val)
 
-        # For MUL/IMUL, SF/ZF/AF/PF are undefined - mask them out for eflags comparison
-        # MUL/IMUL opcodes: F6/5, F7/5 (one-op), 0F AF (two-op), 69/6B (three-op)
+        # Flags the instruction leaves undefined (Intel docs) are not compared.
         if reg == 'eflags' and nbytes:
-            is_mul_imul = False
-            # Skip prefixes to find the actual opcode
-            prefixes = {0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3}
-            idx = 0
-            while idx < len(nbytes) and nbytes[idx] in prefixes:
-                idx += 1
-            if idx < len(nbytes):
-                opcode = nbytes[idx]
-                if opcode == 0x0F and idx + 1 < len(nbytes) and nbytes[idx + 1] == 0xAF:
-                    is_mul_imul = True  # IMUL r,r/m (two-op)
-                elif opcode in (0x69, 0x6B):
-                    is_mul_imul = True  # IMUL r,r/m,imm (three-op)
-                elif opcode in (0xF6, 0xF7) and idx + 1 < len(nbytes):
-                    modrm = nbytes[idx + 1]
-                    reg_field = (modrm >> 3) & 7
-                    if reg_field in (4, 5):  # MUL=4, IMUL=5
-                        is_mul_imul = True
-            if is_mul_imul:
-                # Mask out SF(7), ZF(6), AF(4), PF(2) - these are undefined
-                undef_mask = 0xFFFFFF2B  # ~(0x80 | 0x40 | 0x10 | 0x04)
+            undef_mask = undefined_flags_mask(nbytes, init_regs, shxd_count)
+            if undef_mask != 0xFFFFFFFF:
                 expected_val = expected_val & undef_mask
                 got_val = got_val & undef_mask
-                if mask_val is None:
-                    mask_val = undef_mask
-                else:
-                    mask_val = mask_val & undef_mask
-
-            # For BT/BTS/BTR/BTC, only CF is defined - mask out OF, SF, ZF, AF, PF
-            # Opcodes: 0F A3 (BT), 0F AB (BTS), 0F B3 (BTR), 0F BB (BTC), 0F BA /4-7 (imm8)
-            is_bit_test = False
-            if idx < len(nbytes) and opcode == 0x0F and idx + 1 < len(nbytes):
-                op2 = nbytes[idx + 1]
-                if op2 in (0xA3, 0xAB, 0xB3, 0xBB):
-                    is_bit_test = True  # BT/BTS/BTR/BTC Ev,Gv
-                elif op2 == 0xBA and idx + 2 < len(nbytes):
-                    modrm = nbytes[idx + 2]
-                    reg_field = (modrm >> 3) & 7
-                    if reg_field in (4, 5, 6, 7):  # BT/BTS/BTR/BTC Ev,Ib
-                        is_bit_test = True
-            if is_bit_test:
-                # Mask out OF(11), SF(7), ZF(6), AF(4), PF(2) - only CF is defined
-                undef_mask = 0xFFFFF72B  # ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04)
-                expected_val = expected_val & undef_mask
-                got_val = got_val & undef_mask
-                if mask_val is None:
-                    mask_val = undef_mask
-                else:
-                    mask_val = mask_val & undef_mask
-
-            # For BSF/BSR, only ZF is defined - mask out CF, OF, SF, AF, PF
-            # Opcodes: 0F BC (BSF), 0F BD (BSR)
-            is_bit_scan = False
-            if idx < len(nbytes) and opcode == 0x0F and idx + 1 < len(nbytes):
-                op2 = nbytes[idx + 1]
-                if op2 in (0xBC, 0xBD):
-                    is_bit_scan = True  # BSF/BSR Gv,Ev
-            if is_bit_scan:
-                # Mask out OF(11), SF(7), CF(0), AF(4), PF(2) - only ZF is defined
-                undef_mask = 0xFFFFF76A  # ~(0x800 | 0x80 | 0x10 | 0x04 | 0x01)
-                expected_val = expected_val & undef_mask
-                got_val = got_val & undef_mask
-                if mask_val is None:
-                    mask_val = undef_mask
-                else:
-                    mask_val = mask_val & undef_mask
+                mask_val = undef_mask if mask_val is None else mask_val & undef_mask
 
             # For DIV/IDIV with divide error, EFLAGS is undefined (Intel docs)
-            # Opcodes: F6/6 (DIV), F6/7 (IDIV), F7/6 (DIV), F7/7 (IDIV)
-            is_div_idiv = False
-            if idx < len(nbytes) and opcode in (0xF6, 0xF7) and idx + 1 < len(nbytes):
-                modrm = nbytes[idx + 1]
-                reg_field = (modrm >> 3) & 7
-                if reg_field in (6, 7):  # DIV=6, IDIV=7
-                    is_div_idiv = True
-            if is_div_idiv:
-                # Check if a divide error occurred (CS changed = exception taken)
-                init_cs = init_regs.get('cs', 0)
-                expected_cs = final_regs.get('cs', init_cs)
-                if init_cs != expected_cs:
-                    # Divide error occurred - EFLAGS is undefined per Intel docs
-                    # Skip EFLAGS comparison entirely
-                    expected_val = got_val  # Force match
-
-            # For SHLD/SHRD, OF is undefined when count != 1
-            # Opcodes: 0F A4 (SHLD Ib), 0F A5 (SHLD CL), 0F AC (SHRD Ib), 0F AD (SHRD CL)
-            if shxd_count is not None:
-                # For SHLD/SHRD, AF is undefined for all counts.
-                undef_mask = 0xFFFFFFEF  # ~0x10
-                if shxd_count != 1:
-                    # OF is undefined when count != 1.
-                    undef_mask &= 0xFFFFF7FF  # ~0x800
-                expected_val = expected_val & undef_mask
-                got_val = got_val & undef_mask
-                if mask_val is None:
-                    mask_val = undef_mask
-                else:
-                    mask_val = mask_val & undef_mask
-
-            # For shifts/rotates, OF is undefined when count > 1
-            # Opcodes: C0/C1 (grp2 imm8), D0/D1 (grp2 count=1), D2/D3 (grp2 count=CL)
-            is_grp2_shift = False
-            grp2_count = None
-            grp2_modrm_reg = None
-            grp2_width = None
-            if idx < len(nbytes):
-                if opcode in (0xC0, 0xC1):
-                    is_grp2_shift = True
-                    grp2_count = nbytes[-1] & 0x1F  # imm8 masked to 5 bits
-                elif opcode in (0xD0, 0xD1):
-                    is_grp2_shift = True
-                    grp2_count = 1
-                elif opcode in (0xD2, 0xD3):
-                    is_grp2_shift = True
-                    init_ecx = init_regs.get('ecx', 0)
-                    grp2_count = init_ecx & 0x1F  # CL masked to 5 bits
-                if is_grp2_shift and idx + 1 < len(nbytes):
-                    grp2_modrm_reg = (nbytes[idx + 1] >> 3) & 7
-                    # Determine operand width based on opcode
-                    if opcode in (0xC0, 0xD0, 0xD2):  # Eb (byte)
-                        grp2_width = 8
-                    else:  # Ev (word/dword)
-                        # Check for operand size prefix (66h)
-                        has_66 = 0x66 in nbytes[:idx]
-                        d_bit = init_regs.get('d', 0)
-                        if d_bit:
-                            grp2_width = 16 if has_66 else 32
-                        else:
-                            grp2_width = 32 if has_66 else 16
-            if is_grp2_shift and grp2_count is not None and grp2_count > 1:
-                # Mask out OF(11) - undefined for count > 1
-                undef_mask = 0xFFFFF7FF  # ~0x800
-                expected_val = expected_val & undef_mask
-                got_val = got_val & undef_mask
-                if mask_val is None:
-                    mask_val = undef_mask
-                else:
-                    mask_val = mask_val & undef_mask
-            # For SHL/SHR/SAR, CF is undefined when count >= width
-            # modrm_reg: SHL=4, SHR=5, SAL=6(undocumented), SAR=7
-            if (is_grp2_shift and grp2_count is not None and grp2_width is not None
-                    and grp2_modrm_reg in (4, 5, 6, 7) and grp2_count >= grp2_width):
-                # Mask out CF(0) - undefined for count >= width
-                undef_mask = 0xFFFFFFFE  # ~0x01
-                expected_val = expected_val & undef_mask
-                got_val = got_val & undef_mask
-                if mask_val is None:
-                    mask_val = undef_mask
-                else:
-                    mask_val = mask_val & undef_mask
+            if is_div_fault(nbytes, init_regs, final_regs):
+                expected_val = got_val  # Force match
 
         if got_val != expected_val:
             if mask_val is not None:
@@ -678,6 +613,28 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False):
                         div_flags_addrs = {flags_addr, flags_addr + 1}
                         skip_flags_ram = True
 
+    # A fault taken after the instruction completed (the trailing HLT could
+    # not be fetched) pushes FLAGS as the instruction left them: the bits it
+    # leaves undefined are undefined in that image too.  The frame's IP then
+    # differs from the instruction's own IP.
+    frame_flags_mask = {}
+    final_cs = final_regs.get('cs', init_regs.get('cs', 0))
+    if nbytes and final_cs != init_regs.get('cs', 0) and 'esp' in final_regs:
+        undef = undefined_flags_mask(nbytes, init_regs, shxd_count)
+        # The capture's own EFLAGS mask names the flags it left undefined.
+        if final_mask and 'eflags' in final_mask:
+            undef &= final_mask['eflags']
+        fin_mem = dict(final_ram)
+        ss_base = final_regs.get('ss', init_regs.get('ss', 0)) << 4
+        fsp = final_regs['esp'] & 0xFFFF
+        ip_addrs = [(ss_base + ((fsp + k) & 0xFFFF)) for k in range(2)]
+        fl_addrs = [(ss_base + ((fsp + 4 + k) & 0xFFFF)) for k in range(2)]
+        if undef != 0xFFFFFFFF and all(a in fin_mem for a in ip_addrs):
+            pushed_ip = fin_mem[ip_addrs[0]] | (fin_mem[ip_addrs[1]] << 8)
+            if pushed_ip != (init_regs.get('eip', 0) & 0xFFFF):
+                frame_flags_mask = {fl_addrs[0]: undef & 0xFF,
+                                    fl_addrs[1]: (undef >> 8) & 0xFF}
+
     for addr, expected_val in final_ram:
         # Skip FLAGS bytes for divide error (undefined per Intel)
         if skip_flags_ram and addr in div_flags_addrs:
@@ -696,6 +653,10 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False):
             if addr == ac_addr:
                 expected_val = ((expected_val & ~0x04) |
                                 ((init_regs.get('eflags', 0) >> 16) & 0x04))
+
+        if got_val is not None and addr in frame_flags_mask:
+            expected_val &= frame_flags_mask[addr]
+            got_val &= frame_flags_mask[addr]
 
         if got_val is None:
             errors.append(f"RAM @{addr:08x} not found in results")
