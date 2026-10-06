@@ -23,6 +23,13 @@ TB = Path(os.environ.get('Z486_TESTBENCH', TESTS / 'obj_dir' / 'Vtb_z486'))
 TEST_DIR = TESTS / 'singlestep_protected' / 'v1'
 
 VERBOSE = False
+# Expected-result model.  The vectors come from 86Box, which pushes the
+# pre-instruction RF (0) in a fault frame.  A 486 sets RF in the EFLAGS image
+# pushed before entry into any fault handler (i486 Programmer's Reference,
+# 11.3.1.1), so '486' expects that bit; '386' compares the vectors unchanged.
+CPU = '486'
+# Exceptions that push an error code ahead of EIP/CS/EFLAGS.
+ERROR_CODE_VECTORS = {8, 10, 11, 12, 13, 14, 17}
 
 
 def build_if_needed():
@@ -300,8 +307,16 @@ def run_test(test, verbose=False, notrace=True):
                 errors.append(f"{seg}.flags: expected 0x{expected_seg['flags']:04x}, got 0x{got_seg['flags']:04x}")
                 ok = False
 
-        # Check RAM
+        # Check RAM.  For a fault on a 486 the pushed EFLAGS image carries
+        # RF=1: it sits at the handler-entry ESP + 8 (+4 with an error code).
+        rf_byte = None
+        if CPU == '486' and expected_fault and 'esp' in final_regs:
+            vec = expected_fault.get('vector')
+            rf_byte = (final_regs['esp'] + (12 if vec in ERROR_CODE_VECTORS else 8)
+                       + 2) & 0xFFFFFFFF
         for addr, expected_val in final_ram:
+            if addr == rf_byte:
+                expected_val |= 0x01
             got_val = mem_results.get(addr)
             if got_val is None:
                 errors.append(f"RAM @{addr:08x} not found in results")
@@ -575,7 +590,7 @@ function filterCards(mode, btn) {
 
 
 def main():
-    global VERBOSE
+    global VERBOSE, CPU
 
     parser = argparse.ArgumentParser(description='Protected Mode Single-Step Test Runner')
     parser.add_argument('-f', '--file', help='JSON test file name (without path)')
@@ -585,10 +600,13 @@ def main():
     parser.add_argument('-j', '--jobs', type=int, default=None, help='Parallel jobs')
     parser.add_argument('--dir', type=str, default=None, help='Test directory override')
     parser.add_argument('--skip-faults', action='store_true', help='Skip tests that expect faults')
+    parser.add_argument('--cpu', choices=('386', '486'), default='486',
+                        help='Expected-result model: 486 expects RF=1 in fault frames (default: 486)')
     parser.add_argument('-nt', '--notrace', action='store_true', help='Do not generate trace.vcd waveform')
     parser.add_argument('--html', type=str, default=None, nargs='?', const='pm_report.html',
                         help='Generate HTML report (default: pm_report.html)')
     args = parser.parse_args()
+    CPU = args.cpu
 
     VERBOSE = args.verbose
     test_dir = Path(args.dir) if args.dir else TEST_DIR
