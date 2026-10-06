@@ -37,9 +37,9 @@ added to before trusting it.
 | C3 | D$ load vs pipelined store patch | a read that prereads the data RAM in the cycle a store patches it takes the registered patch value | checked | `patch_fwd_hit` (`l1_cache.sv`) |
 | C4 | D$ store→load forwarding | a younger store to the same dword is merged over an older one, oldest→youngest | guarded | ordered merge in `l1_cache.sv`; `store_fwd_word*` and `tb_l1_cache` |
 | C5 | D$ store queue vs uncacheable/IO ordering | IO/INTA/device accesses drain older stores; direct VGA transactions remain mutually ordered but may bypass unrelated RAM stores | guarded | `tb_memory_order` checks both drain and intentional VGA bypass |
-| C6 | I$ lookup vs snoop/patch | a fetch whose tag was captured before a same-line snoop or pending patch must miss | proven | `lookup_snoop_conflict` (`l1_icache.sv`, `eb6f9c4`) |
+| C6 | I$ lookup vs snoop/patch | a fetch whose tag was captured before a same-line snoop or pending patch must miss; while a store patch is held behind an invalidate (address not visible), every lookup misses | proven | `lookup_snoop_conflict` (`l1_icache.sv`, `eb6f9c4`), `patch_held`; `tb_cache_coherence` CASES 2-3 |
 | C7 | I$ fill vs snoop | a snoop that clears the fill's line cannot be reinstated; a snoop that owns the way port defers the install instead of dropping it | proven | `fill_line_snooped_r`, `fill_tag_wait_r`; `tb_l1_icache` |
-| C8 | I$ fill vs in-flight D$ stores | a fill merges the D$ store queue and the live store over the gathered line | proven | `l1_icache.sv` fill merge; `storeq_fwd` |
+| C8 | I$ fill vs in-flight D$ stores | a fill merges the I$ patch queue (the last three D$ store patches) and the registered patch over the gathered line; a whole-L1 flush retires the queue | proven | `l1_icache.sv` fill merge (`patchq_*`, `snoop_patch_r`); `tb_cache_coherence` CASES 1, 6 |
 | C9 | D$→I$ store patch delivery | a store patch is not dropped when it collides with an external invalidate; invalidate has priority | guarded | `tb_memory_order` strands a patch behind external then queued DIRECT invalidates; `tb_l1_cache` checks idle store backpressure |
 | C10 | external snoop fan-out | one snoop reaches both caches with the same address | checked | `cache_unit.sv` wiring; `tb_l1_icache`, `tb_l1_cache` |
 | C11 | whole-L1 flush | a sweep completes bounded regardless of in-flight fills, and a request during a walk is queued | proven | `8c5a832`; `tb_cache_flush` |
@@ -48,6 +48,10 @@ added to before trusting it.
 | C14 | page-walker cache coherency | PDE/PTE reads and A/D write-backs observe and update the D$ | guarded | `pte_cache_coherence`: cached PTE update, INVLPG, new-frame read/write and old-frame preservation |
 | C15 | VIPT probe races | a speculative probe never beats a demand, and a probe that races a patch takes the patch | proven | `vipt_hit_vec`, `vipt_probe_share`, replay; `tb_l1_icache`/`tb_l1_cache` |
 | C16 | page-table A/D write-back elision | a write-back that would change no bit is skipped | proven | `paging_walker.sv`; `tb_paging_walker` |
+| C17 | branch-target buffer vs stores | every store (paging path, WR_FAST, RMW_FAST) kills a buffered target line with the same page-offset line bits, so a linear alias also matches | **fixed** | `spec_store_hit` (`prefetch.sv`), `pf_spec_store` (`z486.sv`); `smc_spec_buffer`, `smc_spec_buffer_rm` |
+| C18 | I$ patch queue vs whole-L1 flush | a flush retires every queued patch, so a later fill cannot merge CPU bytes over DMA data | **fixed** | `l1_icache.sv` (`flush_launch`); `dma_flush_patchq`, `tb_cache_coherence` CASE 6 |
+| C19 | branch-target buffer vs flush drain | the buffer stays killed for the whole flush busy window, so no line read from the pre-flush I$ during the drain survives | **fixed** | `pf_flush_kill_r` (`z486.sv`); `flush_async_spec` |
+| C20 | I$ lookup vs held store patch | see C6: a patch held in `cache_unit`'s slot behind an invalidate blocks hits | **fixed** | `patch_held`; `tb_cache_coherence` CASES 2-3 |
 
 ## Found: C1/C2, the D$ external-snoop guards (upstream omission)
 
@@ -166,6 +170,35 @@ while a flush was armed. `tb_l1_cache` accepts the older store/probe, arms the
 flush, requires all new openings/resolve hits to close, and then checks the
 older store survives. Both caches mask read acceptance at the arm boundary.
 
+## Found: C17-C20, self-modifying code and the platform flush
+
+An audit of self-modifying code and of the PC-98 platform's DMA flush (which
+replaces the snoop on that platform) found four defects:
+
+- **C17.** The prefetcher's branch-target buffer (`spec_line` and its victim)
+  was killed only by paging-path stores and WR_FAST, on the full linear line
+  address. The RMW_FAST store (ADD/SUB/AND/OR/XOR m,r and INC/DEC/NOT/NEG m)
+  was never reported, and a store through another linear alias of the code
+  page did not match, so a self-patching loop kept its old code after the
+  back-edge jump. Every store now reports its page-offset line bits [11:4],
+  which are untranslated.
+- **C18.** The I$ patch queue was cleared only by a same-line snoop, so after
+  "CPU writes a buffer, DMA loads code, platform flushes" the next fill merged
+  the CPU's stale bytes over the DMA data. The queue only covers fills in
+  flight, and a flush drains the posted stores first and cancels every fill,
+  so the sweep start retires it.
+- **C19.** The buffer kill was a one-cycle pulse when the flush went busy, but
+  the I$ keeps serving its pre-flush lines while the posted stores drain; a
+  branch-target fetch in that window kept the old line past the sweep. The kill
+  now lasts the whole busy window.
+- **C20.** A store patch stranded in `cache_unit`'s one-entry slot behind an
+  invalidate (a held snoop, or a one-cycle DIRECT-write invalidate) was not a
+  lookup conflict, so a fetch hit the old line.
+
+`tb_protected_mode` port 0xCC schedules an asynchronous platform flush with a
+bus stall (`+async_stall=W`) for C19; `tb_cache_coherence` checks C18 and C20
+at the `memory.sv` boundary.
+
 ## 486 cache operating modes and locked cycles
 
 CR0.CD, CR0.NW, PCD and LOCK change *when* the L1s allocate or are bypassed,
@@ -179,7 +212,11 @@ never the coherence contract above:
 - NW=1 (only legal with CD=1) keeps write hits in the D-cache and ignores
   external snoops. This is the 486's cache-as-RAM mode; after a flush it is
   simply "cache off". Software that leaves NW=1 with valid lines accepts the
-  same staleness a 486 would show.
+  same staleness a 486 would show. One difference is a known limit: a 486's
+  unified cache would execute code written into a valid line under NW=1, but
+  this core's split I$ fills from memory plus its three-entry patch queue, so
+  with more than three later stores the old code runs.
+  Self-modifying code under CD=NW=1 is not expected in practice.
 - A locked read waits for the store queue, reads memory even when the line is
   valid, and its write updates the line; `lock` stays high until the write has
   left the store queue.
