@@ -456,11 +456,10 @@ check-reset-lists:
 	@python3 test_reset_lists.py
 	@python3 $(Z486_DIR)/scripts/check_reset_lists.py
 
-# SURVEY BENCH: reports hazards the core still has, and is expected to fail
-# until the age-order arbitration is made structural.  Not a release gate.
+# The survey's old findings were fixed; a new finding must fail the gate.
 test-gpr-hazard: obj_dir/Vtb_gpr_hazard
-	@echo "Running GPR hazard survey bench (findings are expected)..."
 	@./obj_dir/Vtb_gpr_hazard | tee obj_dir/z486_gpr_hazard.out
+	@grep -q 'GPR HAZARD SURVEY: no hazards observed' obj_dir/z486_gpr_hazard.out
 
 # The shared producer arbitration: one order for the commit and all views.
 test-gpr-merge: obj_dir/Vtb_gpr_write_merge
@@ -561,7 +560,7 @@ help:
 	@echo "  make test-l1-icache - Run PIPT L1 instruction cache unit test"
 	@echo "  make test-memory-order - Run device/store ordering unit test"
 	@echo "  make test-load-waw  - Run same-cycle GPR write-arbitration unit test"
-	@echo "  make test-gpr-hazard - Survey the GPR hazard class (expected findings)"
+	@echo "  make test-gpr-hazard - Gate the GPR hazard survey"
 	@echo "  make test-pc98-map - Execute/modify code in PC-98 DIRECT/NO_ALLOC windows"
 	@echo "  make check-reset-lists - Audit always_ff reset branches"
 	@echo "  make test-memmap-template - Run memory-map template unit test"
