@@ -67,6 +67,7 @@ module event_control
     input  logic any_fault_r,
     input  logic gp_fault_trigger,
     input  logic gp_fault_r,
+    input  logic ac_fault_r,       // the registered #GP-path fault is an alignment check
     input  logic ss_segment_fault,
     input  logic ss_fault_r,
     input  logic page_fault,
@@ -269,6 +270,7 @@ always_comb begin
     if (gp_fault_r) begin
         seq_fault_redirect.valid = 1'b1;
         seq_fault_redirect.target = gp_fault_double_r ? UADDR_DOUBLE_FAULT :
+                                    ac_fault_r ? UADDR_ALIGN_FAULT :
                                     (ss_fault_r ? UADDR_STACK_FAULT :
                                                   UADDR_GENERAL_FAULT1);
     end
