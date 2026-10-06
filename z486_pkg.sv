@@ -890,6 +890,7 @@ localparam ALUSRC_CONST_100 = 6'h0A;  // 0x100, descriptor Accessed bit (z486 ad
 localparam ALUSRC_TMPB = 6'h0B;
 localparam ALUSRC_TMPC = 6'h0C;
 localparam ALUSRC_TMPD = 6'h0D;
+localparam ALUSRC_CONST_200 = 6'h0E;  // 0x200, TSS descriptor Busy bit (z486 addition)
 localparam ALUSRC_OPR_R = 6'h0F;
 localparam ALUSRC_ALLONES = 6'h10;    // 0xFFFFFFFF mask
 localparam ALUSRC_TMPG = 6'h12;

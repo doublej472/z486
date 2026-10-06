@@ -525,6 +525,7 @@ function automatic logic [31:0] read_alu_source(input logic [5:0] field);
         ALUSRC_TMPB: read_alu_source = tmpb;
         ALUSRC_TMPC: read_alu_source = tmpc;
         ALUSRC_TMPD: read_alu_source = tmpd;
+        ALUSRC_CONST_200: read_alu_source = 32'h200;
         ALUSRC_OPR_R: read_alu_source = opr_r;
         ALUSRC_TMPG: read_alu_source = tmpg;
         ALUSRC_TMPH: read_alu_source = slctr;
