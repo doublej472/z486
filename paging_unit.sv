@@ -27,6 +27,14 @@ module paging_unit
     input        [31:0] invlpg_linear,
     output              invlpg_ack,
 
+    // 486 TLB test registers (see paging_tlb)
+    input               tlbt_req,
+    input        [31:0] tlbt_tr6,
+    input        [31:0] tlbt_tr7,
+    output              tlbt_lookup_done,
+    output       [31:0] tlbt_tr6_out,
+    output       [31:0] tlbt_tr7_out,
+
     //=========================================================================
     // LA bus, requester 2 (segmentation, E stage): demand memory/IO request
     //=========================================================================
@@ -294,7 +302,14 @@ paging_tlb #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) tlb_inst (
     .update_pcd     (tlb_update_pcd),
     .invalidate_all (cr3_write),
     .invalidate_page(invlpg_fire),
-    .invalidate_vpn (invlpg_linear[31:12])
+    .invalidate_vpn (invlpg_linear[31:12]),
+    .tlbt_req       (tlbt_req),
+    .tlbt_tr6       (tlbt_tr6),
+    .tlbt_tr7       (tlbt_tr7),
+    .tlbt_done      (),
+    .tlbt_lookup_done(tlbt_lookup_done),
+    .tlbt_tr6_out   (tlbt_tr6_out),
+    .tlbt_tr7_out   (tlbt_tr7_out)
 );
 
 //=============================================================================
