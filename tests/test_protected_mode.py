@@ -339,9 +339,10 @@ def run_simulation(test_name, test_config, hex_file, code_phys_base, verbose=Fal
             print(f"  stderr: {result.stderr}")
 
     # Check result
-    passed = "TEST PASSED" in result.stdout
     failed = "TEST FAILED" in result.stdout
     timeout = "TIMEOUT" in result.stdout
+    passed = (result.returncode == 0 and "TEST PASSED" in result.stdout
+              and not failed and not timeout)
 
     return passed, failed, timeout, result.stdout
 
@@ -444,6 +445,7 @@ Examples:
     parser.add_argument('--keep', action='store_true', help='Keep intermediate files')
     parser.add_argument('-c', '--cycles', type=int, default=20_000, help='Max cycles')
     parser.add_argument('--list', action='store_true', help='List available tests')
+    parser.add_argument('--strict', action='store_true', help='Reject expected failures (release gate)')
 
     args = parser.parse_args()
 
@@ -476,6 +478,12 @@ Examples:
             return 1
         tests_to_run = [name for name in tests_to_run
                         if not TESTS[name].get("requires_x87", False)]
+
+    if args.strict:
+        expected = [name for name in tests_to_run if TESTS[name].get('expect_fail')]
+        if expected:
+            print('Error: expected failures are not release passes: ' + ', '.join(expected))
+            return 1
 
     # Run tests
     passed_count = 0

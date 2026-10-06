@@ -139,6 +139,9 @@ PLA4_RTL := $(Z486_DIR)/protection.sv
 
 all: build
 
+check-runner:
+	python3 test_runner_contract.py
+
 # Build all testbenches
 build: obj_dir/Vtb_z486 obj_dir/Vtb_protected_mode
 
@@ -387,7 +390,7 @@ test-full: build
 
 test-protected: obj_dir/Vtb_protected_mode
 	@echo "Running protected mode tests..."
-	./test_protected_mode.py
+	./test_protected_mode.py --strict
 
 test-386: obj_dir/Vtb_test386
 	@echo "Running test386.asm..."
