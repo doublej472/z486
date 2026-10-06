@@ -92,6 +92,7 @@ module paging_unit
     input        [31:0] pf_linear_addr,    // LINEAR address (DWORD-aligned)
     input               pf_redirect_queued,// Redirect request queued behind current prefetch
     output      [127:0] pf_rdata,          // Cache line returned to prefetch
+    output reg          pf_nocache,        // pf_rdata is not cacheable (PCD or CR0.CD)
     output reg          pf_fault,          // Page fault response to prefetch
     output reg   [2:0]  pf_fault_code,     // Saved prefetch fault code ([U,W,P])
     output reg   [31:0] pf_fault_addr,     // Linear address of faulted prefetch
@@ -115,6 +116,7 @@ module paging_unit
     output logic        dcache_req_is_inta,   // Request is INTA cycle
     output logic        dcache_req_is_x87,    // Registered reserved x87 pseudo-I/O request
     output logic        dcache_req_is_vga_mem,// Physical VGA aperture
+    output logic        dcache_req_is_pcd,    // Page-level cache disable (PCD) for this access
 
     input               dcache_req_accepted,  // Demand-side request accepted this cycle
     input               dcache_req_complete,  // Demand-side request complete
@@ -126,6 +128,7 @@ module paging_unit
     //=========================================================================
     output logic        icache_req_valid,     // Prefetch request valid
     output logic [31:0] icache_req_phys_addr, // Prefetch physical address
+    output logic        icache_req_is_pcd,    // The code page's PTE.PCD
     input               icache_req_accepted,  // Icache accepted request this cycle
     input               icache_req_complete,  // Icache read complete
     input       [127:0] icache_rdata,         // Icache read line
@@ -174,6 +177,7 @@ wire        tlb_writable;
 wire        tlb_user;
 wire        tlb_dirty;
 wire        tlb_is_vga_mem;
+wire        tlb_is_pcd;
 // Live (combinational) TLB lookup of the demand linear, used at PG_IDLE to
 // precompute whether a write will post, so the post-write DLY grace at
 // PG_MEM_TLB needs no combinational TLB term on the uc_exec path.
@@ -190,6 +194,7 @@ logic [19:0] tlb_update_pfn;
 logic        tlb_update_writable;
 logic        tlb_update_user;
 logic        tlb_update_dirty;
+logic        tlb_update_pcd;
 
 //=============================================================================
 // State Machine
@@ -255,6 +260,7 @@ paging_tlb #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) tlb_inst (
     .user           (tlb_user),
     .dirty          (tlb_dirty),
     .is_vga_mem     (tlb_is_vga_mem),
+    .is_pcd         (tlb_is_pcd),
     .linear_addr_live(linear_addr),       // same registered linear -> seg-adder off the live-TLB cone
     .live_hit       (live_tlb_hit),
     .live_physical_addr(live_tlb_physical),
@@ -276,12 +282,14 @@ paging_tlb #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) tlb_inst (
     .vipt_refill_writable(tlb_writable),
     .vipt_refill_user(tlb_user),
     .vipt_refill_dirty(tlb_dirty),
+    .vipt_refill_pcd(tlb_is_pcd),
     .update_valid   (tlb_update_valid),
     .update_vpn     (tlb_update_vpn),
     .update_pfn     (tlb_update_pfn),
     .update_writable(tlb_update_writable),
     .update_user    (tlb_update_user),
     .update_dirty   (tlb_update_dirty),
+    .update_pcd     (tlb_update_pcd),
     .invalidate_all (cr3_write),
     .invalidate_page(invlpg_fire),
     .invalidate_vpn (invlpg_linear[31:12])
@@ -298,6 +306,8 @@ wire [19:0] walk_result_pfn;
 wire        walk_result_writable;
 wire        walk_result_user;
 wire        walk_result_dirty;
+wire        walk_result_pcd;
+wire        walker_mem_pcd;
 
 wire        walker_mem_rd;
 wire        walker_mem_wr;
@@ -317,6 +327,9 @@ reg        dcache_req_is_inta_r;
 reg        dcache_req_is_x87_r;
 reg        icache_req_valid_r;
 reg [31:0] icache_req_phys_addr_r;
+// PCD of a retained request.  Paging disabled means PCD=0.
+reg        dcache_req_pcd_r;
+reg        icache_req_pcd_r;
 
 // Walker bus read/write tracking: prevents re-emission while op is in flight
 reg walk_biu_pending;
@@ -349,10 +362,12 @@ paging_walker walker_inst (
     .result_writable(walk_result_writable),
     .result_user    (walk_result_user),
     .result_dirty   (walk_result_dirty),
+    .result_pcd     (walk_result_pcd),
     .mem_rd         (walker_mem_rd),
     .mem_wr         (walker_mem_wr),
     .mem_addr       (walker_mem_addr),
     .mem_wdata      (walker_mem_wdata),
+    .mem_pcd        (walker_mem_pcd),
     .mem_data       (dcache_rdata),
     .mem_ready      (walker_feed_ready),
     .dbg_pde        (dbg_walk_pde),
@@ -552,6 +567,23 @@ assign dcache_req_is_vga_mem = early_present ? early_is_vga_mem :
                                z486_page_in_window(dcache_req_phys_addr_r[31:12], VGA_BASE, VGA_TOP);
 assign icache_req_valid = icache_req_valid_r || fast_pf_candidate;
 assign icache_req_phys_addr = icache_req_valid_r ? icache_req_phys_addr_r : fast_pf_phys;
+// PCD only qualifies reads: they decide whether a miss may allocate.  The
+// early and pretranslated demand paths never carry a PCD page (pretranslated
+// reads come from the sidecar, which rejects PCD pages; early writes do not
+// allocate), and a write's PCD is irrelevant to this write-through L1.
+assign dcache_req_is_pcd = early_present ? 1'b0 :
+                           req_mem_present ? (pg_enable && tlb_is_pcd) :
+                           dcache_req_pcd_r;
+assign icache_req_is_pcd = icache_req_valid_r ? icache_req_pcd_r
+                                              : (pg_enable && tlb_is_pcd);
+// One prefetch line is outstanding at a time; its cacheability travels with
+// the response so the prefetcher's branch-target buffer can honor it.
+always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n)
+        pf_nocache <= 1'b0;
+    else if (icache_req_valid && icache_req_accepted)
+        pf_nocache <= icache_req_is_pcd || cr0[30];
+end
 
 // Keep the registered TLB lookup address on a dedicated write-enable path.
 wire idle_mem_precheck_capture = idle_mem_precheck && !mem_is_io;
@@ -609,6 +641,7 @@ always_comb begin
     tlb_update_writable = walk_result_writable;
     tlb_update_user = walk_result_user;
     tlb_update_dirty = walk_result_dirty;
+    tlb_update_pcd = walk_result_pcd;
 end
 
 function automatic [1:0] op_size_bytes_m1(input [1:0] op_size);
@@ -691,6 +724,8 @@ always_ff @(posedge clk or negedge reset_n) begin
         dcache_req_is_x87_r <= 1'b0;
         icache_req_valid_r <= 1'b0;
         icache_req_phys_addr_r <= 32'h0;
+        dcache_req_pcd_r <= 1'b0;
+        icache_req_pcd_r <= 1'b0;
         page_fault <= 1'b0;
         pf_fault <= 1'b0;
         pf_fault_code <= 3'b000;
@@ -814,6 +849,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                         if (!idle_io_crossing) begin
                             // IO/INTA fast path data (cannot segment-fault)
                             dcache_req_phys_addr_r <= idle_request_linear;
+                            dcache_req_pcd_r <= 1'b0;
                             dcache_req_write_r <= mem_write;
                             dcache_req_be_r <= mem_be;
                             dcache_io_wdata_r <= shift_write_data(mem_wdata, mem_op_size, idle_request_linear[1:0]);
@@ -831,6 +867,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                             req_is_io <= 1'b1;
                             // First half data
                             dcache_req_phys_addr_r <= linear_addr;
+                            dcache_req_pcd_r <= 1'b0;
                             dcache_req_write_r <= mem_write;
                             dcache_req_be_r <= calc_be_first(mem_op_size, linear_addr[1:0]);
                             dcache_req_wdata_r <= split_write_first(mem_wdata, linear_addr[1:0], mem_op_size);
@@ -952,10 +989,10 @@ always_ff @(posedge clk or negedge reset_n) begin
                     end else if (cache_lookup_granted) begin
                         automatic logic [31:0] phys = {walk_result_pfn, req_linear[11:0]};
                         if (req_crossing) begin
-                            emit_first_half(phys);
+                            emit_first_half(phys, walk_result_pcd);
                             state <= PG_CROSS_WAIT1;
                         end else begin
-                            emit_single(phys);
+                            emit_single(phys, walk_result_pcd);
                             // Don't ack yet - ack on dcache_req_complete via fast_path_pending
                             fast_path_pending <= 1'b1;
                             state <= PG_IDLE;
@@ -970,10 +1007,10 @@ always_ff @(posedge clk or negedge reset_n) begin
                 if (cache_lookup_granted) begin
                     automatic logic [31:0] phys = {walk_result_pfn, req_linear[11:0]};
                     if (req_crossing) begin
-                        emit_first_half(phys);
+                        emit_first_half(phys, walk_result_pcd);
                         state <= PG_CROSS_WAIT1;
                     end else begin
-                        emit_single(phys);
+                        emit_single(phys, walk_result_pcd);
                         fast_path_pending <= 1'b1;
                         state <= PG_IDLE;
                     end
@@ -994,21 +1031,21 @@ always_ff @(posedge clk or negedge reset_n) begin
             PG_CROSS_TLB2: begin
                 if (req_is_io) begin
                     // IO crossing: no TLB needed, emit second half directly
-                    emit_second_half(req_linear2);
+                    emit_second_half(req_linear2, 1'b0);
                     dcache_req_is_io_r <= 1'b1;
                     state <= PG_CROSS_WAIT2;
                 end else if (!pg_enable) begin
                     if (req_check_only) begin
                         complete_mem_request();
                     end else if (cache_lookup_granted) begin
-                        emit_second_half(req_linear2);
+                        emit_second_half(req_linear2, 1'b0);
                         state <= PG_CROSS_WAIT2;
                     end
                 end else if (tlb_hit && slow_tlb_access_ok && (!req_is_write || tlb_dirty)) begin
                     if (req_check_only) begin
                         complete_mem_request();
                     end else if (cache_lookup_granted) begin
-                        emit_second_half(tlb_physical_addr);
+                        emit_second_half(tlb_physical_addr, tlb_is_pcd);
                         state <= PG_CROSS_WAIT2;
                     end
                 end else if (tlb_hit && !slow_tlb_access_ok) begin
@@ -1030,7 +1067,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                         complete_mem_request();
                     end else if (cache_lookup_granted) begin
                         automatic logic [31:0] phys2 = {walk_result_pfn, req_linear2[11:0]};
-                        emit_second_half(phys2);
+                        emit_second_half(phys2, walk_result_pcd);
                         state <= PG_CROSS_WAIT2;
                     end else begin
                         state <= PG_CROSS_LOOKUP2;
@@ -1041,7 +1078,7 @@ always_ff @(posedge clk or negedge reset_n) begin
             PG_CROSS_LOOKUP2: begin
                 if (cache_lookup_granted) begin
                     automatic logic [31:0] phys2 = {walk_result_pfn, req_linear2[11:0]};
-                    emit_second_half(phys2);
+                    emit_second_half(phys2, walk_result_pcd);
                     state <= PG_CROSS_WAIT2;
                 end
             end
@@ -1072,7 +1109,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                     end else if (cache_lookup_granted) begin
                         // Walk succeeded, emit BIU request with translated address
                         automatic logic [31:0] pf_phys = {walk_result_pfn, pf_linear_addr[11:0]};
-                        emit_pf_biu_req(pf_phys);
+                        emit_pf_biu_req(pf_phys, walk_result_pcd);
                         state <= PG_PF_BIU_WAIT;
                     end else begin
                         state <= PG_PF_LOOKUP;
@@ -1092,7 +1129,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                     state <= PG_PF_WALKING;
                 end else if (cache_lookup_granted) begin
                     automatic logic [31:0] pf_phys = {walk_result_pfn, pf_linear_addr[11:0]};
-                    emit_pf_biu_req(pf_phys);
+                    emit_pf_biu_req(pf_phys, walk_result_pcd);
                     state <= PG_PF_BIU_WAIT;
                 end
             end
@@ -1176,6 +1213,7 @@ endtask
 task automatic emit_walker_biu_req();
     dcache_req_valid_r <= 1'b1;
     dcache_req_phys_addr_r <= walker_mem_addr;
+    dcache_req_pcd_r <= walker_mem_pcd;
     dcache_req_write_r <= walker_mem_wr;
     dcache_req_be_r <= 4'b1111;
     dcache_req_wdata_r <= walker_mem_wdata;
@@ -1188,9 +1226,10 @@ task automatic emit_walker_biu_req();
 endtask
 
 // Emit a single non-crossing request
-task automatic emit_single(input [31:0] phys_addr);
+task automatic emit_single(input [31:0] phys_addr, input pcd);
     dcache_req_valid_r <= 1'b1;
     dcache_req_phys_addr_r <= phys_addr;
+    dcache_req_pcd_r <= pcd;
     dcache_req_write_r <= req_is_write;
     // req_offset == phys_addr[1:0] (paging preserves bits [11:0])
     dcache_req_be_r <= calc_be(req_op_size, req_offset);
@@ -1208,9 +1247,10 @@ task automatic emit_single(input [31:0] phys_addr);
 endtask
 
 // Emit first half of a crossing request
-task automatic emit_first_half(input [31:0] phys_addr);
+task automatic emit_first_half(input [31:0] phys_addr, input pcd);
     dcache_req_valid_r <= 1'b1;
     dcache_req_phys_addr_r <= phys_addr;
+    dcache_req_pcd_r <= pcd;
     dcache_req_write_r <= req_is_write;
     dcache_req_be_r <= calc_be_first(req_op_size, req_offset);
     dcache_req_wdata_r <= split_write_first(req_wdata, req_offset, req_op_size);
@@ -1227,10 +1267,11 @@ task automatic emit_first_half(input [31:0] phys_addr);
 endtask
 
 // Emit second half of a crossing request
-task automatic emit_second_half(input [31:0] phys_addr);
+task automatic emit_second_half(input [31:0] phys_addr, input pcd);
     automatic logic [1:0] fb = first_half_bytes(req_offset);
     dcache_req_valid_r <= 1'b1;
     dcache_req_phys_addr_r <= phys_addr;
+    dcache_req_pcd_r <= pcd;
     dcache_req_write_r <= req_is_write;
     dcache_req_be_r <= calc_be_second(req_op_size, req_offset);
     dcache_req_wdata_r <= split_write_second(req_wdata, req_offset, req_op_size);
@@ -1247,9 +1288,10 @@ task automatic emit_second_half(input [31:0] phys_addr);
 endtask
 
 // Emit prefetch BIU request (always DWORD read, no crossing)
-task automatic emit_pf_biu_req(input [31:0] phys_addr);
+task automatic emit_pf_biu_req(input [31:0] phys_addr, input pcd);
     icache_req_valid_r <= 1'b1;
     icache_req_phys_addr_r <= phys_addr;
+    icache_req_pcd_r <= pcd;
 endtask
 
 // synthesis translate_off

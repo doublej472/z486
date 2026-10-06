@@ -25,6 +25,7 @@ module paging_tlb
     output reg          user,           // Combined PDE & PTE U/S
     output reg          dirty,          // D bit from PTE
     output              is_vga_mem,     // Physical address is in A0000-BFFFF
+    output              is_pcd,         // PTE.PCD of the registered lookup's entry
 
     // Live demand lookup interface. This keeps the idle demand fast path off
     // the registered-address mux used by prefetch/walker lookups.
@@ -57,6 +58,7 @@ module paging_tlb
     input               vipt_refill_writable,
     input               vipt_refill_user,
     input               vipt_refill_dirty,
+    input               vipt_refill_pcd,
 
     // Update interface (from page walker)
     input               update_valid,
@@ -65,6 +67,7 @@ module paging_tlb
     input               update_writable,
     input               update_user,
     input               update_dirty,
+    input               update_pcd,
 
     // Invalidate all entries (on CR3 write)
     input               invalidate_all,
@@ -85,6 +88,7 @@ reg writable_q [7:0][3:0];
 reg user_q     [7:0][3:0];
 reg dirty_q    [7:0][3:0];
 reg vga_mem    [7:0][3:0];
+reg pcd_q      [7:0][3:0];
 
 reg [2:0] plru [7:0];
 
@@ -183,6 +187,11 @@ assign is_vga_mem = (hit0 && vga_mem[lookup_set][0]) ||
                     (hit2 && vga_mem[lookup_set][2]) ||
                     (hit3 && vga_mem[lookup_set][3]);
 
+assign is_pcd = (hit0 && pcd_q[lookup_set][0]) ||
+                (hit1 && pcd_q[lookup_set][1]) ||
+                (hit2 && pcd_q[lookup_set][2]) ||
+                (hit3 && pcd_q[lookup_set][3]);
+
 // Encode hit into 2-bit way index
 wire [1:0] hit_way = hit0 ? 2'd0 :
                      hit1 ? 2'd1 :
@@ -218,7 +227,9 @@ wire vipt_refill_write = vipt_refill_valid && !update_valid;
 reg [31:0] vipt_linear_r;
 reg        vipt_hazard_r;
 reg [VIPT_TLB_ENTRIES-1:0] vipt_valid;
-// {VPN tag[19:8], PFN[19:0], writable, user, dirty, VGA}
+// {VPN tag[19:8], PFN[19:0], writable, user, dirty, VGA}.  A PCD page sets
+// the VGA bit too: every direct-path consumer then rejects the page, and its
+// accesses take the demand path, which carries the page's PCD.
 `Z486_BLOCK_RAM_NO_RW_CHECK reg [35:0] vipt_tlb [0:VIPT_TLB_ENTRIES-1];
 reg [35:0] vipt_tlb_q;
 
@@ -258,6 +269,7 @@ always_ff @(posedge clk) begin
         vipt_tlb[update_vpn[7:0]] <= {update_vpn[19:8], update_pfn,
                                       update_writable, update_user,
                                       update_dirty,
+                                      update_pcd ||
                                       z486_page_in_window(update_pfn, VGA_BASE, VGA_TOP)};
     else if (vipt_refill_write)
         vipt_tlb[vipt_refill_index] <= {vipt_refill_linear[31:20],
@@ -265,6 +277,7 @@ always_ff @(posedge clk) begin
                                         vipt_refill_writable,
                                         vipt_refill_user,
                                         vipt_refill_dirty,
+                                        vipt_refill_pcd ||
                                         z486_page_in_window(vipt_refill_pfn, VGA_BASE, VGA_TOP)};
 end
 
@@ -395,6 +408,7 @@ always_ff @(posedge clk or negedge reset_n) begin
             user_q[update_set][victim_way]     <= update_user;
             dirty_q[update_set][victim_way]    <= update_dirty;
             vga_mem[update_set][victim_way]    <= z486_page_in_window(update_pfn, VGA_BASE, VGA_TOP);
+            pcd_q[update_set][victim_way]      <= update_pcd;
             case (victim_way)
                 2'd0: begin plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b1; end
                 2'd1: begin plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b0; end

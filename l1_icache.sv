@@ -48,7 +48,10 @@ module l1_icache #(
     input         cache_enable,
     // NO_ALLOC fill: answer the fetch but do not install a line, so an
     // unmapped/uncached window never evicts or aliases a cacheable line.
-    input         cpu_no_alloc
+    input         cpu_no_alloc,
+    // 486 non-cacheable fetch (PTE.PCD or CR0.CD): a valid line still
+    // answers, but a miss is not allocated.
+    input         cpu_no_fill
 );
 
 localparam integer WORD_OFFSET_BITS = 2;
@@ -123,6 +126,7 @@ reg        req_valid_r;
 reg [31:0] req_addr_r;
 reg        req_uncacheable_r;
 reg        req_no_alloc_r;
+reg        req_no_fill_r;
 reg [TAG_BITS-1:0] req_tag_r;
 reg [SET_BITS-1:0] req_set_r;
 
@@ -441,7 +445,8 @@ wire snoop_clears_fill_line = registered_snoop_fill_conflict;
 // A snoop owns the tag port while the completed fill waits. Data and tag
 // install together after the event; a snoop of the fill's own line instead
 // leaves it uncached for the remainder of that fill.
-wire fill_install_allowed = !req_no_alloc_r && !live_snoop_fill_conflict &&
+wire fill_install_allowed = !req_no_alloc_r && !req_no_fill_r &&
+                            !live_snoop_fill_conflict &&
                             !registered_snoop_fill_conflict &&
                             !fill_line_snooped_r && !fill_killed_r;
 wire data_fill_write = tag_fill_write && fill_install_allowed;
@@ -647,6 +652,7 @@ always_ff @(posedge clk) begin
                     req_addr_r <= cpu_addr;
                     req_uncacheable_r <= cpu_uncacheable;
                     req_no_alloc_r <= cpu_no_alloc;
+                    req_no_fill_r <= cpu_no_fill;
                     req_tag_r <= cpu_tag;
                     req_set_r <= cpu_set;
                     state <= S_LOOKUP;

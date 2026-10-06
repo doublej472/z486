@@ -33,6 +33,7 @@ module prefetch
     output reg        pf_redirect_queued,
     input             pf_ack_toggle,
     input      [127:0] pf_rdata,
+    input             pf_nocache,    // this line is not cacheable (PTE.PCD or CR0.CD)
     input             pf_fault,      // page fault response for this fetch
     input      [2:0]  pf_fault_code,
     input      [31:0] pf_fault_addr,
@@ -488,8 +489,10 @@ always_ff @(posedge clk or negedge reset_n) begin
             spec_adopted_r <= spec_adopt;
             if (spec_data_now) begin
                 // Ack in the flush cycle itself: seed consumed it; buffer too.
+                // The branch-target buffer is a cache: never retain a line
+                // from a non-cacheable fetch.
                 spec_line  <= pf_rdata;
-                spec_valid <= 1'b1;
+                spec_valid <= !pf_nocache;
             end
             spec_poison <= 1'b0;
             // A flush that bypasses an in-flight spec fetch invalidates its
@@ -510,14 +513,14 @@ always_ff @(posedge clk or negedge reset_n) begin
                 // buffer (never suspends - the fetch may be down a wrong path).
                 spec_inflight <= 1'b0;
                 spec_line <= pf_rdata;
-                spec_valid <= !pf_fault && !spec_poison;
+                spec_valid <= !pf_fault && !spec_poison && !pf_nocache;
             end else if (spec_adopted_r && !pf_drop_inflight && !pf_fault) begin
                 // Adopted post-flush fill arriving: it fills the queue as
                 // usual (fill_commit), AND populates the buffer for the
                 // loop's next iteration (re-own via spec_match_now, no
                 // refetch).  Faults/drops fall through to the branch below.
                 spec_line  <= pf_rdata;
-                spec_valid <= !spec_poison;
+                spec_valid <= !spec_poison && !pf_nocache;
                 pf_fetch_addr <= pf_fetch_addr + 32'd16;
                 pf_fetch_word_start <= 2'd0;
             end else if (pf_drop_inflight || pf_fault) begin

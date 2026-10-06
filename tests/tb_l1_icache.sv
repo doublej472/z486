@@ -9,6 +9,7 @@ module tb_l1_icache;
     reg [31:0] cpu_addr = 32'h0;
     wire [127:0] cpu_line;
     reg cpu_valid = 1'b0;
+    reg tb_no_fill = 1'b0;   // PCD/CD fetch: may hit, never allocates
     wire cpu_ready;
     wire cpu_resp_valid;
 
@@ -69,7 +70,8 @@ module tb_l1_icache;
         .flush_busy(flush_busy),
         .flush_done(flush_done),
         .cache_enable(1'b1),
-        .cpu_no_alloc(1'b0)
+        .cpu_no_alloc(1'b0),
+        .cpu_no_fill(tb_no_fill)
     );
 
     // Instrumentation for the same-way fill/snoop investigation: does a fill
@@ -619,6 +621,22 @@ module tb_l1_icache;
         cache_read(32'h40, 128'h00000004_00000003_00000002_00000001);
         if (mem_request_count != mem_request_before)
             $fatal(1, "I-cache repeated a stale snoop after the line was refilled");
+
+        // A PCD/CD fetch still hits a valid line, but its miss is answered
+        // without allocating: the next fetch of that line misses again.
+        tb_no_fill = 1'b1;
+        mem_request_before = mem_request_count;
+        cache_read(32'h40, 128'h00000004_00000003_00000002_00000001);
+        if (mem_request_count != mem_request_before)
+            $fatal(1, "I-cache no-fill fetch did not take the valid line");
+        mem_put_line(32'h2c0, 32'h21, 32'h22, 32'h23, 32'h24);
+        cache_read(32'h2c0, 128'h00000024_00000023_00000022_00000021);
+        mem_put_line(32'h2c0, 32'h31, 32'h32, 32'h33, 32'h34);
+        mem_request_before = mem_request_count;
+        cache_read(32'h2c0, 128'h00000034_00000033_00000032_00000031);
+        if (mem_request_count != mem_request_before + 1)
+            $fatal(1, "I-cache no-fill fetch allocated its miss");
+        tb_no_fill = 1'b0;
 
         $display("L1 PIPT instruction cache unit test PASS (same-way fill/snoop write-port cycles: %0d)",
                  same_way_cycles);

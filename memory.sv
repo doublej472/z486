@@ -79,6 +79,11 @@ module memory
     input              dcache_req_is_inta,
     input              dcache_req_is_x87,
     input              dcache_req_is_vga_mem,
+    input              dcache_req_is_pcd,    // page-level cache disable: a read miss does not allocate
+    // CR0.CD: no line allocates.  CR0.NW: write hits stay in the L1 and
+    // external invalidations are ignored (486 cache operating modes).
+    input              cache_cd,
+    input              cache_nw,
     output             dcache_req_accepted, // Request ownership transferred
     output             dcache_req_complete, // Read or write operation completed
     output             dcache_read_complete, // Read data is valid this cycle
@@ -116,6 +121,7 @@ module memory
     // Paging-unit instruction request
     input              icache_req_valid,
     input      [31:0]  icache_req_phys_addr_raw,
+    input              icache_req_is_pcd,
     output             icache_req_accepted, // Prefetch request ownership transferred
     output             icache_req_complete, // Full instruction line is valid
     output     [127:0] icache_rdata,
@@ -147,6 +153,10 @@ module memory
     input              line_resp_valid,      // Complete aligned line returned
     output             inta
 );
+
+// CR0.NW=1 disables external invalidation cycles (486 cache operating modes);
+// the CPU's own DIRECT-write invalidation of the split I-cache is internal.
+wire snoop_valid_eff = snoop_valid && !cache_nw;
 
 wire [31:0] dcache_cpu_dout;
 wire dcache_cpu_ready;
@@ -234,6 +244,9 @@ cache_unit #(
     .dcache_req_is_io(dcache_req_is_io),
     .dcache_req_is_inta(dcache_req_is_inta),
     .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
+    .dcache_req_is_pcd(dcache_req_is_pcd),
+    .cache_cd(cache_cd),
+    .cache_nw(cache_nw),
     // Execution core: WR_FAST store and VIPT load/RMW preread
     .fast_store_valid(fast_store_valid),
     .fast_store_phys_addr_raw(fast_store_phys_addr_raw),
@@ -252,6 +265,7 @@ cache_unit #(
     // Paging unit: instruction line request (prefetch)
     .icache_req_valid(icache_req_valid),
     .icache_req_phys_addr_raw(icache_req_phys_addr_raw),
+    .icache_req_is_pcd(icache_req_is_pcd),
     .icache_req_accepted(icache_req_accepted),
     .icache_req_complete(icache_req_complete),
     .icache_rdata(icache_rdata),
@@ -293,7 +307,7 @@ cache_unit #(
     // External coherence (snoop invalidation) and the merged I-cache
     // invalidation from the bus unit.
     .snoop_addr(snoop_addr),
-    .snoop_valid(snoop_valid),
+    .snoop_valid(snoop_valid_eff),
     .cache_flush(cache_flush),
     .cache_flush_insn(cache_flush_insn),
     .cache_flush_busy(cache_flush_busy),
@@ -376,7 +390,7 @@ bus_unit #(.ENABLE_X87(ENABLE_X87)) bus_unit_inst (
     // External coherence (snoop invalidation) and the merged I-cache
     // invalidation forwarded to the cache unit.
     .snoop_addr(snoop_addr),
-    .snoop_valid(snoop_valid),
+    .snoop_valid(snoop_valid_eff),
     .icache_invalidate_valid(icache_invalidate_valid),
     .icache_invalidate_addr(icache_invalidate_addr)
 );
