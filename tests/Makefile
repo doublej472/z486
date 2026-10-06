@@ -142,6 +142,10 @@ all: build
 check-runner:
 	python3 test_runner_contract.py
 
+check-generators:
+	python3 $(Z486_DIR)/scripts/ucode_optimize.py --check
+	VERILATOR=$(VERILATOR) JOBS=$(JOBS) python3 check_pla_image.py
+
 # Build all testbenches
 build: obj_dir/Vtb_z486 obj_dir/Vtb_protected_mode
 
