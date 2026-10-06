@@ -99,13 +99,75 @@ Deliberate limits, all documented where they apply:
 
 - TR3/TR4 and the TR5 line read/write commands are stored but do not access
   the split L1s (the 486's unified cache-test model has no single equivalent).
-- Page-table A/D and descriptor accessed-bit updates are not bus-locked.
 - NW=1 write hits update the D-cache and patch a resident I-cache line; a later
   I-cache miss reads memory, not the D-cache.
 - A data breakpoint on the instruction after MOV SS, or inside INT n, is
   dropped with the suppressed trap rather than delayed.
 - UMOV (0F 10-13), SALC and ICEBP behave as on a 486; CPUID, RDTSC/RDMSR/
   WRMSR, RSM, CMOV and CR4 raise #UD (486SX without CPUID).
+
+## Sibling-bug audit (third pass)
+
+Five audits looked for siblings of the defects fixed above: cache coherence,
+fault delivery, debug/system registers, bus locking and paging, and test
+coverage (mutation testing). Every confirmed defect was reproduced with a
+directed program or bench case that fails before its fix and passes after it.
+
+| defect | fix | test |
+| --- | --- | --- |
+| #AC on the frame pushes to a ring-0 stack from CPL3 (INT n, call gate) livelocked | SS references through the stack switch or with SS.DPL < 3 are privilege-0 references | `ac_supervisor_push`, `ac_supervisor_callgate` |
+| a fault after a task switch commits pushed and restored the old task's EFLAGS (IOPL, VM) | FLAGSB loads at 788/789 always take effect | `ts_commit_fault_eflags` |
+| RF=0 in the frames of faults raised during a task switch and of the GD #DB | RF also set at 893 (TSS skip) and 3A5 (GD) | `fault_rf_classes`, `ts_commit_fault_rf`, `fault_rf_gd` |
+| RF not cleared after a direct-path load/RMW, leaking into the next interrupt frame | RF also clears at the next issue; the issue captures see it | `rf_clear_after_insn` |
+| INVLPG was segment-checked: #SS at CPL3, #SS(0) at CPL0 beyond the limit | INVLPG is not a memory operand for the segment check | `invlpg_ss_limit_gp`, `invlpg_no_limit_cpl0` |
+| a page-crossing write wrote its first half before page 2 faulted; the restarted RMW applied it twice | both pages are translated and checked before any byte is written | `split_rmw_fault`, `split_rmw_fault_lock`, `split_write_fault_np` |
+| walker A/D updates were unlocked whole-entry rewrites, losing another master's write | locked re-read, re-check, then write `fresh|A|D` under LOCK# | `lock_walker_ad` (+ `_ctl`), `tb_paging_walker` |
+| TR7.PWT read 0 for walked TLB entries | PTE.PWT kept for the TR7 readback | `tlb_pwt` |
+| self-modifying code through RMW stores or a linear alias ran stale code from the prefetcher's branch-target buffer | every store kills the buffered line by page-offset bits | `smc_spec_buffer`, `smc_spec_buffer_rm` |
+| the I-cache patch queue survived a whole-L1 flush and merged stale bytes into post-DMA fills | the queue is retired when the flush starts | `dma_flush_patchq`, `tb_cache_coherence` |
+| the branch-target buffer refilled from the pre-flush I-cache during a flush drain | it stays killed for the whole flush window | `flush_async_spec` |
+| a store patch held behind an invalidate let the I-cache serve the old line | a held patch blocks I-cache hits | `tb_cache_coherence` cases 2/3 |
+| ARPL followed by a slow next issue froze the microcode ROM on a stale RPT word (hang at memory latency >= 10) | only an executing word may repeat | `arpl_idle_rpt`; `opcode_sweep_486` under narrow responses |
+| ALU r/m,reg, FF/0 and F7/2 RMWs read memory three times when RMW_FAST was refused (device apertures) | the refused operand is read once | `rmw_reads`, `rmw_read_forms`, PC-98 `rmw_device_reads`, `lock_window` |
+| LOCK-prefixed RMW_FAST forms neither locked nor read memory | no RMW_FAST for LOCK | `lock_rmw_forms`, `nw_lock` |
+| LOCK# dropped between back-to-back locked instructions, and was held through fault/interrupt delivery | priority to the next locked read; delivery is not locked | `lock_b2b`, `intr_after_lock`, `lock_ud` |
+| matching but unenabled data breakpoints were not reported in DR6 | breakpoint mode also runs while a data breakpoint is programmed | `debug_bn_noenable` |
+| every segment load rewrote its descriptor (a read-only GDT with WP=1 shut the CPU down); TSS busy set unlocked | write only to set a clear A bit, and set B, with locked read-modify-writes | `desc_ro_gdt`, `lock_desc_abit`, `lock_tss_busy` (+ `_ctl`), `null_gdt_write` |
+| a TSS below its minimum limit raised #GP(0) and left the new TSS busy | #TS(TSS selector) before the switch | `ts_short_limit` |
+| faults later in a CALL through a gate reported EXT=1 | EXT has its own flag; the CALL dispatch does not set it | `far_xfer_restart` |
+| a CALL gate's too-small new stack raised #SS(0) | #SS(new SS selector) (INT n keeps #SS(0)) | `callgate_newstack_ss`, `int_newstack_ss` |
+| x87 build: an ESC right behind MOV CR0 setting EM/TS executed instead of raising #NM | no direct x87 path while CR0 is written | `x87_em_nm`; `opcode_sweep_486` with x87 |
+| an IRETD to V86 with AC=1 onto a misaligned ESP0 raised #AC on its own frame pops and looped (introduced by the first #AC fix's V86 exclusion) | V86 stack accesses use the same SS.DPL test | `ac_v86_iret` (+ `ac_v86_stack`, `ac_v86_task`) |
+| an instruction running past the CS limit (real-mode 64 KiB wrap, or any segment) executed instead of raising #GP(0) | instruction fetch is checked against the CS limit; sequential EIP is 32 bits | `cs_limit_fetch_real`; 83 SingleStepTests cases |
+| LOCK on a string instruction after REP/REPNE ran as a plain REP string | LOCK sticks against a later F2/F3 and raises #UD | `lock_rep_ud`; 26 SingleStepTests cases |
+| a faulting REPNE STOS lost the ECX of completed elements; a faulting REPE/REPNE CMPS/SCAS pushed the instruction-start FLAGS | ECX and the FLAGS backup advance with each committed element | `rep_string_fault_progress`; 53 SingleStepTests cases |
+
+Mutation testing of the fix commits (72 mutants) left 28 alive at first; 17
+were killed by new programs and two repaired benches (the walker bench's
+locked-update check had been a no-op), 10 are equivalent or redundant (each
+recorded with its reason), and one exposed the V86 #AC bug above.
+
+Guards added by the audit (all pass): `opcode_sweep_486` (422 entries of the
+0F map, LOCK forms, FPU escapes and invalid forms against the Intel486 table),
+`debug_kinds` (data breakpoints on 37 access kinds), `restart_cpl3_pf` (18
+#PF restart sites), `seg_fault_vectors`, `cr0_ops`, `tlb_test2`, `lock_forms`,
+`pte_snoop_*` and others listed in the commits.
+
+The walker's locked A/D update costs Dhrystone 74 cycles (five first stores to
+clean pages each pay a locked PTE read); the baseline is deliberately moved to
+the value in the gate table below.
+
+Deliberate limits found by the audit:
+
+- Same-level exception/interrupt frame pushes at CPL3 (a conforming handler,
+  no stack switch) are not alignment-checked, so #AC is never raised during
+  delivery (and the #AC-versus-#DF class question cannot arise).
+- A CALL gate whose new stack is too small writes the part of the frame that
+  fits before raising #SS(new SS selector); a 486 checks the room first. Only
+  inner-stack scratch is written and the CALL restarts.
+- Unenabled instruction breakpoints (RW = 00) are not reported in DR6.
+- With CR0.NW=1, self-modifying code whose new bytes are still only in the
+  D-cache runs the old code (split L1s; see `docs/coherency-audit.md`).
 
 ## Measured local release gate
 
@@ -120,23 +182,33 @@ objects, and tests run under both response models. Latest measured results:
 
 | check | result |
 | --- | --- |
-| integer/protected directed programs, whole-line responses | 152/152 PASS |
-| same programs, narrow responses | 152/152 PASS |
-| directed programs with x87 enabled | 160/160 PASS |
+| integer/protected directed programs, whole-line responses | 247/247 PASS |
+| same programs, narrow responses | 247/247 PASS |
+| directed programs with x87 enabled | 255/255 PASS |
 | simple instruction cases | 26/26 PASS |
-| PC-98 map programs | 3/3 whole-line + 3/3 narrow PASS |
+| PC-98 map programs | 5/5 whole-line + 5/5 narrow PASS |
 | seeded pipeline fuzz (`test-fuzz`, 12 seeds x 3 latencies) | 36/36 PASS, self-test rejects a corrupted expectation |
-| unit/survey/reset benches | 12/12 PASS; GPR survey has no new findings |
+| unit/survey/reset benches | 13/13 PASS (incl. `test-cache-coherence`); GPR survey has no new findings |
 | additional 32-bit-tag L1 benches | 2/2 PASS |
 | reset-audit and runner fixtures | 14 + 4 PASS |
 | pragma / consumed ROM columns / SHIFT pairing checks | PASS |
 | generated microcode/recipes | up to date |
 | committed PLA vs fresh generation | 1024 words match, all 4096 mode lanes verified |
-| Dhrystone | PASS, **253183 cycles / 121837 instructions / CPI 2.078**, unchanged |
+| Dhrystone | PASS, **253251 cycles / 121837 instructions / CPI 2.079** (re-baselined: +74 locked walker A/D update, -6 RMW read-once) |
 
 Expected failures cannot be used as release passes. The PLA check generates
 into a temporary directory and compares the committed image; regenerating and
 then comparing the new image to itself is not the release check.
+
+## External conformance (third pass)
+
+Run with `tests/prepare.sh` data, `--cpu 486`, on the RTL at commit 1c3f590:
+
+| suite | result |
+| --- | --- |
+| SingleStepTests 80386 real mode, all 1,758,700 vectors | 1,758,700/1,758,700 after the fixes above; the remaining differences are documented 386-vs-486 rules in `test_singlestep_real.py` (EFLAGS AC and reserved bits, AC cleared by real-mode interrupts, undefined flags of a faulting AAM and of a trailing fault's frame, IDIV quotients the 386 completed out of range, a RET returning to itself, the 386EX's on-chip REMAPCFG ports) |
+| SingleStepTests protected mode (86Box), 6100 vectors | 6100/6100 (`--cpu 486`: RF=1 in fault frames, i486 PRM 11.3.1.1) |
+| test386.asm (CPU_FAMILY=4) | complete: every self-checking POST (00h-1Ch, E0h) passes, POST 0xFF reached, and all 44,926 POST 0xEE result lines match `test386-EE-reference.txt` |
 
 ## Out-of-context timing (Cyclone V, 85 MHz)
 
@@ -150,6 +222,8 @@ whether the changes made it worse.
 | before | 1-5 | -7.82, -8.43, -8.39, -8.21, -8.28 | -8.22 | -32.7k to -37.7k | 19,066-19,141 |
 | 486SX, defaults | 1-5 | -8.53, -8.47, -8.56, -8.35, -8.12 | -8.40 | -36.1k to -41.7k | 19,965-20,014 |
 | 486SX, `ENABLE_HW_BREAKPOINTS=0 ENABLE_TLB_TEST=0` | 1-2 | -7.94, -7.91 | -7.92 | -35.7k to -37.3k | 19,422-19,695 |
+| end of second pass (563970b), re-fit | 1-3 | -8.53, -8.47, -8.56 | -8.52 | -40.3k to -41.7k | 19,984-20,011 |
+| after the third-pass audit fixes (9126bfc) | 1-3 | -8.10, -8.17, -8.40 | -8.22 | -35.0k to -37.3k | 19,670-19,716 |
 
 - The mean worst-slack difference (0.18 ns) is inside the seed spread
   (0.6 ns within one tree). The critical paths are the same families as
@@ -159,19 +233,28 @@ whether the changes made it worse.
 - Area: +900 ALMs (+4.7%) at the defaults. Sharing the TLB walker write index
   with the TR6 write removed about 700 ALMs from an earlier version, and the
   instruction-breakpoint decision is registered off the issue cone.
+- Third pass: the audit fixes did not cost slack or area. Worst slack
+  moved from -8.52 to -8.22 ns (mean of three seeds; inside the seed spread),
+  TNS improved by about 13% and area fell by about 300 ALMs (1.5%), mostly
+  from narrowing the branch-target-buffer kill compare from 28 to 8 bits.
+  The per-path breakdown of these fits was not extracted; the claim is only
+  that worst slack, TNS and area did not get worse.
 - Builds that need the area or slack back can set `ENABLE_HW_BREAKPOINTS=0`
   and/or `ENABLE_TLB_TEST=0`. The debug/test registers, GD/BS/BT/T-bit
-  traps, cache controls, #AC and LOCK# remain. With both off, exactly
-  `debug_bp`, `debug_bp2` and `test_regs` fail; the other 149 directed tests
-  pass.
-- Performance: Dhrystone cycle count is identical (253183). Ordinary code
-  does not enter debug or alignment-check slow mode.
+  traps, cache controls, #AC and LOCK# remain. With both off (measured at
+  the end of the second pass), exactly `debug_bp`, `debug_bp2` and
+  `test_regs` fail; every other directed test passes.
+- Performance at the end of the second pass: Dhrystone cycle count
+  identical (253183). Ordinary code does not enter debug or alignment-check
+  slow mode.
 
 ## What this does not establish
 
-- The external SingleStepTests datasets and `test386.asm/test386.bin` are not
-  available in this checkout. The local release gate cannot substitute for
-  broad reference-driven architectural conformance tests.
+- The external suites are downloaded by `tests/prepare.sh`, not bundled, and
+  are not part of `test-release`. Their datasets come from a real 80386
+  (real mode) and the 86Box emulator (protected mode), so 486-specific
+  behaviour is only checked through the runners' documented `--cpu 486`
+  rules and the directed programs.
 - The OOC fits above are the CPU alone with virtual pins; they are not a
   full-SoC timing closure, and the core already missed 85 MHz OOC before this
   work. No full-SoC clock-rate guarantee is being made.

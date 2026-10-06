@@ -32,17 +32,29 @@ master may take the memory bus. It covers:
 - a LOCK-prefixed read-modify-write and XCHG with a memory operand, from the
   locked read until the instruction has ended and its stores have left the
   CPU (the store queue is empty and the bus accepted the write);
-- the TSS busy-bit update of a task switch, from its read to the end of the
-  instruction;
+- the TSS busy-bit set of a task switch or LTR and the clear of the
+  outgoing task's busy bit, each a locked read-modify-write of the
+  descriptor's high dword;
+- a descriptor accessed-bit update (only when A was clear: a segment load
+  whose descriptor already has A set writes nothing);
+- the page walker's A/D update, from its locked re-read of the PDE/PTE until
+  the write has left the CPU (only when A or D actually changes);
 - both cycles of an interrupt-acknowledge pair.
 
-A locked read is never served by the L1: it waits for every older store and
-reads memory, as a 486 locked read cycle does; the locked write updates a
-valid line and memory. The core's own instruction fetches may still appear on
-the bus while `lock` is high. Page-table A/D updates and descriptor
-accessed-bit updates are **not** bus-locked (no other master is expected to
-modify those tables concurrently). A platform without other masters may leave
-`lock` unconnected.
+Fault and interrupt delivery is never locked, even right after a locked
+instruction, and two back-to-back locked instructions keep `lock` high across
+both. A locked read is never served by the L1: it waits for every older store
+and reads memory, as a 486 locked read cycle does; the locked write updates a
+valid line and memory. LOCK-prefixed RMWs never use the cached fast RMW
+pipeline. The core's own instruction fetches may still appear on the bus
+while `lock` is high. A platform without other masters may leave `lock`
+unconnected.
+
+PC9821_z486_MiSTer (as of 2026-10) ties the snoop port off, does not connect
+`lock`, and keeps floppy DMA coherent with the whole-L1 flush; its DMA master
+does not wait for LOCK#. The locked cycles above matter for atomicity only
+once a platform master honours `lock`; the flush-related fixes
+(`docs/coherency-audit.md`) matter there today.
 
 ## 486 cache controls
 
