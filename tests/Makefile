@@ -3,8 +3,11 @@
 # Builds and runs single-instruction tests for the z486 core
 
 # Paths
+SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
 Z486_DIR := ..
 VERILATOR := verilator
+JOBS ?= 8
 
 # Source files
 # Note: muldiv.sv and bus_prefetch.sv are standalone modules that can optionally
@@ -47,7 +50,11 @@ RTL_SRCS := $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_pkg.sv $(X87_DIR)
 			$(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv \
 			$(filter-out $(X87_DIR)/x87_pkg.sv $(X87_DIR)/x87_ucode_pkg.sv,$(X87_RTL)) \
 			$(Z486_DIR)/dsp_mul.sv $(Z486_DIR)/protection.sv $(Z486_DIR)/segmentation_unit.sv
-RTL_DEPS := $(Z486_DIR)/ucode_recipes.svh $(X87_GEN) \
+RTL_DEPS := $(Z486_DIR)/ucode_recipes.svh $(Z486_DIR)/z486_platform.svh \
+            $(Z486_DIR)/z486_pc98_preset.svh $(Z486_DIR)/pla_entry.svh \
+            $(Z486_DIR)/pla_control.svh $(Z486_DIR)/length_table.svh \
+            $(Z486_DIR)/ucode.hex $(Z486_DIR)/pla_entry_rom.hex \
+            $(Z486_DIR)/pla_group_entry.hex $(X87_GEN) \
 			$(X87_DIR)/x87_logexp_rom.sv
 # Optional modules (not yet integrated):
 # RTL_SRCS += $(Z486_DIR)/muldiv.sv $(Z486_DIR)/bus_prefetch.sv
@@ -60,7 +67,7 @@ VFLAGS_BASE += -Wall -Wno-fatal -Wno-UNOPTFLAT -Wno-SYNCASYNCNET
 VFLAGS_BASE += -cc --exe
 VFLAGS_BASE += -O3
 VFLAGS_BASE += --build
-VFLAGS_BASE += -j 0
+VFLAGS_BASE += -j $(JOBS)
 VFLAGS_BASE += -I$(Z486_DIR)
 VFLAGS_BASE += -I$(X87_DIR)
 VFLAGS_BASE += -I$(X87_REF_DIR)
@@ -193,9 +200,9 @@ obj_dir/Vtb_l1_icache: $(Z486_DIR)/l1_icache.sv $(TB_L1I_SRCS) $(CPP_L1I_SRCS)
 	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_l1_icache $(TB_L1I_SRCS) $(Z486_DIR)/l1_icache.sv $(CPP_L1I_SRCS)
 	@echo "Build complete: obj_dir/Vtb_l1_icache"
 
-obj_dir/Vtb_memory_order: $(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv $(TB_MEMORY_ORDER_SRCS) $(CPP_MEMORY_ORDER_SRCS)
+obj_dir/Vtb_memory_order: $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/z486_pkg.sv $(RTL_DEPS) $(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv $(TB_MEMORY_ORDER_SRCS) $(CPP_MEMORY_ORDER_SRCS)
 	@echo "Building memory ordering unit test with Verilator..."
-	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_memory_order $(TB_MEMORY_ORDER_SRCS) \
+	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_memory_order $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_pkg.sv $(TB_MEMORY_ORDER_SRCS) \
 		$(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv $(CPP_MEMORY_ORDER_SRCS)
 	@echo "Build complete: obj_dir/Vtb_memory_order"
 
@@ -354,8 +361,9 @@ test-simple: build
 	./test_simple.py
 
 test-full: build
-	@echo "Running z486 full instruction tests..."
-	./test_full_singlestep.py
+	@echo "Running external single-step reference tests (prepare.sh installs datasets)..."
+	./test_singlestep_real.py --limit 0 --no-color
+	./test_singlestep_protected.py -n 0 -nt
 
 test-protected: obj_dir/Vtb_protected_mode
 	@echo "Running protected mode tests..."
