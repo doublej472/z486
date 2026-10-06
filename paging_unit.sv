@@ -152,6 +152,8 @@ module paging_unit
     // PC-98 debug taps: the page walker's last PDE/PTE reads
     output       [31:0] dbg_walk_pde,
     output       [31:0] dbg_walk_pte,
+    // LOCK# for the walker's locked A/D read-modify-write
+    output              walk_lock,
     output       [3:0]  dbg_state            // current FSM state (PG_*)
 );
 
@@ -325,6 +327,7 @@ wire        walk_result_user;
 wire        walk_result_dirty;
 wire        walk_result_pcd;
 wire        walker_mem_pcd;
+wire        walker_mem_locked;
 
 wire        walker_mem_rd;
 wire        walker_mem_wr;
@@ -387,6 +390,8 @@ paging_walker walker_inst (
     .mem_addr       (walker_mem_addr),
     .mem_wdata      (walker_mem_wdata),
     .mem_pcd        (walker_mem_pcd),
+    .mem_locked     (walker_mem_locked),
+    .ad_lock        (walk_lock),
     .mem_data       (dcache_rdata),
     .mem_ready      (walker_feed_ready),
     .dbg_pde        (dbg_walk_pde),
@@ -1275,7 +1280,7 @@ task automatic emit_walker_biu_req();
     dcache_req_valid_r <= 1'b1;
     dcache_req_phys_addr_r <= walker_mem_addr;
     dcache_req_pcd_r <= walker_mem_pcd;
-    dcache_req_locked_r <= 1'b0;
+    dcache_req_locked_r <= walker_mem_locked;
     dcache_req_write_r <= walker_mem_wr;
     dcache_req_be_r <= 4'b1111;
     dcache_req_wdata_r <= walker_mem_wdata;
