@@ -437,6 +437,155 @@ always @(posedge clk) begin : m0_profile_sample
     end
 end
 
+// TLB port and sidecar audit (+profile_m0), counted only while paging is on.
+// M0_TLBPORT: 0 cycles  1 paging-on cycles  2 prefetch wants a translation
+// (paging idle)  3 prefetch translated in one cycle  4 registered port held
+// another page (capture bubble)  5 ...displaced by a demand capture
+// 6 demand and prefetch want the registered port in the same cycle
+// 7 prefetch waiting while paging serves demand  8 live-port lookups
+// 9 ...I/O  10 ...memory  11-12 unused (the live port is gone)
+// 13 prefetch walks  14 demand walks  15 walk cycles  16 INVLPG  17 CR3 writes
+// 18 cycles a direct probe or store route needs a translation  19 ...and
+// prefetch wants one too  20 cycles with two or more translation needs
+// M0_SIDECAR: per consumer (0 direct-load/RMW/ucode-read probe, 1 store
+// route) {events, hit, hazard-poisoned, miss held by the main TLB}.
+// M0_SHADOW <cfg> <sets> <ways> <lookups> <hits>: standalone LRU TLBs that
+// fill on every miss. Configs 0-3 see the sidecar stream (direct probes and
+// store routes); 4-7 see every translation (sidecar stream, memory live
+// lookups, prefetch page changes), i.e. one unified i486-style TLB.
+localparam integer M0_NSH = 8;
+localparam integer M0_SH_SETS [M0_NSH] = '{32, 64, 128, 256, 8, 16, 8, 16};
+localparam integer M0_SH_WAYS [M0_NSH] = '{1, 1, 1, 1, 4, 4, 8, 8};
+longint m0_tlbport [0:20];
+longint m0_sidecar [0:1][0:3];
+longint m0_shadow_lookups [M0_NSH];
+longint m0_shadow_hits [M0_NSH];
+logic [19:0] m0_sh_tag [M0_NSH][0:255][0:7];
+logic        m0_sh_v   [M0_NSH][0:255][0:7];
+longint      m0_sh_age [M0_NSH][0:255][0:7];
+logic   m0_lookup_by_demand;
+logic   m0_probe_prev;
+logic [19:0] m0_pf_last_vpn;
+
+function automatic logic m0_main_tlb_has(input logic [19:0] vpn);
+    logic [2:0]  set;
+    logic [16:0] tag;
+    set = vpn[2:0];
+    tag = vpn[19:3];
+    m0_main_tlb_has =
+        (dut.paging_inst.tlb_inst.valid_q[set][0] && dut.paging_inst.tlb_inst.lookup_copy0[set][36:20] == tag) ||
+        (dut.paging_inst.tlb_inst.valid_q[set][1] && dut.paging_inst.tlb_inst.lookup_copy1[set][36:20] == tag) ||
+        (dut.paging_inst.tlb_inst.valid_q[set][2] && dut.paging_inst.tlb_inst.lookup_copy2[set][36:20] == tag) ||
+        (dut.paging_inst.tlb_inst.valid_q[set][3] && dut.paging_inst.tlb_inst.lookup_copy3[set][36:20] == tag);
+endfunction
+
+// One LRU lookup in shadow config c; a miss fills the oldest way.
+task automatic m0_shadow_access(input integer c, input logic [19:0] vpn);
+    integer set, victim;
+    logic hit;
+    set = vpn % M0_SH_SETS[c];
+    hit = 1'b0;
+    victim = 0;
+    m0_shadow_lookups[c] += 1;
+    for (integer w = 0; w < M0_SH_WAYS[c]; w++)
+        if (m0_sh_v[c][set][w] && m0_sh_tag[c][set][w] == vpn) begin
+            hit = 1'b1;
+            m0_sh_age[c][set][w] = cycle;
+        end
+    if (hit) begin
+        m0_shadow_hits[c] += 1;
+    end else begin
+        for (integer w = 1; w < M0_SH_WAYS[c]; w++)
+            if (!m0_sh_v[c][set][w] ||
+                (m0_sh_v[c][set][victim] && m0_sh_age[c][set][w] < m0_sh_age[c][set][victim]))
+                victim = w;
+        m0_sh_v[c][set][victim] = 1'b1;
+        m0_sh_tag[c][set][victim] = vpn;
+        m0_sh_age[c][set][victim] = cycle;
+    end
+endtask
+
+task automatic m0_shadow_flush(input logic all, input logic [19:0] vpn);
+    for (integer c = 0; c < M0_NSH; c++)
+        for (integer i = 0; i < 256; i++)
+            for (integer w = 0; w < 8; w++)
+                if (all || m0_sh_tag[c][i][w] == vpn) m0_sh_v[c][i][w] = 1'b0;
+endtask
+
+task automatic m0_sidecar_consume(input integer site, input logic [19:0] vpn);
+    m0_sidecar[site][0] += 1;
+    if (dut.paging_inst.tlb_inst.vipt_match) m0_sidecar[site][1] += 1;
+    if (dut.paging_inst.tlb_inst.vipt_hazard_r) m0_sidecar[site][2] += 1;
+    if (!dut.paging_inst.tlb_inst.vipt_match && m0_main_tlb_has(vpn)) m0_sidecar[site][3] += 1;
+    for (integer c = 0; c < M0_NSH; c++) m0_shadow_access(c, vpn);
+endtask
+
+always @(posedge clk) begin : m0_tlb_sample
+    if (!reset_n) begin
+        m0_lookup_by_demand = 1'b0;
+        m0_probe_prev = 1'b0;
+        m0_pf_last_vpn = 20'hfffff;
+        m0_shadow_flush(1'b1, 20'd0);
+    end else if ($test$plusargs("profile_m0")) begin
+        m0_tlbport[0] += 1;
+        if (dut.paging_inst.cr3_write) m0_shadow_flush(1'b1, 20'd0);
+        if (dut.paging_inst.invlpg_fire) m0_shadow_flush(1'b0, dut.paging_inst.invlpg_linear[31:12]);
+        if (dut.paging_inst.pg_enable) begin
+            m0_tlbport[1] += 1;
+            if (dut.paging_inst.idle_pf_req) m0_tlbport[2] += 1;
+            if (dut.paging_inst.fast_pf_candidate) m0_tlbport[3] += 1;
+            if (dut.paging_inst.idle_pf_req && !dut.paging_inst.pf_tlb_match) begin
+                m0_tlbport[4] += 1;
+                if (m0_lookup_by_demand) m0_tlbport[5] += 1;
+            end
+            if (dut.paging_inst.idle_mem_precheck_capture && dut.paging_inst.pf_pending)
+                m0_tlbport[6] += 1;
+            if (dut.paging_inst.pf_pending && !dut.paging_inst.s_idle) m0_tlbport[7] += 1;
+            if (dut.paging_inst.idle_data_req) begin
+                m0_tlbport[8] += 1;
+                if (dut.paging_inst.mem_is_io) m0_tlbport[9] += 1;
+                else if (dut.paging_inst.live_valid) begin
+                    m0_tlbport[10] += 1;
+                    for (integer c = 4; c < M0_NSH; c++)
+                        m0_shadow_access(c, dut.paging_inst.linear_addr[31:12]);
+                end
+            end
+            if (dut.paging_inst.idle_pf_req &&
+                dut.paging_inst.pf_linear_addr[31:12] != m0_pf_last_vpn) begin
+                m0_pf_last_vpn = dut.paging_inst.pf_linear_addr[31:12];
+                for (integer c = 4; c < M0_NSH; c++) m0_shadow_access(c, m0_pf_last_vpn);
+            end
+            if (dut.paging_inst.tlb_update_valid) begin
+                if (dut.paging_inst.state == 4'd10) m0_tlbport[13] += 1;
+                else m0_tlbport[14] += 1;
+            end
+            if (dut.paging_inst.state == 4'd2 || dut.paging_inst.state == 4'd7 ||
+                dut.paging_inst.state == 4'd10)
+                m0_tlbport[15] += 1;
+            begin
+                integer needs;
+                logic direct;
+                direct = dut.dcache_vipt_probe_valid || dut.data_access_inst.st_route_pre;
+                needs = direct + dut.paging_inst.idle_pf_req +
+                        (dut.paging_inst.idle_data_req && !dut.paging_inst.mem_is_io);
+                if (direct) m0_tlbport[18] += 1;
+                if (direct && dut.paging_inst.idle_pf_req) m0_tlbport[19] += 1;
+                if (needs >= 2) m0_tlbport[20] += 1;
+            end
+            // A probe's preread resolves in the next cycle against vipt_linear_r.
+            if (m0_probe_prev)
+                m0_sidecar_consume(0, dut.paging_inst.tlb_inst.vipt_linear_r[31:12]);
+            if (dut.data_access_inst.st_route_pre)
+                m0_sidecar_consume(1, dut.paging_inst.tlb_inst.vipt_linear_r[31:12]);
+        end
+        if (dut.paging_inst.invlpg_fire) m0_tlbport[16] += 1;
+        if (dut.paging_inst.cr3_write) m0_tlbport[17] += 1;
+        if (dut.paging_inst.idle_mem_precheck_capture) m0_lookup_by_demand = 1'b1;
+        else if (dut.paging_inst.idle_pf_lookup_capture) m0_lookup_by_demand = 1'b0;
+        m0_probe_prev = dut.dcache_vipt_probe_valid;
+    end
+end
+
 final begin : m0_profile_report
     if ($test$plusargs("profile_m0")) begin
         for (integer i = 0; i < 10; i++)
@@ -454,6 +603,14 @@ final begin : m0_profile_report
         for (integer i = 0; i < 7; i++)
             $display("M0_LDELIG %0d %0d", i, m0_ldelig[i]);
         $display("M0_LDCLASS_NOTHW %0d", m0_ldclass_nothw);
+        for (integer i = 0; i < 21; i++)
+            $display("M0_TLBPORT %0d %0d", i, m0_tlbport[i]);
+        for (integer i = 0; i < 2; i++)
+            $display("M0_SIDECAR %0d %0d %0d %0d %0d", i, m0_sidecar[i][0],
+                     m0_sidecar[i][1], m0_sidecar[i][2], m0_sidecar[i][3]);
+        for (integer i = 0; i < M0_NSH; i++)
+            $display("M0_SHADOW %0d %0d %0d %0d %0d", i, M0_SH_SETS[i], M0_SH_WAYS[i],
+                     m0_shadow_lookups[i], m0_shadow_hits[i]);
         $display("M0_ESC_TOTAL %0d executor_busy %0d", m0_esc_total, m0_esc_xbusy);
         for (integer i = 0; i < 4096; i++)
             if (m0_esc_uc[i] > 20000)

@@ -19,8 +19,8 @@ module tb_dhrystone;
     localparam CODE_PHYS_BASE = 32'h0001_0000;
     localparam LINEAR_BASE    = 32'h0001_0000;
     localparam SEG_LIMIT      = 20'hF_FFFF;
-    localparam DEFAULT_DATA_FLAGS = 16'h21E0;
-    localparam DEFAULT_CODE_FLAGS = 16'hA1E0;
+    localparam DEFAULT_DATA_FLAGS = 16'h29E0;  // data RW, S=1, P=1, D/B=1, G=1
+    localparam DEFAULT_CODE_FLAGS = 16'hA9E0;  // code exec/read, S=1, P=1, D/B=1, G=1
 
     reg clk = 0;
     always #5 clk <= ~clk;
@@ -91,6 +91,9 @@ module tb_dhrystone;
         .snoop_valid(1'b0),
         .a20_enable(1'b1),
         .cpu_speed_sel(cpu_speed_sel),
+        .fast_off_req(1'b0),
+        .cache_off_req(1'b0),
+        .x87_off_req(1'b0),
 `endif
         .intr(intr),
         .nmi(nmi),

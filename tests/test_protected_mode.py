@@ -99,6 +99,10 @@ def generate_page_tables(mappings, page_dir_addr=0x0000):
                 pde = generate_page_table_entry(page_tables[pde_idx], 'RW')
                 page_dir[pde_idx] = pde
 
+            # A user mapping needs a user PDE as well.
+            if 'U' in flags.upper():
+                page_dir[pde_idx] |= 0x04
+
             # Create PTE
             pt_base = page_tables[pde_idx]
             pte = generate_page_table_entry(physical_addr, flags)
@@ -352,6 +356,15 @@ def run_test(test_name, verbose=False, trace=False, keep_files=False, cycles=20_
         return False, f"Unknown test: {test_name}"
 
     test_config = TESTS[test_name]
+    # A test that times a fast path or a cache hit, or needs a fast path to
+    # reach its trigger, has nothing to check while the fast paths or the L1
+    # caches are off or toggling.
+    sim_args = os.environ.get('SIM_PLUSARGS', '')
+    if test_config.get('fast_paths_only') and any(
+            arg in sim_args for arg in ('z486_fast_off', 'z486_fast_toggle',
+                                        'z486_hardwired_off', 'z486_cache_off',
+                                        'z486_cache_toggle')):
+        return True, "SKIP (fast paths only)"
     asm_file = TESTS_DIR / test_config['asm']
     bin_file = TESTS_DIR / f"{test_name}.bin"
     lst_file = TESTS_DIR / f"{test_name}.lst"

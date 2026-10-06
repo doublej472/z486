@@ -47,7 +47,7 @@ RTL_SRCS := $(Z486_DIR)/z486_pkg.sv $(X87_DIR)/x87_pkg.sv \
 			$(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv \
 			$(filter-out $(X87_DIR)/x87_pkg.sv $(X87_DIR)/x87_ucode_pkg.sv,$(X87_RTL)) \
 			$(Z486_DIR)/dsp_mul.sv $(Z486_DIR)/protection.sv $(Z486_DIR)/segmentation_unit.sv
-RTL_DEPS := $(Z486_DIR)/ucode_recipes.svh $(X87_GEN) \
+RTL_DEPS := $(Z486_DIR)/ucode_recipes.svh $(Z486_DIR)/pb_b1_class.svh $(X87_GEN) \
 			$(X87_DIR)/x87_logexp_rom.sv
 # Optional modules (not yet integrated):
 # RTL_SRCS += $(Z486_DIR)/muldiv.sv $(Z486_DIR)/bus_prefetch.sv
@@ -343,7 +343,7 @@ test-x87-core: obj_dir_x87_core/Vtb_x87_core
 
 test-x87-integration: obj_dir_x87/Vtb_protected_mode
 	@echo "Running x87-enabled CPU protocol tests..."
-	Z486_ENABLE_X87=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_x87/Vtb_protected_mode ./test_protected_mode.py x87_protocol x87_env32 x87_arithmetic x87_m32_page_fault x87_heap32 x87_qemu_special x87_qemu_exceptions
+	Z486_ENABLE_X87=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_x87/Vtb_protected_mode ./test_protected_mode.py x87_protocol x87_env32 x87_arithmetic x87_m32_page_fault x87_heap32 x87_qemu_special x87_qemu_exceptions x87_off_sx
 
 test-x87-integer: obj_dir_x87_int/Vtb_z486
 	@echo "Running integer regressions with x87 enabled..."

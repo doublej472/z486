@@ -1,4 +1,5 @@
 {
+  "fast_paths_only": true,
   "asm": "hardwired_load_intr_boundary.asm",
   "start_mode": "real",
   "cr0": 0,

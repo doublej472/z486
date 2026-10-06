@@ -1,4 +1,5 @@
 {
+  "fast_paths_only": true,
   "asm": "vipt_load_interlocks.asm",
   "start_mode": "protected",
   "cr0": "0x80000001",

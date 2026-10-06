@@ -63,6 +63,9 @@ module tb_protected_mode #(
         .snoop_valid(1'b0),
         .a20_enable(1'b1),
         .cpu_speed_sel(2'd0),
+        .fast_off_req(1'b0),
+        .cache_off_req(1'b0),
+        .x87_off_req(1'b0),
         .single_step(1'b0), // Continuous execution
         .dbg_CS(),
         .dbg_EIP(),
@@ -80,6 +83,14 @@ module tb_protected_mode #(
 
     // Instruction counting
     wire instruction_boundary = dut.uc_is_rni && dut.uc_active;
+    // The current instruction ran the HLTS bus cycle (it really halted).
+    reg hlt_halted = 1'b0;
+    always @(posedge clk) begin
+        if (dut.i_issue && !dut.stall)
+            hlt_halted <= 1'b0;
+        else if (dut.uc_exec && dut.uc_buscode == 6'h3C)   // BUSOP_HLTS
+            hlt_halted <= 1'b1;
+    end
     reg prev_instruction_boundary = 0;
     longint instruction_count = 0;
     longint x87_command_count = 0;
@@ -599,6 +610,8 @@ module tb_protected_mode #(
 
     // Hardware interrupt emulation
     reg [7:0] intr_vector = 8'h20;     // Vector to return on INTA
+    int unsigned fuzz_irq_period = 0;  // +fuzz_irq_period=N: random INTR
+    initial void'($value$plusargs("fuzz_irq_period=%d", fuzz_irq_period));
     reg       intr_request = 0;        // Pending INTR request from signal port
     reg       nmi_request = 0;         // Pending NMI request from signal port
     int       intr_delay = 0;          // Cycles to delay before asserting intr/nmi
@@ -757,6 +770,22 @@ module tb_protected_mode #(
                             $display("========================================");
                             test_done <= 1;
                         end else begin
+                            // +dump_mem=file +dump_lo=hex +dump_hi=hex: write memory
+                            // [lo, hi) as hex bytes. The status write is I/O, which
+                            // waits for posted stores, so memory is final here.
+                            begin
+                                string dump_file;
+                                int unsigned dump_lo, dump_hi;
+                                int fd;
+                                if ($value$plusargs("dump_mem=%s", dump_file) &&
+                                    $value$plusargs("dump_lo=%h", dump_lo) &&
+                                    $value$plusargs("dump_hi=%h", dump_hi)) begin
+                                    fd = $fopen(dump_file, "w");
+                                    for (int unsigned a = dump_lo; a < dump_hi && a < MEM_SIZE; a++)
+                                        $fwrite(fd, "%02x\n", mem[a]);
+                                    $fclose(fd);
+                                end
+                            end
                             $display("");
                             $display("========================================");
                             $display("  TEST PASSED!");
@@ -1553,6 +1582,12 @@ module tb_protected_mode #(
                 $finish;
             end
 
+            // Fuzzing: +fuzz_irq_period=N raises INTR at random, about once
+            // every N cycles while none is pending; INTA clears it as usual.
+            if (fuzz_irq_period > 0 && !intr && !inta_first &&
+                ($urandom % fuzz_irq_period) == 0)
+                intr <= 1'b1;
+
             // Hardware interrupt signal generation
             // The load's first cycle, executed from the ROM or as a direct load
             // (whose ROM word does not execute).
@@ -1618,7 +1653,10 @@ module tb_protected_mode #(
             end
 
             // Check for HLT (can be disabled for HLT-wakeup interrupt tests)
-            if (stop_on_hlt && dut.i.opcode == 8'hF4 && instruction_boundary && !prev_instruction_boundary) begin
+            // Only an HLT that reached the halt bus cycle ends the test: one
+            // above CPL 0 raises #GP instead (still F4 at its boundary).
+            if (stop_on_hlt && dut.i.opcode == 8'hF4 && instruction_boundary && !prev_instruction_boundary &&
+                hlt_halted) begin
                 $display("");
                 $display("========================================");
                 $display("  HLT EXECUTED");
@@ -1639,6 +1677,17 @@ module tb_protected_mode #(
             // One line per D2 -> EX issue: cycle, EIP after the issue, ROM entry.
             if ($test$plusargs("trace_issue") && dut.i_issue && !dut.stall)
                 $display("ISSUE %0d %08X %03X", cycle, dut.EIP, dut.issue_entry);
+            // Architectural state as each instruction issues (reference
+            // co-simulation): the data unit's capture view merges every GPR
+            // write landing on this edge, eflags_fwd the pending flags.
+            if ($test$plusargs("trace_state") && dut.i_issue && !dut.stall)
+                $display("ST %0d %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X",
+                         cycle, dut.EIP,
+                         dut.data_unit_inst.gpr_capture_view[0], dut.data_unit_inst.gpr_capture_view[1],
+                         dut.data_unit_inst.gpr_capture_view[2], dut.data_unit_inst.gpr_capture_view[3],
+                         dut.forwarded_esp,
+                         dut.data_unit_inst.gpr_capture_view[5], dut.data_unit_inst.gpr_capture_view[6],
+                         dut.data_unit_inst.gpr_capture_view[7], dut.eflags_fwd);
             if ($test$plusargs("trace_instr") && instruction_boundary && !prev_instruction_boundary)
                 $display("INSTR[%0d]: CS:EIP=%04X:%08X IR=%02X EAX=%08X",
                          instruction_count, dut.CS, dut.EIP, dut.i.opcode, dut.EAX);

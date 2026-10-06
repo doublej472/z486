@@ -53,6 +53,9 @@ module tb_test386;
         .snoop_valid(1'b0),
         .a20_enable(1'b1),
         .cpu_speed_sel(2'd0),
+        .fast_off_req(1'b0),
+        .cache_off_req(1'b0),
+        .x87_off_req(1'b0),
         .single_step(1'b0), // Continuous execution for test386.asm
         .dbg_CS(),
         .dbg_EIP(),
