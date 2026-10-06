@@ -1361,7 +1361,7 @@ always_ff @(posedge clk) begin
         uc_flags <= 32'h0000_0002;
     end else begin
         if (instr_start)
-            uc_flags <= eflags;
+            uc_flags <= {eflags[31:17], eflags[16] && !clear_rf, eflags[15:0]};
         if (flag2_ucflags_p) begin
             uc_flags[0]  <= flag2_cf_r;
             uc_flags[4]  <= flag2_af_r;
@@ -1525,7 +1525,10 @@ always_ff @(posedge clk) begin
         flags_backup_active <= 1'b0;
     end else if (instr_start && !halted) begin
         flags_backup_active <= 1'b1;
-        flags_backup <= eflags_fwd;
+        // The issue edge also clears RF for the instruction that just
+        // completed (clear_rf); the new instruction's backup must see it.
+        flags_backup <= {eflags_fwd[31:17], eflags_fwd[16] && !clear_rf,
+                         eflags_fwd[15:0]};
     end else if (exec && aluop == ALUJMP_FLGSBA) begin
         if (!flags_backup_active) begin
             flags_backup_active <= 1'b1;
