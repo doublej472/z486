@@ -44,6 +44,7 @@ module data_unit
     input  logic        any_fault,
     input  logic        clear_rf,
     input  logic        set_rf,           // instruction-breakpoint #DB: the pushed image carries RF=1
+    input  logic        fault_set_rf,     // fault delivery: the pushed FLAGS image carries RF=1
     input  logic        gate_detect,
     output logic        flags_backup_active,
 
@@ -1514,6 +1515,11 @@ always_ff @(posedge clk) begin
     end else if (exec && dest == DEST_FLAGSB) begin
         if (!flags_backup_active)
             flags_backup <= dest_value;
+    end else if (fault_set_rf) begin
+        // Fault-class delivery: the CROM sets EFLAGS.RF (MASK16 + 1) before
+        // it pushes the FLAGSB image; a 486 pushes RF=1 for every fault so
+        // the restarted instruction does not re-trigger its code breakpoint.
+        flags_backup[16] <= 1'b1;
     end
 end
 

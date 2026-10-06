@@ -1059,6 +1059,9 @@ localparam [11:0] UADDR_STACK_FAULT    = 12'h863;  // #SS(0) - sets SIGMA=3, err
 localparam [11:0] UADDR_DIVIDE_ERROR   = 12'h824;  // #DE(0) - divide error (vector 0)
 localparam [11:0] UADDR_DOUBLE_FAULT   = 12'h83F;  // #DF - vector 8, zero error code
 localparam [11:0] UADDR_ALIGN_FAULT    = 12'h9F6;  // #AC(0) - vector 17 (optimizer-owned entry)
+// Fault-class delivery word that sets EFLAGS.RF (EFLAGS <- EFLAGS | 10000h);
+// interrupts and traps enter the common body after it.
+localparam [11:0] UADDR_FAULT_SET_RF   = 12'h899;
 // The exception-entry cluster: any fault raised while the microcode is inside
 // this range is a re-entry of a delivery already in progress.
 localparam [11:0] UADDR_FAULT_ENTRY_FIRST = 12'h85B;
