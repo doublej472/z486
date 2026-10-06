@@ -584,6 +584,34 @@ module tb_l1_icache;
             $fatal(1);
         end
 
+        // A snoop is one event, not a permanent clear of its saved way. Fill
+        // all ways of a set, invalidate its oldest line, then refill that way.
+        // A subsequent idle clock must not clear the new line again.
+        reset = 1'b1;
+        repeat (5) @(negedge clk);
+        reset = 1'b0;
+        repeat (20) @(negedge clk);
+        mem_put_line(32'h40, 1, 2, 3, 4);
+        mem_put_line(32'hC0, 5, 6, 7, 8);
+        mem_put_line(32'h140, 9, 10, 11, 12);
+        mem_put_line(32'h1C0, 13, 14, 15, 16);
+        cache_read(32'h40, 128'h00000004_00000003_00000002_00000001);
+        cache_read(32'hC0, 128'h00000008_00000007_00000006_00000005);
+        cache_read(32'h140, 128'h0000000C_0000000B_0000000A_00000009);
+        cache_read(32'h1C0, 128'h00000010_0000000F_0000000E_0000000D);
+        @(negedge clk);
+        invalidate_addr = 32'h40;
+        invalidate_valid = 1'b1;
+        @(negedge clk);
+        invalidate_valid = 1'b0;
+        repeat (5) @(negedge clk);
+        cache_read(32'h40, 128'h00000004_00000003_00000002_00000001);
+        mem_request_before = mem_request_count;
+        repeat (5) @(negedge clk);
+        cache_read(32'h40, 128'h00000004_00000003_00000002_00000001);
+        if (mem_request_count != mem_request_before)
+            $fatal(1, "I-cache repeated a stale snoop after the line was refilled");
+
         $display("L1 PIPT instruction cache unit test PASS (same-way fill/snoop write-port cycles: %0d)",
                  same_way_cycles);
         $finish;
