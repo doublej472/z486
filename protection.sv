@@ -108,9 +108,15 @@ wire test_en = uc_exec && is_6x && !is_ptsav &&
 
 wire protun_writing = uc_exec && (uc_dest == DEST_PROTUN);
 wire set_accessed = pe_mode && uc_exec && is_ptovrr;
-wire [31:0] protun_next = (set_accessed && uc_source_value[12])
-                           ? (uc_source_value | 32'h0000_0100)
-                           : uc_source_value;
+// WRITE_RPL (call gate to an inner level, 5FD) writes the target selector
+// to PROTUN with its RPL replaced by the target's DPL, the new CPL: 5FF
+// takes the TSS stack slot from it. A gate ignores its target's RPL.
+wire write_rpl_now = uc_exec && pe_mode && (uc_aluop == ALUJMP_PTGEN) && (uc_alu_src == 6'h2C);
+wire [31:0] protun_src = write_rpl_now ? {uc_source_value[31:2], desc_raw_hi_r[14:13]}
+                                       : uc_source_value;
+wire [31:0] protun_next = (set_accessed && protun_src[12])
+                           ? (protun_src | 32'h0000_0100)
+                           : protun_src;
 wire [31:0] protun_fwd = protun_writing ? protun_next : protun_r;
 wire [31:0] descriptor_value = is_ptovrr ? opr_r :
                                (uc_alu_src == TST_DES_GRANUL)
@@ -642,8 +648,10 @@ always_comb begin
                     pla_test_addr = 12'h5D5;
                     pla_test_flags = 4'b0001;
                 end
-            end else if (!p1 && u && x && ce) begin
-                // Terms 62/92: !p1, u, x, ce
+            end else if (s1_desc_dpl <= s1_cpl && u && x && ce) begin
+                // Terms 62/92: !p1, u, x, ce. A transfer to conforming code
+                // needs DPL <= CPL and ignores RPL; PTOVRR's p1 compares
+                // DPL with RPL, so the check is made here.
                 if (!p) begin
                     // Term 62 → 0x870
                     pla_test_addr = 12'h870;
@@ -693,7 +701,9 @@ always_comb begin
         // TST_DES_JGDEST (0x14) - Jump gate destination code segment
         //----------------------------------------------------------------------
         TST_DES_JGDEST: begin
-            if (!p1 && p2 && u && x) begin
+            // A gate ignores its target selector's RPL: p1 (RPL against
+            // DPL in PTOVRR) is replaced by DPL against CPL.
+            if (s1_desc_dpl <= s1_cpl && p2 && u && x) begin
                 // Terms 31, 49, 87: !p1, p2, u, x
                 if (!p) begin
                     // Terms 31, 49 → 0x870
@@ -703,7 +713,7 @@ always_comb begin
                     pla_test_addr = 12'h5DA;
                     pla_test_flags = 4'b0001;
                 end
-            end else if (!p1 && u && x && ce) begin
+            end else if (s1_desc_dpl <= s1_cpl && u && x && ce) begin
                 // Terms 73, 91: !p1, u, x, ce
                 if (!p) begin
                     // Term 73 → 0x870
@@ -727,8 +737,8 @@ always_comb begin
             // Term 31: !p1 p2 !b13 !p u x → 0x870
             if (!p1 && p2 && !b13 && !p && u && x)
                 pla_test_addr = pla_test_addr | 12'h870;
-            // Term 73: !p1 !p u x ce → 0x870
-            if (!p1 && !p && u && x && ce)
+            // Term 73: !p1 !p u x ce → 0x870 (conforming: DPL <= CPL, as JMP)
+            if (s1_desc_dpl <= s1_cpl && !p && u && x && ce)
                 pla_test_addr = pla_test_addr | 12'h870;
             // Term 54: !p1 p2 !b13 p u x → 0x5D5, K=0001
             if (!p1 && p2 && !b13 && p && u && x) begin
@@ -736,7 +746,7 @@ always_comb begin
                 pla_test_flags = pla_test_flags | 4'b0001;
             end
             // Term 88: !p1 p u x ce → 0x5D5, K=0001
-            if (!p1 && p && u && x && ce) begin
+            if (s1_desc_dpl <= s1_cpl && p && u && x && ce) begin
                 pla_test_addr = pla_test_addr | 12'h5D5;
                 pla_test_flags = pla_test_flags | 4'b0001;
             end
@@ -746,19 +756,22 @@ always_comb begin
         // TST_DES_CGDEST (0x17) - Call Gate Destination Code Segment
         //----------------------------------------------------------------------
         TST_DES_CGDEST: begin
+            // A gate ignores its target selector's RPL (Win95 Setup's
+            // SYSDETMG builds one whose target has RPL 3): the PLA's !p1
+            // (RPL against DPL in PTOVRR) is this DPL-against-CPL check.
             if (s1_desc_dpl > s1_cpl) begin
                 // Target DPL exceeds CPL: illegal outward transition → #GP
             end else begin
                 // Term 2: !p1 !p2 p u x !ce → 0x021, KLMN=1100
-                if (!p1 && !p2 && p && u && x && !ce) begin
+                if (!p2 && p && u && x && !ce) begin
                     pla_test_addr = 12'h021;
                     pla_test_flags = 4'b1100;
                 end
                 // Term 72: !p1 !p u x → 0x870
-                if (!p1 && !p && u && x)
+                if (!p && u && x)
                     pla_test_addr = pla_test_addr | 12'h870;
                 // Term 102: !p1 p u x → 0x5DA, K=0001
-                if (!p1 && p && u && x) begin
+                if (p && u && x) begin
                     pla_test_addr = pla_test_addr | 12'h5DA;
                     pla_test_flags = pla_test_flags | 4'b0001;
                 end
@@ -997,7 +1010,13 @@ always_comb begin
         // TST_DES_LAR (0x30) - Test LAR/LSL VERR/VERW
         //----------------------------------------------------------------------
         TST_DES_LAR: begin
-            if (!p1 && u) begin
+            // A non-conforming segment or system descriptor is visible
+            // only when DPL >= CPL as well as RPL (PTOVRR's p1 has only
+            // RPL); as TST_DES_VERR. A 386 call gate has x and ce set, so
+            // conforming code is u && x && ce.
+            if (s1_cpl > s1_desc_dpl && !(u && x && ce)) begin
+                // Fall through to 718 (CLZF)
+            end else if (!p1 && u) begin
                 // Term 115: !p1, u → 0x71A (most general)
                 pla_test_addr = 12'h71A;
             end else if (u && x && ce) begin
@@ -1098,7 +1117,9 @@ always_comb begin
         // TST_DES_LSL (0x31) - Load Segment Limit
         //----------------------------------------------------------------------
         TST_DES_LSL: begin  // TST_DES_LSL
-            if (!p1 && u) begin
+            if (s1_cpl > s1_desc_dpl && !(u && x && ce)) begin
+                // DPL < CPL, not conforming code: fall through (CLZF), as LAR
+            end else if (!p1 && u) begin
                 // Term 126: !p1, u → 0x6EE (most general)
                 pla_test_addr = 12'h6EE;
             end else if (!p1 && !ce && a) begin

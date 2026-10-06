@@ -34,7 +34,7 @@ module address_unit
     input  logic [31:0] source_value,
     input  logic [31:0] alu_value,
     input  logic [31:0] alu_value_hold,
-    input  logic        instr_jcc,
+    input  logic        jcc_word,            // Executing Jcc's IN=+ word: add the held displacement
     input  logic        pe,
     input  logic        is_dword,
     input  logic        descsw_mode,
@@ -230,7 +230,7 @@ always_comb begin
     case (ind_op)
         INDOP_PLUS_ALU: begin
             exec_linear_a = ind_source_irf2 ? ind : source_value;
-            exec_linear_b = instr_jcc ? alu_value_hold : alu_value;
+            exec_linear_b = jcc_word ? alu_value_hold : alu_value;
             if (ind_dest_class == INDDEST_DESSTK)
                 exec_linear_mask16 = !pe || !ss_stack32;
             else if (ind_dest_class == INDDEST_DESCOD)
@@ -305,7 +305,7 @@ always_ff @(posedge clk) begin
                 automatic logic [31:0] operand1;
                 automatic logic [31:0] operand2;
                 operand1 = ind_source_irf2 ? ind : source_value;
-                operand2 = instr_jcc ? alu_value_hold : alu_value;
+                operand2 = jcc_word ? alu_value_hold : alu_value;
                 if (ind_dest_class == INDDEST_DESSTK)
                     mask16 = !pe || !ss_stack32;
                 else if (ind_dest_class == INDDEST_DESCOD)
@@ -403,7 +403,7 @@ always_ff @(posedge clk) begin
         case (ind_op)
             INDOP_PLUS_ALU: begin
                 automatic logic [31:0] operand2;
-                operand2 = instr_jcc ? alu_value_hold : alu_value;
+                operand2 = jcc_word ? alu_value_hold : alu_value;
                 if (alu_source != ALUSRC_ZERO)
                     ind_delta <= operand2;
                 ind_owner_issue_r <= 1'b0;

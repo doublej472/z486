@@ -302,11 +302,19 @@ wire [2:0] pred_shift_widx = wide_widx(issue_instr.dst_reg_sel, issue_instr.oper
 wire pbn_shift_conf = (issue_recipe.commit_sel == RECIPE_COMMIT_SHIFT) &&
     (pb_next_ea.base_sel[pred_shift_widx] || pb_next_ea.index_sel[pred_shift_widx] ||
      pbn_read_mask[pred_shift_widx]);
-recipe_meta_t pbn_recipe;
-assign pbn_recipe = recipe_metadata(pb_next_instr);
-wire pbn_type = pb_b1_type(pb_next_instr, pbn_recipe);
-wire pbn_safe = (!pbn_recipe.reads_flags || !issue_recipe.writes_flags || pbn_recipe.jcc) &&
-    (!pbn_recipe.uses_ea ||
+// The successor's recipe class, from its opcode and ModR/M fields alone
+// (pb_b1_class.svh, generated from the recipe table and checked against it in
+// simulation). Taken from the D1 entry point, the entry ROMs and the recipe
+// table would set the cycle.
+`include "pb_b1_class.svh"
+wire [3:0] pbn_class = pb_b1_class(pb_next_instr.has_0f, pb_next_instr.opcode,
+                                   pb_next_instr.modrm);
+wire pbn_type = pbn_class[3] && (pb_next_instr.rep_lock == PREFIX_NOREPLOCK);
+wire pbn_reads_flags = pbn_class[2];
+wire pbn_uses_ea = pbn_class[1];
+wire pbn_jcc = pbn_class[0];
+wire pbn_safe = (!pbn_reads_flags || !issue_recipe.writes_flags || pbn_jcc) &&
+    (!pbn_uses_ea ||
      !ea_conflict(pred1_we, pred1_widx, pb_next_ea, pb_next_instr,
                   issue_recipe.commit_sel == RECIPE_COMMIT_ESP)) &&
     !(mem_hazard && (pb_next_ea.base_sel[mem_widx] || pb_next_ea.index_sel[mem_widx] ||
@@ -461,6 +469,17 @@ end
 //=============================================================================
 
 // synthesis translate_off
+recipe_meta_t pbn_recipe;
+assign pbn_recipe = recipe_metadata(pb_next_instr);
+wire pbn_type_exact = pb_b1_type(pb_next_instr, pbn_recipe);
+always @(posedge clk)
+    if (reset_n && pb_load &&
+        ((pbn_type != pbn_type_exact) ||
+         (pbn_type && ({pbn_reads_flags, pbn_uses_ea, pbn_jcc} !=
+                       {pbn_recipe.reads_flags, pbn_recipe.uses_ea, pbn_recipe.jcc}))))
+        $fatal(1, "pb_b1_class disagrees with the recipe table: entry %03x opcode %02x modrm %02x class %b type %b",
+               pb_next_instr.entry_point, pb_next_instr.opcode, pb_next_instr.modrm,
+               pbn_class, pbn_type_exact);
 always @(posedge clk)
     if (reset_n && pb_load && pbn_type &&
         |(recipe_gpr_read_mask(pb_next_instr) & ~pbn_read_mask))

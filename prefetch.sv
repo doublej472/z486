@@ -226,6 +226,22 @@ wire [5:0] byte_advance = {4'b0000, pf_byte_offset} + {1'b0, pop_len};
 wire [3:0] k1p_sum = {2'b00, k1p_boff} + k1p_adv;
 wire [3:0] k1p_preread_sum = {2'b00, k1p_boff} + k1p_preread_adv;
 
+logic [255:0] queue_nf;         // next queue without a flush: the fill only
+logic [255:0] queue_fl;         // next queue on a flush that hits the buffered line
+always_comb begin
+    for (int k = 0; k < 8; k++) begin
+        queue_nf[32*k +: 32] = prefetch_queue[k];
+        queue_fl[32*k +: 32] = prefetch_queue[k];
+    end
+    if (good_ack)
+        for (int j = 0; j < 4; j++)
+            if (2'(j) >= pf_fetch_word_start)
+                queue_nf[{pf_wptr[2], 2'(j), 5'b0} +: 32] = line_word(pf_rdata, 2'(j));
+    for (int j = 0; j < 4; j++)
+        if (2'(j) >= spec_off[3:2])
+            queue_fl[32*j +: 32] = line_word(spec_hit_line, 2'(j));
+end
+
 logic [3:0]  rptr_next;
 logic [3:0]  wptr_next;
 logic [1:0]  byte_offset_next;
@@ -239,8 +255,11 @@ always_comb begin
     byte_offset_next = pf_byte_offset;
     k1p_word_next = k1p_word + {2'b00, k1p_sum[3:2]};
     k1p_boff_next = k1p_sum[1:0];
+    // The queue words come from the two next-queue views above: the fill
+    // without a flush, the seeded target line on a flush that hits it.
     for (int k = 0; k < 8; k++)
-        queue_next[k] = prefetch_queue[k];
+        queue_next[k] = q_flush ? (spec_flush_hit ? queue_fl[32*k +: 32] : prefetch_queue[k])
+                                : queue_nf[32*k +: 32];
 
     if (pop_now) begin
         byte_offset_next = byte_advance[1:0];
@@ -250,12 +269,8 @@ always_comb begin
     // Queue slots are aligned to line words: line word j always lands in
     // slot {half, j}. After a flush the pointers start at the target's word
     // within the line (see below), so a fill needs no per-slot word mux.
-    if (fill_commit) begin
-        for (int j = 0; j < 4; j++)
-            if (2'(j) >= pf_fetch_word_start)
-                queue_next[{pf_wptr[2], 2'(j)}] = line_word(pf_rdata, 2'(j));
+    if (fill_commit)
         wptr_next = pf_wptr + {1'b0, fetch_write_words};
-    end
 
     if (q_flush) begin
         rptr_next = {2'b00, flush_word};
@@ -263,15 +278,10 @@ always_comb begin
         byte_offset_next = k1pj_boff;
         k1p_word_next = {2'b00, flush_word};
         k1p_boff_next = k1pj_boff;
-        if (spec_flush_hit) begin
-            // Seed the queue from the buffered target line right now. All
-            // placement selects come from the LATCHED spec_off - only the hit
-            // control bit sees the late flush address.
-            for (int j = 0; j < 4; j++)
-                if (2'(j) >= spec_off[3:2])
-                    queue_next[j] = line_word(spec_hit_line, 2'(j));
+        // A hit seeds the queue from the buffered target line (queue_fl):
+        // all placement selects come from the LATCHED spec_off.
+        if (spec_flush_hit)
             wptr_next = 4'd4;
-        end
     end
 
     if (seed_now) begin
@@ -329,17 +339,31 @@ end
 // required preread window below supplies the advancing case. The late control
 // path therefore ends at one 64-bit select instead of traversing an add and
 // byte aligner.
-wire [31:0] k1p_hold_word_cur = queue_next[ptr_idx(k1p_word)];
-wire [31:0] k1p_hold_word_nxt = queue_next[ptr_idx(k1p_word + 4'd1)];
-wire [31:0] k1p_hold_word_2nd = queue_next[ptr_idx(k1p_word + 4'd2)];
-wire [63:0] k1q_hold_next =
-    k1p_boff == 2'd0 ? {k1p_hold_word_nxt,       k1p_hold_word_cur} :
-    k1p_boff == 2'd1 ? {k1p_hold_word_2nd[7:0],  k1p_hold_word_nxt,
-                                                k1p_hold_word_cur[31:8]} :
-    k1p_boff == 2'd2 ? {k1p_hold_word_2nd[15:0], k1p_hold_word_nxt,
-                                                k1p_hold_word_cur[31:16]} :
-                      {k1p_hold_word_2nd[23:0], k1p_hold_word_nxt,
-                                                k1p_hold_word_cur[31:24]};
+//
+// q_flush is decided late (a taken Jcc's forwarded flags), so the D1 windows
+// are formed for both outcomes and q_flush picks one last. Without a flush the
+// queue takes only the fill; with one it is the buffered target line seeded
+// at the latched spec_off. A flush that misses the buffered line empties the
+// queue, so its window is unused until the refill rewrites it, and the flush
+// view need not follow pf_flush_addr there.
+function automatic [63:0] d1_window(input logic [255:0] q,   // queue, slot k at [32k +: 32]
+                                    input logic [3:0] word,
+                                    input logic [1:0] boff);
+    logic [31:0] cur, nxt, nd2;
+    begin
+        cur = q[{ptr_idx(word), 5'b0} +: 32];
+        nxt = q[{ptr_idx(word + 4'd1), 5'b0} +: 32];
+        nd2 = q[{ptr_idx(word + 4'd2), 5'b0} +: 32];
+        d1_window = boff == 2'd0 ? {nxt, cur} :
+                    boff == 2'd1 ? {nd2[7:0], nxt, cur[31:8]} :
+                    boff == 2'd2 ? {nd2[15:0], nxt, cur[31:16]} :
+                                   {nd2[23:0], nxt, cur[31:24]};
+    end
+endfunction
+
+
+wire [63:0] k1q_hold_next  = d1_window(queue_nf, k1p_word, k1p_boff);
+wire [63:0] k1q_flush_next = d1_window(queue_fl, {2'b00, spec_off[3:2]}, spec_off[1:0]);
 
 // Run the entry-table cursor from structural decode alone. If the real D1
 // cursor is held by D2, the decoder keeps the prior table output; therefore
@@ -349,38 +373,22 @@ logic [1:0] k1p_preread_boff;
 always_comb begin
     k1p_preread_word = k1p_word + {2'b00, k1p_preread_sum[3:2]};
     k1p_preread_boff = k1p_preread_sum[1:0];
-    if (q_flush) begin
-        k1p_preread_word = {2'b00, flush_word};
-        k1p_preread_boff = k1pj_boff;
-    end else if (seed_now) begin
+    if (seed_now) begin
         k1p_preread_word = k1p_preread_word + seed_delta;
         k1p_preread_boff = pf_fetch_addr[1:0];
     end
 end
 
-wire [31:0] k1p_preread_word_cur = queue_next[ptr_idx(k1p_preread_word)];
-wire [31:0] k1p_preread_word_nxt = queue_next[ptr_idx(k1p_preread_word + 4'd1)];
-wire [31:0] k1p_preread_word_2nd = queue_next[ptr_idx(k1p_preread_word + 4'd2)];
-wire [63:0] k1q_preread_next =
-    k1p_preread_boff == 2'd0 ? {k1p_preread_word_nxt,
-                                k1p_preread_word_cur} :
-    k1p_preread_boff == 2'd1 ? {k1p_preread_word_2nd[7:0],
-                                k1p_preread_word_nxt,
-                                k1p_preread_word_cur[31:8]} :
-    k1p_preread_boff == 2'd2 ? {k1p_preread_word_2nd[15:0],
-                                k1p_preread_word_nxt,
-                                k1p_preread_word_cur[31:16]} :
-                               {k1p_preread_word_2nd[23:0],
-                                k1p_preread_word_nxt,
-                                k1p_preread_word_cur[31:24]};
+wire [63:0] k1q_preread_nf = d1_window(queue_nf, k1p_preread_word, k1p_preread_boff);
+wire [63:0] k1q_preread_next = q_flush ? k1q_flush_next : k1q_preread_nf;
 assign k1q_early = k1q_preread_next;
 
 // q_flush gives both cursor views the same redirected origin. Otherwise the
 // real cursor advances exactly when structural preread and committed advance
 // agree; disagreement means D2 held the handoff.
 wire k1p_commit_preread = q_flush || (k1p_adv == k1p_preread_adv);
-wire [63:0] k1q_next = k1p_commit_preread
-                        ? k1q_preread_next : k1q_hold_next;
+wire [63:0] k1q_next = q_flush ? k1q_flush_next :
+                       (k1p_adv == k1p_preread_adv) ? k1q_preread_nf : k1q_hold_next;
 
 // synthesis translate_off
 wire [31:0] k1p_reference_word_cur = queue_next[ptr_idx(k1p_word_next)];
@@ -398,10 +406,37 @@ wire [63:0] k1q_reference =
                            {k1p_reference_word_2nd[23:0],
                              k1p_reference_word_nxt,
                              k1p_reference_word_cur[31:24]};
+// The pre-split early window: the preread cursor (flush leg included) over
+// the full next queue.
+logic [3:0] ref_preread_word;
+logic [1:0] ref_preread_boff;
+always_comb begin
+    ref_preread_word = k1p_word + {2'b00, k1p_preread_sum[3:2]};
+    ref_preread_boff = k1p_preread_sum[1:0];
+    if (q_flush) begin
+        ref_preread_word = {2'b00, flush_word};
+        ref_preread_boff = k1pj_boff;
+    end else if (seed_now) begin
+        ref_preread_word = ref_preread_word + seed_delta;
+        ref_preread_boff = pf_fetch_addr[1:0];
+    end
+end
+logic [255:0] queue_next_packed;
+always_comb for (int k = 0; k < 8; k++) queue_next_packed[32*k +: 32] = queue_next[k];
+wire [63:0] k1q_early_reference = d1_window(queue_next_packed, ref_preread_word, ref_preread_boff);
+// A flush that misses the buffered line leaves an empty queue: no window is
+// read until the refill, so only that case may differ.
+wire k1q_window_dont_care = q_flush && !spec_flush_hit;
 always_ff @(posedge clk) begin
-    if (reset_n && (k1q_next !== k1q_reference))
+    if (reset_n && !k1q_window_dont_care && (k1q_next !== k1q_reference))
         $fatal(1, "PF D1 WINDOW MISMATCH: selected=%h reference=%h",
                k1q_next, k1q_reference);
+    if (reset_n && !k1q_window_dont_care && (k1q_early !== k1q_early_reference))
+        $fatal(1, "PF D1 EARLY WINDOW MISMATCH: selected=%h reference=%h",
+               k1q_early, k1q_early_reference);
+    if (reset_n && k1q_window_dont_care && (wptr_next != rptr_next))
+        $fatal(1, "PF: a flush missing the buffered line left queue words (rptr %0d wptr %0d)",
+               rptr_next, wptr_next);
 end
 // synthesis translate_on
 

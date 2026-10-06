@@ -70,6 +70,8 @@ module data_unit
 
     // Load pipeline: registered VIPT load write-back into the register file
     input  logic        load_wb_valid,             // Registered VIPT load WB
+    input  logic        load_issue,                // A direct load issues (it writes back later)
+    input  logic        load_pipe_flush,           // In-flight direct loads are dropped
     input  logic [2:0]  load_wb_dst,
     input  logic [1:0]  load_wb_size,
     input  logic [31:0] load_wb_data,
@@ -327,10 +329,9 @@ wire [7:0] pend_shift_mask = recipe_shift_write.valid ? (8'h01 << recipe_shift_w
 wire [7:0] pend_dly_mask   = dly_gpr_forward.valid ? (8'h01 << dly_gpr_forward.dst) : 8'h00;
 
 logic [31:0] gpr_ex_view [0:7];
-logic [31:0] gpr_ea_view [0:7];
 logic [31:0] gpr_capture_view [0:7];
 always_comb begin
-    logic [31:0] current, merged, dly_value, shift_value, captured;
+    logic [31:0] current, merged, captured;
     for (int r = 0; r < 8; r++) begin
         current = read_gpr_value(3'(r), 2'd2);
 
@@ -343,24 +344,6 @@ always_comb begin
                 default:    merged = opr_r;
             endcase
         gpr_ex_view[r] = merged;
-
-        case (dly_gpr_forward.mode)
-            EA_FWD_BLO: dly_value = {current[31:8], dly_gpr_forward.data[7:0]};
-            EA_FWD_BHI: dly_value = {current[31:16], dly_gpr_forward.data[7:0], current[7:0]};
-            EA_FWD_W:   dly_value = {current[31:16], dly_gpr_forward.data[15:0]};
-            default:    dly_value = dly_gpr_forward.data;
-        endcase
-        if (recipe_shift_write.size == 2'd0)
-            shift_value = recipe_shift_write.dst[2]
-                ? {current[31:16], recipe_shift_data[7:0], current[7:0]}
-                : {current[31:8], recipe_shift_data[7:0]};
-        else if (recipe_shift_write.size == 2'd1)
-            shift_value = {current[31:16], recipe_shift_data[15:0]};
-        else
-            shift_value = recipe_shift_data;
-        gpr_ea_view[r] = pend_dly_mask[r]   ? dly_value :
-                         pend_shift_mask[r] ? shift_value :
-                         pend_load_mask[r]  ? load_wb_forward_data : current;
 
         captured = merged;
         if (pend_shift_mask[r]) begin
@@ -385,13 +368,30 @@ always_comb begin
 end
 
 // An EX operand read, formatted to its size.
+// The register is selected first and the plain-load WB and ROM-load commit
+// are applied by index, as for the EA view, so a variable DSTREG/SRCREG read
+// does not put the forwarding masks in front of its eight-way select.
 function automatic logic [31:0] read_gpr_load_forwarded(
     input logic [2:0] reg_sel,
     input logic [1:0] size
 );
     logic [31:0] merged;
+    logic [2:0]  idx;
     begin
-        merged = gpr_ex_view[(size == 2'd0) ? {1'b0, reg_sel[1:0]} : reg_sel];
+        idx = (size == 2'd0) ? {1'b0, reg_sel[1:0]} : reg_sel;
+        merged = pend_load_mask[idx] ? load_wb_forward_data
+                                     : read_gpr_value(idx, 2'd2);
+        // if/else, not case: Quartus 17 fails elaborating this case in a function
+        if (pend_mem_mask[idx]) begin
+            if (recipe_memory_mode == EA_FWD_BLO)
+                merged = {merged[31:8], opr_r[7:0]};
+            else if (recipe_memory_mode == EA_FWD_BHI)
+                merged = {merged[31:16], opr_r[7:0], merged[7:0]};
+            else if (recipe_memory_mode == EA_FWD_W)
+                merged = {merged[31:16], opr_r[15:0]};
+            else
+                merged = opr_r;
+        end
         if (size == 2'd0)
             read_gpr_load_forwarded = reg_sel[2] ? {24'd0, merged[15:8]}
                                                  : {24'd0, merged[7:0]};
@@ -401,6 +401,14 @@ function automatic logic [31:0] read_gpr_load_forwarded(
             read_gpr_load_forwarded = merged;
     end
 endfunction
+
+// synthesis translate_off
+always_ff @(posedge clk)
+    if (reset_n)
+        for (int r = 0; r < 8; r++)
+            if (read_gpr_load_forwarded(3'(r), 2'd2) !== gpr_ex_view[r])
+                $fatal(1, "EX GPR READ MISMATCH: r%0d", r);
+// synthesis translate_on
 
 // Every late GPR write landing on this edge (any direct-load WB included).
 assign pend_write_mask = pend_dly_mask | pend_shift_mask |
@@ -426,13 +434,84 @@ function automatic logic [31:0] read_gpr_capture(
     end
 endfunction
 
-// A D2 base/index read.
+// A D2 base/index read through the EA view: the delay-slot write, else a
+// deferred shift, else plain-load WB data, merged at its width into the
+// register. The register is selected first and the pending writes' targets
+// are compared with the index alongside, so the forwarding decode does not
+// sit in front of the eight-way register select.
 function automatic logic [31:0] read_ea_gpr(
     input logic       valid,
     input logic [2:0] idx
 );
-    read_ea_gpr = valid ? gpr_ea_view[idx] : 32'd0;
+    logic [31:0] current, dly_value, shift_value;
+    logic        dly_hit, shift_hit, load_hit;
+    begin
+        current = read_gpr_value(idx, 2'd2);
+        dly_hit   = dly_gpr_forward.valid && (dly_gpr_forward.dst == idx);
+        shift_hit = recipe_shift_write.valid && (recipe_shift_widx == idx);
+        load_hit  = pend_load_mask[idx];
+        // if/else, not case: Quartus 17 fails elaborating this case in a function
+        if (dly_gpr_forward.mode == EA_FWD_BLO)
+            dly_value = {current[31:8], dly_gpr_forward.data[7:0]};
+        else if (dly_gpr_forward.mode == EA_FWD_BHI)
+            dly_value = {current[31:16], dly_gpr_forward.data[7:0], current[7:0]};
+        else if (dly_gpr_forward.mode == EA_FWD_W)
+            dly_value = {current[31:16], dly_gpr_forward.data[15:0]};
+        else
+            dly_value = dly_gpr_forward.data;
+        if (recipe_shift_write.size == 2'd0)
+            shift_value = recipe_shift_write.dst[2]
+                ? {current[31:16], recipe_shift_data[7:0], current[7:0]}
+                : {current[31:8], recipe_shift_data[7:0]};
+        else if (recipe_shift_write.size == 2'd1)
+            shift_value = {current[31:16], recipe_shift_data[15:0]};
+        else
+            shift_value = recipe_shift_data;
+        read_ea_gpr = !valid    ? 32'd0 :
+                      dly_hit   ? dly_value :
+                      shift_hit ? shift_value :
+                      load_hit  ? load_wb_forward_data : current;
+    end
 endfunction
+
+// synthesis translate_off
+// Reference: the EA view formed per register, then selected.
+function automatic logic [31:0] ref_ea_gpr(
+    input logic       valid,
+    input logic [2:0] idx
+);
+    logic [31:0] view [0:7];
+    logic [31:0] current, dly_value, shift_value;
+    begin
+        for (int r = 0; r < 8; r++) begin
+            current = read_gpr_value(3'(r), 2'd2);
+            case (dly_gpr_forward.mode)
+                EA_FWD_BLO: dly_value = {current[31:8], dly_gpr_forward.data[7:0]};
+                EA_FWD_BHI: dly_value = {current[31:16], dly_gpr_forward.data[7:0], current[7:0]};
+                EA_FWD_W:   dly_value = {current[31:16], dly_gpr_forward.data[15:0]};
+                default:    dly_value = dly_gpr_forward.data;
+            endcase
+            if (recipe_shift_write.size == 2'd0)
+                shift_value = recipe_shift_write.dst[2]
+                    ? {current[31:16], recipe_shift_data[7:0], current[7:0]}
+                    : {current[31:8], recipe_shift_data[7:0]};
+            else if (recipe_shift_write.size == 2'd1)
+                shift_value = {current[31:16], recipe_shift_data[15:0]};
+            else
+                shift_value = recipe_shift_data;
+            view[r] = pend_dly_mask[r]   ? dly_value :
+                      pend_shift_mask[r] ? shift_value :
+                      pend_load_mask[r]  ? load_wb_forward_data : current;
+        end
+        ref_ea_gpr = valid ? view[idx] : 32'd0;
+    end
+endfunction
+always_ff @(posedge clk)
+    if (reset_n &&
+        ((ea_base_value !== ref_ea_gpr(ea_base.valid, ea_base.index)) ||
+         (ea_index_value !== ref_ea_gpr(ea_index.valid, ea_index.index))))
+        $fatal(1, "EA GPR READ MISMATCH");
+// synthesis translate_on
 
 // Every direct load captures its destination's prior value before cache data
 // enters WB; a byte or word load merges into it. Older writes may still land
@@ -476,6 +555,7 @@ function automatic logic [31:0] read_alu_source(input logic [5:0] field);
         ALUSRC_TMPH: read_alu_source = slctr;
         ALUSRC_PROTUN: read_alu_source = protun;
         ALUSRC_ALLONES: read_alu_source = 32'hffff_ffff;
+        ALUSRC_EFLAGS_PUSH: read_alu_source = 32'hfffc_ffff;
         ALUSRC_FLAGS_MASK: read_alu_source = 32'h0007_7fd7;
         ALUSRC_CONST_4000: read_alu_source = 32'h4000;
         ALUSRC_CONST_N200: read_alu_source = 32'hffff_fdff;
@@ -554,8 +634,8 @@ function automatic logic [31:0] read_source(input logic [5:0] field);
         SRC_COUNTR: read_source = countr;
         SRC_PROTUN: read_source = protun;
         SRC_TMPeIP: read_source = tmpeip;
-        SRC_TMPeSP: read_source = op_size_src == 2'd2 ? tmpesp :
-                                                           {16'd0, tmpesp[15:0]};
+        // The whole saved ESP: a fault restores it (89A) whatever the code size.
+        SRC_TMPeSP: read_source = tmpesp;
         SRC_DR6: read_source = dr6;
         SRC_DR7: read_source = dr7;
         SRC_CSOPCD: read_source = csopcd;
@@ -954,8 +1034,11 @@ always_ff @(posedge clk) begin
                         !recipe_commit_cancel)
                         write_gpr(dst_reg_sel_r, alu_result, op_size);
 
+                // POPA/POPAD discard the popped ESP slot (their eSP words set
+                // the pointer); a task switch's IRF loads do write ESP.
                 DEST_IRF:
-                    if (countr[5:3] != 3'b100)
+                    if (countr[5:3] != 3'b100 &&
+                        !(countr[2:0] == 3'd4 && !instr.has_0f && instr.opcode == 8'h61))
                         write_gpr(countr[2:0], dest_value,
                                   is_dword ? 2'd2 : 2'd1);
                 default: ;
@@ -1311,6 +1394,38 @@ end
 // writes land at that edge. Take the backup again one cycle later.
 logic flags_backup_refresh;
 
+// A direct ALU load (ALU r, m) commits its flags at writeback, which can come
+// after its successor has started and taken its backup. Count the direct
+// loads issued before the executing instruction that have not written back;
+// a flag commit from one of those is older, and its flags are merged into the
+// backup (a fault in the successor must restore them, not the stale ones).
+logic [1:0] loads_pending;          // issued, not yet written back
+logic [1:0] older_loads_pending;    // of those, issued before the current instruction
+logic       flag2_older_p;          // flag2 holds an older load's flag commit
+always_ff @(posedge clk) begin
+    if (!reset_n || load_pipe_flush) begin
+        loads_pending <= 2'd0;
+        older_loads_pending <= 2'd0;
+        flag2_older_p <= 1'b0;
+    end else begin
+        loads_pending <= loads_pending + {1'b0, load_issue} -
+                         {1'b0, load_wb_valid && (loads_pending != 2'd0)};
+        flag2_older_p <= load_wb_alu_commit && (older_loads_pending != 2'd0);
+        if (instr_start)
+            older_loads_pending <= loads_pending -
+                                   {1'b0, load_wb_valid && (loads_pending != 2'd0)};
+        else if (load_wb_valid && (older_loads_pending != 2'd0))
+            older_loads_pending <= older_loads_pending - 2'd1;
+    end
+end
+
+// REPE/REPNE CMPS and SCAS commit every iteration (count, pointers and the
+// compare's flags) and the microcode keeps no flags backup for them: a fault
+// part way pushes the flags of the last completed iteration.
+wire next_rep_flag_string = !next_instr.has_0f && next_instr.rep_lock[1] &&
+                            ((next_instr.opcode == 8'hA6) || (next_instr.opcode == 8'hA7) ||
+                             (next_instr.opcode == 8'hAE) || (next_instr.opcode == 8'hAF));
+
 always_ff @(posedge clk) begin
     flags_backup_refresh <= reset_n && instr_start && !halted && !interrupt_entry;
     if (!reset_n) begin
@@ -1321,11 +1436,24 @@ always_ff @(posedge clk) begin
         flags_backup <= eflags;
     end else if (interrupt_entry) begin
         flags_backup_active <= 1'b0;
+    end else if (exec && dest == DEST_EFLAGS && source_field == SRC_FLAGSB) begin
+        // FAULT restores EFLAGS from the backup (892), which consumes it: the
+        // interrupt entry's EFLAGS -> FLAGSB then takes the RF the fault set.
+        flags_backup_active <= 1'b0;
     end else if (instr_start && !halted) begin
-        flags_backup_active <= 1'b1;
+        flags_backup_active <= !next_rep_flag_string;
         flags_backup <= eflags_fwd;
     end else if (flags_backup_refresh) begin
         flags_backup <= eflags_fwd;
+    end else if (flag2_older_p && flags_backup_active) begin
+        flags_backup[0]  <= flag2_cf_r;
+        flags_backup[4]  <= flag2_af_r;
+        flags_backup[11] <= flag2_of_r;
+        if (flag2_zsp_r) begin
+            flags_backup[2] <= flag2_pf;
+            flags_backup[6] <= flag2_zf;
+            flags_backup[7] <= flag2_sf;
+        end
     end else if (exec && aluop == ALUJMP_FLGSBA) begin
         if (!flags_backup_active) begin
             flags_backup_active <= 1'b1;

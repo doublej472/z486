@@ -52,6 +52,8 @@ module data_access
     output logic [1:0]              ucrd_size_r,
     output logic                    ucrd_slow_req_r,
     output logic                    ucrd_slow_submit,
+    output logic                    ucrd_slow_wait_r,     // missed: in paging
+    output logic                    ucrd_take,            // a microcode read probes now
     output logic                    ucrd_x87_r,
     output hardwired_load_payload_t vipt_load_slow_r,
     output logic [31:0]             vipt_probe_linear,
@@ -69,8 +71,10 @@ module data_access
     input  logic [1:0]              issue_load_low,
     input  logic [31:0]             issue_mem_linear,
     input  logic                    pe,
+    input  logic                    vm,
     input  logic                    seg_gp_fault,
     input  logic                    ss_flat32,
+    input  logic [5:0]              seg_readable,     // per segment: a read needs no microcode check
     // Data unit: load writeback and operands
     input  logic [31:0]             forwarded_esp,
     input  logic [31:0]             mem_wdata,
@@ -175,16 +179,18 @@ wire       vipt_load_retire;
 // cycle and translation and tag finalize the next (the L1 contract), so no
 // live TLB lookup sits in the RD cycle. A miss goes to paging's registered
 // path.
-wire       ucrd_take;                  // a microcode read probes now
 reg        ucrd_valid_r;               // probed last cycle; resolves now
-reg        ucrd_slow_wait_r;           // missed: in paging
 // In the resolve cycle a uop with side effects runs only when the read's
 // translation was already known good in the RD cycle (the sidecar held its
 // page), so no fault can follow; a bus operation always waits, keeping
 // memory order behind a possible miss. After a miss every uop waits until
 // OPR_R is written.
 reg        ucrd_tlbok_r;               // the read's translation was known good
-assign stall_ucrd = (ucrd_valid_r && !uc_p_pure_dly && (!ucrd_tlbok_r || uc_busreq)) ||
+// A pure DLY may pass the resolve cycle only when the read cannot leave the
+// fast path's translation (known good): after a TLB miss it waits like any
+// uop, or a DLY that folds its instruction's RNI (MOV r,m) retires and the
+// delay slot copies a stale OPR_R before the slow path returns or faults.
+assign stall_ucrd = (ucrd_valid_r && (!ucrd_tlbok_r || (!uc_p_pure_dly && uc_busreq))) ||
                         ucrd_slow_req_r || ucrd_slow_wait_r;
 wire       ucrd_busy = ucrd_valid_r || ucrd_slow_req_r || ucrd_slow_wait_r;
 reg        rd_fast_probed_r;            // D2 preread was accepted
@@ -619,10 +625,11 @@ wire rd_fast_hit = rd_fast_valid_r && rd_fast_probed_r &&
                    dcache_vipt_resolve_hit;
 assign rd_fast_finish = rd_fast_valid_r && i_first && uc_exec;
 // A microcode read hit writes OPR_R as paging does for a single access: the
-// dword shifted down to its byte lane.
+// operand shifted down from its byte lane and zero-extended from its size.
 assign fast_opr_commit = (rd_fast_finish && rd_fast_hit) || ucrd_hit;
 assign fast_opr_data = ucrd_valid_r
-    ? (dcache_vipt_resolve_data >> {ucrd_linear_r[1:0], 3'b000})
+    ? format_hardwired_load(dcache_vipt_resolve_data, ucrd_linear_r[1:0],
+                            ucrd_size_r, LOAD_RESULT_COPY)
     : format_hardwired_load(dcache_vipt_resolve_data, rd_fast_lane_r,
                             rd_fast_size_r, LOAD_RESULT_COPY);
 always_ff @(posedge clk) begin
@@ -840,7 +847,10 @@ assign d2_vipt_ret = !i_bus.has_0f && ((i_bus.opcode == 8'hC3) || (i_bus.opcode 
                      i_bus.data32 && i_bus.stack_op && d2_flat_ss32;
 assign d2_ret_esp = forwarded_esp + 32'd4 +
                     ((i_bus.opcode == 8'hC2) ? {16'd0, i_bus.immediate[15:0]} : 32'd0);
-assign d2_vipt_candidate = !hardwired_off &&
+// A direct access skips the microcode's segment check; one whose segment is
+// not readable (a null selector) takes the ROM path, which faults.
+wire d2_seg_readable = !pe || vm || (i_bus.mem_seg < 4'd6 && seg_readable[i_bus.mem_seg[2:0]]);
+assign d2_vipt_candidate = d2_seg_readable && !hardwired_off &&
                            (i_bus.rep_lock == PREFIX_NOREPLOCK) &&
                            (((d2_vipt_plain_mov || d2_vipt_movx || d2_vipt_alu) &&
                              i_bus.has_modrm && (i_bus.modrm[7:6] != 2'b11) &&
@@ -860,7 +870,7 @@ wire d2_vipt_rmw_opcode = ((i_bus.opcode == 8'hF6) ||
                              (i_bus.opcode == 8'hFF)) &&
                             ((i_bus.modrm[5:3] == 3'b000) ||
                              (i_bus.modrm[5:3] == 3'b001)));
-assign d2_vipt_rmw_candidate = !hardwired_off &&
+assign d2_vipt_rmw_candidate = d2_seg_readable && !hardwired_off &&
                            (i_bus.ucode_action == RECIPE_ACTION_RMW_FAST) &&
                            (((i_bus.opcode == 8'hF6) ||
                              (i_bus.opcode == 8'hF7) ||

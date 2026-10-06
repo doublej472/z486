@@ -34,6 +34,7 @@ module ucode_rom
     output      [5:0]  q_shift_alu_src,
     output      [6:0]  q_shift_aluop,
     output      [1:0]  q_shift_sigma_sel,
+    output      [6:0]  q_alu_op_sel,     // {from IR, CMP/TEST, constant ALU op}
     output      [2:0]  q_dly_source,
     output      [8:0]  q_mem_ctrl,
     output      [8:0]  q_ind_ctrl,
@@ -48,6 +49,9 @@ module ucode_rom
 `Z486_KEEP reg [5:0] q_shift_alu_src_r;
 `Z486_KEEP reg [6:0] q_shift_aluop_r;
 `Z486_KEEP reg [1:0] q_shift_sigma_sel_r;
+// Powers up as the pre-decode of the all-zero field (ALUJMP_ALU), like the
+// raw field it shadows.
+`Z486_KEEP reg [6:0] q_alu_op_sel_r = {2'b10, ALU_PASS};
 reg [2:0] q_dly_source_r;
 `Z486_KEEP reg [8:0] q_mem_ctrl_r;
 reg [8:0] q_ind_ctrl_r;
@@ -110,6 +114,32 @@ endfunction
 
 // Compact result selector for the SIGMA write path. Keep the raw seven-bit
 // ALU/jump field out of the barrel-result mux and SHIFT2 flag capture.
+// ALU operation for the ALU/jump field, classified ahead of the ALU so the
+// op select is one registered 2:1 choice instead of a casez on the raw field:
+// [6] the op comes from the instruction (decoded_alu_op), [5] CMP/TEST picks
+// CMP or AND by the instruction, else [4:0] is the op.
+function automatic [6:0] alu_op_predecode(input [6:0] aluop);
+    case (aluop)
+        ALUJMP_ALU,
+        ALUJMP_INCDEC,
+        ALUJMP_SZ_EXT,
+        ALUJMP_AAAAAS,
+        ALUJMP_DAADAS,
+        ALUJMP_SERECO: alu_op_predecode = {2'b10, ALU_PASS};
+        ALUJMP_CMPTST: alu_op_predecode = {2'b01, ALU_PASS};
+        ALUJMP_AND:    alu_op_predecode = {2'b00, ALU_AND};
+        ALUJMP_OR:     alu_op_predecode = {2'b00, ALU_OR};
+        ALUJMP_XOR:    alu_op_predecode = {2'b00, ALU_XOR};
+        ALUJMP_SIGN:   alu_op_predecode = {2'b00, ALU_SIGN};
+        ALUJMP_ADD:    alu_op_predecode = {2'b00, ALU_ADD};
+        ALUJMP_ADC:    alu_op_predecode = {2'b00, ALU_ADC};
+        ALUJMP_SUB:    alu_op_predecode = {2'b00, ALU_SUBT};
+        ALUJMP_CMP:    alu_op_predecode = {2'b00, ALU_CMP};
+        ALUJMP_PASS2:  alu_op_predecode = {2'b00, ALU_PASS2};
+        default:       alu_op_predecode = {2'b00, ALU_PASS};
+    endcase
+endfunction
+
 function automatic [1:0] shift_sigma_predecode(input [6:0] aluop);
     case (aluop)
         ALUJMP_SHIFT1:
@@ -360,6 +390,7 @@ always_ff @(posedge clk) begin
         q_shift_alu_src_r <= q_mem[36:31];
         q_shift_aluop_r <= q_mem[17:11];
         q_shift_sigma_sel_r <= shift_sigma_predecode(q_mem[17:11]);
+        q_alu_op_sel_r <= alu_op_predecode(q_mem[17:11]);
         q_dly_source_r <= dly_source_predecode(q_mem[23:18]);
         q_mem_ctrl_r <= mem_ctrl_predecode(q_mem[36:0]);
         q_ind_ctrl_r <= ind_ctrl_predecode(q_mem[36:0]);
@@ -380,6 +411,7 @@ assign q_shift_uc_carry = q_shift_uc_carry_r;
 assign q_shift_alu_src = q_shift_alu_src_r;
 assign q_shift_aluop = q_shift_aluop_r;
 assign q_shift_sigma_sel = q_shift_sigma_sel_r;
+assign q_alu_op_sel = q_alu_op_sel_r;
 assign q_dly_source = q_dly_source_r;
 assign q_mem_ctrl = q_mem_ctrl_r;
 assign q_ind_ctrl = q_ind_ctrl_r;
@@ -394,6 +426,10 @@ always_ff @(posedge clk)
     if ((^q[36:0] !== 1'bx) &&
         (q_shift_sigma_sel !== shift_sigma_predecode(q[17:11])))
         $fatal(1, "SHIFT SIGMA PREDECODE MISMATCH");
+always_ff @(posedge clk)
+    if ((^q[36:0] !== 1'bx) &&
+        (q_alu_op_sel !== alu_op_predecode(q[17:11])))
+        $fatal(1, "ALU OP PREDECODE MISMATCH: %h vs %h (field %h)", q_alu_op_sel, alu_op_predecode(q[17:11]), q[17:11]);
 // synthesis translate_on
 
 endmodule

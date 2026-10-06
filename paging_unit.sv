@@ -611,10 +611,18 @@ task automatic write_opr_r_bytes(
     // Now place extracted bytes into OPR_R at opr_offset
     case (opr_offset)
         2'd0: begin
-            // A read starting at OPR_R byte 0 should zero-extend the fetched
-            // fragment. Leaving upper bytes untouched leaks stale data into
-            // 8/16-bit operands such as far pointers and selectors.
-            OPR_R <= extracted;
+            // A read starting at OPR_R byte 0 zero-extends the fetched
+            // fragment (only its bytes: an aligned word read must not keep
+            // the dword's upper half). Leaving upper bytes untouched leaks
+            // stale data into 8/16-bit operands such as far pointers and
+            // selectors, and a 16-bit RETF to an outer 32-bit stack would
+            // take ESP[31:16] from the SS slot beside SP.
+            case (opr_bytes)
+                2'd0: OPR_R <= {24'h0, extracted[7:0]};
+                2'd1: OPR_R <= {16'h0, extracted[15:0]};
+                2'd2: OPR_R <= {8'h0, extracted[23:0]};
+                default: OPR_R <= extracted;
+            endcase
         end
         2'd1: begin
             case (opr_bytes)
@@ -1021,8 +1029,10 @@ always_ff @(posedge clk or negedge reset_n) begin
                         pf_ack_toggle_r <= ~pf_ack_toggle_r;
                         state <= PG_IDLE;
                     end else if (walk_fault) begin
-                        // Prefetch page fault: silently ack with fault flag
-                        ack_prefetch_fault(tlb_lookup_addr, walk_fault_code);
+                        // Prefetch page fault: silently ack with fault flag.
+                        // The fetch's own address: the lookup register is
+                        // re-selected each cycle and may hold another by now.
+                        ack_prefetch_fault(pf_linear_addr, walk_fault_code);
                         state <= PG_IDLE;
                     end else if (cache_lookup_granted) begin
                         // Walk succeeded, emit BIU request with translated address

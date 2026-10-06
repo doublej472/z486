@@ -70,6 +70,7 @@ module event_control
     input  logic ss_segment_fault,
     input  logic ss_fault_r,
     input  logic page_fault,
+    input  logic data_page_fault,     // the executing instruction's access (not a fetch)
     input  logic [2:0] pg_fault_code,
     input  logic [31:0] pg_cr2_out,
     input  logic div_overflow,
@@ -412,6 +413,15 @@ always_ff @(posedge clk) begin
                 ((i_bus.boundary_action == BOUNDARY_ACTION_INTO) && EFLAGS[11]);
             instr_eip_written <= 1'b0;
             gate_in_progress <= 1'b0;
+        end
+
+        // A faulting instruction does not complete, so its single-step trap
+        // is not taken: TF traps after the instruction re-executes. A fetch
+        // fault belongs to an instruction that never issued and keeps the
+        // previous one's trap.
+        if (gp_fault_trigger || data_page_fault || div_overflow) begin
+            tf_active_r <= 1'b0;
+            tf_trap_suppress_r <= 1'b0;
         end
 
         if (q_flush && pe_mode_toggle_now)

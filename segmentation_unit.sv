@@ -90,7 +90,7 @@ module segmentation_unit
     input  logic au_exec_addr32,
     input  logic [5:0] au_alu_source,
     input  logic [8:0] au_ind_ctrl,
-    input  logic au_instr_jcc,
+    input  logic au_jcc_word,
 
     // Paging and control registers: fault readback
     input  logic [2:0] au_fault_code,
@@ -117,6 +117,8 @@ reg         dt_target_idt;      // Tracks GDTR vs IDTR for SBAS/SLIM_TABLE
 reg         addr_size;          // 1=32-bit, 0=16-bit effective address
 reg [31:0]  seg_base_r;         // Registered segment base
 reg [31:0]  seg_limit_r;        // Registered segment limit
+reg         seg_expdown_r;      // Registered segment is expand-down data
+reg         seg_big_r;          // and its B bit (upper bound 4 GB, else 64 KB)
 
 // Full hidden descriptors exist only for the six architectural segment
 // registers, TR, and LDTR. GDTR/IDTR contain only base+limit, and SEG_IO is a
@@ -274,7 +276,16 @@ wire start_out_of_bounds = base_diff[32];
 // access_size encoding (0=byte,1=word,3=dword) == bytes-1, so check remaining < access_size
 wire [31:0] diff_res = base_diff[31:0];
 wire size_fault = (diff_res[31:3] == 29'd0) && (diff_res[2:0] < access_size);
-wire limit_violated = start_out_of_bounds | size_fault;
+// Expand-down data segments allow offsets limit+1 .. 0xFFFF (B=0) or
+// 0xFFFFFFFF (B=1); the access faults if it starts at or below the limit or
+// its last byte passes the upper bound.
+wire [3:0] low_end = {1'b0, eff_offset[2:0]} + {2'b00, access_size};
+wire ed_end_fault = seg_big_r
+                  ? ((&eff_offset[31:3]) && low_end[3])
+                  : ((|eff_offset[31:16]) || ((&eff_offset[15:3]) && low_end[3]));
+wire limit_violated = seg_expdown_r
+                    ? (!start_out_of_bounds || ed_end_fault)
+                    : (start_out_of_bounds | size_fault);
 
 // Real mode: a boundary-crossing access always faults (even SS -> #SS, e.g.
 // POPAD at SP=0xFFFE); only start-out-of-bounds keeps the 16-bit-stack wrap.
@@ -292,9 +303,22 @@ wire seg_writable = (seg_sel == SEG_ES) ? (!desc_cache[SEG_ES].seg_type[3] && de
                     1'b1;  // TR/IDT/GDT/IO: no write check
 wire write_fault = pe && is_write && !seg_writable && !is_dtable;
 
+// Reads need a readable descriptor: data, or code with R set. A null selector
+// loads type 0 with S=0 (a system type no data register can hold otherwise),
+// so this also makes any use of a null ES/DS/FS/GS #GP(0).
+function automatic logic desc_readable(input seg_desc_t d);
+    desc_readable = d.S && (!d.seg_type[3] || d.seg_type[1]);
+endfunction
+wire seg_readable = (seg_sel == SEG_ES) ? desc_readable(desc_cache[SEG_ES]) :
+                    (seg_sel == SEG_DS) ? desc_readable(desc_cache[SEG_DS]) :
+                    (seg_sel == SEG_FS) ? desc_readable(desc_cache[SEG_FS]) :
+                    (seg_sel == SEG_GS) ? desc_readable(desc_cache[SEG_GS]) :
+                    1'b1;  // CS/SS: checked at load; TR/IDT/GDT/IO: none
+wire read_fault = pe && !vm && !is_write && !seg_readable && !is_dtable;
+
 assign seg_fault = check_en && is_mem_op &&
                    (seg_sel != SEG_IO) &&
-                   (rm_limit_fault || pm_limit_fault || write_fault);
+                   (rm_limit_fault || pm_limit_fault || write_fault || read_fault);
 
 function automatic [31:0] seg_base_for(input [3:0] sel, input dsw);
     case (sel)
@@ -335,6 +359,20 @@ function automatic [31:0] expand_raw_limit(input [20:0] raw_limit);
     expand_raw_limit = raw_limit[20]
                      ? {raw_limit[19:0], 12'hFFF}
                      : {12'h000, raw_limit[19:0]};
+endfunction
+
+// {expand-down, B} of a data segment; during DESCSW the new stack
+// descriptor sits in the CS slot, as in raw_limit_for.
+function automatic [1:0] seg_expdown_for(input [3:0] sel, input dsw);
+    seg_desc_t d;
+    begin
+        case (sel)
+            SEG_ES, SEG_DS, SEG_FS, SEG_GS: d = desc_cache[sel[2:0]];
+            SEG_SS: d = dsw ? desc_cache[SEG_CS] : desc_cache[SEG_SS];
+            default: d = '0;
+        endcase
+        seg_expdown_for = {!d.seg_type[3] && d.seg_type[2], d.D_B};
+    end
 endfunction
 
 function automatic [31:0] seg_limit_for(input [3:0] sel, input dsw);
@@ -557,6 +595,7 @@ always_ff @(posedge clk) begin
         addr_size <= 1'b0;
         seg_base_r <= 32'h0;  // DS_base at reset
         seg_limit_r <= 32'hFFFF;
+        {seg_expdown_r, seg_big_r} <= 2'b00;
         stack_push_mode <= 1'b0;
         descsw_mode <= 1'b0;
         tss_access_flag <= 1'b0;
@@ -574,8 +613,10 @@ always_ff @(posedge clk) begin
             stack_push_mode <= 1'b0;
             descsw_mode <= 1'b0;
             tss_access_flag <= 1'b1;
-            if (seg_sel == SEG_SS)
+            if (seg_sel == SEG_SS) begin
                 seg_limit_r <= seg_limit_for(SEG_SS, 1'b0);
+                {seg_expdown_r, seg_big_r} <= seg_expdown_for(SEG_SS, 1'b0);
+            end
         end
         if (ctssaf_pulse)
             tss_access_flag <= 1'b0;
@@ -584,6 +625,7 @@ always_ff @(posedge clk) begin
                 seg_sel <= seg_target;
                 seg_is_io <= (seg_target == SEG_IO);
                 seg_limit_r <= seg_limit_for(seg_target, 1'b0);
+                {seg_expdown_r, seg_big_r} <= seg_expdown_for(seg_target, 1'b0);
                 i_addr32_r <= init_addr32;
                 i_stack_op_r <= init_stack_op;
                 stack_push_mode <= 1'b0;
@@ -596,8 +638,10 @@ always_ff @(posedge clk) begin
                 if (clear_descsw) begin
                     descsw_mode <= 1'b0;
                     seg_limit_r <= seg_limit_for(seg_target, 1'b0);
+                    {seg_expdown_r, seg_big_r} <= seg_expdown_for(seg_target, 1'b0);
                 end else begin
                     seg_limit_r <= seg_limit_for(seg_target, descsw_mode);
+                    {seg_expdown_r, seg_big_r} <= seg_expdown_for(seg_target, descsw_mode);
                 end
             end
 
@@ -611,6 +655,7 @@ always_ff @(posedge clk) begin
                 seg_is_io <= 1'b0;
                 descsw_mode <= 1'b1;
                 seg_limit_r <= seg_limit_for(SEG_CS, 1'b0);
+                {seg_expdown_r, seg_big_r} <= seg_expdown_for(SEG_SS, 1'b1);
             end
 
             default: ;
@@ -646,7 +691,7 @@ address_unit address_unit_inst (
     .source_value(au_source_value),
     .alu_value(au_alu_value),
     .alu_value_hold(au_alu_value_hold),
-    .instr_jcc(au_instr_jcc),
+    .jcc_word(au_jcc_word),
     .pe(pe),
     .is_dword(au_is_dword),
     .descsw_mode(descsw_mode),

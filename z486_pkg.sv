@@ -890,6 +890,7 @@ localparam ALUSRC_TMPC = 6'h0C;
 localparam ALUSRC_TMPD = 6'h0D;
 localparam ALUSRC_OPR_R = 6'h0F;
 localparam ALUSRC_ALLONES = 6'h10;    // 0xFFFFFFFF mask
+localparam ALUSRC_EFLAGS_PUSH = 6'h11; // 0xFFFCFFFF: PUSHFD's EFLAGS image without VM and RF
 localparam ALUSRC_TMPG = 6'h12;
 localparam ALUSRC_TMPH = 6'h13;
 localparam ALUSRC_PROTUN = 6'h15;

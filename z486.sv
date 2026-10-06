@@ -111,11 +111,16 @@ reg [1:0]  op_size_decode;          // Decoded operand size (saved at i_issue, r
 reg [1:0]  srcreg_size;             // Same as op_size most of the time, different for MOVZX/MOVSX and etc
 reg [1:0]  srcreg_size_decode;      // Decoded srcreg_size (saved at i_issue, restored by BITSDE)
 `Z486_KEEP reg [1:0] op_size_src;            // Local copy for generic source mux fanout
+// Further identical copies split op_size_src's fanout (several hundred): the
+// data unit's operand formatting and the dword decode. Preserved registers are
+// not duplicated by the fitter, so the copies are explicit.
+`Z486_KEEP reg [1:0] op_size_du;             // data unit operand size
+`Z486_KEEP reg [1:0] op_size_dw;             // is_dword
 `Z486_KEEP reg [1:0] op_size_src_decode;
 `Z486_KEEP reg [1:0] srcreg_size_src;
 `Z486_KEEP reg [1:0] srcreg_size_src_decode;
 // Width consumers read the timing-local replica of op_size.
-wire       is_dword = (op_size_src == 2'd2);
+wire       is_dword = (op_size_dw == 2'd2);
 
 // Integer Data Unit interconnect.
 wire [31:0] alu_src;                // ALU source input this cycle
@@ -179,6 +184,8 @@ wire         ucrd_route_pre;
 wire [1:0]   ucrd_size_r;
 wire         ucrd_slow_req_r;
 wire         ucrd_slow_submit;
+wire         ucrd_slow_wait_r;
+wire         ucrd_take;
 wire         ucrd_x87_r;
 hardwired_load_payload_t vipt_load_slow_r;
 wire [31:0]  vipt_probe_linear;
@@ -266,6 +273,15 @@ wire ds_flat   = desc_cache[SEG_DS].G && (&desc_cache[SEG_DS].limit) &&
                  (desc_cache[SEG_DS].seg_type[3] || !desc_cache[SEG_DS].seg_type[2]);
 wire ss_flat32 = desc_cache[SEG_SS].G && desc_cache[SEG_SS].D_B && (&desc_cache[SEG_SS].limit) &&
                  (desc_cache[SEG_SS].seg_type[3] || !desc_cache[SEG_SS].seg_type[2]);
+// Segments a direct load may read without the microcode's segment check:
+// data, or readable code (a null selector loads type 0 with S=0, which an
+// access must #GP). Indexed as desc_cache: ES CS SS DS FS GS.
+function automatic logic desc_readable(input seg_desc_t d);
+    desc_readable = d.S && (!d.seg_type[3] || d.seg_type[1]);
+endfunction
+wire [5:0] seg_readable = {desc_readable(desc_cache[SEG_GS]), desc_readable(desc_cache[SEG_FS]),
+                           desc_readable(desc_cache[SEG_DS]), desc_readable(desc_cache[SEG_SS]),
+                           desc_readable(desc_cache[SEG_CS]), desc_readable(desc_cache[SEG_ES])};
 
 wire       pe = CR0[0];             // Protected mode enable
 wire       vm = EFLAGS[17];         // Virtual 8086 mode
@@ -496,12 +512,13 @@ logic      fast_off_sim = 1'b0;           // simulation plusargs below
 // so it stays coherent and can come back on at any time.
 logic      cache_off_sim = 1'b0;
 // The x87 switch is taken at reset only: removing the FPU under a running
-// program would only lose its state.
+// program would only lose its state. A build without the FPU behaves as the
+// switch does (a 486SX: ESC instructions do nothing, FNSTSW stores nothing).
 logic      x87_off_sim = 1'b0;
 reg        x87_off;
 always_ff @(posedge clk)
     if (!reset_n)
-        x87_off <= x87_off_req || x87_off_sim;
+        x87_off <= x87_off_req || x87_off_sim || !ENABLE_X87;
 reg        hardwired_off;
 always_ff @(posedge clk)
     if (!reset_n || q_flush)
@@ -712,6 +729,7 @@ wire        uc_shift_uc_carry;
 wire [5:0]  uc_alu_src_shift;
 wire [6:0]  uc_aluop_shift;
 wire [1:0]  uc_shift_sigma_sel;
+wire [6:0]  uc_alu_op_sel;          // pre-decoded ALU op: {from IR, CMP/TEST, op}
 wire [2:0]  uc_dly_source;
 wire [8:0]  uc_mem_ctrl;
 wire [8:0]  uc_ind_ctrl;
@@ -1022,13 +1040,21 @@ decoder decoder_inst (
     .fetch_blocked(decoder_fetch_blocked)
 );
 
-// A mode transition flushes the frontend before another D1 handoff, giving
-// these local timing replicas time to match architectural state.
+// The local mode replicas lag architectural state by one cycle. A far
+// transfer loads the new CS descriptor before its frontend flush, so D1 may
+// hand off the sequential successor in that cycle, decoded in the old mode;
+// the flush must discard it before anything issues.
 // synthesis translate_off
-always_ff @(posedge clk)
-    if (reset_n && d1_issue_direct &&
-        ({decoder_default32_r, decoder_native_pe_r} !== {D, pe && !vm}))
+logic d1_stale_mode_handoff;
+always_ff @(posedge clk) begin
+    if (!reset_n || q_flush)
+        d1_stale_mode_handoff <= 1'b0;
+    else if (d1_issue_direct &&
+             ({decoder_default32_r, decoder_native_pe_r} !== {D, pe && !vm}))
+        d1_stale_mode_handoff <= 1'b1;
+    if (reset_n && d1_stale_mode_handoff && i_issue && !q_flush)
         $fatal(1, "D1 MODE REPLICA MISMATCH");
+end
 // synthesis translate_on
 
 //=============================================================================
@@ -1187,7 +1213,11 @@ end
 
 // synthesis translate_off
 always_ff @(posedge clk) begin
-    if (reset_n && fast_store_valid && dcache_req_valid)
+    // Paging may present a cached demand while WR_FAST waits for the L1 (a
+    // prefetch walk's PTE read); bus_unit holds it off until the store is
+    // accepted. Both owning the L1 CPU port in one cycle would be the bug.
+    if (reset_n && fast_store_accepted && dcache_req_accepted &&
+        memory_inst.bus_unit_inst.normal_cache_req)
         $fatal(1, "WR_FAST collided with paging demand");
     if (reset_n && uc_exec &&
         (i.ucode_action == RECIPE_ACTION_RMW_FAST) &&
@@ -1273,7 +1303,7 @@ function automatic [5:0] decode_dly_gpr(input [6:0] dest);
             DEST_eCX: begin we = 1'b1; sel = 3'd1; mode = i.addr32 ? FWD_D : FWD_W; end
             DEST_eSI: begin we = 1'b1; sel = 3'd6; mode = i.addr32 ? FWD_D : FWD_W; end
             DEST_eDI: begin we = 1'b1; sel = 3'd7; mode = i.addr32 ? FWD_D : FWD_W; end
-            DEST_IRF: if (COUNTR[5:3] != 3'b100)
+            DEST_IRF: if (COUNTR[5:3] != 3'b100 && !(COUNTR[2:0] == 3'd4 && !i.has_0f && i.opcode == 8'h61))
                 begin we = 1'b1; sel = COUNTR[2:0]; mode = is_dword ? FWD_D : FWD_W; end
             default: ;
         endcase
@@ -1319,7 +1349,9 @@ wire [31:0] vipt_esp_value = (vipt_load_wb_size_r == 2'd1)
                            ? {ESP[31:16], vipt_load_wb_data[15:0]}
                            : vipt_load_wb_data;
 assign forwarded_esp = (recipe_esp_fwd || (pop_direct_r && i_first)) ? SIGMA :
-                            dly_esp_fwd  ? dly_fwd_value :
+                            dly_esp_fwd  ? (dly_gpr_mode == FWD_W
+                                            ? {ESP[31:16], dly_fwd_value[15:0]}
+                                            : dly_fwd_value) :
                             shc_esp_fwd  ? (recipe_shift_write.size == 2'd1
                                             ? {ESP[31:16], recipe_shift_data[15:0]}
                                             : recipe_shift_data) :
@@ -1389,7 +1421,7 @@ function automatic [7:0] gpr_dest_mask(input [6:0] dst);
         DEST_USTEP_ALU:
             gpr_dest_mask = gpr_wr_expand(i.dst_reg_sel);
         DEST_IRF:
-            if (COUNTR[5:3] != 3'b100)
+            if (COUNTR[5:3] != 3'b100 && !(COUNTR[2:0] == 3'd4 && !i.has_0f && i.opcode == 8'h61))
                 gpr_dest_mask = 8'h01 << COUNTR[2:0];
         default: ;
     endcase
@@ -1561,7 +1593,10 @@ segmentation_unit seg_unit (
     .au_exec_addr32(i.addr32),
     .au_alu_source(uc_alu_src),
     .au_ind_ctrl(uc_ind_ctrl),
-    .au_instr_jcc(i.rel_branch_kind == REL_BRANCH_JCC),
+    // Keyed on the microword, not the instruction: a late write fault of the
+    // predecessor runs its delivery microcode while a Jcc is the current
+    // instruction, and its IN=+ words must add their own ALU constant.
+    .au_jcc_word(uc_aluop == ALUJMP_JNcond),
     // Paging and control registers: fault readback
     .au_fault_code(latched_pf_code),
     .au_fault_addr(latched_pf_addr),
@@ -1707,7 +1742,11 @@ wire [2:0]  data_fault_code;
 wire [31:0] data_cr2_out;
 // The executing instruction is older than a blocked frontend fetch. If both
 // faults arrive together, preserve the demand-side exception and CR2 value.
-wire [2:0]  pg_fault_code = data_page_fault ? data_fault_code : ifetch_fault_code;
+// A code fetch's walk can run before the instruction's privilege is
+// established (an IRET to ring 3 starts prefetching before it loads CS), so
+// a fetch fault takes U/S from the CPL it is raised at; a fetch is a read.
+wire [2:0]  pg_fault_code = data_page_fault ? data_fault_code
+                                            : {cpl == 2'd3, 1'b0, ifetch_fault_code[0]};
 wire [31:0] pg_cr2_out = data_page_fault ? data_cr2_out : ifetch_fault_addr;
 assign page_fault = data_page_fault || ifetch_page_fault;
 
@@ -1734,10 +1773,21 @@ assign mem_req_current = mem_op_eligible && uc_busreq;  // drives paging unit
 // Delay prefetch on upcoming demand memory
 wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || d2_resident);
 
+// VM as the current instruction issued. An IRET to V86 sets VM before it
+// reads the rest of its frame from the ring-0 stack; those reads stay
+// supervisor, while everything a V86 instruction does is user (CPL 3).
+reg vm_at_issue;
+always_ff @(posedge clk)
+    if (!reset_n)
+        vm_at_issue <= 1'b0;
+    else if (i_issue && !stall)
+        vm_at_issue <= vm;
+
 // Implicit supervisor access: descriptor table and TSS reads, cross-privilege
-// stack writes use CPL=0 for paging regardless of current CPL.
+// stack writes, and an IRET's frame after it has entered V86 use CPL=0 for
+// paging regardless of current CPL.
 wire implicit_supervisor = mem_is_dtable || (mem_seg_sel == SEG_TR) ||
-                           descsw_mode || (vm && CS[1:0] == 2'b00);
+                           descsw_mode || (vm && !vm_at_issue);
 assign pg_cpl = implicit_supervisor ? 2'b00 : cpl;
 
 // Registered fault redirect state.
@@ -1818,6 +1868,8 @@ data_access data_access_inst (
     .ucrd_size_r(ucrd_size_r),
     .ucrd_slow_req_r(ucrd_slow_req_r),
     .ucrd_slow_submit(ucrd_slow_submit),
+    .ucrd_slow_wait_r(ucrd_slow_wait_r),
+    .ucrd_take(ucrd_take),
     .ucrd_x87_r(ucrd_x87_r),
     .vipt_load_slow_r(vipt_load_slow_r),
     .vipt_probe_linear(vipt_probe_linear),
@@ -1835,8 +1887,10 @@ data_access data_access_inst (
     .issue_load_low(issue_load_low),
     .issue_mem_linear(issue_mem_linear),
     .pe(pe),
+    .vm(vm),
     .seg_gp_fault(seg_gp_fault),
     .ss_flat32(ss_flat32),
+    .seg_readable(seg_readable),
     // Data unit: load writeback and operands
     .forwarded_esp(forwarded_esp),
     .mem_wdata(mem_wdata),
@@ -2049,8 +2103,9 @@ wire prot_jump_valid;               // Status outputs retained for debug visibil
 wire prot_validation_ok;
 wire prot_result_valid;
 wire [15:0] selector_desc_end = {slctr_fwd[15:3], 3'b111};
+// The LDT limit is page-granular when its descriptor's G is set.
 wire selector_oob_wire = slctr_fwd[2]
-    ? ({12'h0, desc_cache[7].limit} < {4'h0, selector_desc_end})
+    ? (seg_effective_limit(desc_cache[7]) < {16'h0, selector_desc_end})
     : (gdt_limit[15:0] < selector_desc_end);
 
 wire [1:0]  prot_desc_dpl;
@@ -2173,6 +2228,7 @@ event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
     .ss_segment_fault(ss_segment_fault),
     .ss_fault_r(ss_fault_r),
     .page_fault(page_fault),
+    .data_page_fault(data_page_fault),
     .pg_fault_code(pg_fault_code),
     .pg_cr2_out(pg_cr2_out),
     .div_overflow(div_overflow),
@@ -2239,16 +2295,13 @@ wire       uc_jump_taken_prev;          // Jump taken last cycle (for RNi: termi
 
 reg [31:0] TMPeIP;                  // Saved EIP for RPTI (repeat instruction)
 reg [31:0] wr_restart_eip;          // TMPeIP at each demand-write issue, for late write faults
+reg [31:0] ucrd_restart_eip;        // TMPeIP/TMPeSP when a microcode read probes: its miss can
+reg [31:0] ucrd_restart_esp;        // fault after younger instructions have issued
 reg [31:0] wr_restart_esp;          // and the writer's instruction-start ESP
 reg [31:0] TMPeSP;                  // Saved ESP for fault handling
 
 // Hardwired relative-branch target and microcode PREF restart (from IND).
 wire [31:0] pf_flush_ip = IND;
-assign pf_flush_addr = branch_ustep_redirect ? (CS_base + ea_reg) :
-                       ret_redirect          ? (CS_base + vipt_load_wb_target_r) :
-                       early_redirect        ? (CS_base + br_target) :
-                       pe_mode_toggle_now    ? (CS_base + EIP) :
-                                               (CS_base + pf_flush_ip);
 
 wire        br_is_jcc      = i.rel_branch_kind == REL_BRANCH_JCC;
 wire        br_is_jmp_rel  = i.rel_branch_kind == REL_BRANCH_JMP;
@@ -2256,6 +2309,18 @@ wire        br_is_call_rel = i.rel_branch_kind == REL_BRANCH_CALL;
 wire [31:0] br_disp        = i.branch_rel8 ? {{24{i.displacement[7]}}, i.displacement[7:0]}
                                         : i.displacement;
 assign br_target = EIP + br_disp;
+
+// A taken Jcc's redirect (branch_ustep_redirect) is decided by forwarded flags
+// late in the cycle, so its address is added on its own and selected after
+// the adders; the other sources are selected before theirs. The precise CALL
+// redirect is named on its own here so the flags do not reach that select.
+wire        early_call_redirect = i_first && is_dword && br_is_call_rel && !early_redirected;
+wire [31:0] pf_branch_addr = CS_base + ea_reg;
+wire [31:0] pf_other_addr  = ret_redirect        ? (CS_base + vipt_load_wb_target_r) :
+                             early_call_redirect ? (CS_base + br_target) :
+                             pe_mode_toggle_now  ? (CS_base + EIP) :
+                                                   (CS_base + pf_flush_ip);
+assign pf_flush_addr = branch_ustep_redirect ? pf_branch_addr : pf_other_addr;
 `ifdef Z486_DEBUG_BRANCH_TARGET
 // synthesis translate_off
 always @(posedge clk) begin
@@ -2270,7 +2335,7 @@ end
 
 // Precise early CALL redirect at i_first; its branch uStep must not flush again.
 assign early_redirect = (branch_ustep_redirect && !early_redirected) || ret_redirect ||
-                        (i_first && is_dword && br_is_call_rel && !early_redirected);
+                        early_call_redirect;
 // A fault or interrupt abandons the instruction that owned an early redirect.
 // Clear that ownership before its handler's microcode PREF reaches q_flush.
 always_ff @(posedge clk or negedge reset_n) begin
@@ -2360,6 +2425,7 @@ microsequencer microsequencer_inst (
     .uc_alu_src_shift(uc_alu_src_shift),
     .uc_aluop_shift(uc_aluop_shift),
     .uc_shift_sigma_sel(uc_shift_sigma_sel),
+    .uc_alu_op_sel(uc_alu_op_sel),
     .uc_dly_source(uc_dly_source),
     .uc_mem_ctrl(uc_mem_ctrl),
     .uc_ind_ctrl(uc_ind_ctrl),
@@ -2465,12 +2531,16 @@ always_ff @(posedge clk) begin
         op_size <= 2'd1;  // Default to word size (16-bit real mode)
         srcreg_size <= 2'd1;
         op_size_src <= 2'd1;
+        op_size_du <= 2'd1;
+        op_size_dw <= 2'd1;
         srcreg_size_src <= 2'd1;
     end else if (i_issue && !halted) begin
         // Instruction start: widths have already been resolved in D1.
         op_size <= i_bus.operand_size;
         op_size_decode <= i_bus.operand_size;
         op_size_src <= i_bus.operand_size;
+        op_size_du <= i_bus.operand_size;
+        op_size_dw <= i_bus.operand_size;
         op_size_src_decode <= i_bus.operand_size;
         srcreg_size <= i_bus.source_size;
         srcreg_size_decode <= i_bus.source_size;
@@ -2479,13 +2549,15 @@ always_ff @(posedge clk) begin
     end else if (uc_exec) begin
         // Microcode BITS operations
         case (uc_aluop)
-            ALUJMP_BITS8:  begin op_size <= 2'd0; srcreg_size <= 2'd0; op_size_src <= 2'd0; srcreg_size_src <= 2'd0; end
-            ALUJMP_BITS16: begin op_size <= 2'd1; srcreg_size <= 2'd1; op_size_src <= 2'd1; srcreg_size_src <= 2'd1; end
-            ALUJMP_BITS32: begin op_size <= 2'd2; srcreg_size <= 2'd2; op_size_src <= 2'd2; srcreg_size_src <= 2'd2; end
+            ALUJMP_BITS8:  begin op_size <= 2'd0; srcreg_size <= 2'd0; op_size_src <= 2'd0; op_size_du <= 2'd0; op_size_dw <= 2'd0; srcreg_size_src <= 2'd0; end
+            ALUJMP_BITS16: begin op_size <= 2'd1; srcreg_size <= 2'd1; op_size_src <= 2'd1; op_size_du <= 2'd1; op_size_dw <= 2'd1; srcreg_size_src <= 2'd1; end
+            ALUJMP_BITS32: begin op_size <= 2'd2; srcreg_size <= 2'd2; op_size_src <= 2'd2; op_size_du <= 2'd2; op_size_dw <= 2'd2; srcreg_size_src <= 2'd2; end
             ALUJMP_BITSDE: begin
                 op_size <= op_size_decode;
                 srcreg_size <= srcreg_size_decode;
                 op_size_src <= op_size_src_decode;
+                op_size_du <= op_size_src_decode;
+                op_size_dw <= op_size_src_decode;
                 srcreg_size_src <= srcreg_size_src_decode;
             end
             default: ;
@@ -2616,14 +2688,22 @@ always_ff @(posedge clk) begin
     // Chained-store fault attribution: capture the restart IP at every demand WRITE issue
     // and ESP: a PUSH whose write faults restarts with the ESP it started with,
     // not that of a successor issued meanwhile. In the writer's first cycle
-    // TMPeSP is still loading, so take ESP directly.
-    if (mem_req_to_paging && mem_write_now && mem_accepted) begin
+    // TMPeSP is still loading, so take ESP directly. A check-write (CW, e.g.
+    // ENTER's probe of the new stack) faults with a write code too.
+    if (mem_req_to_paging && (mem_write_now || paging_is_write_access) && mem_accepted) begin
         wr_restart_eip <= TMPeIP;
         wr_restart_esp <= i_first ? ESP : TMPeSP;
+    end
+    if (ucrd_take) begin
+        ucrd_restart_eip <= TMPeIP;
+        ucrd_restart_esp <= i_first ? ESP : TMPeSP;
     end
     if (page_fault && pg_fault_code[1]) begin
         TMPeIP <= wr_restart_eip;
         TMPeSP <= wr_restart_esp;
+    end else if (data_page_fault && ucrd_slow_wait_r) begin
+        TMPeIP <= ucrd_restart_eip;
+        TMPeSP <= ucrd_restart_esp;
     end else if (data_page_fault && vipt_load_slow_wait_r) begin
         TMPeIP <= vipt_load_slow_r.restart_eip;
         // A direct POP has already written ESP; its fault restarts from the
@@ -2648,7 +2728,9 @@ end
 // Derive control signals from ALU opcode
 // INC=11000, DEC=11001, INC2=11100, DEC2=11101: all have op[4:3]==11 && op[1]==0
 wire alu_update_carry = !(alu_op5[4:3] == 2'b11 && !alu_op5[1]);
-assign alu_op5 = map_alu_op(uc_aluop_shift);
+assign alu_op5 = uc_alu_op_sel[6] ? i.decoded_alu_op :
+                 uc_alu_op_sel[5] ? (i.cmptest_is_cmp ? ALU_CMP : ALU_AND) :
+                                    uc_alu_op_sel[4:0];
 
 // IMUL: F6.5, F7.5, 0FAF, 69, 6B; MUL: F6.4 and F7.4.
 wire is_signed_mul = i.mul_signed;
@@ -2656,6 +2738,8 @@ wire clear_rf = (i_rni_delay &&
                  i.boundary_action != BOUNDARY_ACTION_PRESERVE_RF) ||
                 (recipe_rni && uc_exec);
 
+// synthesis translate_off
+// Reference: the ALU op from the raw ALU/jump field.
 function automatic [4:0] map_alu_op(input [6:0] uc_op);
 begin
     casez (uc_op)
@@ -2687,6 +2771,10 @@ begin
     endcase
 end
 endfunction
+always_ff @(posedge clk)
+    if (reset_n && (^uc_aluop_shift !== 1'bx) && (alu_op5 !== map_alu_op(uc_aluop_shift)))
+        $fatal(1, "ALU OP SELECT MISMATCH: %h vs %h", alu_op5, map_alu_op(uc_aluop_shift));
+// synthesis translate_on
 
 data_unit data_unit_inst (
     // Clock and reset
@@ -2729,7 +2817,7 @@ data_unit data_unit_inst (
     // Decoder: EX and D2 instruction, operand sizes, stack-operation class (ispval)
     .instr(i),
     .next_instr(i_bus),
-    .op_size(op_size_src),
+    .op_size(op_size_du),
     .srcreg_size(srcreg_size_src),
     .op_size_src(op_size_src),
     .srcreg_size_src(srcreg_size_src),
@@ -2748,6 +2836,8 @@ data_unit data_unit_inst (
     .recipe_memory_write(recipe_mem_write),
     // Load pipeline: registered VIPT load write-back into the register file
     .load_wb_valid(vipt_load_wb_valid_r),
+    .load_issue(vipt_issue_load),
+    .load_pipe_flush(q_flush || any_fault || interrupt_entry),
     .load_wb_dst(vipt_load_wb_dst_r),
     .load_wb_size(vipt_load_wb_size_r),
     .load_wb_data(vipt_load_wb_data),
