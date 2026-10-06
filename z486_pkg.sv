@@ -291,7 +291,7 @@ typedef struct packed {
     logic [1:0]  operand_size;         // Initial destination width: byte/word/dword
     logic [1:0]  source_size;          // Initial source width (differs for MOVZX/SX)
     logic        mul_signed;           // MUL/IMUL signedness resolved in D1
-    logic        div_quotient_zf;      // 386-compatible unsigned-DIV ZF result
+    logic        div_quotient_zf;      // unsigned DIV (F6/F7 /6): takes the 386 divide-step flags
     flag_op_t    flag_op;              // CMC/CLC/STC/CLI/STI/CLD/STD action
     logic [10:0] fop;                  // Architectural x87 ESC/ModR/M command
     logic        shift_is_double;      // SHLD/SHRD rather than group-2 shift
@@ -1066,6 +1066,11 @@ localparam [11:0] UADDR_RPTI_RNI       = 12'h20F;  // REP interrupt restart boun
 localparam [11:0] UADDR_PAGE_FAULT     = 12'h8E9;  // #PF(14) - page fault
 localparam [11:0] UADDR_INVALID_LOCK   = 12'h82B;  // #UD for invalid LOCK usage
 localparam [11:0] UADDR_BSWAP          = 12'h9C4;  // Optimizer-owned 486 BSWAP entry
+localparam [11:0] UADDR_XADD_R         = 12'h9D9;  // Optimizer-owned 486 XADD r,r
+localparam [11:0] UADDR_XADD_M         = 12'h9DC;  // Optimizer-owned 486 XADD m,r
+localparam [11:0] UADDR_CMPXCHG_R      = 12'h9E2;  // Optimizer-owned 486 CMPXCHG r,r
+localparam [11:0] UADDR_CMPXCHG_M      = 12'h9E9;  // Optimizer-owned 486 CMPXCHG m,r
+localparam [11:0] UADDR_INVD           = 12'h9F3;  // Optimizer-owned 486 INVD/WBINVD
 localparam [11:0] UADDR_CALL_GATE_386  = 12'h5BE;  // 386 call-gate handler
 localparam [11:0] UADDR_MORE_PRIVILEGE = 12'h5FB;  // Cross-privilege call path
 

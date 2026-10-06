@@ -13,6 +13,8 @@ module memory #(
     input              clk,
     input              reset_n,
     input              a20_enable,
+    input              cache_enable,  // Dev menu: L1 caches on
+    input              x87_off,       // Dev menu: no coprocessor
     input              device_mmio_enable,
     input      [31:0]  device_mmio_base,
 
@@ -125,6 +127,7 @@ cache_unit #(.PROTECT_UMA_ROM(PROTECT_UMA_ROM), .DCACHE_SET_BITS(DCACHE_SET_BITS
     .clk(clk),
     .reset_n(reset_n),
     .a20_enable(a20_enable),
+    .cache_enable(cache_enable),
     .device_mmio_enable(device_mmio_enable),
     .device_mmio_base(device_mmio_base),
     // Paging unit: demand data request (physical address, before A20 masking)
@@ -201,6 +204,7 @@ bus_unit #(.ENABLE_X87(ENABLE_X87)) bus_unit_inst (
     // Clock and reset
     .clk(clk),
     .reset_n(reset_n),
+    .x87_off(x87_off),
     // Paging unit: demand request, cycle type and completion
     .dcache_req_valid(dcache_req_valid),
     .dcache_req_write(dcache_req_write),

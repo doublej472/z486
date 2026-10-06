@@ -36,6 +36,7 @@ module protection_unit
     input               cr0_ts,           // CR0.TS (Task Switched)
     input               cr0_em,           // CR0.EM (Emulation)
     input               cr0_mp,           // CR0.MP (Monitor Coprocessor)
+    input               x87_off,          // Dev menu: no FPU, as a 486SX
 
     // Current CS descriptor facts used by PTGEN transition commands.
     input        [1:0]  cs_descriptor_dpl,
@@ -1275,6 +1276,9 @@ assign pla_test_output = {pla_test_flags, pla_test_addr, 2'b00};
 //==============================================================================
 // Stage 2: Register PLA4 outputs (posedge clk when pipe_en)
 //==============================================================================
+localparam logic [11:0] UADDR_WAIT_DONE = 12'h3C8;   // nop, RNI
+wire sx_esc_nop = x87_off && s1_valid && (s1_test_const[5:3] == 3'b111) &&
+                  (pla_test_addr == 12'h000);
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         s2_jump_addr <= 12'h000;
@@ -1285,8 +1289,12 @@ always_ff @(posedge clk) begin
         s2_is_checking_test <= 1'b0;
         s2_test_const <= 6'h0;
     end else if (pipe_en) begin
-        s2_jump_addr <= pla_test_addr;
-        s2_jump_valid <= (pla_test_addr != 12'h000);
+        // Without an FPU, as on a 486SX, an ESC instruction that passes its
+        // CR0 test (no #NM) does nothing: it leaves through WAIT_DONE. The
+        // redirect blocks the delay slots' bus operations as #NM does. WAIT
+        // (test 34-37) needs no change: BUSY# reads inactive.
+        s2_jump_addr <= sx_esc_nop ? UADDR_WAIT_DONE : pla_test_addr;
+        s2_jump_valid <= sx_esc_nop || (pla_test_addr != 12'h000);
         s2_flags <= pla_test_flags;
         s2_valid <= s1_valid;
         s2_cpl_transition <= pla_test_cpl_transition;

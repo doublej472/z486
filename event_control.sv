@@ -13,6 +13,7 @@ module event_control
     // Clock and reset
     input  logic clk,
     input  logic reset_n,
+    input  logic x87_off,               // Dev menu: no coprocessor
 
     // Microsequencer and E-stage lifecycle (current microword and its enables)
     input  logic [11:0] uc_addr,
@@ -114,6 +115,8 @@ module event_control
     output logic triple_fault_reset
 );
 
+wire x87_on = ENABLE_X87 && !x87_off;
+
 
 // Fault delivery is sequencer control state. Address and data units contribute
 // requests through the cross-unit fault signals declared at the front.
@@ -163,7 +166,7 @@ always_comb begin
     seq_conditions.no_carry = !uc_flags[0];
     seq_conditions.no_overflow = !uc_flags[11];
     // PEREQ branches while the request signal is inactive.
-    seq_conditions.pereq_inactive = ENABLE_X87 ? !x87_pereq : uc_jpereq_fwd;
+    seq_conditions.pereq_inactive = x87_on ? !x87_pereq : uc_jpereq_fwd;
     seq_conditions.flags_backup_inactive = !flags_backup_active;
     seq_conditions.tss_access = tss_access_flag;
     seq_conditions.interrupt_hw = interrupt_hw;
@@ -177,8 +180,8 @@ always_comb begin
     seq_conditions.io_ok = !pe ||
         (cpl <= EFLAGS[13:12] && (!vm || !i.port_io));
     seq_conditions.no_interrupt = !interrupt_pending;
-    seq_conditions.x87_not_busy = ENABLE_X87 ? x87_busy_n : 1'b1;
-    seq_conditions.x87_error = ENABLE_X87 ? !x87_error_n : 1'b0;
+    seq_conditions.x87_not_busy = x87_on ? x87_busy_n : 1'b1;
+    seq_conditions.x87_error = x87_on ? !x87_error_n : 1'b0;
     seq_conditions.task_16bit = !desc_cache[6].seg_type[3];
     seq_conditions.desc_accessed = desc_raw_hi[8];
 end

@@ -226,17 +226,19 @@ assign result = overflow ? (is_sar ? sar_overflow_result : 32'd0) : shifted[31:0
 // therefore the selected low-word bit; do not route the full 64-bit barrel
 // result back into the architectural flag write path.
 assign bit_test_cf = alu_value[count[4:0]];
-// SHIFT2 writes the barrel result into SIGMA on the same edge that starts the
-// existing one-cycle deferred flag retirement.  Derive Z/S/P from that
-// registered result during the retirement cycle instead of placing the
-// barrel, width selection, and zero reduction in front of the flag flops.
-// shift1_size is the operand size captured by the preceding SHIFT1 setup.
-assign flags_pf = ~^sigma[7:0];
-assign flags_zf = shift1_size == 2'd0 ? sigma[7:0] == 8'd0 :
-                  shift1_size == 2'd1 ? sigma[15:0] == 16'd0 :
-                                             sigma[31:0] == 32'd0;
-assign flags_sf = shift1_size == 2'd0 ? sigma[7] :
-                  shift1_size == 2'd1 ? sigma[15] : sigma[31];
+// SHIFT2 registers the barrel result on the edge that starts the one-cycle
+// deferred flag retirement; Z/S/P are derived from that register during the
+// retirement cycle, keeping the barrel, width selection and zero reduction
+// out of the flag flops. A private copy, not SIGMA: an instruction issued
+// into the shift's dead slot (a PUSH's ESP update) may write SIGMA on the
+// same edge. shift1_size is the operand size captured by the SHIFT1 setup.
+logic [31:0] flags_value_r;
+assign flags_pf = ~^flags_value_r[7:0];
+assign flags_zf = shift1_size == 2'd0 ? flags_value_r[7:0] == 8'd0 :
+                  shift1_size == 2'd1 ? flags_value_r[15:0] == 16'd0 :
+                                             flags_value_r[31:0] == 32'd0;
+assign flags_sf = shift1_size == 2'd0 ? flags_value_r[7] :
+                  shift1_size == 2'd1 ? flags_value_r[15] : flags_value_r[31];
 
 always_comb begin
     setup_result = alu_dst;
@@ -273,6 +275,7 @@ always_ff @(posedge clk) begin
 
                 if (instr_is_shxd) begin
                     swap <= !shift_right;
+                    overflow <= 1'b0;
                     count <= shift_right ? raw_count : width - raw_count;
                     operation <= shift_right ? ROR : ROL;
                     set_zsp <= 1'b1;
@@ -304,6 +307,7 @@ always_ff @(posedge clk) begin
             ALUJMP_LDBSRM: begin
                 swap <= 1'b0;
                 count <= alu_src[4:0] & (width - 1'b1);
+                overflow <= 1'b0;
             end
             ALUJMP_LDBSRU: begin
                 swap <= 1'b0;
@@ -338,6 +342,7 @@ always_ff @(posedge clk) begin
     end else begin
         flags_commit <= exec && is_shift2 && count_nonzero;
         if (exec && is_shift2 && count_nonzero) begin
+            flags_value_r <= result;
             flags_we_zsp <= set_zsp;
             flags_we_of <= 1'b0;
             if (instr_is_shxd) begin

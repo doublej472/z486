@@ -9,6 +9,10 @@ function automatic logic [11:0] pla_control_opcode_lookup(
     /* verilator lint_off CASEOVERLAP */
     casez ({has_0f, instruction})
         // has_0f 76543210 abcdefghijkl
+        // 486 additions, not in the 386 ROM: CMPXCHG and XADD take ModR/M
+        // like ALU r/m,r (W bit, no immediate, writes flags).
+        9'b1_1011000?: pla_control_opcode_lookup = 12'b101100010110;
+        9'b1_1100000?: pla_control_opcode_lookup = 12'b101100010110;
         9'b0_10100010: pla_control_opcode_lookup = 12'b100110000111;
         9'b1_10100011: pla_control_opcode_lookup = 12'b101100010100;
         9'b1_10101?11: pla_control_opcode_lookup = 12'b101100010100;

@@ -11,6 +11,7 @@ module bus_unit
     // Clock and reset
     input  logic clk,
     input  logic reset_n,
+    input  logic x87_off,               // Dev menu: no coprocessor
 
     // Paging unit: demand request, cycle type and completion
     input  logic dcache_req_valid,
@@ -89,9 +90,13 @@ logic [7:0] dcache_rd_pending;
 logic [7:0] icache_rd_pending;
 // direct_rd_pending: port
 
-assign x87_req_selected = ENABLE_X87 && dcache_req_valid && dcache_req_is_x87;
+assign x87_req_selected = ENABLE_X87 && !x87_off && dcache_req_valid && dcache_req_is_x87;
+// With the x87 off a 486SX has no coprocessor and no coprocessor bus cycles:
+// a port cycle that an ESC routine still issues completes here, writes
+// dropped and reads all ones.
+wire x87_sink = ENABLE_X87 && x87_off && dcache_req_valid && dcache_req_is_x87;
 
-wire dcache_direct_req = dcache_req_valid && !x87_req_selected &&
+wire dcache_direct_req = dcache_req_valid && !x87_req_selected && !x87_sink &&
                          (dcache_req_is_io || dcache_req_is_inta ||
                           dcache_req_is_vga_mem ||
                           dcache_req_is_device_mmio);
@@ -146,10 +151,12 @@ wire normal_req_complete = dcache_cpu_resp_valid ||
 wire normal_read_complete = dcache_cpu_resp_valid || direct_rd_resp_now;
 wire [31:0] normal_rdata = dcache_cpu_resp_valid ? dcache_cpu_dout : din;
 
-assign dcache_req_accepted = x87_req_selected ? x87_req_accepted : normal_req_accepted;
-assign dcache_req_complete = normal_req_complete || x87_req_complete;
-assign dcache_read_complete = normal_read_complete || x87_read_complete;
-assign dcache_rdata = x87_read_complete ? x87_rdata : normal_rdata;
+assign dcache_req_accepted = x87_sink || (x87_req_selected ? x87_req_accepted : normal_req_accepted);
+assign dcache_req_complete = normal_req_complete || x87_req_complete || x87_sink;
+assign dcache_read_complete = normal_read_complete || x87_read_complete ||
+                              (x87_sink && !dcache_req_write);
+assign dcache_rdata = x87_sink ? 32'hFFFF_FFFF :
+                      x87_read_complete ? x87_rdata : normal_rdata;
 
 assign addr       = ext_addr_r;
 assign be         = ext_be_r;

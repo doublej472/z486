@@ -120,8 +120,10 @@ reg sim_uma_rom_writable /* verilator public_flat_rw */ = 1'b0;
 `else
 wire sim_uma_rom_writable = 1'b0;
 `endif
+// Decode the full address: a partial compare also protects the 32MB aliases
+// (0x20C0000-0x20FFFFF, ...) and silently drops writes to that RAM.
 wire cpu_protect_write = PROTECT_UMA_ROM && !sim_uma_rom_writable && cpu_write &&
-                         (cpu_addr[24:18] == 7'b000_0011);
+                         (cpu_addr[31:18] == 14'h0003);
 
 // Tag/data storage.
 // Keep validity in the otherwise under-filled tag RAM word. This removes four
@@ -510,9 +512,10 @@ wire [SET_BITS-1:0] preread_set =
 wire [WORD_OFFSET_BITS-1:0] preread_word =
     vipt_probe_fire ? vipt_probe_word : cpu_preread_word;
 wire [BRAM_ADDR_BITS-1:0] preread_bram_addr = {preread_set, preread_word};
+// A store that hits patches the line even while the cache is disabled, so the
+// cache stays coherent and can be re-enabled without a flush.
 wire data_store_write = (state == S_LOOKUP) && req_valid_r && req_write_r &&
-                        !req_protect_write_r && lookup_hit &&
-                        !req_uncacheable_r;
+                        !req_protect_write_r && lookup_hit;
 wire data_fill_write = (state == S_FILL) &&
                        (mem_resp_valid || wide_fill_install);
 wire [1:0] data_write_way = data_store_write ? lookup_way : fill_way;

@@ -63,7 +63,6 @@ module data_unit
     // Hardwired control: recipe state and deferred recipe commits
     input  logic        recipe_rni,               // Current recipe uStep contains RNI
     input  recipe_state_t recipe_state,           // Latched hardwired recipe
-    input  logic        hardwired_off,
     input  logic        recipe_commit_cancel,     // Cancel deferred recipe commit
     output recipe_pending_write_t recipe_shift_write, // Deferred shift GPR commit
     output logic [31:0] recipe_shift_data,          // Deferred shift result
@@ -75,6 +74,7 @@ module data_unit
     input  logic [1:0]  load_wb_size,
     input  logic [31:0] load_wb_data,
     input  logic        load_wb_is_alu,          // Registered memory operand feeds shared ALU
+    input  logic [7:0]  load_wb_fwd_mask,        // Registered: valid, not ALU, byte-normalized dst
     input  logic [4:0]  load_wb_alu_op,
     input  logic        load_alu_dst_capture,    // Capture destination GPR at EX/WB boundary
     input  logic [2:0]  load_alu_dst_capture_dst,
@@ -200,6 +200,7 @@ logic        muldiv_tmpb_write;
 logic [31:0] muldiv_tmpb_value;
 logic        muldiv_counter_early_exit;
 logic        muldiv_quotient_zero;
+logic [5:0]  muldiv_div_flags;
 logic        muldiv_flag_overflow;
 
 logic sh_flags_commit;
@@ -313,7 +314,14 @@ wire [2:0] load_wb_widx = (load_wb_size == 2'd0)
 //                             commits land on
 // A plain load's WB value is already merged with its destination's prior
 // value; an M3 ALU result is not forwarded (its readers are interlocked).
-wire [7:0] pend_load_mask  = (load_wb_valid && !load_wb_is_alu) ? (8'h01 << load_wb_widx) : 8'h00;
+// Registered with the WB token so the forwarding selects start at a flop.
+wire [7:0] pend_load_mask  = load_wb_fwd_mask;
+// synthesis translate_off
+always_ff @(posedge clk)
+    if (reset_n && (load_wb_fwd_mask !==
+                    ((load_wb_valid && !load_wb_is_alu) ? (8'h01 << load_wb_widx) : 8'h00)))
+        $fatal(1, "LOAD WB FORWARD MASK MISMATCH: %b", load_wb_fwd_mask);
+// synthesis translate_on
 wire [7:0] pend_mem_mask   = recipe_memory_write.valid ? recipe_memory_dst_onehot : 8'h00;
 wire [7:0] pend_shift_mask = recipe_shift_write.valid ? (8'h01 << recipe_shift_widx) : 8'h00;
 wire [7:0] pend_dly_mask   = dly_gpr_forward.valid ? (8'h01 << dly_gpr_forward.dst) : 8'h00;
@@ -397,6 +405,26 @@ endfunction
 // Every late GPR write landing on this edge (any direct-load WB included).
 assign pend_write_mask = pend_dly_mask | pend_shift_mask |
                          (load_wb_valid ? (8'h01 << load_wb_widx) : 8'h00);
+
+// A shift operand captured one cycle ahead (SHIFT2 SRCREG): a deferred shift
+// or delay-slot write landing on the capture edge must be seen, as for a
+// partial load's merge base.
+function automatic logic [31:0] read_gpr_capture(
+    input logic [2:0] reg_sel,
+    input logic [1:0] size
+);
+    logic [31:0] merged;
+    begin
+        merged = gpr_capture_view[(size == 2'd0) ? {1'b0, reg_sel[1:0]} : reg_sel];
+        if (size == 2'd0)
+            read_gpr_capture = reg_sel[2] ? {24'd0, merged[15:8]}
+                                          : {24'd0, merged[7:0]};
+        else if (size == 2'd1)
+            read_gpr_capture = {16'd0, merged[15:0]};
+        else
+            read_gpr_capture = merged;
+    end
+endfunction
 
 // A D2 base/index read.
 function automatic logic [31:0] read_ea_gpr(
@@ -922,7 +950,7 @@ always_ff @(posedge clk) begin
                                dest_value[23:16], dest_value[31:24]}, 2'd2);
 
                 DEST_USTEP_ALU:
-                    if (recipe_state.hardwired && !hardwired_off &&
+                    if (recipe_state.hardwired &&
                         !recipe_commit_cancel)
                         write_gpr(dst_reg_sel_r, alu_result, op_size);
 
@@ -1215,9 +1243,13 @@ always_ff @(posedge clk) begin
                 end
                 ALUJMP_BITTST: eflags[0] <= shift_bit_test_cf;
                 ALUJMP_DIV5: begin
-                    eflags[0] <= 1'b0;
+                    // Unsigned DIV leaves the last divide step's flags, as
+                    // the 386 does; IDIV and AAM keep the older behaviour.
                     if (instr.div_quotient_zf)
-                        eflags[6] <= muldiv_quotient_zero;
+                        {eflags[11], eflags[7], eflags[6], eflags[4], eflags[2], eflags[0]} <=
+                            muldiv_div_flags;
+                    else
+                        eflags[0] <= 1'b0;
                 end
                 ALUJMP_CLZF: eflags[6] <= 1'b0;
                 ALUJMP_SEZF: eflags[6] <= 1'b1;
@@ -1275,7 +1307,12 @@ always_ff @(posedge clk) begin
     end
 end
 
+// An instruction can issue in its predecessor's last exec cycle, whose flag
+// writes land at that edge. Take the backup again one cycle later.
+logic flags_backup_refresh;
+
 always_ff @(posedge clk) begin
+    flags_backup_refresh <= reset_n && instr_start && !halted && !interrupt_entry;
     if (!reset_n) begin
         flags_backup_active <= 1'b0;
         flags_backup <= 32'd0;
@@ -1286,6 +1323,8 @@ always_ff @(posedge clk) begin
         flags_backup_active <= 1'b0;
     end else if (instr_start && !halted) begin
         flags_backup_active <= 1'b1;
+        flags_backup <= eflags_fwd;
+    end else if (flags_backup_refresh) begin
         flags_backup <= eflags_fwd;
     end else if (exec && aluop == ALUJMP_FLGSBA) begin
         if (!flags_backup_active) begin
@@ -1425,8 +1464,7 @@ always_comb begin
                                     ? dest_value : tmpe;
         2'd2: shift2_capture_value = (exec && aluop == ALUJMP_SHIFT1)
                                     ? shift_setup_result : sigma;
-        2'd3: shift2_capture_value = read_gpr_load_forwarded(src_reg_sel_r,
-                                                              op_size);
+        2'd3: shift2_capture_value = read_gpr_capture(src_reg_sel_r, op_size);
         default: shift2_capture_value = 32'd0;
     endcase
 end
@@ -1518,6 +1556,7 @@ mul_div mul_div_inst (
     .counter_early_exit(muldiv_counter_early_exit),
     .div_overflow(div_overflow),
     .div_quotient_zero(muldiv_quotient_zero),
+    .div_flags(muldiv_div_flags),
     .mul_flag_overflow(muldiv_flag_overflow)
 );
 

@@ -49,6 +49,12 @@ module z486
 
     // Architectural execution rate: 0=full, 1=15, 2=30, 3=56 MHz.
     input       [1:0]  cpu_speed_sel,
+    // Dev menu: run every instruction through the 386 microcode.
+    input              fast_off_req,
+    // Dev menu: L1 caches off (every access goes to memory).
+    input              cache_off_req,
+    // Dev menu: no coprocessor, as a build without the x87 (taken at reset).
+    input              x87_off_req,
 
     // Debug/test control
     input              single_step, // Halt after each instruction (for single-step tests)
@@ -191,6 +197,7 @@ wire [1:0]   vipt_load_alu_dst_capture_size;
 wire [4:0]   vipt_load_wb_alu_op_r;
 wire [31:0]  vipt_load_wb_data;
 wire [7:0]   vipt_load_wb_dst_onehot_r;
+wire [7:0]   vipt_load_wb_fwd_mask_r;
 wire [2:0]   vipt_load_wb_dst_r;
 wire         vipt_load_wb_is_alu_r;
 wire [1:0]   vipt_load_wb_size_r;
@@ -317,6 +324,7 @@ always @(posedge clk)
 // synthesis translate_on
 
 wire        page_fault;             // Page fault (declared fully at paging unit instantiation)
+wire        data_page_fault;
 wire [1:0]  prot_cpl;               // CPL for protection unit (declared fully near protection logic)
 
 // Paging and memory interconnect.
@@ -479,7 +487,49 @@ recipe_pending_write_t recipe_mem_write;   // Deferred load commit
 recipe_pending_write_t recipe_shift_write; // Deferred shift commit
 wire [31:0] recipe_shift_data;              // Deferred shift result
 wire       recipe_slot_stale;               // Reclaimed RNI slot is stale
-wire       hardwired_off;                    // Simulation-only disable
+// Fast-path switch (Dev menu). Off runs every instruction through the 386
+// microcode: each fast path checks hardwired_off at one eligibility point. A
+// new request takes effect only on a pipeline flush, which discards D2's
+// decisions, so no instruction sees both settings.
+logic      fast_off_sim = 1'b0;           // simulation plusargs below
+// Caches off takes effect per request: a disabled L1 still patches store hits,
+// so it stays coherent and can come back on at any time.
+logic      cache_off_sim = 1'b0;
+// The x87 switch is taken at reset only: removing the FPU under a running
+// program would only lose its state.
+logic      x87_off_sim = 1'b0;
+reg        x87_off;
+always_ff @(posedge clk)
+    if (!reset_n)
+        x87_off <= x87_off_req || x87_off_sim;
+reg        hardwired_off;
+always_ff @(posedge clk)
+    if (!reset_n || q_flush)
+        hardwired_off <= fast_off_req || fast_off_sim;
+
+// synthesis translate_off
+// +z486_fast_off starts with the fast paths off; +z486_fast_toggle=N flips the
+// request at random, about once every N cycles. +z486_cache_off and
+// +z486_cache_toggle=N do the same for the L1 caches.
+integer fast_toggle_period = 0;
+integer cache_toggle_period = 0;
+initial begin
+    if ($test$plusargs("z486_hardwired_off") || $test$plusargs("z486_fast_off"))
+        fast_off_sim = 1'b1;
+    if ($test$plusargs("z486_cache_off"))
+        cache_off_sim = 1'b1;
+    if ($test$plusargs("z486_x87_off"))
+        x87_off_sim = 1'b1;
+    void'($value$plusargs("z486_fast_toggle=%d", fast_toggle_period));
+    void'($value$plusargs("z486_cache_toggle=%d", cache_toggle_period));
+end
+always @(posedge clk) begin
+    if (fast_toggle_period > 0 && ($urandom % fast_toggle_period) == 0)
+        fast_off_sim <= !fast_off_sim;
+    if (cache_toggle_period > 0 && ($urandom % cache_toggle_period) == 0)
+        cache_off_sim <= !cache_off_sim;
+end
+// synthesis translate_on
 wire       recipe_rni;                       // Current uStep contains RNI
 wire       branch_ustep_redirect;     // bounded branch uStep redirects frontend
 wire       branch_ustep_rni;          // synthetic RNI, independent of execution stall
@@ -562,7 +612,10 @@ always_ff @(posedge clk) begin
 end
 // synthesis translate_on
 
-wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
+// A data page fault on an older posted write redirects this cycle: the word
+// waiting behind that write (a successor's) must not commit anything.
+wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry &&
+                       !data_page_fault;
 wire       dly_grace_now = mem_dly_grace && uc_p_pure_dly;
 wire       posted_write_release = mem_write_dly_grace && !uc_busreq;    // release non-busop writes after one cycle
 // A word whose bus operation the direct load suppresses (its ROM word while
@@ -712,6 +765,8 @@ memory #(
     .clk(clk),
     .reset_n(reset_n),
     .a20_enable(a20_enable),
+    .cache_enable(!cache_off_req && !cache_off_sim),
+    .x87_off(x87_off),
     .device_mmio_enable(device_mmio_enable),
     .device_mmio_base(device_mmio_base),
 
@@ -1648,7 +1703,6 @@ assign any_fault_issue = gp_fault_trigger || page_fault;
 assign any_fault = any_fault_issue || div_overflow;
 // Registered any_fault is used for deferred SIGMA/TMPeSP writes.
 always_ff @(posedge clk) any_fault_r <= any_fault;
-wire        data_page_fault;
 wire [2:0]  data_fault_code;
 wire [31:0] data_cr2_out;
 // The executing instruction is older than a blocked frontend fetch. If both
@@ -1798,6 +1852,7 @@ data_access data_access_inst (
     .vipt_load_wb_alu_op_r(vipt_load_wb_alu_op_r),
     .vipt_load_wb_data(vipt_load_wb_data),
     .vipt_load_wb_dst_onehot_r(vipt_load_wb_dst_onehot_r),
+    .vipt_load_wb_fwd_mask_r(vipt_load_wb_fwd_mask_r),
     .vipt_load_wb_dst_r(vipt_load_wb_dst_r),
     .vipt_load_wb_is_alu_r(vipt_load_wb_is_alu_r),
     .vipt_load_wb_size_r(vipt_load_wb_size_r),
@@ -1906,6 +1961,7 @@ paging_unit paging_inst (
     .cpl                (ucrd_slow_submit ? ucrd_cpl_r : pg_cpl),
     .mem_is_io          (paging_owned_submit ? 1'b0 : mem_is_io),
     .mem_be             (mem_be_now),
+    .fast_off           (hardwired_off),
     .vipt_preread       (dcache_vipt_probe_valid || st_tlb_pre || sidecar_bg_pre),
     .vipt_linear_addr   (st_tlb_pre ? issue_mem_linear :
                          sidecar_bg_pre ? ind_linear : vipt_probe_linear),
@@ -2026,6 +2082,7 @@ protection_unit protection_unit_inst (
     .cr0_ts(CR0[3]),
     .cr0_em(CR0[2]),
     .cr0_mp(CR0[1]),
+    .x87_off(x87_off),
     .cs_descriptor_dpl(desc_cache[SEG_CS].DPL),
     .cs_descriptor_exec(desc_cache[SEG_CS].seg_type[3]),
     .cs_descriptor_conforming(desc_cache[SEG_CS].seg_type[2]),
@@ -2064,6 +2121,7 @@ event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
     // Clock and reset
     .clk(clk),
     .reset_n(reset_n),
+    .x87_off(x87_off),
     // Microsequencer and E-stage lifecycle (current microword and its enables)
     .uc_addr(uc_addr),
     .uc_aluop(uc_aluop),
@@ -2181,6 +2239,7 @@ wire       uc_jump_taken_prev;          // Jump taken last cycle (for RNi: termi
 
 reg [31:0] TMPeIP;                  // Saved EIP for RPTI (repeat instruction)
 reg [31:0] wr_restart_eip;          // TMPeIP at each demand-write issue, for late write faults
+reg [31:0] wr_restart_esp;          // and the writer's instruction-start ESP
 reg [31:0] TMPeSP;                  // Saved ESP for fault handling
 
 // Hardwired relative-branch target and microcode PREF restart (from IND).
@@ -2555,11 +2614,17 @@ always_ff @(posedge clk) begin
         TMPeSP <= ESP;  // instruction-start ESP for a restartable fault frame
 
     // Chained-store fault attribution: capture the restart IP at every demand WRITE issue
-    if (mem_req_to_paging && mem_write_now && mem_accepted)
+    // and ESP: a PUSH whose write faults restarts with the ESP it started with,
+    // not that of a successor issued meanwhile. In the writer's first cycle
+    // TMPeSP is still loading, so take ESP directly.
+    if (mem_req_to_paging && mem_write_now && mem_accepted) begin
         wr_restart_eip <= TMPeIP;
-    if (page_fault && pg_fault_code[1])
+        wr_restart_esp <= i_first ? ESP : TMPeSP;
+    end
+    if (page_fault && pg_fault_code[1]) begin
         TMPeIP <= wr_restart_eip;
-    else if (data_page_fault && vipt_load_slow_wait_r) begin
+        TMPeSP <= wr_restart_esp;
+    end else if (data_page_fault && vipt_load_slow_wait_r) begin
         TMPeIP <= vipt_load_slow_r.restart_eip;
         // A direct POP has already written ESP; its fault restarts from the
         // ESP it started with, even if a younger instruction since issued.
@@ -2677,7 +2742,6 @@ data_unit data_unit_inst (
     // Hardwired control: recipe state and deferred recipe commits
     .recipe_rni(recipe_rni),
     .recipe_state(recipe_state),
-    .hardwired_off(hardwired_off),
     .recipe_commit_cancel(any_fault_issue),
     .recipe_shift_write(recipe_shift_write),
     .recipe_shift_data(recipe_shift_data),
@@ -2688,6 +2752,7 @@ data_unit data_unit_inst (
     .load_wb_size(vipt_load_wb_size_r),
     .load_wb_data(vipt_load_wb_data),
     .load_wb_is_alu(vipt_load_wb_is_alu_r),
+    .load_wb_fwd_mask(vipt_load_wb_fwd_mask_r),
     .load_wb_alu_op(vipt_load_wb_alu_op_r),
     .load_alu_dst_capture(vipt_load_alu_dst_capture),
     .load_alu_dst_capture_dst(vipt_load_alu_dst_capture_dst),
@@ -2791,7 +2856,7 @@ x87_unit #(.ENABLE_X87(ENABLE_X87)) x87 (
     .req_rdata(x87_rdata),
     .direct_launch(i_issue),
     .direct_candidate(x87_direct_candidate),
-    .direct_allowed(!CR0[3] && !CR0[2]),
+    .direct_allowed(!CR0[3] && !CR0[2] && !x87_off),
     .direct_fop(i.fop),
     .direct_reg(i_bus.modrm[7:6] == 2'b11),
     .direct_store((i_bus.modrm[7:6] != 2'b11) && ((i_bus.opcode == 8'hD9) || (i_bus.opcode == 8'hDB)) &&

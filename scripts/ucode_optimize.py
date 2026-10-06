@@ -140,6 +140,82 @@ PATCHES = [
     Patch(0x9C4, "BSWAP r32 extension: SRCREG -> byte-swapped SRCREG + RNI",
           copy_from=0x003, fields=dict(dst=DEST_USTEP_BSWAP)),
 
+    # XADD (0F C0/C1) and CMPXCHG (0F B0/B1) have no 80386 PLA entry; the
+    # decoder selects these words by ModR/M form. Operands follow ALU r/m,r:
+    # DSTREG is r/m, SRCREG is reg; the decoder supplies ADD for XADD, CMP for
+    # CMPXCHG's CMPTST and condition Z for its JNcond.
+    # XADD r,r: SRC gets the old DEST before DEST gets the sum, so XADD r,r
+    # with one register leaves the sum.
+    Patch(0x9D9, "XADD r,r: DSTREG -> TMPB, ALU DSTREG + SRCREG (flags)",
+          copy_from=0x030, fields=dict(src=0x3D, dst=0x0B, alusrc=0x3E, aluop=0x00)),
+    Patch(0x9DA, "XADD r,r: TMPB -> SRCREG + RNI",
+          copy_from=0x030, fields=dict(src=0x0B, dst=0x3E, op=0)),
+    Patch(0x9DB, "XADD r,r: SIGMA -> DSTREG in the RNI delay slot",
+          copy_from=0x030, fields=dict(src=0x1E, dst=0x3D)),
+    # XADD m,r: read for write (as ALU m,r), write the sum, and update SRC from
+    # OPR_R only after the write has completed, as XCHG m,r does (an RNI delay
+    # slot GPR write takes SIGMA, OPR_R, COUNTR or -1).
+    Patch(0x9DC, "XADD m,r: flags backup + RD for write",
+          copy_from=0x04A),
+    Patch(0x9DD, "XADD m,r: DLY for the read",
+          copy_from=0x030, fields=dict(sub=0)),
+    Patch(0x9DE, "XADD m,r: ALU OPR_R + SRCREG (flags)",
+          copy_from=0x030, fields=dict(src=0x2D, alusrc=0x3E, aluop=0x00)),
+    Patch(0x9DF, "XADD m,r: SIGMA -> OPR_W + WR",
+          copy_from=0x030, fields=dict(src=0x1E, dst=0x2D, bus=0x12)),
+    Patch(0x9E0, "XADD m,r: RNI + DLY for the write",
+          copy_from=0x030, fields=dict(op=0, sub=0)),
+    Patch(0x9E1, "XADD m,r: OPR_R -> SRCREG + UNL in the RNI delay slot",
+          copy_from=0x030, fields=dict(src=0x2D, dst=0x3E, sub=1)),
+    # CMPXCHG r,r: compare the accumulator with DEST; equal stores SRC in
+    # DEST, otherwise the accumulator takes DEST.
+    Patch(0x9E2, "CMPXCHG r,r: CMPTST eAX_AL - DSTREG (flags)",
+          copy_from=0x030, fields=dict(src=0x28, alusrc=0x3D, aluop=0x03)),
+    Patch(0x9E3, "CMPXCHG r,r: JNcond (not equal) -> 9E7",
+          copy_from=0x030, fields=dict(aluop=0x41, alusrc=0x03)),
+    Patch(0x9E4, "CMPXCHG r,r: blank jump delay slot",
+          copy_from=0x030),
+    Patch(0x9E5, "CMPXCHG r,r equal: SRCREG -> DSTREG + RNI",
+          copy_from=0x030, fields=dict(src=0x3E, dst=0x3D, op=0)),
+    Patch(0x9E6, "CMPXCHG r,r equal: blank RNI delay slot",
+          copy_from=0x030),
+    Patch(0x9E7, "CMPXCHG r,r not equal: DSTREG -> eAX_AL + RNI",
+          copy_from=0x030, fields=dict(src=0x3D, dst=0x28, op=0)),
+    Patch(0x9E8, "CMPXCHG r,r not equal: blank RNI delay slot",
+          copy_from=0x030),
+    # CMPXCHG m,r always writes the destination: SRC when equal, the old
+    # value otherwise (as the 486 does); the accumulator is updated only
+    # after that write has completed.
+    Patch(0x9E9, "CMPXCHG m,r: flags backup + RD for write",
+          copy_from=0x04A),
+    Patch(0x9EA, "CMPXCHG m,r: DLY for the read",
+          copy_from=0x030, fields=dict(sub=0)),
+    Patch(0x9EB, "CMPXCHG m,r: CMPTST eAX_AL - OPR_R (flags) + UNL (as ALU m,r 04C)",
+          copy_from=0x030, fields=dict(src=0x28, alusrc=0x0F, aluop=0x03, sub=1)),
+    Patch(0x9EC, "CMPXCHG m,r: SRCREG -> OPR_W, JNcond (not equal) -> 9F0",
+          copy_from=0x030, fields=dict(src=0x3E, dst=0x2D, aluop=0x41, alusrc=0x03)),
+    Patch(0x9ED, "CMPXCHG m,r: blank jump delay slot",
+          copy_from=0x030),
+    Patch(0x9EE, "CMPXCHG m,r equal: WR + RNI",
+          copy_from=0x030, fields=dict(bus=0x12, op=0)),
+    Patch(0x9EF, "CMPXCHG m,r equal: DLY for the write in the RNI delay slot",
+          copy_from=0x030, fields=dict(sub=0)),
+    Patch(0x9F0, "CMPXCHG m,r not equal: OPR_R -> OPR_W + WR",
+          copy_from=0x030, fields=dict(src=0x2D, dst=0x2D, bus=0x12)),
+    Patch(0x9F1, "CMPXCHG m,r not equal: RNI + DLY for the write",
+          copy_from=0x030, fields=dict(op=0, sub=0)),
+    Patch(0x9F2, "CMPXCHG m,r not equal: OPR_R -> eAX_AL in the RNI delay slot",
+          copy_from=0x030, fields=dict(src=0x2D, dst=0x28)),
+    # INVD/WBINVD (0F 08/09): CPL 0 only (as CLTS); the L1 caches are
+    # write-through and coherent with every bus master, so there is nothing
+    # to write back and discarding lines is not architecturally visible.
+    Patch(0x9F3, "INVD/WBINVD: LJMPNP NO_PRIVILEGE (as CLTS)",
+          copy_from=0x0DC),
+    Patch(0x9F4, "INVD/WBINVD: RNI in the jump delay slot",
+          copy_from=0x030, fields=dict(op=0)),
+    Patch(0x9F5, "INVD/WBINVD: blank RNI delay slot",
+          copy_from=0x030),
+
     # 0F 01 /7 uses an address operand but performs no data transfer. The CPU
     # sidecar serializes this RNI word with the paging unit and invalidates the
     # addressed TLB entry; the following blank word is its architectural delay

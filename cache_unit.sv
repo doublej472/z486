@@ -16,6 +16,7 @@ module cache_unit
     input  logic clk,
     input  logic reset_n,
     input  logic a20_enable,
+    input  logic cache_enable,          // Dev menu: L1 caches on
     input  logic device_mmio_enable,
     input  logic [31:0] device_mmio_base,
 
@@ -288,7 +289,7 @@ l1_cache #(
     .mem_line_resp_valid(dcache_mem_line_resp_valid),
     .snoop_addr(snoop_addr),
     .snoop_valid(snoop_valid),
-    .cache_enable(1'b1)
+    .cache_enable(cache_enable)
 );
 
 l1_icache #(
@@ -318,7 +319,7 @@ l1_icache #(
     .patch_valid(icache_write_patch_valid),
     .invalidate_addr(snoop_addr),
     .invalidate_valid(snoop_valid),
-    .cache_enable(1'b1)
+    .cache_enable(cache_enable)
 );
 
 endmodule

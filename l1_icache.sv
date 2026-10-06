@@ -67,10 +67,10 @@ wire [SET_BITS-1:0] cpu_set = cpu_addr[SET_MSB:SET_LSB];
 wire [TAG_BITS-1:0] patch_tag = patch_addr[TAG_MSB:TAG_LSB];
 wire [SET_BITS-1:0] patch_set = patch_addr[SET_MSB:SET_LSB];
 wire [WORD_OFFSET_BITS-1:0] patch_word = patch_addr[LINE_OFFSET_BITS-1:BYTE_OFFSET_BITS];
-// The prefetcher consumes whole 16-byte lines.  Unlike demand data accesses,
-// an instruction fetch cannot be satisfied by a single uncacheable DWORD
-// bypass without corrupting branch targets in the middle of the line.
+// The prefetcher consumes whole 16-byte lines, so an uncacheable fetch reads
+// the full line like a fill and delivers it without installing it.
 wire cpu_uncacheable = !cache_enable;
+reg  fill_uncached_r;                  // the current fill must not install
 
 `Z486_BLOCK_RAM reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1];
 `Z486_BLOCK_RAM reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1];
@@ -105,6 +105,7 @@ reg        req_valid_r;
 reg [31:0] req_addr_r;
 reg        req_uncacheable_r;
 reg [TAG_BITS-1:0] req_tag_r;
+reg        req_snoop_conflict_r;   // the request's tag read raced a snoop's tag clear
 reg [SET_BITS-1:0] req_set_r;
 
 reg        mem_valid_r;
@@ -120,7 +121,6 @@ localparam [2:0] S_RESET_INIT  = 3'd0;
 localparam [2:0] S_IDLE        = 3'd1;
 localparam [2:0] S_LOOKUP      = 3'd2;
 localparam [2:0] S_FILL        = 3'd3;
-localparam [2:0] S_BYPASS_WAIT = 3'd4;
 
 reg [2:0] state;
 reg [SET_BITS-1:0] init_set;
@@ -275,7 +275,7 @@ wire [127:0] lookup_way_line = way_line_mux(lookup_way, rd_line0_r, rd_line1_r, 
 // line, so reject that live collision. External DMA invalidation is held and
 // reaches the registered snoop before the pending DMA write can commit; keeping
 // it out of this hit cone avoids a system-to-prefetch timing path.
-wire lookup_snoop_conflict =
+wire lookup_snoop_conflict = req_snoop_conflict_r ||
     (snoop_valid_r && (snoop_tag_r == req_tag_r) && (snoop_set_r == req_set_r)) ||
     (patch_valid && (patch_tag == req_tag_r) && (patch_set == req_set_r));
 wire lookup_hit_usable = lookup_hit && !lookup_snoop_conflict;
@@ -370,7 +370,7 @@ wire registered_snoop_fill_conflict = snoop_valid_r &&
 // both operations need the same way RAM for different lines, the fill may
 // win: replacing the old tag also invalidates the snooped line.  Only a snoop
 // targeting the line being filled must leave that fill uncached.
-wire fill_install_allowed = !live_snoop_fill_conflict &&
+wire fill_install_allowed = !fill_uncached_r && !live_snoop_fill_conflict &&
                             !registered_snoop_fill_conflict;
 wire data_fill_write = tag_fill_write && fill_install_allowed;
 
@@ -448,6 +448,7 @@ always_ff @(posedge clk) begin
         state <= S_RESET_INIT;
         init_set <= {SET_BITS{1'b0}};
         req_valid_r <= 1'b0;
+        req_snoop_conflict_r <= 1'b0;
         ready_r <= 1'b0;
         resp_valid_r <= 1'b0;
         line_r <= 128'h0;
@@ -537,6 +538,10 @@ always_ff @(posedge clk) begin
                     req_addr_r <= cpu_addr;
                     req_uncacheable_r <= cpu_uncacheable;
                     req_tag_r <= cpu_tag;
+                    // A matching snoop clears its tag on this edge, while this
+                    // request reads the old one.
+                    req_snoop_conflict_r <= snoop_valid_r && (snoop_tag_r == cpu_tag) &&
+                                            (snoop_set_r == cpu_set);
                     req_set_r <= cpu_set;
                     state <= S_LOOKUP;
                 end
@@ -545,14 +550,7 @@ always_ff @(posedge clk) begin
             S_LOOKUP: begin
                 req_valid_r <= 1'b0;
 
-                if (req_uncacheable_r) begin
-                    if (!mem_valid_r && !mem_busy) begin
-                        mem_valid_r <= 1'b1;
-                        mem_addr_r <= req_addr_r;
-                        mem_burstcount_r <= 8'd1;
-                        state <= S_BYPASS_WAIT;
-                    end
-                end else if (lookup_hit_usable) begin
+                if (lookup_hit_usable && !req_uncacheable_r) begin
                     plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
                     state <= S_IDLE;
                     ready_r <= 1'b1;
@@ -564,6 +562,7 @@ always_ff @(posedge clk) begin
                     fill_count <= {WORD_OFFSET_BITS{1'b0}};
                     fill_line <= 128'h0;
                     fill_requested <= 1'b0;
+                    fill_uncached_r <= req_uncacheable_r;
                     state <= S_FILL;
                 end
             end
@@ -597,15 +596,6 @@ always_ff @(posedge clk) begin
                         ready_r <= 1'b1;
                     end
                     fill_count <= fill_count + 1'b1;
-                end
-            end
-
-            S_BYPASS_WAIT: begin
-                if (mem_resp_valid) begin
-                    line_r <= {4{mem_dout}};
-                    resp_valid_r <= 1'b1;
-                    state <= S_IDLE;
-                    ready_r <= 1'b1;
                 end
             end
 

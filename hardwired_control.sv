@@ -53,7 +53,7 @@ module hardwired_control
     output recipe_meta_t issue_recipe,
     output logic        issue_hardwired,
     output logic        x87_direct_candidate,
-    output logic        disabled,
+    input  logic        disabled,           // fast paths off (Dev menu)
     output logic        pb_issue,         // Issue the skeleton into a dead RNI slot (B1)
     output logic        pb_slot,          // ROM port B supplies the next executing word
     output logic        recipe_rni,       // Current recipe uStep contains RNI
@@ -69,22 +69,15 @@ logic branch_ustep_r;
 logic branch_ustep_jcc_r;
 logic jcc_fold_r;
 logic jcc_issue_valid_r;
-logic hardwired_off = 1'b0;
-
-// synthesis translate_off
-initial if ($test$plusargs("z486_hardwired_off") ||
-            $test$plusargs("z486_fast_off")) hardwired_off = 1'b1;
-// synthesis translate_on
 
 //=============================================================================
 // Recipe classification and active execution state
 //=============================================================================
 
 assign issue_recipe = recipe_metadata(issue_instr);
-assign disabled = hardwired_off;
-assign issue_hardwired = issue_recipe.hardwired && !hardwired_off;
+assign issue_hardwired = issue_recipe.hardwired && !disabled;
 assign x87_direct_candidate =
-    issue_recipe.commit_sel == RECIPE_ACTION_X87_DIRECT;
+    issue_recipe.commit_sel == RECIPE_ACTION_X87_DIRECT && !disabled;
 wire recipe_active = i_first && recipe_state.hardwired;
 assign recipe_rni = recipe_state.hardwired && uc_active && i_rni;
 
@@ -280,6 +273,28 @@ function automatic logic [7:0] pb_read_mask(input dec_entry_t e);
 endfunction
 wire [7:0] pbn_read_mask = pb_read_mask(pb_next_instr);
 
+// A byte or word load into a register (MOV, MOVZX/MOVSX, POP) merges into its
+// destination's prior value, captured from the forwarded register view. An
+// ALU load's M3 result is not in that view.
+function automatic logic [7:0] pb_merge_mask(input dec_entry_t e);
+    logic [7:0] o;
+    logic merge;
+    begin
+        o = e.opcode;
+        merge = (e.operand_size != 2'd2) &&
+            (e.has_0f ? ((o == 8'hB6) || (o == 8'hB7) || (o == 8'hBE) || (o == 8'hBF))
+                      : ((o == 8'h8A) || (o == 8'h8B) || (o == 8'hA0) || (o == 8'hA1) ||
+                         (o[7:3] == 5'b01011)));
+        pb_merge_mask = 8'h00;
+        // MOVZX/MOVSX name their destination in the ModRM reg field.
+        if (merge)
+            pb_merge_mask[e.has_0f ? e.src_reg_sel :
+                          (e.operand_size == 2'd0) ? {1'b0, e.dst_reg_sel[1:0]} :
+                                                     e.dst_reg_sel] = 1'b1;
+    end
+endfunction
+wire [7:0] pbn_merge_mask = pb_merge_mask(pb_next_instr);
+
 // The slot is the predecessor's RNI word, a clock after this decision. A shift
 // older than the predecessor has committed by then (D2 EA reads forward it),
 // so only a shifting predecessor's own result conflicts.
@@ -312,7 +327,8 @@ wire pb_b1_from_multi = recipe_state.hardwired && recipe_state.multi_ustep &&
 // A direct load completes in the data pipeline, so its first word is already
 // a dead slot. Its successor may not read the load's M3 ALU result (no WB
 // forwarding) or, after a flag-writing load, the flags.
-wire pbn_load_alu_conf = issue_recipe.writes_flags && pbn_read_mask[issue_load_widx];
+wire pbn_load_alu_conf = issue_recipe.writes_flags &&
+    (pbn_read_mask[issue_load_widx] || pbn_merge_mask[issue_load_widx]);
 // A direct POP writes ESP in its first cycle; a stack successor takes the
 // forwarded value, but an ESP base or index waits for the register.
 wire pb_b1_from_load = load_pipe_issue && !tf_issue &&
@@ -484,7 +500,7 @@ always @(posedge clk) begin
     if (reset_n && !stall && recipe_rni && uc_exec && !i_issue && !recipe_state.slot_has_work) begin
         ds_total++;
         if (decq_empty)                                      ds_empty++;
-        else if (!issue_recipe.hardwired || hardwired_off)                ds_seq++;
+        else if (!issue_recipe.hardwired || disabled)                     ds_seq++;
         else if (interrupt_pending || single_step)           ds_intr++;
         else if (issue_recipe.reads_flags && recipe_state.writes_flags &&
                  !issue_recipe.jcc)                             ds_flags++;

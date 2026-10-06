@@ -27,6 +27,7 @@ module mul_div
     output logic        counter_early_exit, // DSP completion terminates repeat loop
     output logic        div_overflow,
     output logic        div_quotient_zero,
+    output logic [5:0]  div_flags,          // {OF,SF,ZF,AF,PF,CF} of the last divide step
     output logic        mul_flag_overflow
 );
 
@@ -44,6 +45,9 @@ logic        div_first_cycle;
 logic [31:0] div_iter_q_next;
 logic [31:0] div_iter_r_next;
 logic        div_iter_r_nonneg_next;
+logic [5:0]  div_iter_flags_next;
+logic [5:0]  div_flags_r;
+assign div_flags = div_flags_r;
 logic [31:0] div_divisor_masked;
 logic [31:0] div_divisor_abs;
 logic        div_dividend_neg;
@@ -108,6 +112,7 @@ always_ff @(posedge clk) begin
                     divtmp           <= div_iter_q_next;
                     div_r_nonneg      <= div_iter_r_nonneg_next;
                     div_first_cycle  <= 1'b0;
+                    div_flags_r      <= div_iter_flags_next;
                 end
                 ALUJMP_PREDIV: begin
                     divtmp               <= div_iter_q_next;
@@ -184,7 +189,8 @@ always_comb begin
     d_in = use_prediv ? div_divisor_abs : div_divisor_masked;
     r_nonneg_in = use_prediv ? 1'b1 : div_r_nonneg;
     div7_calc(q_in, r_in, d_in, r_nonneg_in, op_size,
-              div_iter_q_next, div_iter_r_next, div_iter_r_nonneg_next);
+              div_iter_q_next, div_iter_r_next, div_iter_r_nonneg_next,
+              div_iter_flags_next);
 end
 
 always_comb begin
@@ -300,7 +306,8 @@ task automatic div7_calc(
     input  logic [1:0]  size,
     output logic [31:0] q_out,
     output logic [31:0] r_out,
-    output logic        r_nonneg_out
+    output logic        r_nonneg_out,
+    output logic [5:0]  flags_out
 );
     int unsigned width;
     logic [31:0] q;
@@ -337,6 +344,27 @@ task automatic div7_calc(
     q_next[0] = r_nonneg_out;
     q_out = div_op_by_size(DIV_OP_MASK, q_next, size);
     r_out = div_op_by_size(DIV_OP_MASK, r_next_full[31:0], size);
+
+    // The step's ALU flags at the operand width: the 386 leaves those of the
+    // last step after DIV (SingleStepTests 386 captures), where a Cyrix part
+    // leaves the flags unchanged.
+    begin
+        logic [31:0] a, res;
+        logic        a_msb, b_msb, res_msb, carry;
+        a   = r_shifted[31:0] & width_mask[31:0];
+        res = r_next_full[31:0] & width_mask[31:0];
+        a_msb   = a[width-1];
+        b_msb   = d[width-1];
+        res_msb = res[width-1];
+        carry   = r_nonneg_prev_in ? (a < d) : ({1'b0, a} + {1'b0, d}) >> width != 0;
+        flags_out[0] = carry;
+        flags_out[1] = ~^res[7:0];
+        flags_out[2] = a[4] ^ d[4] ^ res[4];
+        flags_out[3] = res == 32'd0;
+        flags_out[4] = res_msb;
+        flags_out[5] = r_nonneg_prev_in ? ((a_msb ^ b_msb) & (a_msb ^ res_msb))
+                                        : (~(a_msb ^ b_msb) & (a_msb ^ res_msb));
+    end
 endtask
 
 endmodule

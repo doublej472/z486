@@ -63,6 +63,7 @@ module paging_unit
 
     // Read-only D2 TLB preread. EX consumes these outputs one cycle later;
     // a miss continues through the ordinary demand interface above.
+    input               fast_off,          // Dev menu: fast paths off
     input               vipt_preread,
     input        [31:0] vipt_linear_addr,
     input               vipt_fallback,
@@ -166,12 +167,6 @@ wire        tlb_is_vga_mem;
 // Live (combinational) TLB lookup of the demand linear, used at PG_IDLE to
 // precompute whether a write will post, so the post-write DLY grace at
 // PG_MEM_TLB needs no combinational TLB term on the uc_exec path.
-wire        live_tlb_hit;
-wire [31:0] live_tlb_physical;
-wire        live_tlb_writable;
-wire        live_tlb_user;
-wire        live_tlb_dirty;
-wire        live_tlb_is_vga_mem;
 // TLB update signals (from page walker)
 logic        tlb_update_valid;
 logic [19:0] tlb_update_vpn;
@@ -243,13 +238,6 @@ paging_tlb tlb_inst (
     .user           (tlb_user),
     .dirty          (tlb_dirty),
     .is_vga_mem     (tlb_is_vga_mem),
-    .linear_addr_live(linear_addr),       // same registered linear -> seg-adder off the live-TLB cone
-    .live_hit       (live_tlb_hit),
-    .live_physical_addr(live_tlb_physical),
-    .live_writable  (live_tlb_writable),
-    .live_user      (live_tlb_user),
-    .live_dirty     (live_tlb_dirty),
-    .live_is_vga_mem(live_tlb_is_vga_mem),
     .vipt_preread   (vipt_preread),
     .vipt_linear_addr(vipt_linear_addr),
     .vipt_hit       (vipt_tlb_hit),
@@ -351,16 +339,10 @@ wire slow_tlb_user_ok = !slow_is_user_mode || tlb_user;
 wire slow_tlb_write_ok = !req_is_write || tlb_writable || (!slow_is_user_mode && !wp_enable);
 wire slow_tlb_access_ok = slow_tlb_user_ok && slow_tlb_write_ok;
 
-wire live_is_user     = (cpl == 2'd3);
-wire live_user_ok     = !live_is_user || live_tlb_user;
-wire live_store_perm_ok = live_tlb_writable ||
-                          (!live_is_user && !wp_enable);
-// live_valid gates the optimistic write-post: when the live-TLB input is a
-// registered don't-care (complex modrm whose true linear is seg_linear, only
-// in req_linear), defer the write instead of trusting the wrong-address lookup.
-wire live_store_posts = !pg_enable ||
-    (live_valid && live_tlb_hit && live_user_ok && live_store_perm_ok &&
-     live_tlb_dirty);
+// A write posts in its request cycle only without paging. With paging it
+// takes the registered lookup: the TLB has one port, as on the i486. (A store
+// whose page the sidecar holds already takes the direct store route.)
+wire live_store_posts = !pg_enable;
 reg  write_will_post; // registered live_store_posts, valid in the PG_MEM_TLB cycle
 
 // Prefetch is always a read at the current CPL, so only the U/S check matters.
@@ -419,24 +401,6 @@ wire req_mem_dcache_candidate = (state == PG_MEM_TLB) && req_can_translate &&
                                 cache_lookup_granted;
 wire req_mem_dcache_accept = req_mem_dcache_candidate && dcache_req_accepted;
 
-// synthesis translate_off
-// SET-read-at-019 validation: the live TLB physical captured at PG_IDLE must
-// equal the registered TLB physical at PG_MEM_TLB (same TLB, same linear), so a
-// demand read can present the live physical to the dcache one cycle early.
-reg [19:0] live_pfn_pre;
-reg        live_hit_pre;
-always_ff @(posedge clk) begin
-    if (idle_data_req && !mem_write && !mem_is_io) begin
-        live_pfn_pre <= live_tlb_physical[31:12];
-        // Only trust the live lookup when linear_addr_live is the true linear;
-        // for complex modrm it is a registered don't-care, so don't compare.
-        live_hit_pre <= live_valid && live_tlb_hit;
-    end
-    if (reset_n && (state == PG_MEM_TLB) && !req_is_write && live_hit_pre && tlb_hit &&
-        (live_pfn_pre !== tlb_physical_addr[31:12]))
-        $display("%0t: LIVE PFN MISMATCH live=%05x reg=%05x", $time, live_pfn_pre, tlb_physical_addr[31:12]);
-end
-// synthesis translate_on
 wire req_mem_posted_done = req_mem_dcache_accept && req_is_write && dcache_req_complete;
 assign mem_write_dly_grace = (state == PG_MEM_TLB) && req_is_write && write_will_post && !req_crossing;
 // Fault-capable window of a demand write (see the port comment).  States
@@ -452,9 +416,38 @@ wire dcache_posted_write_done = (dcache_req_valid_r || req_mem_dcache_candidate)
 wire cross2_tlb_dirty_ok = !req_is_write || tlb_dirty;
 wire cross2_can_translate = !pg_enable || (tlb_hit && slow_tlb_access_ok && cross2_tlb_dirty_ok);
 wire pf_tlb_match = !pg_enable || (tlb_lookup_addr_r[31:12] == pf_linear_addr[31:12]);
+// Last prefetch translation. A demand capture reloads the shared registered
+// lookup address; this one-entry copy keeps code fetch translating in one
+// cycle meanwhile. Like the sidecar, it may outlive the four-way entry until
+// INVLPG or a CR3 write.
+reg        pf_xlat_valid;
+reg [19:0] pf_xlat_vpn;
+reg [19:0] pf_xlat_pfn;
+reg        pf_xlat_user;
+wire pf_xlat_hit = !fast_off && pf_xlat_valid && (pf_xlat_vpn == pf_linear_addr[31:12]) &&
+                   ((cpl != 2'd3) || pf_xlat_user);
 wire fast_pf_candidate = idle_pf_req && cache_lookup_granted &&
-                         (!pg_enable || (pf_tlb_match && tlb_hit && pf_tlb_user_ok));
-wire [31:0] fast_pf_phys = pg_enable ? {tlb_physical_addr[31:12], pf_linear_addr[11:0]} : pf_linear_addr;
+                         (!pg_enable || pf_xlat_hit ||
+                          (pf_tlb_match && tlb_hit && pf_tlb_user_ok));
+wire [31:0] fast_pf_phys = !pg_enable ? pf_linear_addr :
+                           pf_xlat_hit ? {pf_xlat_pfn, pf_linear_addr[11:0]} :
+                                         {tlb_physical_addr[31:12], pf_linear_addr[11:0]};
+
+always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        pf_xlat_valid <= 1'b0;
+        pf_xlat_vpn <= 20'd0;
+        pf_xlat_pfn <= 20'd0;
+        pf_xlat_user <= 1'b0;
+    end else if (cr3_write || invlpg_fire) begin
+        pf_xlat_valid <= 1'b0;
+    end else if (pg_enable && idle_pf_req && pf_tlb_match && tlb_hit) begin
+        pf_xlat_valid <= 1'b1;
+        pf_xlat_vpn <= pf_linear_addr[31:12];
+        pf_xlat_pfn <= tlb_physical_addr[31:12];
+        pf_xlat_user <= tlb_user;
+    end
+end
 
 assign mem_accepted = mem_accepted_r || idle_mem_ready;
 wire        req_mem_present    = (state == PG_MEM_TLB);
@@ -467,13 +460,9 @@ wire        early_wr_present   = early_wr_idx_drive && !idle_mem_crossing &&
 // translation from coupling into an older registered direct request.
 wire        early_wr_data_drive = early_wr_present && !dcache_req_valid_r;
 wire        early_idx_drive    = early_wr_idx_drive;
-// The live physical frame is consumed only after live_tlb_hit qualifies an
-// early request.  The TLB therefore need not synthesize a linear-address
-// fallback into this already-deep cache-finalize path.
-wire [31:0] early_phys         = pg_enable ? {live_tlb_physical[31:12], linear_addr[11:0]}
-                                          : linear_addr;
-wire        early_is_vga_mem   = pg_enable ? live_tlb_is_vga_mem
-                                           : (linear_addr[31:17] == 15'h5);
+// An early write needs paging off, so its physical address is its linear
+// address; a pretranslated read carries its own registered physical address.
+wire [31:0] early_phys         = linear_addr;
 wire        req_is_vga_mem     = pg_enable ? tlb_is_vga_mem
                                            : (req_linear[31:17] == 15'h5);
 wire        early_wr_accept    = early_wr_present && dcache_req_accepted;
@@ -533,6 +522,8 @@ assign x87_req_wdata = dcache_io_wdata_r;
 assign dcache_req_is_io = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_io_r;
 assign dcache_req_is_inta = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_inta_r;
 assign dcache_req_is_x87 = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_x87_r;
+wire        early_is_vga_mem   = pretrans_present ? (pretrans_phys[31:17] == 15'h5)
+                                                  : (linear_addr[31:17] == 15'h5);
 assign dcache_req_is_vga_mem = early_present ? early_is_vga_mem :
                                req_mem_present ? req_is_vga_mem :
                                (dcache_req_phys_addr_r[31:17] == 15'h5);

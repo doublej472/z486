@@ -642,6 +642,10 @@ task automatic build_struct_work(
     logic        imm_sign_extend;
     logic        invalid_lock;
     logic        instr_bswap;
+    logic        instr_xadd;
+    logic        instr_cmpxchg;
+    logic        instr_invd;
+    logic [11:0] entry_486;
     logic        is_setcc;
     logic        is_movzx_movsx;
     logic        is_movzx_word;
@@ -689,13 +693,23 @@ task automatic build_struct_work(
         invalid_lock = check_lock_invalid(prefix_rep_lock, prefix_0f, opcode,
                                           has_modrm, modrm);
         instr_bswap = prefix_0f && (opcode[7:3] == 5'b11001);
+        // Other 486 additions with optimizer-owned entries.
+        instr_xadd = prefix_0f && (opcode[7:1] == 7'b1100000);
+        instr_cmpxchg = prefix_0f && (opcode[7:1] == 7'b1011000);
+        instr_invd = prefix_0f && (opcode[7:1] == 7'b0000100);
+        entry_486 = instr_bswap ? UADDR_BSWAP :
+                    instr_xadd ? ((modrm[7:6] == 2'b11) ? UADDR_XADD_R : UADDR_XADD_M) :
+                    instr_cmpxchg ? ((modrm[7:6] == 2'b11) ? UADDR_CMPXCHG_R
+                                                           : UADDR_CMPXCHG_M) :
+                    UADDR_INVD;
         w.entry.boundary_action = invalid_lock ? BOUNDARY_ACTION_NONE :
             decode_boundary_action(prefix_0f, opcode, has_modrm, modrm);
         w.entry.seg_reg_sel = decode_segment_register(prefix_0f, opcode,
                                                        has_modrm, modrm);
         w.entry.cmptest_is_cmp = (opcode[7:2] == 6'b100000) ||
-                                 (opcode[7:3] == 5'b00111);
-        w.entry.decoded_alu_op = decode_instruction_alu_op(prefix_0f, opcode,
+                                 (opcode[7:3] == 5'b00111) || instr_cmpxchg;
+        w.entry.decoded_alu_op = instr_xadd ? ALU_ADD :
+                                 decode_instruction_alu_op(prefix_0f, opcode,
                                                            has_modrm, modrm);
         w.entry.mul_signed = (!prefix_0f &&
                               (opcode == 8'h69 || opcode == 8'h6B)) ||
@@ -727,14 +741,18 @@ task automatic build_struct_work(
             w.entry.rel_branch_kind = REL_BRANCH_CALL;
         w.entry.branch_rel8 = !prefix_0f &&
                               ((opcode[7:4] == 4'h7) || (opcode == 8'hEB));
-        w.entry.branch_condition = opcode[3:0];
+        // CMPXCHG's JNcond takes its mismatch path when ZF is clear.
+        w.entry.branch_condition = instr_cmpxchg ? 4'h4 : opcode[3:0];
         if (!prefix_0f && (opcode[7:1] == 7'b1110000))
             w.entry.repeat_kind = opcode[0] ? REPEAT_KIND_LOOPE
                                              : REPEAT_KIND_LOOPNE;
         w.entry.entry_point = invalid_lock ? UADDR_INVALID_LOCK :
-                              instr_bswap ? UADDR_BSWAP : entry_final[11:0];
-        w.entry.stack_op = (invalid_lock || instr_bswap) ? 1'b0 : entry_final[13];
-        w.entry.stack_dir = (invalid_lock || instr_bswap) ? 1'b0 : entry_final[12];
+                              (instr_bswap || instr_xadd || instr_cmpxchg || instr_invd)
+                                  ? entry_486 : entry_final[11:0];
+        w.entry.stack_op = (invalid_lock || instr_bswap || instr_xadd || instr_cmpxchg ||
+                            instr_invd) ? 1'b0 : entry_final[13];
+        w.entry.stack_dir = (invalid_lock || instr_bswap || instr_xadd || instr_cmpxchg ||
+                             instr_invd) ? 1'b0 : entry_final[12];
         // BSWAP has a fixed r32 operand even in a 16-bit code segment.
         if (instr_bswap)
             w.entry.data32 = 1'b1;

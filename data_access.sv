@@ -86,6 +86,7 @@ module data_access
     output logic [4:0]              vipt_load_wb_alu_op_r,
     output logic [31:0]             vipt_load_wb_data,
     output logic [7:0]              vipt_load_wb_dst_onehot_r,
+    output logic [7:0]              vipt_load_wb_fwd_mask_r,   // forwarded GPR (not an M3 ALU load)
     output logic [2:0]              vipt_load_wb_dst_r,
     output logic                    vipt_load_wb_is_alu_r,
     output logic [1:0]              vipt_load_wb_size_r,
@@ -432,12 +433,14 @@ always_ff @(posedge clk) begin
         vipt_load_wb_target_r <= 32'd0;
         vipt_load_wb_dst_r <= 3'd0;
         vipt_load_wb_dst_onehot_r <= 8'd0;
+        vipt_load_wb_fwd_mask_r <= 8'd0;
         vipt_load_wb_size_r <= 2'd2;
         vipt_load_wb_is_alu_r <= 1'b0;
         vipt_load_wb_alu_op_r <= 5'd0;
         vipt_load_overlap_r <= 1'b0;
     end else begin
         vipt_load_wb_valid_r <= 1'b0;
+        vipt_load_wb_fwd_mask_r <= 8'd0;
 
         if (vipt_load_wb_valid_r)
             vipt_load_overlap_r <= 1'b0;
@@ -500,6 +503,7 @@ always_ff @(posedge clk) begin
                 vipt_load_wb_target_r <= dcache_vipt_resolve_data;
                 vipt_load_wb_dst_r <= vipt_load_ex_r.dst;
                 vipt_load_wb_dst_onehot_r <= vipt_load_ex_r.dst_onehot;
+                vipt_load_wb_fwd_mask_r <= vipt_load_ex_r.is_alu ? 8'd0 : vipt_load_ex_r.dst_onehot;
                 vipt_load_wb_size_r <= vipt_load_ex_r.write_size;
                 vipt_load_wb_is_alu_r <= vipt_load_ex_r.is_alu;
                 vipt_load_wb_alu_op_r <= vipt_load_ex_r.alu_op;
@@ -564,6 +568,7 @@ always_ff @(posedge clk) begin
             vipt_load_wb_target_r <= OPR_R;
             vipt_load_wb_dst_r <= vipt_load_slow_r.dst;
             vipt_load_wb_dst_onehot_r <= vipt_load_slow_r.dst_onehot;
+            vipt_load_wb_fwd_mask_r <= vipt_load_slow_r.is_alu ? 8'd0 : vipt_load_slow_r.dst_onehot;
             vipt_load_wb_size_r <= vipt_load_slow_r.write_size;
             vipt_load_wb_is_alu_r <= vipt_load_slow_r.is_alu;
             vipt_load_wb_alu_op_r <= vipt_load_slow_r.alu_op;
@@ -575,6 +580,7 @@ always_ff @(posedge clk) begin
             vipt_load_slow_req_r <= 1'b0;
             vipt_load_slow_wait_r <= 1'b0;
             vipt_load_wb_valid_r <= 1'b0;
+            vipt_load_wb_fwd_mask_r <= 8'd0;
             vipt_load_ex_probed_r <= 1'b0;
             vipt_load_overlap_r <= 1'b0;
         end
@@ -692,7 +698,7 @@ wire        ucrd_uc_read = uc_data_busreq && uc_is_mem_busop &&
     !uc_is_write && !uc_is_check_write && !mem_is_io &&
     (uc_buscode != BUSOP_RD_IND) && i_first && i_ex.ind_is_ea && !x87_direct_mem_req;
 wire [1:0]  ucrd_size_now = x87_direct_mem_req ? 2'd2 : mem_eff_size;
-assign ucrd_route_pre = mem_op_eligible && (ucrd_uc_read || x87_direct_mem_req) &&
+assign ucrd_route_pre = !hardwired_off && mem_op_eligible && (ucrd_uc_read || x87_direct_mem_req) &&
     ind_linear_valid && !vipt_load_slow_req_r && !ucrd_valid_r &&
     !ucrd_slow_req_r && !ucrd_slow_wait_r && paging_demand_idle &&
     !access_crosses_dword(ucrd_size_now, ind_linear[1:0]) &&
@@ -704,7 +710,7 @@ assign ucrd_take = ucrd_route_pre && !gp_fault_trigger && (x87_direct_mem_req ||
 // when that translation permits it (present, writable at this privilege,
 // dirty, not the VGA aperture) and the L1 takes a store now; otherwise it
 // enters paging.
-wire        st_route_pre = mem_op_eligible && uc_data_busreq && uc_is_mem_busop &&
+wire        st_route_pre = !hardwired_off && mem_op_eligible && uc_data_busreq && uc_is_mem_busop &&
     uc_is_write && !uc_is_check_write && !mem_is_io &&
     sidecar_valid_r && (sidecar_page_r == ind_linear[31:12]) && ind_linear_valid &&
     !access_crosses_dword(mem_eff_size, ind_linear[1:0]) &&
