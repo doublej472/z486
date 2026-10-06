@@ -102,6 +102,7 @@ module tb_paging_walker;
   reg [31:0] mut_val;
   int        locked_rd_count;
   reg [31:0] locked_rd_addr [0:MAXW-1];
+  int        rd_after_locked;   // unlocked reads issued after a locked read
 
   // ==== One-cycle-latency slave; logs every accepted write ====
   reg pending;
@@ -126,12 +127,18 @@ module tb_paging_walker;
           if (locked_rd_count < MAXW)
             locked_rd_addr[locked_rd_count] = mem_addr;
           locked_rd_count = locked_rd_count + 1;
-        end else if (mem_rd && mut_armed && mem_addr == mut_addr) begin
+        end else if (mem_rd && locked_rd_count != 0) begin
+          rd_after_locked = rd_after_locked + 1;
+        end
+        if (mem_rd && !mem_locked && mut_armed && mem_addr == mut_addr) begin
           mut_armed = 1'b0;
           mem[mi(mem_addr)] <= mut_val;
         end
         if (mem_wr) begin
-          bit seen = 1'b0;
+          // (static variable: an initializer would run only once, so after
+          // the first matching write every later write passed unchecked)
+          bit seen;
+          seen = 1'b0;
           for (int i = 0; i < locked_rd_count && i < MAXW; i = i + 1)
             if (locked_rd_addr[i] == mem_addr) seen = 1'b1;
           if (!seen || !ad_lock) begin
@@ -166,6 +173,7 @@ module tb_paging_walker;
                             input bit wp);
     wr_count = 0;
     locked_rd_count = 0;
+    rd_after_locked = 0;
     linear_addr = lin;
     req_is_write = wr;
     req_cpl = cpl;
@@ -488,7 +496,24 @@ module tb_paging_walker;
       $fatal(1);
     end
 
-    $display("PAGING WALKER TEST PASS (%0d cases)", 21);
+    // 22. The PDE is made not present before its A update: the locked PDE
+    //     re-read faults (P=0) at once - no PTE is read through the
+    //     not-present PDE - and nothing is written.
+    case_name = "PDE made not present before A update";
+    setup(entry(1'b1, 1'b1, 1'b0, 1'b0), entry(1'b1, 1'b1, 1'b1, 1'b1));
+    mut_addr = PDE_ADDR;
+    mut_val = NOT_PRESENT;
+    mut_armed = 1'b1;
+    start_walk(WALK_LIN, 1'b0, 2'd0, 1'b0);
+    expect_fault(3'b000);
+    expect_writes(0, 32'h0, 32'h0, 32'h0, 32'h0);
+    if (rd_after_locked != 0) begin
+      $display("PAGING WALKER FAIL [%s]: %0d read(s) after the locked PDE read",
+               case_name, rd_after_locked);
+      $fatal(1);
+    end
+
+    $display("PAGING WALKER TEST PASS (%0d cases)", 22);
     $finish;
   end
 endmodule
