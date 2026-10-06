@@ -65,8 +65,7 @@ module tb_data_access;
     logic stall_wio = '0;
     logic stall_x87_direct = '0;
     logic uc_active = '0;
-    logic [11:0] uc_addr = '0;
-    logic [11:0] uc_addr_mem_r = '0;
+    logic        rmw_fallback_release = 1'b0;
     logic [5:0] uc_buscode = '0;
     logic uc_busreq = '0;
     logic uc_data_busreq = '0;
@@ -139,8 +138,7 @@ module tb_data_access;
         .stall_wio(stall_wio),
         .stall_x87_direct(stall_x87_direct),
         .uc_active(uc_active),
-        .uc_addr(uc_addr),
-        .uc_addr_mem_r(uc_addr_mem_r),
+        .rmw_fallback_release(rmw_fallback_release),
         .uc_buscode(uc_buscode),
         .uc_busreq(uc_busreq),
         .uc_data_busreq(uc_data_busreq),
