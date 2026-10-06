@@ -2756,9 +2756,13 @@ always_ff @(posedge clk) begin
             default: ; // No write
         endcase
 
-        // COPY_STACK_DPL: commit the transition DPL to CS[1:0].
-        if (prot_transition.copy_stack_dpl && prot_transition.active)
+        // This transition establishes CPL before the final DEST_CS word.
+        // End the PE-entry override here too, or an outer-level IRET made
+        // without an initial far jump validates its new SS at CPL0.
+        if (prot_transition.copy_stack_dpl && prot_transition.active) begin
             CS[1:0] <= prot_transition.copy_dpl;
+            pe_entry_cpl_zero <= 1'b0;
+        end
 
         // WRITE_RPL: write new CPL into SLCTR[1:0] from loaded CS descriptor's DPL
         if (prot_transition.write_rpl)
