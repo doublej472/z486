@@ -10,6 +10,13 @@ module tb_z486 #(
 );
     // Segment cache array indices (from z486_pkg)
     localparam SEG_ES = 0, SEG_CS = 1, SEG_SS = 2, SEG_DS = 3;
+
+    // debug_ip is the address after the last completed instruction.
+    wire [32:0] tb_cs_limit = dut.seg_unit.desc_cache[SEG_CS].G
+                            ? {1'b0, dut.seg_unit.desc_cache[SEG_CS].limit, 12'hFFF}
+                            : {13'd0, dut.seg_unit.desc_cache[SEG_CS].limit};
+    wire next_beyond_limit = ({1'b0, dut.debug_ip} > tb_cs_limit);
+
     localparam SEG_FS = 4, SEG_GS = 5, SEG_IDT = 6, SEG_TR = 8, SEG_GDT = 10;
 
     // Clock and reset
@@ -68,7 +75,11 @@ module tb_z486 #(
         .win0_unmapped(1'b0),
         .ram_cache_top(32'hffff_ffff),
         .cpu_speed_sel(2'd0),
-        .single_step(1'b1), // Halt after each instruction for single-step tests
+        // Halt after each instruction for single-step tests - except when
+        // the instruction ended at the CS limit, so its successor (the
+        // captured HLT) cannot be fetched: that #GP(0) delivery is part of
+        // the recorded result (see the report logic below).
+        .single_step(!next_beyond_limit),
         .dbg_CS(),
         .dbg_EIP(),
         .dbg_CS_base(),
@@ -437,6 +448,9 @@ module tb_z486 #(
     // Main test loop
     integer cycle = 0;
     reg prev_instruction_boundary = 0;
+    reg post_first = 1'b0;      // first instruction done; watching the HLT fetch
+    reg post_fault = 1'b0;      // the trailing fetch faulted; delivering it
+    reg post_report = 1'b0;     // state is final: report it
     always @(posedge clk) begin
         if (reset_n) begin
             cycle <= cycle + 1;
@@ -513,7 +527,23 @@ module tb_z486 #(
                 $finish;
             end
 
-            if (stop_after_first && dbg_first_done) begin
+            // The captures execute the instruction followed by HLT.  When
+            // that HLT cannot be fetched because the instruction ended at the
+            // CS limit (offset 0FFFFh in real mode), the capture records the
+            // resulting #GP(0) delivery, so run that fetch fault through its
+            // delivery before reporting.  Every other case reports at once.
+            if (stop_after_first && dbg_first_done && !post_report) begin
+                post_first <= 1'b1;
+                if (dut.ifetch_limit_fault)
+                    post_fault <= 1'b1;
+                if (!post_first && !next_beyond_limit)
+                    post_report <= 1'b1;
+                if (post_fault && dut.i_rni_delay && !dut.stall)
+                    post_report <= 1'b1;
+            end
+
+            if (stop_after_first && dbg_first_done &&
+                (post_report || (!post_first && !next_beyond_limit))) begin
                 $display("First instruction completed at cycle %0d", cycle);
                 wait_dcache_store_drain();
 
