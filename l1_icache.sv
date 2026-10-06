@@ -55,7 +55,7 @@ localparam integer WORD_OFFSET_BITS = 2;
 localparam integer BYTE_OFFSET_BITS = 2;
 localparam integer LINE_OFFSET_BITS = WORD_OFFSET_BITS + BYTE_OFFSET_BITS;
 localparam integer NUM_SETS = 1 << SET_BITS;
-localparam integer PHYS_ADDR_BITS = 27; // maximum supported RAM is 128MB
+localparam integer PHYS_ADDR_BITS = `Z486_L1_PHYS_ADDR_BITS; // default tag reach: 128 MiB
 localparam integer TAG_BITS = PHYS_ADDR_BITS - LINE_OFFSET_BITS - SET_BITS;
 localparam integer SET_LSB = LINE_OFFSET_BITS;
 localparam integer SET_MSB = SET_LSB + SET_BITS - 1;
@@ -71,6 +71,14 @@ localparam integer SET_DW_LSB = SET_LSB - BYTE_OFFSET_BITS;
 localparam integer SET_DW_MSB = SET_MSB - BYTE_OFFSET_BITS;
 localparam integer TAG_DW_LSB = TAG_LSB - BYTE_OFFSET_BITS;
 localparam integer TAG_DW_MSB = TAG_MSB - BYTE_OFFSET_BITS;
+
+// synthesis translate_off
+initial begin
+    if (SET_BITS < 1 || SET_BITS > 8 || PHYS_ADDR_BITS > 32 ||
+        PHYS_ADDR_BITS <= LINE_OFFSET_BITS + SET_BITS)
+        $fatal(1, "Invalid L1 I-cache index/tag width (VIPT indexes must stay in page offset)");
+end
+// synthesis translate_on
 
 wire [TAG_BITS-1:0] cpu_tag = cpu_addr[TAG_MSB:TAG_LSB];
 wire [SET_BITS-1:0] cpu_set = cpu_addr[SET_MSB:SET_LSB];

@@ -1,4 +1,5 @@
 `timescale 1ns/1ns
+`include "z486_platform.svh"
 
 module tb_l1_icache;
     reg clk = 0;
@@ -118,7 +119,9 @@ module tb_l1_icache;
     endtask
 
     function automatic [31:0] mem_get32(input [31:0] addr);
-        if (addr[31:25] == 7'b0000001) begin
+        if (addr[31:27] != 0) begin
+            mem_get32 = 32'h9abc_def0;
+        end else if (addr[31:25] == 7'b0000001) begin
             case (addr[3:2])
                 2'd0: mem_get32 = 32'h1357_9BDF;
                 2'd1: mem_get32 = 32'h2468_ACE0;
@@ -211,6 +214,10 @@ module tb_l1_icache;
         cache_read(32'h40, 128'h00FF_EEDD_CCBB_AA99_8877_6655_4433_2211);
         // Complete physical tags distinguish lines separated by 32MB.
         cache_read(32'h0200_0040, 128'hAA55_FF00_55AA_00FF_2468_ACE0_1357_9BDF);
+        if (`Z486_L1_PHYS_ADDR_BITS > 27) begin
+            cache_read(32'h0800_0040, 128'h9abc_def0_9abc_def0_9abc_def0_9abc_def0);
+            cache_read(32'h40, 128'h00FF_EEDD_CCBB_AA99_8877_6655_4433_2211);
+        end
         cache_read(32'h40, 128'h00FF_EEDD_CCBB_AA99_8877_6655_4433_2211);
 
         // Accept a hit in the same cycle that a store snoops the cached line.
@@ -353,7 +360,8 @@ module tb_l1_icache;
         cache_read(32'h280, 128'h2800_0003_2800_0002_2800_0001_2800_0000);
         cache_read(32'h300, 128'h3000_0003_3000_0002_3000_0001_3000_0000);
         cache_read(32'h380, 128'h3800_0003_3800_0002_3800_0001_3800_0000);
-        if (!dut.tag_way1[0][20] || dut.tag_way1[0][19:0] != 20'h00006) begin
+        if (!dut.tag_way1[0][dut.TAG_VALID_BIT] ||
+            dut.tag_way1[0][dut.TAG_BITS-1:0] != dut.TAG_BITS'(6)) begin
             $display("L1 ICACHE COLLISION SETUP expected 0x300 in way 1");
             $fatal(1);
         end
