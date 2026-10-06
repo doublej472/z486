@@ -721,7 +721,16 @@ module tb_protected_mode #(
     //   0xC8: write performs that external write directly into the RAM model,
     //         behind the caches and with NO snoop: the CPU must not observe it
     //         until a cache flush.
+    //   0xCC: write N schedules an asynchronous platform flush N cycles later
+    //         (as a DMA terminal count would raise it, independent of the
+    //         program) and holds the external bus not-ready from the write
+    //         for +async_stall=W cycles (default 60), so the flush's drain of
+    //         the posted stores lasts a while.
     reg         cache_flush_req = 1'b0;
+    int         async_flush_in = 0;
+    int         async_stall = 0;
+    int         async_stall_len = 60;
+    initial void'($value$plusargs("async_stall=%d", async_stall_len));
     wire        cache_flush_busy;
     wire        cache_flush_done;
     reg  [31:0] dma_poke_addr = 32'h0;
@@ -874,6 +883,17 @@ module tb_protected_mode #(
         // unit latches it internally for the walk.
         cache_flush_req <= 1'b0;
         xdma_snoop_valid <= 1'b0;
+        if (async_flush_in > 1)
+            async_flush_in <= async_flush_in - 1;
+        else if (async_flush_in == 1) begin
+            async_flush_in <= 0;
+            cache_flush_req <= 1'b1;
+            if ($test$plusargs("trace_io"))
+                $display("PLATFORM: asynchronous cache flush requested, bus stall remaining %0d",
+                         async_stall);
+        end
+        if (async_stall > 0)
+            async_stall <= async_stall - 1;
         if (xdma_en && reset_n && !xdma_done) begin
             if (!xdma_armed && valid && ready && !rd_busy && !write && !io && !inta &&
                 ({addr, 2'b00} == {xdma_trig[31:2], 2'b00})) begin
@@ -907,7 +927,7 @@ module tb_protected_mode #(
             $fatal(1, "x87 transaction escaped to external I/O: addr=%08x write=%b",
                    {addr, 2'b00}, write);
 
-        ready <= !rd_busy;
+        ready <= !rd_busy && (async_stall <= 1);
         resp_valid <= 1'b0;
         line_resp_valid <= 1'b0;
         // Don't clear din - hold it stable for page walker timing
@@ -1158,6 +1178,13 @@ module tb_protected_mode #(
                     cache_flush_req <= 1'b1;
                     if ($test$plusargs("trace_io"))
                         $display("PLATFORM: cache flush requested");
+                end
+
+                // Asynchronous platform flush (0xCC): fires dout cycles from
+                // now; the external bus is held busy from this write.
+                if (port == 16'h00CC) begin
+                    async_flush_in <= dout;
+                    async_stall <= async_stall_len;
                 end
 
                 // External-write address (0xC4)
