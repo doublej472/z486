@@ -166,6 +166,27 @@ while a flush was armed. `tb_l1_cache` accepts the older store/probe, arms the
 flush, requires all new openings/resolve hits to close, and then checks the
 older store survives. Both caches mask read acceptance at the arm boundary.
 
+## 486 cache operating modes and locked cycles
+
+CR0.CD, CR0.NW, PCD and LOCK change *when* the L1s allocate or are bypassed,
+never the coherence contract above:
+
+- A PCD/CD read miss is a single bus read behind the store queue (like an
+  uncached window access), so it cannot pass an older posted store; a hit is
+  still served, exactly as on a 486.
+- CD=1 also stops I-cache allocation and the prefetcher's branch-target buffer
+  from keeping a line, so unsnooped changes to non-cacheable code are fetched.
+- NW=1 (only legal with CD=1) keeps write hits in the D-cache and ignores
+  external snoops. This is the 486's cache-as-RAM mode; after a flush it is
+  simply "cache off". Software that leaves NW=1 with valid lines accepts the
+  same staleness a 486 would show.
+- A locked read waits for the store queue, reads memory even when the line is
+  valid, and its write updates the line; `lock` stays high until the write has
+  left the store queue.
+
+`cache_ctrl_486` and `lock_rmw` observe each mode against an unsnooped RAM
+update (port 0xC4/0xC8), with a cacheable control in every case.
+
 ## Evidence scope and remaining integration work
 
 `make test-pc98-map` executes and modifies code in the PC-98 DIRECT aperture and

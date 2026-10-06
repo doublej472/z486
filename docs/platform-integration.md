@@ -24,6 +24,47 @@ NO_ALLOC_BOUND)`, so the parameter's own L1-tag-reach check still governs and th
 runtime value can only tighten it. With `RAM_BOUND_ENABLE = 0` (the default)
 `ram_cache_top` is unused and behaviour is identical to the parameter-only form.
 
+## Bus lock (`lock`)
+
+`lock` is the 486 LOCK# output (active high). While it is high, no other bus
+master may take the memory bus. It covers:
+
+- a LOCK-prefixed read-modify-write and XCHG with a memory operand, from the
+  locked read until the instruction has ended and its stores have left the
+  CPU (the store queue is empty and the bus accepted the write);
+- the TSS busy-bit update of a task switch, from its read to the end of the
+  instruction;
+- both cycles of an interrupt-acknowledge pair.
+
+A locked read is never served by the L1: it waits for every older store and
+reads memory, as a 486 locked read cycle does; the locked write updates a
+valid line and memory. The core's own instruction fetches may still appear on
+the bus while `lock` is high. Page-table A/D updates and descriptor
+accessed-bit updates are **not** bus-locked (no other master is expected to
+modify those tables concurrently). A platform without other masters may leave
+`lock` unconnected.
+
+## 486 cache controls
+
+CR0.CD, CR0.NW and the page-level PCD bit act on the L1s as on a 486:
+
+| control | effect |
+| --- | --- |
+| CR0.CD=1 | no new line is allocated (data or code); valid lines keep answering |
+| CR0.CD=1, NW=1 | as above, and a write that hits stays in the L1 (no write-through); external snoops are ignored |
+| PTE.PCD=1 | a read or fetch miss in that page is one exact-size bus read (data) or an unallocated line (code); hits are still served; the prefetcher's branch-target buffer does not keep its lines |
+| CR3.PCD / PDE.PCD | the same for the page-directory / page-table read of a walk |
+| PWT | stored in the TLB for TR7 readback; no effect on this write-through L1 |
+
+CD=0 with NW=1 raises #GP(0). Template windows (`DIRECT`/`NO_ALLOC`) remain
+the platform's KEN# equivalent and are independent of these bits.
+
+`RESET_CACHE_DISABLED` (default 0) selects the CR0 reset value. A 486 resets
+with CD=NW=1 (60000010h); the default keeps the core's historical
+caches-enabled reset (00000010h) so firmware that never clears CR0.CD does not
+lose the caches. Set it to 1 for the architectural value when the firmware is
+known to enable caching.
+
 ## Native whole-L1 flush
 
 `cache_flush` is the platform half of a whole-L1 invalidate; the 486 `INVD`
@@ -107,3 +148,11 @@ nothing — the fitter drops the unused wires — so they cost no area and no pi
 It selects a fixed execution-rate limit in `cpu_throttle.sv`; memory, peripherals
 and the timebases keep running at the full clock, so guest pacing by a CPU delay
 loop scales while bus- and peripheral-paced guests do not change.
+
+## 486 feature parameters
+
+| parameter | default | effect |
+| --- | --- | --- |
+| `RESET_CACHE_DISABLED` | 0 | 1 resets CR0 to 60000010h (CD=NW=1) as a real 486; 0 keeps the historical caches-on reset for firmware that never sets CR0.CD=0 |
+| `ENABLE_HW_BREAKPOINTS` | 1 | 0 removes DR0-DR3 address/data matching (about 300-550 ALMs); the registers, GD, BS, BT and task-switch T-bit traps remain |
+| `ENABLE_TLB_TEST` | 1 | 0 makes TR6 writes inert (TR3-TR7 stay readable/writable); the TLB test-copy RAMs are then optimized away |

@@ -35,13 +35,24 @@ hidden from forwarding, preserving the earlier view contract.
 | M3 result reaching younger partial merge | guard | `vipt_alu_dst_partial` |
 | Stale OPR_R forcing a direct token to the slow path (A8/B7) | unit contract pinned | `test-data-access`: normal hit, forced older-token fallback, ordering and returned data; removing the gate fails it |
 | Cold ROM POP followed by VIPT ALU on its destination | integration guard | `rom_pop_vipt_alu`, including ESP/result checks |
-| Delay-slot bypass and live token on one register (A7) | investigative | unit order is pinned; no integrated fail-first instruction sequence yet |
+| Delay-slot bypass and live token on one register (A7) | investigative, not reached | unit order is pinned; the `+monitor_hazards` window monitor never fired in the directed suite or in `test-fuzz` / 90-program soaks |
 
 The attempted A8 instruction program did **not** observe the exact
 EX-token/`mem_opt_wait` overlap: UCRD/direct-path eligibility and sequencing
 change the route. The unit injection is useful proof of the fallback rule, but
 must not be reported as an integrated reproduction. The sibling fuzzer remains
 provenance, not local evidence.
+
+`fuzz_gpr_pipeline.py` (`make -C tests test-fuzz`) is the local follow-up: a
+seeded, self-checking differential stress over loads, stores, RMW,
+partial-register writes, PUSH/POP, LEA, shifts, XCHG, MOVZX/MOVSX, BSWAP,
+IMUL, cache flushes and non-flat-segment loads behind stores, each program at
+memory latencies 0, 7 and 20, with a corrupted-expectation self-test. Its
+`+monitor_hazards` instrumentation reports whether the A7 or A8 window
+occurred. In 90 programs neither did, and every result matched the model:
+`mem_opt_wait` occurs, but those loads are taken by the UCRD probe or the
+crossing path, so no hardwired memory token is live behind them. Both items
+therefore remain *not reproduced* rather than *proven unreachable*.
 
 Two deferred-writer invariants are asserted in `data_unit.sv`: a stalled shift
 is killed after younger WB, and live shift/memory tokens cannot own overlapping
@@ -65,9 +76,12 @@ allowed, not covered by the sibling core's stricter invariant.
 | NMI edge lost in accept window | fixed, fail-first | `test-interrupt-nmi` |
 | New paging demand during registered fault pulse | robustness guard | `vipt_rmw_fault` probe observed redundant walk, not a wrong exception |
 
-Conforming-transition descriptor DPL remains a separate investigative question.
-The original passing `conforming_cpl` test alone is not universal evidence about
-all entry-CPL0 paths. No speculative protection rewrite was added for it.
+Conforming-transition descriptor DPL: `conforming_xfer` is a guard over the
+entry-CPL0 paths the question named — a far JMP from the PE-entry state
+through an RPL 3 selector, a far CALL at CPL0 through an RPL 3 selector, and a
+far CALL from CPL3 through an RPL 0 selector. Each keeps the CPL and sets
+CS.RPL to it; the CPL3 case still faults LIDT. No defect was found, so no
+protection change was made.
 
 ## Coherence
 
