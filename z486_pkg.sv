@@ -1062,6 +1062,9 @@ localparam [11:0] UADDR_ALIGN_FAULT    = 12'h9F6;  // #AC(0) - vector 17 (optimi
 // Fault-class delivery word that sets EFLAGS.RF (EFLAGS <- EFLAGS | 10000h);
 // interrupts and traps enter the common body after it.
 localparam [11:0] UADDR_FAULT_SET_RF   = 12'h899;
+// Fault body word whose JTSSAF skips 894-899 (EIP restore and the RF set)
+// for a fault raised during a task switch's TSS accesses.
+localparam [11:0] UADDR_FAULT_TSS_SKIP = 12'h893;
 // The exception-entry cluster: any fault raised while the microcode is inside
 // this range is a re-entry of a delivery already in progress.
 localparam [11:0] UADDR_FAULT_ENTRY_FIRST = 12'h85B;
