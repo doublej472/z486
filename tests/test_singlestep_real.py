@@ -391,7 +391,12 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False):
         print("Command:", ' '.join(cmd))
 
     # Run testbench
-    p = sp.run(cmd, cwd=str(TESTS), stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+    # The memory image is only needed while the simulator runs; a full
+    # dataset run creates one per test (1.7M), so never leave it behind.
+    try:
+        p = sp.run(cmd, cwd=str(TESTS), stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+    finally:
+        os.unlink(memhex)
     out = p.stdout
 
     # Parse results
