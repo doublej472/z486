@@ -1156,8 +1156,7 @@ always_ff @(posedge clk) begin
                 // POPA/POPAD discard the popped ESP slot (their eSP words set
                 // the pointer); a task switch's IRF loads do write ESP.
                 DEST_IRF:
-                    if (countr[5:3] != 3'b100 &&
-                        !(countr[2:0] == 3'd4 && !instr.has_0f && instr.opcode == 8'h61))
+                    if (irf_writes_gpr(countr, instr.has_0f, instr.opcode))
                         write_gpr(countr[2:0], dest_value,
                                   is_dword ? 2'd2 : 2'd1);
                 default: ;

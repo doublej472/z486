@@ -147,6 +147,10 @@ wire [31:0] debug_ip;  // Debug: IP at instruction completion
 
 reg [31:0] CR0, CR2, CR3;
 reg [31:0] DR6, DR7;
+reg [31:0] DR0, DR1, DR2, DR3;   // linear breakpoint addresses
+// 486 test registers: TR3-TR5 cache test (data, tag, control), TR6/TR7 TLB
+// test (command, data).
+reg [31:0] TR3, TR4, TR5, TR6, TR7;
 wire [31:0] EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI;
 reg [31:0] EIP = 32'h0000FFF0;      // Architectural IP (next instruction) - reset vector
 
@@ -1445,7 +1449,7 @@ function automatic [5:0] decode_dly_gpr(input [6:0] dest);
             DEST_eCX: begin we = 1'b1; sel = 3'd1; mode = i.addr32 ? FWD_D : FWD_W; end
             DEST_eSI: begin we = 1'b1; sel = 3'd6; mode = i.addr32 ? FWD_D : FWD_W; end
             DEST_eDI: begin we = 1'b1; sel = 3'd7; mode = i.addr32 ? FWD_D : FWD_W; end
-            DEST_IRF: if (COUNTR[5:3] != 3'b100 && !(COUNTR[2:0] == 3'd4 && !i.has_0f && i.opcode == 8'h61))
+            DEST_IRF: if (irf_writes_gpr(COUNTR, i.has_0f, i.opcode))
                 begin we = 1'b1; sel = COUNTR[2:0]; mode = is_dword ? FWD_D : FWD_W; end
             default: ;
         endcase
@@ -1563,7 +1567,7 @@ function automatic [7:0] gpr_dest_mask(input [6:0] dst);
         DEST_USTEP_ALU:
             gpr_dest_mask = gpr_wr_expand(i.dst_reg_sel);
         DEST_IRF:
-            if (COUNTR[5:3] != 3'b100 && !(COUNTR[2:0] == 3'd4 && !i.has_0f && i.opcode == 8'h61))
+            if (irf_writes_gpr(COUNTR, i.has_0f, i.opcode))
                 gpr_dest_mask = 8'h01 << COUNTR[2:0];
         default: ;
     endcase
@@ -1627,6 +1631,44 @@ wire        tss_access_flag;
 wire [31:0] seg_base_pending;  // next seg_base_r from seg unit; for unified linear_address relocate
 wire [31:0] seg_base_exec;     // microcode relocation view, excluding issue INIT_SEG
 wire        eff_mask_exec;
+// 486 debug registers behind the original microcode's IRF index 0x70.
+// MOV DRn,r stores with SBAS; MOV r,DRn loads IND with LBAS and then copies
+// IRF2.  The index is the ModR/M reg field (the original microcode derives
+// it from a field this decoder does not supply).
+wire       xreg_mov_dr_wr = i.has_0f && (i.opcode == 8'h23);
+wire       xreg_mov_dr_rd = i.has_0f && (i.opcode == 8'h21);
+// MOV TRn,r loads IND and stores it with SPCR; MOV r,TRn reads with LPCR.
+wire       xreg_mov_tr_wr = i.has_0f && (i.opcode == 8'h26);
+wire       xreg_mov_tr_rd = i.has_0f && (i.opcode == 8'h24);
+wire [2:0] xreg_index = i.modrm[5:3];
+wire       xreg_dr_write = uc_exec && (uc_buscode == BUSOP_SBAS) &&
+                           (uc_dest == DEST_IRF) && xreg_mov_dr_wr;
+wire       xreg_tr_write = uc_exec && (uc_buscode == BUSOP_SPCR) &&
+                           (uc_dest == DEST_IRF) && xreg_mov_tr_wr;
+logic [31:0] xreg_read_value;
+always_comb begin
+    if (xreg_mov_tr_rd)
+        case (xreg_index)
+            3'd3: xreg_read_value = TR3;
+            3'd4: xreg_read_value = TR4;
+            3'd5: xreg_read_value = TR5;
+            3'd6: xreg_read_value = TR6;
+            default: xreg_read_value = TR7;
+        endcase
+    else
+        case (xreg_index)
+            3'd0: xreg_read_value = DR0;
+            3'd1: xreg_read_value = DR1;
+            3'd2: xreg_read_value = DR2;
+            3'd3: xreg_read_value = DR3;
+            3'd4, 3'd6: xreg_read_value = DR6;
+            default: xreg_read_value = DR7;
+        endcase
+end
+// The routines' own LBAS/LPCR words address the IRF; every other LBAS/LPCR
+// (descriptor bases, page-fault registers, CR3) keeps its source.
+wire       xreg_read_sel = (xreg_mov_dr_rd || xreg_mov_tr_rd) && (uc_dest == DEST_IRF);
+
 wire [31:0] seg_lar_result, seg_llim_result, seg_lbas_result;
 
 // Segmentation unit command encoder
@@ -1689,6 +1731,8 @@ segmentation_unit seg_unit (
     .lar_result       (seg_lar_result),
     .llim_result      (seg_llim_result),
     .lbas_result      (seg_lbas_result),
+    .xreg_read_sel    (xreg_read_sel),
+    .xreg_read_value  (xreg_read_value),
     // Segment state
     .seg_sel          (mem_seg_sel),
     .seg_is_io        (mem_seg_is_io),
@@ -2806,8 +2850,17 @@ always_ff @(posedge clk) begin
         // BOOTUP 9BA-9BB leaves PE/MP/EM/TS/PG clear and sets ET for 80387.
         CR0 <= 32'h0000_0010;
         CR2 <= 32'h0;
-        DR6 <= 32'h0;
-        DR7 <= 32'h0;
+        DR6 <= 32'hFFFF_0FF0;
+        DR7 <= 32'h0000_0400;
+        DR0 <= 32'h0;
+        DR1 <= 32'h0;
+        DR2 <= 32'h0;
+        DR3 <= 32'h0;
+        TR3 <= 32'h0;
+        TR4 <= 32'h0;
+        TR5 <= 32'h0;
+        TR6 <= 32'h0;
+        TR7 <= 32'h0;
 
     end else begin
         if (uc_exec) begin
@@ -2837,8 +2890,9 @@ always_ff @(posedge clk) begin
                 CR2 <= external_dest_value;
             end
 
-            DEST_DR6: DR6 <= external_dest_value;
-            DEST_DR7: DR7 <= external_dest_value;
+            DEST_DR6: DR6 <= dr6_value(external_dest_value);
+            DEST_DR7: DR7 <= dr7_value(external_dest_value);
+
 
             // Paging-related destinations (NOP for now)
             DEST_PAGER5: ; // Page cache register - paging-related, NOP
@@ -2870,6 +2924,18 @@ always_ff @(posedge clk) begin
             end
 
             DEST_IRF: begin
+                // MOV DRn,r stores through IRF index 0x70 (SBAS); DR4/DR5
+                // alias DR6/DR7.  The GPR file ignores that index (irf_is_gpr).
+                if (xreg_dr_write)
+                    case (xreg_index)
+                        3'd0: DR0 <= external_dest_value;
+                        3'd1: DR1 <= external_dest_value;
+                        3'd2: DR2 <= external_dest_value;
+                        3'd3: DR3 <= external_dest_value;
+                        3'd4: DR6 <= dr6_value(external_dest_value);
+                        3'd5: DR7 <= dr7_value(external_dest_value);
+                        default: ;
+                    endcase
                 if (COUNTR[5:3] == 3'b100)
                 case (COUNTR[5:0])
                     6'h20: if (uc_buscode != BUSOP_SAR && uc_buscode != BUSOP_SLIM) ES <= external_dest_value[15:0];
@@ -2910,6 +2976,16 @@ always_ff @(posedge clk) begin
             SLCTR[1:0] <= desc_raw_hi[14:13];
 
         end
+
+    // MOV TRn,r (IND holds the value).
+    if (xreg_tr_write)
+        case (xreg_index)
+            3'd3: TR3 <= IND;
+            3'd4: TR4 <= IND & 32'hFFFF_FC00;
+            3'd5: TR5 <= IND & 32'h0000_07FF;
+            3'd6: TR6 <= IND & 32'hFFFF_FFE1;
+            default: TR7 <= IND & 32'hFFFF_FC1C;
+        endcase
 
     // Keep captures in the non-reset arm: old i_first/page_fault levels can
     // otherwise override reset on the very edge that clears those levels.

@@ -654,6 +654,7 @@ task automatic build_struct_work(
     logic        imm_sign_extend;
     logic        invalid_lock;
     logic        instr_bswap;
+    logic        instr_mov_tr;
     logic        is_setcc;
     logic        is_movzx_movsx;
     logic        is_movzx_word;
@@ -716,6 +717,10 @@ task automatic build_struct_work(
         invalid_lock = check_lock_invalid(prefix_rep_lock, prefix_0f, opcode,
                                           has_modrm, modrm);
         instr_bswap = p0f_e && (op_e[7:3] == 5'b11001);
+        // The 486 adds TR3-TR5 to the 80386's TR6/TR7: all five share the
+        // MOV TRn routines.
+        instr_mov_tr = p0f_e && ((op_e == 8'h24) || (op_e == 8'h26)) &&
+                       (modrm[5:3] >= 3'd3);
         w.entry.boundary_action = invalid_lock ? BOUNDARY_ACTION_NONE :
             decode_boundary_action(p0f_e, op_e, has_modrm, modrm);
         w.entry.seg_reg_sel = decode_segment_register(p0f_e, op_e,
@@ -760,15 +765,19 @@ task automatic build_struct_work(
             w.entry.repeat_kind = op_e[0] ? REPEAT_KIND_LOOPE
                                              : REPEAT_KIND_LOOPNE;
         w.entry.entry_point = invalid_lock ? UADDR_INVALID_LOCK :
+                              instr_mov_tr ? (op_e[1] ? UADDR_MOV_TR_TO
+                                                      : UADDR_MOV_TR_FROM) :
                               instr_bswap ? UADDR_BSWAP :
                               instr_xadd ? (instr_mem ? UADDR_XADD_M : UADDR_XADD_R) :
                               instr_cmpxchg ? (instr_mem ? UADDR_CMPXCHG_M
                                                          : UADDR_CMPXCHG_R) :
                               entry_final[11:0];
         w.entry.stack_op = (invalid_lock || instr_bswap || instr_xadd ||
-                            instr_cmpxchg) ? 1'b0 : entry_final[13];
+                            instr_cmpxchg || instr_mov_tr)
+                           ? 1'b0 : entry_final[13];
         w.entry.stack_dir = (invalid_lock || instr_bswap || instr_xadd ||
-                             instr_cmpxchg) ? 1'b0 : entry_final[12];
+                             instr_cmpxchg || instr_mov_tr)
+                            ? 1'b0 : entry_final[12];
         // BSWAP has a fixed r32 operand even in a 16-bit code segment.
         if (instr_bswap)
             w.entry.data32 = 1'b1;
