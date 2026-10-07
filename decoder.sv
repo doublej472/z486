@@ -642,6 +642,7 @@ task automatic build_struct_work(
     logic        imm_sign_extend;
     logic        invalid_lock;
     logic        instr_bswap;
+    logic        instr_loadall;
     logic        instr_mov_tr;
     logic        instr_xadd;
     logic        instr_cmpxchg;
@@ -694,6 +695,8 @@ task automatic build_struct_work(
         invalid_lock = check_lock_invalid(prefix_rep_lock, prefix_0f, opcode,
                                           has_modrm, modrm);
         instr_bswap = prefix_0f && (opcode[7:3] == 5'b11001);
+        // The 80386 CROM still holds LOADALL (0F 07); a 486 raises #UD.
+        instr_loadall = prefix_0f && (opcode == 8'h07);
         // The 486 adds TR3-TR5 to the 80386's TR6/TR7: all five share the
         // MOV TRn routines.
         instr_mov_tr = prefix_0f && ((opcode == 8'h24) || (opcode == 8'h26)) &&
@@ -752,14 +755,15 @@ task automatic build_struct_work(
             w.entry.repeat_kind = opcode[0] ? REPEAT_KIND_LOOPE
                                              : REPEAT_KIND_LOOPNE;
         w.entry.entry_point = invalid_lock ? UADDR_INVALID_LOCK :
+                              instr_loadall ? UADDR_INVALID_LOCK :
                               instr_mov_tr ? (opcode[1] ? UADDR_MOV_TR_TO
                                                         : UADDR_MOV_TR_FROM) :
                               (instr_bswap || instr_xadd || instr_cmpxchg || instr_invd)
                                   ? entry_486 : entry_final[11:0];
         w.entry.stack_op = (invalid_lock || instr_bswap || instr_xadd || instr_cmpxchg ||
-                            instr_invd || instr_mov_tr) ? 1'b0 : entry_final[13];
+                            instr_invd || instr_loadall || instr_mov_tr) ? 1'b0 : entry_final[13];
         w.entry.stack_dir = (invalid_lock || instr_bswap || instr_xadd || instr_cmpxchg ||
-                             instr_invd || instr_mov_tr) ? 1'b0 : entry_final[12];
+                             instr_invd || instr_loadall || instr_mov_tr) ? 1'b0 : entry_final[12];
         // BSWAP has a fixed r32 operand even in a 16-bit code segment.
         if (instr_bswap)
             w.entry.data32 = 1'b1;
