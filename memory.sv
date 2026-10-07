@@ -13,7 +13,7 @@ module memory
     parameter [31:0] DEVICE_MMIO_MASK = 32'hff00_0000,
 
     // A20 gate masks, applied closed / open. Default = PC/AT bit-20 clear /
-    // unmasked. The PC-98 preset overrides A20_MASK_OFF (wrap into 1 MiB).
+    // unmasked. The PC-98 preset uses the same bit-20 clear (Xe10-measured).
     parameter [31:0] A20_MASK_OFF = 32'hffef_ffff,
     parameter [31:0] A20_MASK_ON  = 32'hffff_ffff,
 
