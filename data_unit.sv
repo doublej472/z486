@@ -363,7 +363,10 @@ wire        pr_rom_valid   = interrupt_entry && recipe_rni && recipe_state.hardw
 // and costs ~2.4 ns of setup slack; see the fit table in docs/hazard-survey.md.
 wire pr_stos_valid = exec && !instr.has_0f &&
                      ((instr.opcode == 8'hAA) || (instr.opcode == 8'hAB)) &&
-                     (instr.rep_lock == PREFIX_REP) &&
+                     // F2 STOS repeats exactly like F3 (the microcode loop
+                     // is shared), so both publish the restartable count.
+                     ((instr.rep_lock == PREFIX_REP) ||
+                      (instr.rep_lock == PREFIX_REPNE)) &&
                      (dest == DEST_eDI) && (source_field == SRC_SIGMA);
 wire pr_sigsrc_valid = exec && recipe_rni && !recipe_commit_cancel &&
                        (recipe_state.commit_sel == RECIPE_COMMIT_SIGSRC);
@@ -1561,13 +1564,6 @@ always_ff @(posedge clk) begin
     end
 end
 
-// REPE/REPNE CMPS and SCAS commit every iteration (count, pointers and the
-// compare's flags) and the microcode keeps no flags backup for them: a fault
-// part way pushes the flags of the last completed iteration.
-wire next_rep_flag_string = !next_instr.has_0f && next_instr.rep_lock[1] &&
-                            ((next_instr.opcode == 8'hA6) || (next_instr.opcode == 8'hA7) ||
-                             (next_instr.opcode == 8'hAE) || (next_instr.opcode == 8'hAF));
-
 always_ff @(posedge clk) begin
     flags_backup_refresh <= reset_n && instr_start && !halted && !interrupt_entry;
     if (!reset_n) begin
@@ -1580,11 +1576,16 @@ always_ff @(posedge clk) begin
     end else if (interrupt_entry) begin
         flags_backup_active <= 1'b0;
     end else if (instr_start && !halted) begin
-        flags_backup_active <= !next_rep_flag_string;
+        flags_backup_active <= 1'b1;
         // The issue edge also clears RF for the instruction that just
         // completed (clear_rf); the new instruction's backup must see it.
         flags_backup <= {eflags_fwd[31:17], eflags_fwd[16] && !clear_rf,
                          eflags_fwd[15:0]};
+    end else if (exec && aluop == ALUJMP_LOOPnE && dest == DEST_eCX) begin
+        // REPE/REPNE CMPS/SCAS retire an element when its count reaches eCX
+        // (21E/227/23B/243).  A fault on a later element restarts at that
+        // element, so the pushed FLAGS must carry this element's comparison,
+        // not the instruction-start image.
         flags_backup <= eflags_fwd;
     end else if (flags_backup_refresh) begin
         flags_backup <= eflags_fwd;
