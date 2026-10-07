@@ -407,6 +407,12 @@ reg [31:0] req_wdata;        // Write data
 //  req_cpl declared above (forward declaration for Gowin)
 reg [1:0]  req_offset;       // Address offset [1:0]
 reg        req_check_only;   // CW: check write only, no bus write
+// A write crossing into the next page must not commit its first half before
+// the second page is known to translate and permit the write: a #PF on page
+// 2 restarts the instruction, which would apply the first half twice.  Such a
+// write first runs the check-only crossing path (both pages translated, A/D
+// set, no data written) and then restarts at PG_MEM_TLB as a normal write.
+reg        req_cross_pre;
 
 // Crossing detection (from latched values)
 reg        req_crossing;     // Current request crosses DWORD boundary
@@ -616,6 +622,11 @@ wire walk_cross_lookup_load = (state == PG_WALKING) &&
 // A check-only crossing translates PG_MEM_TLB -> PG_CROSS_TLB2 directly, so it
 // never runs PG_CROSS_PREP2; load the second-page lookup address here or
 // PG_CROSS_TLB2 re-reads the first page's already-hit TLB entry.
+// A finished page-crossing write precheck re-looks up the first page.  Only
+// leave the lookup on page 2 while it may still be walked (TLB2 miss).
+wire cross_pre_relookup = req_cross_pre &&
+                          (((state == PG_CROSS_TLB2) && tlb_hit) ||
+                           ((state == PG_CROSS_WALK2) && walk_done));
 wire cross2_lookup_load = (state == PG_CROSS_PREP2) ||
                           ((state == PG_MEM_TLB) && req_can_translate &&
                            !req_perm_fault && req_check_only && req_crossing);
@@ -635,6 +646,9 @@ always_comb begin
     end else if (walk_cross_lookup_load || cross2_lookup_load) begin
         tlb_lookup_addr_load = 1'b1;
         tlb_lookup_addr_next = req_linear2;
+    end else if (cross_pre_relookup) begin
+        tlb_lookup_addr_load = 1'b1;
+        tlb_lookup_addr_next = req_linear;
     end
 end
 
@@ -775,6 +789,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         req_crossing <= 1'b0;
         req_linear2 <= 32'h0;
         req_check_only <= 1'b0;
+        req_cross_pre <= 1'b0;
         cr2_reg <= 32'h0;
         walk_request <= 1'b0;
         walk_biu_pending <= 1'b0;
@@ -1071,14 +1086,14 @@ always_ff @(posedge clk or negedge reset_n) begin
                     state <= PG_CROSS_WAIT2;
                 end else if (!pg_enable) begin
                     if (req_check_only) begin
-                        complete_mem_request();
+                        complete_check_only();
                     end else if (cache_lookup_granted) begin
                         emit_second_half(req_linear2, 1'b0);
                         state <= PG_CROSS_WAIT2;
                     end
                 end else if (tlb_hit && slow_tlb_access_ok && (!req_is_write || tlb_dirty)) begin
                     if (req_check_only) begin
-                        complete_mem_request();
+                        complete_check_only();
                     end else if (cache_lookup_granted) begin
                         emit_second_half(tlb_physical_addr, tlb_is_pcd);
                         state <= PG_CROSS_WAIT2;
@@ -1099,7 +1114,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                     if (walk_fault) begin
                         raise_walk_fault(req_linear2, walk_fault_code);
                     end else if (req_check_only) begin
-                        complete_mem_request();
+                        complete_check_only();
                     end else if (cache_lookup_granted) begin
                         automatic logic [31:0] phys2 = {walk_result_pfn, req_linear2[11:0]};
                         emit_second_half(phys2, walk_result_pcd);
@@ -1192,7 +1207,12 @@ task automatic latch_mem_request(input [31:0] addr, input crossing);
     req_cpl <= cpl;
     req_offset <= addr[1:0];
     req_crossing <= crossing;
-    req_check_only <= mem_check_only;
+    // Only a paged memory write whose second half starts a new page.
+    req_cross_pre <= crossing && mem_write && !mem_check_only && !mem_is_io &&
+                     pg_enable && (addr[11:2] == 10'h3ff);
+    req_check_only <= mem_check_only ||
+                      (crossing && mem_write && !mem_is_io && pg_enable &&
+                       (addr[11:2] == 10'h3ff));
     req_locked <= mem_locked && !mem_write;
     req_linear2 <= {addr[31:2] + 30'd1, 2'b00};
     req_is_io <= 1'b0;
@@ -1214,7 +1234,21 @@ endtask
 
 task automatic complete_mem_request();
     mem_servicing <= 1'b0;
+    req_cross_pre <= 1'b0;
     state <= PG_IDLE;
+endtask
+
+// End of a crossing check-only translation: a page-crossing write precheck
+// now performs the write from its first page (cross_pre_relookup has
+// reloaded the TLB lookup address); a real CW request completes.
+task automatic complete_check_only();
+    if (req_cross_pre) begin
+        req_cross_pre <= 1'b0;
+        req_check_only <= 1'b0;
+        state <= PG_MEM_TLB;
+    end else begin
+        complete_mem_request();
+    end
 endtask
 
 task automatic raise_perm_fault(
