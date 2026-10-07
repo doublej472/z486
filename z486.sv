@@ -1937,7 +1937,12 @@ always_ff @(posedge clk)
 // stack writes, and an IRET's frame after it has entered V86 use CPL=0 for
 // paging regardless of current CPL.
 wire implicit_supervisor = mem_is_dtable || (mem_seg_sel == SEG_TR) ||
-                           descsw_mode || (vm && !vm_at_issue);
+                           descsw_mode ||
+                           // Exception delivery out of V86 has loaded the
+                           // ring-0 gate target (CS.DPL 0) while VM is set;
+                           // an IRET to V86 has set VM before the rest of its
+                           // frame is read (VM changed since issue).
+                           (vm && ((desc_cache[SEG_CS].DPL == 2'b00) || !vm_at_issue));
 assign pg_cpl = implicit_supervisor ? 2'b00 : cpl;
 
 // Registered fault redirect state.
