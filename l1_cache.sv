@@ -153,6 +153,10 @@ reg [2:0] plru_set [0:NUM_SETS-1];
 // arrays in logic.
 reg [TAG_RAM_BITS-1:0] rd_tag_entry0_r, rd_tag_entry1_r;
 reg [TAG_RAM_BITS-1:0] rd_tag_entry2_r, rd_tag_entry3_r;
+// Ways whose tag was captured on an edge that also cleared their set.  The tag
+// RAM read is synchronous and returns the OLD entry, so without this the very
+// next lookup can hit a line that this clear just invalidated.
+reg [3:0] rd_invalidated_r;
 wire [TAG_BITS-1:0] rd_tag0_r = rd_tag_entry0_r[TAG_BITS-1:0];
 wire [TAG_BITS-1:0] rd_tag1_r = rd_tag_entry1_r[TAG_BITS-1:0];
 wire [TAG_BITS-1:0] rd_tag2_r = rd_tag_entry2_r[TAG_BITS-1:0];
@@ -230,6 +234,10 @@ reg fill_requested;
 reg fill_target_returned;
 reg [127:0] wide_fill_line;
 reg wide_fill_install;
+// The last data beat can complete while a snoop owns the tag write port.
+// Keep the cache in S_FILL until the tag can install; no lookup may observe
+// the old victim tag paired with the newly written data in the meantime.
+reg fill_tag_wait_r;
 
 reg [31:0] dout_r;
 reg resp_valid_r;
@@ -252,6 +260,15 @@ reg  flush_busy_r;
 reg  flush_done_r;
 reg  [SET_BITS-1:0] flush_set_r;
 reg  fill_killed_r;
+// A registered snoop cleared this fill's whole set; hold it for the rest of the
+// fill so the tag install cannot reinstate the line (mirrors the I$'s
+// fill_line_snooped_r).
+reg  fill_set_snooped_r;
+// Same-cycle form: the fill install and the snoop clear share the way write
+// port, so an install of this set must be blocked in the registered cycle as well as after
+// (fill_set_snooped_r keeps it blocked for the rest of the fill).
+wire fill_set_snooped_now = (state == S_FILL) && snoop_valid_r &&
+                            (snoop_set_r == fill_set);
 wire flush_req_new = flush_req & ~flush_req_seen_r;
 wire flush_block = flush_req_new | flush_pending_r | flush_busy_r;
 
@@ -379,12 +396,17 @@ end
 endfunction
 
 wire [3:0] lookup_hit_vec = {
-    rd_valid3_r && (rd_tag3_r == req_tag_r),
-    rd_valid2_r && (rd_tag2_r == req_tag_r),
-    rd_valid1_r && (rd_tag1_r == req_tag_r),
-    rd_valid0_r && (rd_tag0_r == req_tag_r)
+    rd_valid3_r && !rd_invalidated_r[3] && (rd_tag3_r == req_tag_r),
+    rd_valid2_r && !rd_invalidated_r[2] && (rd_tag2_r == req_tag_r),
+    rd_valid1_r && !rd_invalidated_r[1] && (rd_tag1_r == req_tag_r),
+    rd_valid0_r && !rd_invalidated_r[0] && (rd_tag0_r == req_tag_r)
 };
-wire lookup_hit = |lookup_hit_vec;
+// A registered snoop clears the whole set in this cycle, but the synchronous
+// RAM lookup captured its tag a cycle earlier, so that hit is stale.  Reject it
+// (the I$ already does this in l1_icache.sv): the demand misses, refetches, and
+// the external write is observed instead of the pre-snoop line.
+wire lookup_snoop_conflict = snoop_valid_r && (snoop_set_r == req_set_r);
+wire lookup_hit = |lookup_hit_vec && !lookup_snoop_conflict;
 wire [1:0] lookup_way = way_encode(lookup_hit_vec);
 wire [31:0] lookup_way_ram_data = way_data_mux(lookup_way, rd_data0_r, rd_data1_r, rd_data2_r, rd_data3_r);
 // A read may preread its dword in the cycle a store patches the data RAM (a
@@ -401,10 +423,10 @@ wire [31:0] lookup_way_data = patch_fwd_hit ? patch_fwd_data_r : lookup_way_ram_
 wire [TAG_BITS-1:0] vipt_resolve_tag =
     vipt_resolve_phys_addr[TAG_MSB:TAG_LSB];
 wire [3:0] vipt_hit_vec = {
-    rd_valid3_r && (rd_tag3_r == vipt_resolve_tag),
-    rd_valid2_r && (rd_tag2_r == vipt_resolve_tag),
-    rd_valid1_r && (rd_tag1_r == vipt_resolve_tag),
-    rd_valid0_r && (rd_tag0_r == vipt_resolve_tag)
+    rd_valid3_r && !rd_invalidated_r[3] && (rd_tag3_r == vipt_resolve_tag),
+    rd_valid2_r && !rd_invalidated_r[2] && (rd_tag2_r == vipt_resolve_tag),
+    rd_valid1_r && !rd_invalidated_r[1] && (rd_tag1_r == vipt_resolve_tag),
+    rd_valid0_r && !rd_invalidated_r[0] && (rd_tag0_r == vipt_resolve_tag)
 };
 wire [1:0] vipt_hit_way = way_encode(vipt_hit_vec);
 wire [31:0] vipt_way_ram_data = way_data_mux(
@@ -426,6 +448,8 @@ assign vipt_resolve_data = vipt_lookup_store_match
                          : vipt_way_data;
 assign vipt_resolve_hit = vipt_resolve_valid && cache_enable && !flush_block &&
                           (vipt_resolve_phys_addr[31:17] != 15'h5) &&
+                          !(snoop_valid_r && (snoop_set_r ==
+                            vipt_resolve_phys_addr[SET_MSB:SET_LSB])) &&
                           (|vipt_hit_vec);
 wire [BRAM_ADDR_BITS-1:0] req_bram_addr = {req_set_r, req_word_r};
 wire can_accept_cpu = (state == S_IDLE) && !reset && (!cpu_write || cpu_protect_write || storeq_can_accept);
@@ -555,7 +579,8 @@ wire [BRAM_ADDR_BITS-1:0] preread_bram_addr = {preread_set, preread_word};
 // cache stays coherent and can be re-enabled without a flush.
 wire data_store_write = (state == S_LOOKUP) && req_valid_r && req_write_r &&
                         !req_protect_write_r && lookup_hit;
-wire data_fill_write = (state == S_FILL) && !fill_killed_r &&
+wire data_fill_write = (state == S_FILL) && !fill_tag_wait_r && !fill_killed_r &&
+                       !fill_set_snooped_r && !fill_set_snooped_now &&
                        (mem_resp_valid || wide_fill_install);
 wire [1:0] data_write_way = data_store_write ? lookup_way : fill_way;
 
@@ -588,10 +613,14 @@ wire [31:0] data_write_value = data_store_write ?
 // Keep each tag array in one conventional synchronous-read/synchronous-write
 // process. Quartus 17 will not infer a block RAM when the packed valid bit is
 // written from the snoop, reset-init, and fill branches of the cache FSM.
-wire tag_fill_write = (state == S_FILL) && !fill_killed_r &&
-                      (mem_resp_valid || wide_fill_install) &&
-                      (fill_count == {WORD_OFFSET_BITS{1'b1}});
-// registered snoop, and the flush sweep.  The sweep yields to a snoop (whose
+wire tag_fill_write = (state == S_FILL) && !snoop_valid_r && !fill_killed_r &&
+                      !fill_set_snooped_r && !fill_set_snooped_now &&
+                      (fill_tag_wait_r || ((mem_resp_valid || wide_fill_install) &&
+                       (fill_count == {WORD_OFFSET_BITS{1'b1}})));
+// A snoop to ANY set owns all four way write ports. If a fill completes on
+// that edge, defer its tag install, not the snoop: otherwise the fill's way
+// retains a stale valid tag in the snooped set. The sweep also yields to a
+// snoop; a flushed fill is killed, so it cannot fight the sweep's clear.
 wire flush_sweep_w = flush_busy_r && !snoop_valid_r;
 wire tag_clear_all = (state == S_RESET_INIT) || snoop_valid_r || flush_sweep_w;
 wire [SET_BITS-1:0] tag_clear_set = (state == S_RESET_INIT) ? init_set :
@@ -614,6 +643,10 @@ always_ff @(posedge clk) begin
         rd_data2_r <= data_way2[preread_bram_addr];
         rd_data3_r <= data_way3[preread_bram_addr];
         rd_plru_r <= plru_set[preread_set];
+        // The clear is set-wide, so a read launched on the same edge returns
+        // valid entries for every way of that set.  Mask them next cycle.
+        rd_invalidated_r <= (tag_clear_all && (tag_clear_set == preread_set))
+                            ? 4'b1111 : 4'b0000;
     end
 
     // A single process for both ports is recognized as simple dual-port RAM
@@ -665,9 +698,11 @@ always_ff @(posedge clk) begin
         fill_target_returned <= 1'b0;
         wide_fill_line <= 128'd0;
         wide_fill_install <= 1'b0;
+        fill_tag_wait_r <= 1'b0;
         fill_killed_r <= 1'b0;
         snoop_set_r <= {SET_BITS{1'b0}};
         snoop_valid_r <= 1'b0;
+        fill_set_snooped_r <= 1'b0;
         for (integer i = 0; i < STOREQ_DEPTH; i = i + 1)
             storeq_valid[i] <= 1'b0;
         flush_req_seen_r <= 1'b0;
@@ -691,10 +726,18 @@ always_ff @(posedge clk) begin
         // sweep: the sweep runs concurrently with it (it may be blocked on the
         // bus), so the install is suppressed rather than waited out.  The mark
         // sticks until the fill ends.
-        if (state != S_FILL)
+        if (state != S_FILL) begin
             fill_killed_r <= 1'b0;
-        else if (flush_req_new || flush_pending_r || flush_busy_r)
+            fill_set_snooped_r <= 1'b0;
+        end else begin
+            // A snoop clears the whole set; any fill in that set is invalid.
+            // The mark sticks until the fill ends so a later word of the same
+            // fill cannot reinstate the tag either.
+            if (snoop_valid_r && (snoop_set_r == fill_set))
+                fill_set_snooped_r <= 1'b1;
+            if (flush_req_new || flush_pending_r || flush_busy_r)
                 fill_killed_r <= 1'b1;
+        end
 
         if (storeq_draining && mem_ready) begin
             storeq_valid[storeq_tail] <= 1'b0;
@@ -826,6 +869,7 @@ always_ff @(posedge clk) begin
                     fill_requested <= 1'b0;
                     fill_target_returned <= 1'b0;
                     wide_fill_install <= 1'b0;
+                    fill_tag_wait_r <= 1'b0;
                     state <= S_FILL;
                 end
             end
@@ -841,12 +885,25 @@ always_ff @(posedge clk) begin
                     fill_requested <= 1'b1;
                 end
 
-                if (wide_fill_install) begin
-                    if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
-                        plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
-                        wide_fill_install <= 1'b0;
+                if (fill_tag_wait_r) begin
+                    if (!snoop_valid_r) begin
+                        if (tag_fill_write)
+                            plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                        fill_tag_wait_r <= 1'b0;
                         state <= S_IDLE;
                         ready_r <= ready_when_idle;
+                    end
+                end else if (wide_fill_install) begin
+                    if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
+                        wide_fill_install <= 1'b0;
+                        if (snoop_valid_r) begin
+                            fill_tag_wait_r <= 1'b1;
+                        end else begin
+                            if (tag_fill_write)
+                                plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                            state <= S_IDLE;
+                            ready_r <= ready_when_idle;
+                        end
                     end
                     fill_count <= fill_count + 1'b1;
                 end else if (mem_line_resp_valid) begin
@@ -863,12 +920,14 @@ always_ff @(posedge clk) begin
                     end
 
                     if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
-                        // Do NOT restore the other ways' valid bits from the
-                        // fill-START snapshot -- a snoop invalidation landing
-                        // DURING this fill must survive (same bug as l1_icache).
-                        plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
-                        state <= S_IDLE;
-                        ready_r <= ready_when_idle;
+                        if (snoop_valid_r) begin
+                            fill_tag_wait_r <= 1'b1;
+                        end else begin
+                            if (tag_fill_write)
+                                plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                            state <= S_IDLE;
+                            ready_r <= ready_when_idle;
+                        end
                     end
                     fill_count <= fill_count + 1'b1;
                 end

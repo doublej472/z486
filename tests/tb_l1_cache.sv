@@ -272,6 +272,52 @@ module tb_l1_cache;
     end
     endtask
 
+    // Two sets can occupy the same way RAM. Its single write port must not
+    // lose a snoop clear when an unrelated fill completes on that edge.
+    task automatic fill_snoop_collision(input bit wide, input bit cancel_fill);
+    begin
+        do @(negedge clk); while (!cpu_ready);
+        reset = 1'b1;
+        wide_mode = wide;
+        repeat (5) @(negedge clk);
+        reset = 1'b0;
+        repeat (20) @(negedge clk);
+        mem_put32(32'h40, 32'h1122_3344);
+        mem_put32(32'h10, 32'h5566_7788);
+        cache_read(32'h40, 4'hF, 32'h1122_3344);
+        do @(negedge clk); while (!cpu_ready);
+        mem_put32(32'h40, 32'hDEAD_BEEF);
+        fork
+            cache_read(32'h10, 4'hF, 32'h5566_7788);
+            begin
+                do @(negedge clk); while (!(dut.fill_count == 2'd2 &&
+                    (wide ? dut.wide_fill_install : mem_resp_valid)));
+                snoop_addr = 32'h40;
+                snoop_valid = 1'b1;
+                @(negedge clk);
+                if (dut.fill_way != 0 || dut.fill_set != 1 ||
+                    dut.snoop_set_r != 4 || !dut.snoop_valid_r)
+                    $fatal(1, "D-cache fill/snoop collision was not exercised");
+                // Keep the port busy with OTHER sets after this one-cycle
+                // event: repeating 0x40 would hide a dropped first clear.
+                snoop_addr = cancel_fill ? 32'h10 : 32'h80;
+                if (cancel_fill) mem_put32(32'h10, 32'h8765_4321);
+                repeat (3) @(negedge clk);
+                snoop_valid = 1'b0;
+            end
+        join
+        do @(negedge clk); while (!cpu_ready);
+        mem_request_before = mem_request_count;
+        cache_read(32'h10, 4'hF, cancel_fill ? 32'h8765_4321 : 32'h5566_7788);
+        if (!cancel_fill && mem_request_count != mem_request_before)
+            $fatal(1, "D-cache fill/snoop collision lost the unrelated fill");
+        if (cancel_fill && mem_request_count == mem_request_before)
+            $fatal(1, "D-cache deferred fill reinstated a later-snooped line");
+        cache_read(32'h40, 4'hF, 32'hDEAD_BEEF);
+        $display("D-cache different-set fill/snoop PASS wide=%0b cancel=%0b", wide, cancel_fill);
+    end
+    endtask
+
     initial begin
         fork
             begin
@@ -299,6 +345,24 @@ module tb_l1_cache;
         cache_read(32'h40, 4'hF, 32'h4433_2211);       // miss + fill
         cache_read(32'h40, 4'hF, 32'h4433_2211);       // hit
         demand_over_vipt(32'h40, 32'h4433_2211);
+        // The probe's tag read and snoop capture share this edge. Resolve in
+        // the registered clearing cycle must miss just like a demand lookup.
+        do @(negedge clk); while (!vipt_probe_ready);
+        vipt_probe_offset = 12'h040;
+        vipt_probe_valid = 1'b1;
+        snoop_addr = 32'h40;
+        snoop_valid = 1'b1;
+        @(negedge clk);
+        vipt_probe_valid = 1'b0;
+        snoop_valid = 1'b0;
+        vipt_resolve_phys_addr = 32'h40;
+        vipt_resolve_valid = 1'b1;
+        #1;
+        if (vipt_resolve_hit)
+            $fatal(1, "D-cache VIPT resolve hit in the registered snoop clear cycle");
+        @(negedge clk);
+        vipt_resolve_valid = 1'b0;
+        cache_read(32'h40, 4'hF, 32'h4433_2211);
         vipt_read(32'h0000_0040, 32'h0000_0040, 1'b1, 32'h4433_2211);
         vipt_read(32'h0000_0040, 32'h0100_0040, 1'b0, 32'd0);
         // Complete physical tags distinguish lines separated by 32MB.
@@ -371,6 +435,11 @@ module tb_l1_cache;
             $display("L1 WIDE FILL was not installed after one line response");
             $fatal(1);
         end
+
+        fill_snoop_collision(1'b0, 1'b0);
+        fill_snoop_collision(1'b1, 1'b0);
+        fill_snoop_collision(1'b0, 1'b1);
+        fill_snoop_collision(1'b1, 1'b1);
 
         // The flush arm must close the pipelined write opening immediately,
         // not only ready_r. The older accepted store still completes.
