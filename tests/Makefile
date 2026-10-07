@@ -194,15 +194,27 @@ obj_dir/Vtb_test386: $(RTL_SRCS) $(RTL_DEPS) $(TB386_SRCS) $(CPP386_SRCS)
 	$(VERILATOR) $(VFLAGS_FST) --top-module tb_test386 $(TB386_SRCS) $(RTL_SRCS) $(CPP386_SRCS)
 	@echo "Build complete: obj_dir/Vtb_test386"
 
-obj_dir/Vtb_l1_cache: $(Z486_DIR)/l1_cache.sv $(TB_L1_SRCS) $(CPP_L1_SRCS)
+obj_dir/Vtb_l1_cache: $(Z486_DIR)/z486_platform.svh $(Z486_DIR)/l1_cache.sv $(TB_L1_SRCS) $(CPP_L1_SRCS)
 	@echo "Building L1 cache unit test with Verilator..."
 	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_l1_cache $(TB_L1_SRCS) $(Z486_DIR)/l1_cache.sv $(CPP_L1_SRCS)
 	@echo "Build complete: obj_dir/Vtb_l1_cache"
 
-obj_dir/Vtb_l1_icache: $(Z486_DIR)/l1_icache.sv $(TB_L1I_SRCS) $(CPP_L1I_SRCS)
+obj_dir/Vtb_l1_icache: $(Z486_DIR)/z486_platform.svh $(Z486_DIR)/l1_icache.sv $(TB_L1I_SRCS) $(CPP_L1I_SRCS)
 	@echo "Building L1 instruction cache unit test with Verilator..."
 	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_l1_icache $(TB_L1I_SRCS) $(Z486_DIR)/l1_icache.sv $(CPP_L1I_SRCS)
 	@echo "Build complete: obj_dir/Vtb_l1_icache"
+
+obj_dir_tags32/Vtb_l1_cache: $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/z486_platform.svh $(TB_L1_SRCS) $(CPP_L1_SRCS)
+	$(VERILATOR) $(VFLAGS_NOTRACE) -DZ486_L1_PHYS_ADDR_BITS=32 --Mdir obj_dir_tags32 --top-module tb_l1_cache \
+		$(TB_L1_SRCS) $(Z486_DIR)/l1_cache.sv $(CPP_L1_SRCS)
+
+obj_dir_tags32/Vtb_l1_icache: $(Z486_DIR)/l1_icache.sv $(Z486_DIR)/z486_platform.svh $(TB_L1I_SRCS) $(CPP_L1I_SRCS)
+	$(VERILATOR) $(VFLAGS_NOTRACE) -DZ486_L1_PHYS_ADDR_BITS=32 --Mdir obj_dir_tags32 --top-module tb_l1_icache \
+		$(TB_L1I_SRCS) $(Z486_DIR)/l1_icache.sv $(CPP_L1I_SRCS)
+
+test-l1-tags-wide: obj_dir_tags32/Vtb_l1_cache obj_dir_tags32/Vtb_l1_icache
+	./obj_dir_tags32/Vtb_l1_cache
+	./obj_dir_tags32/Vtb_l1_icache
 
 obj_dir/Vtb_memory_order: $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/z486_pkg.sv $(RTL_DEPS) $(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv $(TB_MEMORY_ORDER_SRCS) $(CPP_MEMORY_ORDER_SRCS)
 	@echo "Building memory ordering unit test with Verilator..."
@@ -512,6 +524,7 @@ dhrystone:
 
 # Clean build artifacts
 clean:
+	rm -rf obj_dir_tags32
 	rm -rf obj_dir_x87_testfloat
 	rm -rf obj_dir_x87_fifo
 	rm -rf obj_dir_x87_core

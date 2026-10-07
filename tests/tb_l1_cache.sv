@@ -1,4 +1,5 @@
 `timescale 1ns/1ns
+`include "z486_platform.svh"
 
 module tb_l1_cache;
     reg clk = 0;
@@ -150,7 +151,9 @@ module tb_l1_cache;
     endtask
 
     function automatic [31:0] mem_get32(input [31:0] addr);
-        if (addr[31:25] == 7'b0000001) begin
+        if (addr[31:27] != 0) begin
+            mem_get32 = 32'h9abc_def0;
+        end else if (addr[31:25] == 7'b0000001) begin
             case (addr[3:2])
                 2'd0: mem_get32 = 32'h1357_9BDF;
                 2'd1: mem_get32 = 32'h2468_ACE0;
@@ -368,6 +371,10 @@ module tb_l1_cache;
         vipt_read(32'h0000_0040, 32'h0100_0040, 1'b0, 32'd0);
         // Complete physical tags distinguish lines separated by 32MB.
         cache_read(32'h0200_0040, 4'hF, 32'h1357_9BDF);
+        if (`Z486_L1_PHYS_ADDR_BITS > 27) begin
+            cache_read(32'h0800_0040, 4'hF, 32'h9abc_def0);
+            cache_read(32'h40, 4'hF, 32'h4433_2211);
+        end
         cache_read(32'h40, 4'hF, 32'h4433_2211);
         mem_stall = 1'b1;
         cache_write(32'h40, 4'hC, 32'hAAAA_5555);      // write-hit patch
