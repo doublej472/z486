@@ -543,7 +543,12 @@ wire idle_pf_lookup_capture = pg_enable && idle_pf_req && !pf_tlb_match;
 wire walk_cross_lookup_load = (state == PG_WALKING) &&
                               walk_done && !walk_fault &&
                               req_check_only && req_crossing;
-wire cross2_lookup_load = (state == PG_CROSS_PREP2);
+// A check-only crossing translates PG_MEM_TLB -> PG_CROSS_TLB2 directly, so it
+// never runs PG_CROSS_PREP2; load the second-page lookup address here or
+// PG_CROSS_TLB2 re-reads the first page's already-hit TLB entry.
+wire cross2_lookup_load = (state == PG_CROSS_PREP2) ||
+                          ((state == PG_MEM_TLB) && req_can_translate &&
+                           !req_perm_fault && req_check_only && req_crossing);
 
 logic        tlb_lookup_addr_load;
 logic [31:0] tlb_lookup_addr_next;
