@@ -62,6 +62,33 @@ still needed *after* upstream's rewrite, so:
    rather than copied from the fork, because upstream split `memory.sv` into
    `cache_unit.sv`/`bus_unit.sv` and rewrote most of the core.
 
+## Minimisation triage against 4bfdde0 (2026-10-07)
+
+Every `fix(...)` commit was reverted on the series head (tests kept) and the
+release gate re-run; entangled commits were checked against upstream 4bfdde0
+directly.  Where upstream's implementation passed the fork's fail-first test,
+the fork RTL was dropped and the test kept as a `tests: guard` commit:
+
+- XADD/CMPXCHG: upstream's decoder and routines are used.  Only INVD/WBINVD
+  differ (`pc98(ucode)`: the three words at `UADDR_INVD` enter the whole-L1
+  flush instead of upstream's no-op).
+- SHLD/SHRD and BITTST overflow clear (upstream 6613858 fixed it).
+- Deferred shift Z/S/P capture: upstream's `flags_value_r` passes
+  `shifter_stack_flags`.
+- V86 implicit supervisor: upstream's "VM changed since issue" term passes
+  `v86_user_page`.
+- The relative-branch-kind clear on fault delivery (`pf_store_jcc` passes).
+- The I-cache tag-clear collision mask (`tb_l1_icache` REGISTERED SNOOP RACE
+  passes with the later snoop fixes).
+- The paging-demand hold during the fault pulse (a guard with no failing test;
+  upstream 6613858 fixed the related posted-write case).
+
+The commits that were kept record the failing check in their `Upstream:` line
+where the triage was the deciding evidence.  Two kept commits have no failing
+test behind them: the NEG CF fix (`neg_size_carry` passes on 4bfdde0, kept by
+rule 1 because `alu.sv` is unchanged upstream) and the RNI-delay re-arm guard
+(no fail-first test; upstream's set arm is unchanged).
+
 ## Known hardenings not carried
 
 These are deliberate, recorded omissions - revisit them when a bench can prove
