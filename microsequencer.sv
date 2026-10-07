@@ -380,6 +380,7 @@ function automatic logic reljump_condition(
         ALUJMP_JICEWT: reljump_condition = 1'b0;
         ALUJMP_J16BIT: reljump_condition = c.task_16bit;
         ALUJMP_JDESCA: reljump_condition = c.desc_accessed;
+        ALUJMP_JTSSLIM: reljump_condition = c.tss_limit_short;
         default: reljump_condition = 1'b0;
     endcase
 endfunction

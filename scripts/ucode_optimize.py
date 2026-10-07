@@ -37,6 +37,7 @@ DESC_SKIP_CS = LOADALL_FREE + 0x02       # CS-type tail without the write
 DESC_SET_ACCESSED = LOADALL_FREE + 0x04  # locked Accessed-bit RMW (8 words)
 TASK_SET_BUSY = LOADALL_FREE + 0x0C      # task switch: locked busy-bit RMW (8 words)
 LTR_SET_BUSY = LOADALL_FREE + 0x14       # LTR: locked busy-bit RMW (5 words)
+TASK_LIMIT_CHECK = LOADALL_FREE + 0x19   # task switch: TSS limit check (10 words)
 ALUSRC_CONST_8 = 0x19
 ALUSRC_CONST_4 = 0x33
 ALUSRC_CONST_NEG4 = 0x37
@@ -64,6 +65,9 @@ DEST_USTEP_X87_STORE = 0x71 # Optimizer-owned: x87 store command and result read
 DEST_USTEP_ALU = 0x7E       # Optimizer-owned: commit this word's ALU result to DSTREG.
 DEST_USTEP_BSWAP = 0x7C     # Optimizer-owned: byte-swap SRCREG into itself.
 ALUJMP_JDESCA = 0x20        # Optimizer-owned: jump if descriptor A bit is set.
+ALUJMP_JTSSLIM = 0x4A       # Optimizer-owned: jump if the new TSS limit is too small.
+ALUJMP_JNTSKS = 0x54
+ALUJMP_JMP = 0x5A
 ALUJMP_USTEP_AAD_SHIFT = 0x21 # Optimizer-owned: AAD barrel result and CF clear.
 ALUJMP_USTEP_FAULT_DONE = 0x22 # Optimizer-owned: fault delivery completion.
 ALUJMP_PASS = 0x14
@@ -447,6 +451,38 @@ PATCHES = [
           copy_from=0x6CB),
     Patch(LTR_SET_BUSY + 4, "LTR busy RMW: RNI delay slot (= 6CC)",
           copy_from=0x6CC),
+    # A task switch must raise #TS(new TSS selector) when the new TSS's limit
+    # is below 67h (2Bh for a 286 TSS), before it saves the outgoing task or
+    # marks the new one busy (Intel486 PRM Table 7-1, Table 9-5).  The CROM
+    # had no check; the first TSS access beyond the limit raised #GP(0) after
+    # the busy bit was set.  Every switch (JMP/CALL to a TSS, task gate) passes
+    # 74C with OPR_R = the descriptor's low dword, so test there; JTSSLIM is a
+    # registered compare of the limit (event_control.sv).  The original 74C
+    # branch to the save (73F) or no-save (74E) path follows.
+    Patch(0x74C, "task switch: go to the TSS limit check (74D stays the delay slot)",
+          word=uword(**longjump(TASK_LIMIT_CHECK))),
+    Patch(TASK_LIMIT_CHECK + 0, "TSS limit check: limit too small -> #TS",
+          word=uword(aluop=ALUJMP_JTSSLIM,
+                     alusrc=reljump(TASK_LIMIT_CHECK, TASK_LIMIT_CHECK + 8))),
+    Patch(TASK_LIMIT_CHECK + 1, "TSS limit check: blank jump delay slot",
+          word=uword()),
+    Patch(TASK_LIMIT_CHECK + 2, "TSS limit check: outgoing task not saved yet -> save path",
+          word=uword(aluop=ALUJMP_JNTSKS,
+                     alusrc=reljump(TASK_LIMIT_CHECK + 2, TASK_LIMIT_CHECK + 6))),
+    Patch(TASK_LIMIT_CHECK + 3, "TSS limit check: blank jump delay slot",
+          word=uword()),
+    Patch(TASK_LIMIT_CHECK + 4, "TSS limit check: no-save path (74E)",
+          word=uword(**longjump(0x74E))),
+    Patch(TASK_LIMIT_CHECK + 5, "TSS limit check: blank jump delay slot",
+          word=uword()),
+    Patch(TASK_LIMIT_CHECK + 6, "TSS limit check: save path (73F)",
+          word=uword(**longjump(0x73F))),
+    Patch(TASK_LIMIT_CHECK + 7, "TSS limit check: blank jump delay slot",
+          word=uword()),
+    Patch(TASK_LIMIT_CHECK + 8, "TSS limit check: #TS entry 868 (error code in SIGMA)",
+          word=uword(**longjump(0x868))),
+    Patch(TASK_LIMIT_CHECK + 9, "TSS limit check: delay slot SIGMA = TMP_TR & ~3 (= 85D)",
+          copy_from=0x85D),
     # A null selector loaded by a task switch reaches 7E5 after reading GDT[0];
     # 7E6 wrote that dword back to GDT[0]+4.  A 486 does not touch GDT[0].
     Patch(0x7E6, "null selector in a task switch: no write-back to GDT[0]",
