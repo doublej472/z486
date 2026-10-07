@@ -258,9 +258,14 @@ assign live_is_vga_mem =
     (live_hit3 && vga_mem[live_set3][3]);
 
 // The D2 port uses one synchronous RAM read followed by an EX tag compare.
-// It is maintained as an independent TLB: retaining a translation after the
-// four-way TLB replaces it is valid until software executes INVLPG or reloads
-// CR3, just as retaining it in any other TLB entry would be.
+// It holds a SUBSET of the four-way TLB: a walker refill that replaces a
+// valid entry also drops the victim's sidecar slot. Retaining the victim
+// would be architecturally legal, but a 486 has only the 32-entry TLB, so an
+// evicted page is walked again on its next use - and software can depend on
+// WHEN that walk happens: under VEM486, HSB masks A20 and then reads a BIOS
+// page it read just before, which a 486 still has in its TLB; with the
+// sidecar serving that earlier read the main TLB missed instead, walked with
+// A20 masked (VEM486's tables sit above 1 MiB) and faulted.
 // 256 entries, direct-mapped on VPN[19:12]: one M10K, and no way select on
 // the hit path (it feeds D2 issue through a direct load's hit). Fewer
 // entries let a program's read and write pages collide (Quake: 32 entries
@@ -353,6 +358,10 @@ always_ff @(posedge clk) begin
                                         z486_page_in_window(vipt_refill_pfn, VGA_BASE, VGA_TOP)};
 end
 
+wire       vipt_evict = !(hit0 | hit1 | hit2 | hit3) &&
+                        valid_q[update_set][victim_way];
+wire [7:0] vipt_evict_index = {lookup_tag_q[victim_way][4:0], update_set};
+
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n)
         vipt_valid <= '0;
@@ -362,9 +371,14 @@ always_ff @(posedge clk or negedge reset_n) begin
         vipt_valid <= '0;
     else if (invalidate_page)
         vipt_valid[invalidate_vpn[7:0]] <= 1'b0;
-    else if (update_valid)
+    else if (update_valid) begin
+        // On a walker refill the lookup port reads update_set, so its tag
+        // copy at the victim way is the evicted page's tag. A shared index
+        // keeps the new page (the later assignment wins).
+        if (vipt_evict)
+            vipt_valid[vipt_evict_index] <= 1'b0;
         vipt_valid[update_vpn[7:0]] <= 1'b1;
-    else if (vipt_refill_write)
+    end else if (vipt_refill_write)
         vipt_valid[vipt_refill_index] <= 1'b1;
 end
 
