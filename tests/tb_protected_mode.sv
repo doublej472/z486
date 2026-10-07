@@ -58,6 +58,13 @@ module tb_protected_mode #(
     reg         xdma_snoop_valid = 1'b0;
     bit win0_unmapped = 1'b0;
     initial win0_unmapped = $test$plusargs("win0_unmapped");
+    // +cpu_speed=N drives the throttle selector (0 = full speed).
+    bit [1:0] cpu_speed_sel = 2'd0;
+    initial begin
+        int speed;
+        if ($value$plusargs("cpu_speed=%d", speed))
+            cpu_speed_sel = speed[1:0];
+    end
 
     // Instantiate the z486 CPU
     z486 #(
@@ -98,7 +105,7 @@ module tb_protected_mode #(
         .a20_enable(tb_a20),
         .win0_unmapped(win0_unmapped),
         .ram_cache_top(PC98_MAP ? MEM_SIZE : 32'hffff_ffff),
-        .cpu_speed_sel(2'd0),
+        .cpu_speed_sel(cpu_speed_sel),
         .fast_off_req(1'b0),
         .cache_off_req(1'b0),
         .x87_off_req(1'b0),
