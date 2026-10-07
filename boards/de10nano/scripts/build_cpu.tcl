@@ -84,6 +84,9 @@ set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to clk
 foreach port {
     reset_n addr[*] be[*] burstcount[*] din[*] dout[*] valid ready write io
     resp_valid intr nmi inta snoop_addr[*] snoop_valid a20_enable
+    win0_unmapped ram_cache_top[*]
+    device_mmio_enable device_mmio_base[*]
+    line_read line_din[*] line_resp_valid
     cpu_speed_sel[*] single_step dbg_CS[*] dbg_EIP[*] dbg_CS_base[*]
     dbg_pe dbg_vm dbg_x87_state[*] triple_fault_reset
 } {

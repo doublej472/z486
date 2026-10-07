@@ -37,8 +37,10 @@ module l1_icache #(
     input         patch_valid,
     input  [31:0] invalidate_addr,
     input         invalidate_valid,
-
-    input         cache_enable
+    input         cache_enable,
+    // NO_ALLOC fill: answer the fetch but do not install a line, so an
+    // unmapped/uncached window never evicts or aliases a cacheable line.
+    input         cpu_no_alloc
 );
 
 localparam integer WORD_OFFSET_BITS = 2;
@@ -104,6 +106,7 @@ reg [2:0] rd_plru_r;
 reg        req_valid_r;
 reg [31:0] req_addr_r;
 reg        req_uncacheable_r;
+reg        req_no_alloc_r;
 reg [TAG_BITS-1:0] req_tag_r;
 reg        req_snoop_conflict_r;   // the request's tag read raced a snoop's tag clear
 reg [SET_BITS-1:0] req_set_r;
@@ -282,7 +285,8 @@ wire lookup_hit_usable = lookup_hit && !lookup_snoop_conflict;
 wire can_accept_cpu = (state == S_IDLE) && !reset;
 wire accept_cpu = cpu_valid && ready_r && can_accept_cpu;
 wire lookup_read_hit_now = (state == S_LOOKUP) && req_valid_r &&
-                           !req_uncacheable_r && lookup_hit_usable;
+                           !req_uncacheable_r && !req_no_alloc_r &&
+                           lookup_hit_usable;
 logic [PATCHQ_DEPTH-1:0] patchq_snoop_match;
 logic patchq_snoop_hit;
 logic [31:0] fill_word_next;
@@ -537,6 +541,7 @@ always_ff @(posedge clk) begin
                     req_valid_r <= 1'b1;
                     req_addr_r <= cpu_addr;
                     req_uncacheable_r <= cpu_uncacheable;
+                    req_no_alloc_r <= cpu_no_alloc;
                     req_tag_r <= cpu_tag;
                     // A matching snoop clears its tag on this edge, while this
                     // request reads the old one.
@@ -579,7 +584,8 @@ always_ff @(posedge clk) begin
                     fill_line <= wide_line_next;
                     line_r <= wide_line_next;
                     resp_valid_r <= 1'b1;
-                    plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                        if (fill_install_allowed)
+                        plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
                     state <= S_IDLE;
                     ready_r <= 1'b1;
                 end else if (mem_resp_valid) begin
@@ -591,7 +597,8 @@ always_ff @(posedge clk) begin
                         // Only the tag-RAM fill write sets valid for fill_way.
                         // Do not restore any other way from the fill-start
                         // snapshot: a snoop during this fill must survive.
-                        plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                            if (fill_install_allowed)
+                            plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
                         state <= S_IDLE;
                         ready_r <= 1'b1;
                     end
