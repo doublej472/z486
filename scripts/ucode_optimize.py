@@ -26,6 +26,9 @@ UCODE_BITS = 37
 # overlay and 0x9D9-0x9DB is the INVD/WBINVD flush, so the routines sit above
 # them; everything internal to the block is expressed relative to this address.
 XADD_BASE = 0x9DC
+# Free words after the XADD/CMPXCHG block.
+ALIGN_FAULT_ENTRY = 0x9F6     # 486 #AC fault entry (two words)
+ALUSRC_CONST_8 = 0x19
 ROM_BITS = 40
 SRC_TMPC = 0x0C            # Canonical CROM source encoding.
 DEST_SRCREG = 0x3E         # Canonical CROM destination encoding.
@@ -539,6 +542,15 @@ PATCHES = [
           word=uword(sub=SUB_DLY, op=OP_RNI)),
     Patch((XADD_BASE + 0x19), "CMPXCHG m,r not equal: delay slot eAX <- OPR_R",
           word=uword(src=SRC_OPR_R, dst=DEST_EAX_AL, sub=SUB_UNL)),
+
+    # 486 alignment-check fault (#AC, vector 17, error code 0).  The 80386
+    # CROM has no #AC entry.  Reuse the #GP(0) entry shape at 85B/85C: a long
+    # jump into the shared fault body whose delay slot zeroes the error code
+    # (TMPE) and leaves vector - 9 in SIGMA (8 for vector 17).
+    Patch(ALIGN_FAULT_ENTRY, "#AC entry: long jump into the shared fault body",
+          copy_from=0x85B),
+    Patch(ALIGN_FAULT_ENTRY + 1, "#AC entry: delay slot - error code 0, SIGMA = 17 - 9",
+          copy_from=0x85C, fields=dict(alusrc=ALUSRC_CONST_8)),
 ]
 
 
