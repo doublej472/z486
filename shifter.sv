@@ -275,10 +275,12 @@ always_ff @(posedge clk) begin
 
                 if (instr_is_shxd) begin
                     swap <= !shift_right;
-                    overflow <= 1'b0;
                     count <= shift_right ? raw_count : width - raw_count;
                     operation <= shift_right ? ROR : ROL;
                     set_zsp <= 1'b1;
+                    // Clear the stale overflow left by a prior shift setup; an
+                    // SHLD/SHRD has no overflow result and must not inherit one.
+                    overflow <= 1'b0;
                 end else begin
                     swap <= !shift_operation[0];
                     overflow <= raw_count >= width &&
