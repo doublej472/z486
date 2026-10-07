@@ -96,7 +96,7 @@ def generate_page_tables(mappings, page_dir_addr=0x0000):
                     memory[pt_base + j*4] = struct.pack('<I', 0)
 
                 # Create PDE pointing to this page table
-                pde = generate_page_table_entry(page_tables[pde_idx], 'RW')
+                pde = generate_page_table_entry(page_tables[pde_idx], 'RWU')  # permissive PDE; the PTE still restricts
                 page_dir[pde_idx] = pde
 
             # A user mapping needs a user PDE as well.
@@ -343,9 +343,10 @@ def run_simulation(test_name, test_config, hex_file, code_phys_base, verbose=Fal
             print(f"  stderr: {result.stderr}")
 
     # Check result
-    passed = "TEST PASSED" in result.stdout
     failed = "TEST FAILED" in result.stdout
     timeout = "TIMEOUT" in result.stdout
+    passed = (result.returncode == 0 and "TEST PASSED" in result.stdout
+              and not failed and not timeout)
 
     return passed, failed, timeout, result.stdout
 
@@ -405,10 +406,16 @@ def run_test(test_name, verbose=False, trace=False, keep_files=False, cycles=20_
         )
 
         if passed:
+            if test_config.get('expect_fail'):
+                return False, "XPASS - expected to fail but passed"
             return True, "PASS"
         elif failed:
+            if test_config.get('expect_fail'):
+                return True, "XFAIL - expected failure (unported fix)"
             return False, "FAIL - test reported failure"
         elif timeout:
+            if test_config.get('expect_fail'):
+                return True, "XFAIL - expected timeout (unported fix)"
             return False, "TIMEOUT"
         else:
             return False, "Unknown result"
@@ -451,6 +458,7 @@ Examples:
     parser.add_argument('--keep', action='store_true', help='Keep intermediate files')
     parser.add_argument('-c', '--cycles', type=int, default=20_000, help='Max cycles')
     parser.add_argument('--list', action='store_true', help='List available tests')
+    parser.add_argument('--strict', action='store_true', help='Reject expected failures (release gate)')
 
     args = parser.parse_args()
 
@@ -483,6 +491,12 @@ Examples:
             return 1
         tests_to_run = [name for name in tests_to_run
                         if not TESTS[name].get("requires_x87", False)]
+
+    if args.strict:
+        expected = [name for name in tests_to_run if TESTS[name].get('expect_fail')]
+        if expected:
+            print('Error: expected failures are not release passes: ' + ', '.join(expected))
+            return 1
 
     # Run tests
     passed_count = 0
