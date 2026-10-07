@@ -210,8 +210,9 @@ module tb_memmap_template;
             1'b0, Z486_CACHE_NO_ALLOC, 32'hffff_ffff);
     endfunction
 
-    // PC-98 preset: 1 MiB A20 wrap; A0000-FFFFF and aliases non-cacheable.
-    localparam [31:0] PC98_A20_MASK_OFF = 32'h000f_ffff;
+    // PC-98 preset: A20 off clears bit 20 only (the Xe10's gate drives A20M#);
+    // A0000-FFFFF and aliases non-cacheable. The value is the preset's own.
+    localparam [31:0] PC98_A20_MASK_OFF = `Z486_PC98_A20_MASK_OFF;
     // No-allocate bound straight from the preset (the 128 MiB L1 tag reach).
     localparam [31:0] PC98_RAM_TOP      = `Z486_PC98_NO_ALLOC_BOUND;
     // A platform override: 96 MiB of RAM, everything above it no-allocate.
@@ -317,7 +318,7 @@ module tb_memmap_template;
         check_class("inert 0xFFFFFFFF cacheable", def_inert_class(32'hffff_ffff), Z486_CACHE_CACHEABLE);
 
         $display("--- VGA window on the post-wrap physical (VGA_PRE_WRAP=0) ---");
-        // PC-98 1 MiB wrap: 0x001A0000 masks to the 0x000A0000 window.
+        // PC-98 A20 off: 0x001A0000 masks to the 0x000A0000 window.
         check_class("post-wrap 0x1A0000/0x0A0000 direct",
                     vga_postwrap_class(32'h001a_0000, 32'h000a_0000), Z486_CACHE_DIRECT);
         check_class("post-wrap 0x0A0000/0x0A0000 direct",
@@ -419,10 +420,15 @@ module tb_memmap_template;
                    (32'h001a_0000 & ~32'h0010_0000), 32'h000a_0000);
         check_word("default A20 off keeps A0000",
                    (32'h000a_0000 & ~32'h0010_0000), 32'h000a_0000);
-        check_word("pc98 A20 off 1MiB wrap of reset vector",
-                   (32'hffff_fff0 & PC98_A20_MASK_OFF), 32'h000f_fff0);
-        check_word("pc98 A20 off 1MiB wrap of 1A0000",
+        // The reset fetch with A20 masked lands on 0xFFEFFFF0, so a PC-98
+        // platform decodes its BIOS at 0xFFEE8000-0xFFEFFFFF as well as at
+        // 0xFFFE8000-0xFFFFFFFF (MAME pc9821.cpp maps the IPL bank at both).
+        check_word("pc98 A20 off clears bit 20 of the reset vector",
+                   (32'hffff_fff0 & PC98_A20_MASK_OFF), 32'hffef_fff0);
+        check_word("pc98 A20 off 1A0000 -> 0A0000",
                    (32'h001a_0000 & PC98_A20_MASK_OFF), 32'h000a_0000);
+        check_word("pc98 A20 off keeps bit 21 (2A0000)",
+                   (32'h002a_0000 & PC98_A20_MASK_OFF), 32'h002a_0000);
 
         if (errors == 0) begin
             $display("MEMMAP TEMPLATE UNIT TEST PASS");
