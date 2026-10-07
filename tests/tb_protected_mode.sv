@@ -7,6 +7,9 @@ module tb_protected_mode #(
     parameter ENABLE_X87 = 0,
     parameter MEM_SIZE = 1 << 19,
     parameter DCACHE_SET_BITS = 7,
+    // Compile the actual PC-98 preset, not a run-time approximation. Used by
+    // test-pc98-map to execute/modify code in DIRECT and NO_ALLOC aliases.
+    parameter PC98_MAP = 0,
     // Answer a cache-line fill request (burstcount==4 from an L1) with one
     // 16-byte line_resp_valid beat instead of four narrow resp_valid DWORDs.
     // Upstream tied line_din/line_resp_valid low, so the whole-line fill path -
@@ -46,11 +49,21 @@ module tb_protected_mode #(
     reg         nmi = 0;
     wire        inta;
     wire        triple_fault_reset;
+    bit win0_unmapped = 1'b0;
+    initial win0_unmapped = $test$plusargs("win0_unmapped");
 
     // Instantiate the z486 CPU
     z486 #(
         .ENABLE_X87(ENABLE_X87),
-        .DCACHE_SET_BITS(DCACHE_SET_BITS)
+        .DCACHE_SET_BITS(DCACHE_SET_BITS),
+        .A20_MASK_OFF(PC98_MAP ? 32'h000f_ffff : 32'hffef_ffff),
+        .VGA_ENABLE(PC98_MAP),
+        .VGA_PRE_WRAP(!PC98_MAP),
+        .APERTURE_ENABLE(PC98_MAP),
+        .ALIAS_ENABLE(PC98_MAP),
+        .WIN0_ENABLE(PC98_MAP),
+        .NO_ALLOC_ENABLE(PC98_MAP),
+        .RAM_BOUND_ENABLE(PC98_MAP)
     ) dut (
         .clk(clk),
         .reset_n(reset_n),
@@ -76,8 +89,8 @@ module tb_protected_mode #(
         .cache_flush_busy(cache_flush_busy),
         .cache_flush_done(cache_flush_done),
         .a20_enable(1'b1),
-        .win0_unmapped(1'b0),
-        .ram_cache_top(32'hffff_ffff),
+        .win0_unmapped(win0_unmapped),
+        .ram_cache_top(PC98_MAP ? MEM_SIZE : 32'hffff_ffff),
         .cpu_speed_sel(2'd0),
         .fast_off_req(1'b0),
         .cache_off_req(1'b0),
@@ -96,6 +109,27 @@ module tb_protected_mode #(
     // The regular tests use 512KB. Snapshot replay overrides this parameter
     // with the captured physical-memory size.
     reg [7:0] mem [0:MEM_SIZE-1];
+    // Instrument the feature itself: an ordinary-map binary must not make a
+    // PC-98 test green, and a NO_ALLOC fetch must never install a line.
+    longint direct_code_writes = 0;
+    longint no_alloc_code_fills = 0;
+    initial begin
+        if ($test$plusargs("expect_pc98_map") && !PC98_MAP)
+            $fatal(1, "PC-98 map test requires -GPC98_MAP=1");
+    end
+    always @(posedge clk) begin
+        if (reset_n) begin
+            if (dut.memory_inst.bus_unit_inst.icache_direct_inval)
+                direct_code_writes <= direct_code_writes + 1;
+            if (dut.memory_inst.cache_unit_inst.icache_inst.fill_last_beat &&
+                dut.memory_inst.cache_unit_inst.icache_inst.state == 3'd3 &&
+                dut.memory_inst.cache_unit_inst.icache_inst.req_no_alloc_r)
+                no_alloc_code_fills <= no_alloc_code_fills + 1;
+            if (dut.memory_inst.cache_unit_inst.icache_inst.req_no_alloc_r &&
+                dut.memory_inst.cache_unit_inst.icache_inst.data_fill_write)
+                $fatal(1, "NO_ALLOC code installed an I-cache line");
+        end
+    end
 
     // Instruction counting
     wire instruction_boundary = dut.uc_is_rni && dut.uc_active;
@@ -953,7 +987,11 @@ module tb_protected_mode #(
                             ($test$plusargs("expect_flush_overlap") &&
                              (flush_overlap_cycles == 0)) ||
                             ($test$plusargs("expect_stale_walk") &&
-                             (stale_walk_events == 0))) begin
+                             (stale_walk_events == 0)) ||
+                            ($test$plusargs("expect_direct_code") &&
+                             (direct_code_writes == 0)) ||
+                            ($test$plusargs("expect_no_alloc_code") &&
+                             (no_alloc_code_fills < 2))) begin
                             test_status <= 8'hFF;
                             $display("");
                             $display("========================================");
