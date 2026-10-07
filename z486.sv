@@ -2611,6 +2611,11 @@ always_ff @(posedge clk) begin
     end else if (i_issue) begin
         i <= i_bus;
         i.entry_point <= issue_entry;
+    end else if (any_fault_r) begin
+        // Fault delivery re-enters the exception-entry cluster while `i` may
+        // still hold a Jcc; drop its displacement so the delivery's IND steps
+        // use the microcode constant, not the branch offset.
+        i.rel_branch_kind <= REL_BRANCH_NONE;
     end
     if (interrupt_entry)
         i.rel_branch_kind <= REL_BRANCH_NONE;
