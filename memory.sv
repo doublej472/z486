@@ -2,13 +2,58 @@
 // Memory Unit
 // Connects the bus interface unit and the cache unit
 //
-module memory #(
+module memory
+    import z486_cache_map_pkg::*;
+#(
     parameter PROTECT_UMA_ROM = 0,
     parameter DCACHE_SET_BITS = 7,
     parameter ICACHE_SET_BITS = 7,
     parameter ENABLE_X87 = 0,
     parameter ENABLE_DEVICE_MMIO = 0,
-    parameter [31:0] DEVICE_MMIO_MASK = 32'hff00_0000
+    parameter [31:0] DEVICE_MMIO_MASK = 32'hff00_0000,
+
+    // A20 gate masks, applied closed / open. Default = PC/AT bit-20 clear /
+    // unmasked. The PC-98 preset overrides A20_MASK_OFF (wrap into 1 MiB).
+    parameter [31:0] A20_MASK_OFF = 32'hffef_ffff,
+    parameter [31:0] A20_MASK_ON  = 32'hffff_ffff,
+
+    // VGA/device A0000-BFFFF template window (VGA_ENABLE gates only this copy).
+    parameter        VGA_ENABLE = 0,
+    parameter        VGA_PRE_WRAP = 1,
+    parameter [1:0]  VGA_CLASS = Z486_CACHE_DIRECT,
+    parameter [31:0] VGA_BASE = 32'h000a_0000,
+    parameter [31:0] VGA_TOP  = 32'h000b_ffff,
+
+    // Device aperture (PC-98: A0000-FFFFF). Disabled by default.
+    parameter        APERTURE_ENABLE = 0,
+    parameter [1:0]  APERTURE_CLASS = Z486_CACHE_DIRECT,
+    parameter [31:0] APERTURE_BASE = 32'h000a_0000,
+    parameter [31:0] APERTURE_TOP  = 32'h000f_ffff,
+
+    // Device-memory aliases (PC-98 mirror/PEGC/fw_high). Disabled by default.
+    parameter        ALIAS_ENABLE = 0,
+    parameter [1:0]  ALIAS_CLASS = Z486_CACHE_DIRECT,
+    parameter [31:0] ALIAS0_BASE = 32'h00f0_0000,
+    parameter [31:0] ALIAS0_TOP  = 32'h00ff_ffff,
+    parameter [31:0] ALIAS1_BASE = 32'hfff0_0000,
+    parameter [31:0] ALIAS1_TOP  = 32'hfff7_ffff,
+    parameter [31:0] ALIAS2_BASE = 32'hffff_8000,
+    parameter [31:0] ALIAS2_TOP  = 32'hffff_ffff,
+
+    // Window-0 overlay range (PC-98 0x80000-0x9FFFF), enabled only when win0_unmapped.
+    parameter        WIN0_ENABLE = 0,
+    parameter [1:0]  WIN0_CLASS = Z486_CACHE_NO_ALLOC,
+    parameter [31:0] WIN0_BASE = 32'h0008_0000,
+    parameter [31:0] WIN0_TOP  = 32'h0009_ffff,
+
+    // No-allocate bound: addresses at or above it never install a line.
+    parameter        NO_ALLOC_ENABLE = 0,
+    parameter [1:0]  NO_ALLOC_CLASS = Z486_CACHE_NO_ALLOC,
+    parameter [31:0] NO_ALLOC_BOUND = 32'h0800_0000,
+
+    // Runtime cacheable-RAM top; with RAM_BOUND_ENABLE the effective bound is
+    // min(ram_cache_top, NO_ALLOC_BOUND).
+    parameter        RAM_BOUND_ENABLE = 0
 ) (
     input              clk,
     input              reset_n,
@@ -17,6 +62,11 @@ module memory #(
     input              x87_off,       // Dev menu: no coprocessor
     input              device_mmio_enable,
     input      [31:0]  device_mmio_base,
+    // Window-0 overlay verdict (0x80000-0x9FFFF target is not RAM); the
+    // template's WIN0 window is enabled only while this is asserted.
+    input              win0_unmapped,
+    // The platform's cacheable-RAM top; only read when RAM_BOUND_ENABLE is set.
+    input      [31:0]  ram_cache_top,
 
     // Paging-unit demand request
     input              dcache_req_valid,
@@ -108,6 +158,8 @@ wire dcache_mem_resp_valid;
 wire dcache_mem_valid;
 wire dcache_mem_write;
 wire dcache_req_is_device_mmio;
+wire dcache_req_is_uncached;
+wire dcache_req_is_direct;
 wire [31:0] dcache_req_phys_addr;
 wire dcache_stores_drained;
 wire [31:0] icache_mem_addr;
@@ -122,7 +174,42 @@ wire dcache_read_pending;
 wire direct_rd_pending;
 wire ext_valid_r;
 wire icache_read_pending;
-cache_unit #(.PROTECT_UMA_ROM(PROTECT_UMA_ROM), .DCACHE_SET_BITS(DCACHE_SET_BITS), .ICACHE_SET_BITS(ICACHE_SET_BITS), .ENABLE_DEVICE_MMIO(ENABLE_DEVICE_MMIO), .DEVICE_MMIO_MASK(DEVICE_MMIO_MASK)) cache_unit_inst (
+wire icache_invalidate_valid;
+wire [31:0] icache_invalidate_addr;
+cache_unit #(
+    .PROTECT_UMA_ROM(PROTECT_UMA_ROM),
+    .DCACHE_SET_BITS(DCACHE_SET_BITS),
+    .ICACHE_SET_BITS(ICACHE_SET_BITS),
+    .ENABLE_DEVICE_MMIO(ENABLE_DEVICE_MMIO),
+    .DEVICE_MMIO_MASK(DEVICE_MMIO_MASK),
+    .A20_MASK_OFF(A20_MASK_OFF),
+    .A20_MASK_ON(A20_MASK_ON),
+    .VGA_ENABLE(VGA_ENABLE),
+    .VGA_PRE_WRAP(VGA_PRE_WRAP),
+    .VGA_CLASS(VGA_CLASS),
+    .VGA_BASE(VGA_BASE),
+    .VGA_TOP(VGA_TOP),
+    .APERTURE_ENABLE(APERTURE_ENABLE),
+    .APERTURE_CLASS(APERTURE_CLASS),
+    .APERTURE_BASE(APERTURE_BASE),
+    .APERTURE_TOP(APERTURE_TOP),
+    .ALIAS_ENABLE(ALIAS_ENABLE),
+    .ALIAS_CLASS(ALIAS_CLASS),
+    .ALIAS0_BASE(ALIAS0_BASE),
+    .ALIAS0_TOP(ALIAS0_TOP),
+    .ALIAS1_BASE(ALIAS1_BASE),
+    .ALIAS1_TOP(ALIAS1_TOP),
+    .ALIAS2_BASE(ALIAS2_BASE),
+    .ALIAS2_TOP(ALIAS2_TOP),
+    .WIN0_ENABLE(WIN0_ENABLE),
+    .WIN0_CLASS(WIN0_CLASS),
+    .WIN0_BASE(WIN0_BASE),
+    .WIN0_TOP(WIN0_TOP),
+    .NO_ALLOC_ENABLE(NO_ALLOC_ENABLE),
+    .NO_ALLOC_CLASS(NO_ALLOC_CLASS),
+    .NO_ALLOC_BOUND(NO_ALLOC_BOUND),
+    .RAM_BOUND_ENABLE(RAM_BOUND_ENABLE)
+) cache_unit_inst (
     // Clock, reset and board configuration
     .clk(clk),
     .reset_n(reset_n),
@@ -130,6 +217,8 @@ cache_unit #(.PROTECT_UMA_ROM(PROTECT_UMA_ROM), .DCACHE_SET_BITS(DCACHE_SET_BITS
     .cache_enable(cache_enable),
     .device_mmio_enable(device_mmio_enable),
     .device_mmio_base(device_mmio_base),
+    .win0_unmapped(win0_unmapped),
+    .ram_cache_top(ram_cache_top),
     // Paging unit: demand data request (physical address, before A20 masking)
     .dcache_req_valid(dcache_req_valid),
     .dcache_req_phys_addr_raw(dcache_req_phys_addr_raw),
@@ -166,6 +255,8 @@ cache_unit #(.PROTECT_UMA_ROM(PROTECT_UMA_ROM), .DCACHE_SET_BITS(DCACHE_SET_BITS
     .x87_req_selected(x87_req_selected),
     .normal_cache_req(normal_cache_req),
     .dcache_req_is_device_mmio(dcache_req_is_device_mmio),
+    .dcache_req_is_uncached(dcache_req_is_uncached),
+    .dcache_req_is_direct(dcache_req_is_direct),
     .dcache_req_phys_addr(dcache_req_phys_addr),
     .dcache_cpu_ready(dcache_cpu_ready),
     .dcache_cpu_wr_ready(dcache_cpu_wr_ready),
@@ -195,9 +286,12 @@ cache_unit #(.PROTECT_UMA_ROM(PROTECT_UMA_ROM), .DCACHE_SET_BITS(DCACHE_SET_BITS
     .icache_read_pending(icache_read_pending),
     .din(din),
     .line_din(line_din),
-    // External coherence (snoop invalidation)
+    // External coherence (snoop invalidation) and the merged I-cache
+    // invalidation from the bus unit.
     .snoop_addr(snoop_addr),
-    .snoop_valid(snoop_valid)
+    .snoop_valid(snoop_valid),
+    .icache_invalidate_addr(icache_invalidate_addr),
+    .icache_invalidate_valid(icache_invalidate_valid)
 );
 
 bus_unit #(.ENABLE_X87(ENABLE_X87)) bus_unit_inst (
@@ -229,6 +323,8 @@ bus_unit #(.ENABLE_X87(ENABLE_X87)) bus_unit_inst (
     // Cache unit: request routing and D-cache CPU response
     .normal_cache_req(normal_cache_req),
     .dcache_req_is_device_mmio(dcache_req_is_device_mmio),
+    .dcache_req_is_uncached(dcache_req_is_uncached),
+    .dcache_req_is_direct(dcache_req_is_direct),
     .dcache_req_phys_addr(dcache_req_phys_addr),
     .dcache_cpu_ready(dcache_cpu_ready),
     .dcache_cpu_wr_ready(dcache_cpu_wr_ready),
@@ -269,6 +365,12 @@ bus_unit #(.ENABLE_X87(ENABLE_X87)) bus_unit_inst (
     .dout(dout),
     .din(din),
     .resp_valid(resp_valid),
-    .line_resp_valid(line_resp_valid)
+    .line_resp_valid(line_resp_valid),
+    // External coherence (snoop invalidation) and the merged I-cache
+    // invalidation forwarded to the cache unit.
+    .snoop_addr(snoop_addr),
+    .snoop_valid(snoop_valid),
+    .icache_invalidate_valid(icache_invalidate_valid),
+    .icache_invalidate_addr(icache_invalidate_addr)
 );
 endmodule

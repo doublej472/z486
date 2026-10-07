@@ -33,6 +33,7 @@ module tb_memory_order;
     memory #(
         .DCACHE_SET_BITS(3),
         .ICACHE_SET_BITS(3),
+        .APERTURE_ENABLE(1'b1),
         .ENABLE_DEVICE_MMIO(1'b1),
         .DEVICE_MMIO_MASK(32'hff00_0000)
     ) dut (
@@ -41,6 +42,8 @@ module tb_memory_order;
         .a20_enable(1'b1),
         .device_mmio_enable(1'b1),
         .device_mmio_base(32'hd000_0000),
+        .win0_unmapped(1'b0),
+        .ram_cache_top(32'hffff_ffff),
 
         .dcache_req_valid(dcache_req_valid),
         .dcache_req_phys_addr_raw(dcache_req_phys_addr_raw),

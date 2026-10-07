@@ -6,7 +6,13 @@
 `include "z486_platform.svh"
 
 module paging_tlb
-    import z486_pkg::*;
+    import z486_pkg::*, z486_cache_map_pkg::*;
+#(
+    // VGA/device window classified per 4 KB page in the TLB entry; the default
+    // reproduces upstream's hardcoded A0000-BFFFF (pfn[19:5] == 5).
+    parameter [31:0] VGA_BASE = 32'h000a_0000,
+    parameter [31:0] VGA_TOP  = 32'h000b_ffff
+)
 (
     input               clk,
     input               reset_n,
@@ -237,14 +243,14 @@ always_ff @(posedge clk) begin
         vipt_tlb[update_vpn[7:0]] <= {vipt_epoch, update_vpn[19:8], update_pfn,
                                       update_writable, update_user,
                                       update_dirty,
-                                      update_pfn[19:5] == 15'h5};
+                                      z486_page_in_window(update_pfn, VGA_BASE, VGA_TOP)};
     else if (vipt_refill_write)
         vipt_tlb[vipt_refill_index] <= {vipt_epoch, vipt_refill_linear[31:20],
                                         vipt_refill_pfn,
                                         vipt_refill_writable,
                                         vipt_refill_user,
                                         vipt_refill_dirty,
-                                        vipt_refill_pfn[19:5] == 15'h5};
+                                        z486_page_in_window(vipt_refill_pfn, VGA_BASE, VGA_TOP)};
     else if (vipt_scrub_write)
         vipt_tlb[vipt_scrub_index] <= {VIPT_EPOCH_INVALID, 36'd0};
 end
@@ -356,7 +362,7 @@ always_ff @(posedge clk or negedge reset_n) begin
             writable_q[update_set][victim_way] <= update_writable;
             user_q[update_set][victim_way]     <= update_user;
             dirty_q[update_set][victim_way]    <= update_dirty;
-            vga_mem[update_set][victim_way]    <= (update_pfn[19:5] == 15'h5);
+            vga_mem[update_set][victim_way]    <= z486_page_in_window(update_pfn, VGA_BASE, VGA_TOP);
             case (victim_way)
                 2'd0: begin plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b1; end
                 2'd1: begin plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b0; end

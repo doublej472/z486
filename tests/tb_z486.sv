@@ -62,6 +62,8 @@ module tb_z486 #(
         .snoop_addr(32'h0),
         .snoop_valid(1'b0),
         .a20_enable(1'b1),
+        .win0_unmapped(1'b0),
+        .ram_cache_top(32'hffff_ffff),
         .cpu_speed_sel(2'd0),
         .fast_off_req(1'b0),
         .cache_off_req(1'b0),

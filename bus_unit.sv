@@ -40,6 +40,8 @@ module bus_unit
     // Cache unit: request routing and D-cache CPU response
     input  logic normal_cache_req,
     input  logic dcache_req_is_device_mmio,
+    input  logic dcache_req_is_uncached,
+    input  logic dcache_req_is_direct,
     input  logic [31:0] dcache_req_phys_addr,
     input  logic dcache_cpu_ready,
     input  logic dcache_cpu_wr_ready,
@@ -68,6 +70,13 @@ module bus_unit
     output logic direct_rd_pending,
     output logic dcache_read_pending,
     output logic icache_read_pending,
+
+    // External coherence (snoop invalidation) and the merged I-cache
+    // invalidation forwarded to the cache unit.
+    input  logic [31:0] snoop_addr,
+    input  logic snoop_valid,
+    output logic icache_invalidate_valid,
+    output logic [31:0] icache_invalidate_addr,
 
     // External bus (XA/XD)
     output logic valid,
@@ -98,7 +107,7 @@ wire x87_sink = ENABLE_X87 && x87_off && dcache_req_valid && dcache_req_is_x87;
 
 wire dcache_direct_req = dcache_req_valid && !x87_req_selected && !x87_sink &&
                          (dcache_req_is_io || dcache_req_is_inta ||
-                          dcache_req_is_vga_mem ||
+                          dcache_req_is_uncached ||
                           dcache_req_is_device_mmio);
 assign dcache_read_pending = (dcache_rd_pending != 8'd0);
 assign icache_read_pending = (icache_rd_pending != 8'd0);
@@ -111,10 +120,88 @@ wire direct_req_ordered = dcache_req_is_vga_mem || dcache_stores_drained;
 wire ext_direct_req = dcache_direct_req && direct_req_ordered &&
                       !direct_rd_pending &&
                       !dcache_read_pending && !icache_read_pending;
+// A template DIRECT-window write invalidates its I-cache line in the first
+// bus-valid cycle, without feeding external ready into the I-cache/prefetch
+// merge.  Only DIRECT (not NO_ALLOC) writes need this: NO_ALLOC never installs
+// a line, so there is nothing stale to clear.
+wire dcache_req_direct_inval = dcache_req_is_direct && dcache_req_write &&
+                               !dcache_req_is_io && !dcache_req_is_inta &&
+                               !dcache_req_is_device_mmio;
+wire icache_direct_inval_held;
+// Hold off the next invalidating direct write while the one-entry slot is
+// stranded, so it cannot overwrite the queued address.  Only the launch is
+// gated; ext_direct_req still blocks other ext requests, so the store stalls
+// rather than being dropped.
+wire ext_direct_launch = ext_direct_req &&
+                         !(icache_direct_inval_held && dcache_req_direct_inval);
 wire ext_dcache_req = dcache_mem_valid && !ext_direct_req &&
                       !direct_rd_pending && !icache_read_pending;
 wire ext_icache_req = icache_mem_valid && !ext_direct_req && !ext_dcache_req &&
                       !direct_rd_pending && !dcache_read_pending;
+
+// Instruction-cache coherence for CPU stores into a template DIRECT window: the
+// store bypasses the D-cache, so the matching I-cache line must be invalidated
+// rather than patched.  A colliding invalidate waits in one pending slot, and
+// the next invalidating direct write is held off until it drains.  Inert (and
+// folded away) without template windows: dcache_req_is_direct is then 0.
+logic        ext_direct_inval_r; // first bus-valid cycle of an invalidating write
+logic        icache_direct_inval_pending;
+logic [31:0] icache_direct_inval_addr_r;
+wire icache_direct_inval = ext_direct_inval_r;
+wire [31:0] icache_direct_inval_addr = {ext_addr_r, 2'b00};
+
+// The snoop owns the single-address port, so a queued invalidate is stranded
+// for as long as the snoop is asserted.
+assign icache_direct_inval_held = icache_direct_inval_pending && snoop_valid;
+
+assign icache_invalidate_valid = snoop_valid || icache_direct_inval_pending ||
+                                 icache_direct_inval;
+assign icache_invalidate_addr = snoop_valid ? snoop_addr :
+                                icache_direct_inval_pending ? icache_direct_inval_addr_r :
+                                icache_direct_inval_addr;
+
+// Launch excludes pending reads; ext_valid_r blocks refills until the write is
+// accepted. Thus an early invalidate cannot reinstall old data.
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        ext_direct_inval_r <= 1'b0;
+    else
+        ext_direct_inval_r <= !ext_valid_r && ext_direct_launch &&
+                              dcache_req_direct_inval;
+end
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        icache_direct_inval_pending <= 1'b0;
+        icache_direct_inval_addr_r <= 32'h0;
+    end else if (icache_direct_inval &&
+                 (snoop_valid || icache_direct_inval_pending)) begin
+        // Snoop owns the port this cycle: hold this invalidate.
+        icache_direct_inval_pending <= 1'b1;
+        icache_direct_inval_addr_r <= icache_direct_inval_addr;
+    end else if (icache_direct_inval_pending && !snoop_valid) begin
+        icache_direct_inval_pending <= 1'b0;
+    end
+end
+
+// synthesis translate_off
+// SIM-ONLY invariants of the DIRECT-window I-cache invalidate: the invalidate is
+// presented in the first bus-valid cycle of an exclusive direct write, and a
+// queued invalidate is never overwritten before the I-cache consumes it (with
+// the snoop low the queued entry is presented that cycle, so replacing it then
+// loses nothing).
+always @(posedge clk) begin
+    if (reset_n && icache_direct_inval &&
+        (!ext_valid_r || ext_src_r != EXT_SRC_DIRECT || !ext_write_r ||
+         ext_io_r || ext_inta_r || icache_read_pending ||
+         dcache_read_pending || direct_rd_pending))
+        $fatal(1, "bus_unit: DIRECT invalidate without exclusive write ownership");
+    if (reset_n && icache_direct_inval && icache_direct_inval_pending &&
+        snoop_valid)
+        $fatal(1, "bus_unit: queued direct-write I-cache invalidate %08x overwritten un-consumed by %08x (snoop owns the port)",
+               icache_direct_inval_addr_r, icache_direct_inval_addr);
+end
+// synthesis translate_on
 
 localparam [1:0] EXT_SRC_NONE   = 2'd0;
 localparam [1:0] EXT_SRC_DIRECT = 2'd1;
@@ -206,7 +293,7 @@ always_ff @(posedge clk) begin
                 ext_valid_r <= 1'b0;
                 ext_src_r <= EXT_SRC_NONE;
             end
-        end else if (ext_direct_req) begin
+        end else if (ext_direct_launch) begin
             ext_valid_r <= 1'b1;
             ext_src_r <= EXT_SRC_DIRECT;
             ext_addr_r <= dcache_req_phys_addr[31:2];
