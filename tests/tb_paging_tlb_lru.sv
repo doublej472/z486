@@ -20,7 +20,7 @@
 
 `default_nettype none
 
-module tb_paging_tlb;
+module tb_paging_tlb_lru;
   reg clk = 1'b0;
   always #5 clk = ~clk;
   reg reset_n = 1'b0;

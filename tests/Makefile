@@ -117,7 +117,7 @@ TB_MEMMAP_SRCS := tb_memmap_template.sv
 CPP_MEMMAP_SRCS := sim_main_memmap_template.cpp
 TB_INTERRUPT_NMI_SRCS := tb_interrupt_nmi.sv
 TB_PAGING_WALKER_SRCS := tb_paging_walker.sv
-TB_PAGING_TLB_SRCS := tb_paging_tlb.sv
+TB_PAGING_TLB_SRCS := tb_paging_tlb_lru.sv
 TB_CACHE_FLUSH_SRCS := tb_cache_flush.sv
 TB_X87_BRIDGE_SRCS := tb_x87_bridge.sv
 CPP_X87_BRIDGE_SRCS := sim_main_x87_bridge.cpp
@@ -291,14 +291,14 @@ obj_dir/Vtb_interrupt_nmi: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/interrupt_control
 		$(TB_INTERRUPT_NMI_SRCS)
 	@echo "Build complete: obj_dir/Vtb_interrupt_nmi"
 
-obj_dir/Vtb_paging_tlb: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/paging_tlb.sv $(TB_PAGING_TLB_SRCS)
+obj_dir/Vtb_paging_tlb_lru: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/paging_tlb.sv $(TB_PAGING_TLB_SRCS)
 	@echo "Building paging TLB replacement bench with Verilator..."
 	$(VERILATOR) --timing -Wall -Wno-fatal -Wno-UNOPTFLAT -Wno-SYNCASYNCNET \
 		--binary -O3 -j $(JOBS) -I$(Z486_DIR) \
-		-CFLAGS "-std=c++14 -O3" --top-module tb_paging_tlb \
+		-CFLAGS "-std=c++14 -O3" --top-module tb_paging_tlb_lru \
 		$(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/paging_tlb.sv \
 		$(TB_PAGING_TLB_SRCS)
-	@echo "Build complete: obj_dir/Vtb_paging_tlb"
+	@echo "Build complete: obj_dir/Vtb_paging_tlb_lru"
 
 obj_dir/Vtb_paging_walker: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/paging_walker.sv $(TB_PAGING_WALKER_SRCS)
 	@echo "Building page-walker A/D write-back bench with Verilator..."
@@ -525,9 +525,9 @@ test-paging-walker: obj_dir/Vtb_paging_walker
 		| grep -q "PAGING WALKER TEST PASS" \
 		|| (echo "page-walker A/D write-back bench FAIL"; exit 1)
 
-test-paging-tlb: obj_dir/Vtb_paging_tlb
+test-paging-tlb: obj_dir/Vtb_paging_tlb_lru
 	@echo "Running paging TLB replacement bench..."
-	@./obj_dir/Vtb_paging_tlb | tee obj_dir/z486_paging_tlb.out \
+	@./obj_dir/Vtb_paging_tlb_lru | tee obj_dir/z486_paging_tlb_lru.out \
 		| grep -q "PAGING TLB TEST PASS" \
 		|| (echo "paging TLB replacement bench FAIL"; exit 1)
 
