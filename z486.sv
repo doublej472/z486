@@ -3636,6 +3636,19 @@ wire use_shifter_result = (uc_aluop == ALUJMP_SHIFT2) ||
 // Unit 10: x87 Coprocessor
 //=============================================================================
 
+// An ESC issued while (or right after) a MOV CR0, LMSW, CLTS or task switch
+// writes CR0 must not take the direct x87 path on the old EM/TS: the direct
+// decision samples CR0 at issue, which can overlap the writing word.  Such an
+// ESC takes the microcode path, which checks EM/TS (#NM) after the write.
+wire cr0_write_now = uc_exec && (uc_dest == DEST_CR0);
+reg  cr0_write_r;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        cr0_write_r <= 1'b0;
+    else
+        cr0_write_r <= cr0_write_now;
+end
+
 x87_unit #(.ENABLE_X87(ENABLE_X87)) x87 (
     .clk(clk),
     .reset_n(reset_n),
@@ -3650,7 +3663,7 @@ x87_unit #(.ENABLE_X87(ENABLE_X87)) x87 (
     .req_rdata(x87_rdata),
     .direct_launch(i_issue),
     .direct_candidate(x87_direct_candidate),
-    .direct_allowed(!CR0[3] && !CR0[2] && !x87_off),
+    .direct_allowed(!CR0[3] && !CR0[2] && !cr0_write_now && !cr0_write_r && !x87_off),
     .direct_fop(i.fop),
     .direct_reg(i_bus.modrm[7:6] == 2'b11),
     .direct_store((i_bus.modrm[7:6] != 2'b11) && ((i_bus.opcode == 8'hD9) || (i_bus.opcode == 8'hDB)) &&
