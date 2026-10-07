@@ -105,6 +105,7 @@ CPP_MEMORY_ORDER_SRCS := sim_main_memory_order.cpp
 TB_MEMMAP_SRCS := tb_memmap_template.sv
 CPP_MEMMAP_SRCS := sim_main_memmap_template.cpp
 TB_INTERRUPT_NMI_SRCS := tb_interrupt_nmi.sv
+TB_PAGING_WALKER_SRCS := tb_paging_walker.sv
 TB_X87_BRIDGE_SRCS := tb_x87_bridge.sv
 CPP_X87_BRIDGE_SRCS := sim_main_x87_bridge.cpp
 TB_X87_SEQ_SRCS := tb_x87_sequencer.sv
@@ -124,7 +125,7 @@ CPP_PLA4_SRCS := sim_main_pla4.cpp
 PLA4_RTL := $(Z486_DIR)/protection.sv
 
 # Targets
-.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-memmap-template test-interrupt-nmi test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
+.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-memmap-template test-interrupt-nmi test-paging-walker test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 all: build
 
@@ -209,6 +210,15 @@ obj_dir/Vtb_interrupt_nmi: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/interrupt_control
 		$(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/interrupt_controller.sv \
 		$(TB_INTERRUPT_NMI_SRCS)
 	@echo "Build complete: obj_dir/Vtb_interrupt_nmi"
+
+obj_dir/Vtb_paging_walker: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/paging_walker.sv $(TB_PAGING_WALKER_SRCS)
+	@echo "Building page-walker A/D write-back bench with Verilator..."
+	$(VERILATOR) --timing -Wall -Wno-fatal -Wno-UNOPTFLAT -Wno-SYNCASYNCNET \
+		--binary -O3 -j $(JOBS) -I$(Z486_DIR) \
+		-CFLAGS "-std=c++14 -O3" --top-module tb_paging_walker \
+		$(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/paging_walker.sv \
+		$(TB_PAGING_WALKER_SRCS)
+	@echo "Build complete: obj_dir/Vtb_paging_walker"
 
 obj_dir/Vtb_x87_bridge: $(X87_DIR)/x87_bridge.sv $(TB_X87_BRIDGE_SRCS) $(CPP_X87_BRIDGE_SRCS)
 	@echo "Building x87 bridge unit test with Verilator..."
@@ -350,6 +360,12 @@ test-interrupt-nmi: obj_dir/Vtb_interrupt_nmi
 	@./obj_dir/Vtb_interrupt_nmi | tee obj_dir/z486_interrupt_nmi.out \
 		| grep -q "TB_INTERRUPT_NMI: PASS" \
 		|| (echo "interrupt NMI bench FAIL"; exit 1)
+
+test-paging-walker: obj_dir/Vtb_paging_walker
+	@echo "Running page-walker A/D write-back bench..."
+	@./obj_dir/Vtb_paging_walker | tee obj_dir/z486_paging_walker.out \
+		| grep -q "PAGING WALKER TEST PASS" \
+		|| (echo "page-walker A/D write-back bench FAIL"; exit 1)
 
 test-x87-bridge: obj_dir/Vtb_x87_bridge
 	@echo "Running x87 bridge unit test..."
