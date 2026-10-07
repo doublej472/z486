@@ -197,10 +197,17 @@ always_comb begin
     handoff_work = struct_work.need_sib ? capture_sib(struct_work, sib_b)
                                         : struct_work;
 end
-wire [11:0] handoff_entry_point = recipe_effective_entry(
+// A LOCK-prefixed RMW keeps its original routine: the RMW_FAST overlays read
+// the operand from the L1 and write it through the direct store port, while a
+// locked RMW must read memory under LOCK# (lock_insn, the locked-read path).
+// LOCK is #UD on every other overlay's opcode, so no overlay is taken under it.
+wire [11:0] handoff_overlay_entry = recipe_effective_entry(
     handoff_work.entry.entry_point,
     handoff_work.entry.opcode,
     handoff_work.entry.modrm);
+wire [11:0] handoff_entry_point = (handoff_work.entry.rep_lock == PREFIX_LOCK)
+                                ? handoff_work.entry.entry_point
+                                : handoff_overlay_entry;
 decoder_work_t handoff_d2;
 always_comb begin
     handoff_d2 = handoff_work;
