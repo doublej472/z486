@@ -58,6 +58,18 @@ module tb_protected_mode #(
     reg         xdma_snoop_valid = 1'b0;
     bit win0_unmapped = 1'b0;
     initial win0_unmapped = $test$plusargs("win0_unmapped");
+    // +cpu_speed=N drives the throttle selector (0 = full speed).
+    bit [1:0] cpu_speed_sel = 2'd0;
+    initial begin
+        int speed;
+        if ($value$plusargs("cpu_speed=%d", speed))
+            cpu_speed_sel = speed[1:0];
+    end
+    // +signal_delay_scale=N stretches the 0xEC signal delay: a program that
+    // places an interrupt N clocks into an instruction sequence needs N times
+    // the clocks when the throttle makes every instruction N times longer.
+    int signal_delay_scale = 1;
+    initial void'($value$plusargs("signal_delay_scale=%d", signal_delay_scale));
 
     // Instantiate the z486 CPU
     z486 #(
@@ -98,7 +110,7 @@ module tb_protected_mode #(
         .a20_enable(tb_a20),
         .win0_unmapped(win0_unmapped),
         .ram_cache_top(PC98_MAP ? MEM_SIZE : 32'hffff_ffff),
-        .cpu_speed_sel(2'd0),
+        .cpu_speed_sel(cpu_speed_sel),
         .fast_off_req(1'b0),
         .cache_off_req(1'b0),
         .x87_off_req(1'b0),
@@ -1302,9 +1314,10 @@ module tb_protected_mode #(
 
                 // Signal delay (0xEC) - low 16 bits are cycle delay
                 if (port == 16'h00EC) begin
-                    signal_delay_cycles <= dout[15:0];
+                    signal_delay_cycles <= dout[15:0] * signal_delay_scale;
                     if ($test$plusargs("trace_io"))
-                        $display("SIGNAL CFG: cycle delay=%0d", dout[15:0]);
+                        $display("SIGNAL CFG: cycle delay=%0d (x%0d)", dout[15:0],
+                                 signal_delay_scale);
                 end
 
                 // Signal instruction delay (0xF0) - low 16 bits are retired instruction delay
