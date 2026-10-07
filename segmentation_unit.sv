@@ -57,6 +57,10 @@ module segmentation_unit
     output             eff_mask_pending,   // Next (addr_size || is_dtable): 0 => mask offset to 16b
     output     [31:0]  seg_base_exec,      // Pending base excluding issue-only INIT_SEG
     output             eff_mask_exec,      // Pending mask excluding issue-only INIT_SEG
+    // Ungated direct-load limit verdict at an explicit width.
+    input      [1:0]   dir_access_size,    // 0=byte, 1=word, 3=dword
+    output             dir_seg_fault,
+    output             dir_rmw_fault,      // as above plus the write check (RD_FAST)
     output             seg_fault,          // Segment limit/protection fault
     output             is_stack_fault,     // Fault is on SS (→ #SS not #GP)
 
@@ -287,6 +291,11 @@ wire ed_high_fault = seg_big_r ? (&eff_offset[31:2] && ed_top_carry)
                                : ((eff_offset[31:16] != 16'h0) ||
                                   (&eff_offset[15:2] && ed_top_carry));
 wire ed_limit_violated = ed_start_fault | ed_high_fault;
+wire dir_ed_top_carry = (({1'b0, eff_offset[1:0]} + {1'b0, dir_access_size}) > 3'd3);
+wire dir_ed_high_fault = seg_big_r ? (&eff_offset[31:2] && dir_ed_top_carry)
+                                   : ((eff_offset[31:16] != 16'h0) ||
+                                      (&eff_offset[15:2] && dir_ed_top_carry));
+wire dir_ed_limit_violated = ed_start_fault | dir_ed_high_fault;
 
 // Real mode: a boundary-crossing access always faults (even SS -> #SS, e.g.
 // POPAD at SP=0xFFFE); only start-out-of-bounds keeps the 16-bit-stack wrap.
@@ -317,6 +326,21 @@ wire seg_readable = (seg_sel == SEG_ES) ? desc_readable(desc_cache[SEG_ES]) :
                     (seg_sel == SEG_GS) ? desc_readable(desc_cache[SEG_GS]) :
                     1'b1;  // CS/SS: checked at load; TR/IDT/GDT/IO: none
 wire read_fault = pe && !vm && !is_write && !seg_readable && !is_dtable;
+
+// Ungated direct-load verdict: the data-segment limit/protection verdict is a
+// property of the access (segment cache, effective offset, access width), not
+// of what the cache path later does with it. Used by the VIPT/RD_FAST paths,
+// which evaluate it where IND/seg_sel belong to the in-flight token.
+wire dir_size_fault = (diff_res[31:3] == 29'd0) && (diff_res[2:0] < dir_access_size);
+wire dir_rm_limit_fault = !pe && (dir_size_fault ||
+                          (start_out_of_bounds && !(is_stack_fault && !addr_size)));
+wire dir_pm_limit_fault = pe && !is_dtable &&
+                          (seg_ed_r ? dir_ed_limit_violated
+                                    : (start_out_of_bounds | dir_size_fault));
+assign dir_seg_fault = (seg_sel != SEG_IO) && (dir_rm_limit_fault || dir_pm_limit_fault);
+// RD_FAST always writes, so its segment must also be writable.
+assign dir_rmw_fault = dir_seg_fault ||
+    ((seg_sel != SEG_IO) && pe && !seg_writable && !is_dtable);
 
 assign seg_fault = check_en && is_mem_op &&
                    (seg_sel != SEG_IO) &&

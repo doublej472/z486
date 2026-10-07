@@ -424,6 +424,13 @@ wire        dcache_vipt_probe_ready;
 wire        dcache_vipt_probe_accepted;
 wire        dcache_vipt_probe_direct_accepted;
 wire        dcache_vipt_resolve_valid;
+// Direct-load (VIPT) segment verdict, evaluated where IND/seg_sel belong to the
+// in-flight token, and delivered from the slow stage.
+wire [1:0]  dir_access_size;
+wire        dir_seg_fault;
+wire        dir_rmw_fault;
+wire        vipt_slow_seg_trigger;
+wire        vipt_load_slow_ssf_r;
 wire [31:0] dcache_vipt_resolve_phys_addr;
 wire        dcache_vipt_resolve_hit;
 wire [31:0] dcache_vipt_resolve_data;
@@ -1619,6 +1626,9 @@ segmentation_unit seg_unit (
     .offset           (IND),
     .access_size      (gp_access_adj),
     .check_en         (mem_op_eligible),
+    .dir_access_size  (dir_access_size),
+    .dir_seg_fault    (dir_seg_fault),
+    .dir_rmw_fault    (dir_rmw_fault),
     .is_mem_op        (gp_fault_mem_op),
     .is_write         (gp_fault_wr_op),
     .seg_base_pending (seg_base_pending),
@@ -1785,6 +1795,7 @@ assign stall_invlpg = invlpg_active && !invlpg_priv_fault && !invlpg_ack;
 // RD_FAST uses the authoritative segment checker only as a qualifier. A
 // rejection re-enters the original routine, which owns precise fault delivery.
 assign gp_fault_trigger = (seg_gp_fault && !rd_fast_valid_r) ||
+                          vipt_slow_seg_trigger ||
                           invlpg_priv_fault;
 
 // Deferred GPR commits cancel on any_fault_issue only: a divide overflow fires
@@ -1947,6 +1958,9 @@ data_access data_access_inst (
     .vipt_slow_phys_ok_r(vipt_slow_phys_ok_r),
     .vipt_slow_phys_r(vipt_slow_phys_r),
     .vipt_slow_submit(vipt_slow_submit),
+    .dir_access_size(dir_access_size),
+    .vipt_slow_seg_trigger(vipt_slow_seg_trigger),
+    .vipt_load_slow_ssf_r(vipt_load_slow_ssf_r),
     // Address and segmentation units
     .ds_flat(ds_flat),
     .ind_linear(ind_linear),
@@ -1959,6 +1973,9 @@ data_access data_access_inst (
     .pe(pe),
     .vm(vm),
     .seg_gp_fault(seg_gp_fault),
+    .dir_seg_fault(dir_seg_fault),
+    .dir_rmw_fault(dir_rmw_fault),
+    .ss_segment_fault(ss_segment_fault),
     .ss_flat32(ss_flat32),
     .seg_readable(seg_readable),
     // Data unit: load writeback and operands
@@ -2150,7 +2167,8 @@ always_ff @(posedge clk) begin
         ss_fault_r <= 1'b0;
     end else begin
         gp_fault_r <= gp_fault_trigger;
-        ss_fault_r <= ss_segment_fault;
+        ss_fault_r <= vipt_slow_seg_trigger ? vipt_load_slow_ssf_r
+                                            : ss_segment_fault;
     end
 end
 
@@ -2788,6 +2806,9 @@ always_ff @(posedge clk) begin
         TMPeIP <= EIP;
         TMPeSP <= ESP;
     end
+    else if (vipt_slow_seg_trigger)
+        // A page fault wins over the slow token's #GP (seq_fault_redirect).
+        TMPeIP <= vipt_load_slow_r.restart_eip;
 end
 
 //=============================================================================

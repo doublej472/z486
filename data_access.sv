@@ -65,6 +65,9 @@ module data_access
     output logic                    vipt_slow_phys_ok_r,
     output logic [31:0]             vipt_slow_phys_r,
     output logic                    vipt_slow_submit,
+    output logic [1:0]              dir_access_size,
+    output logic                    vipt_slow_seg_trigger,
+    output logic                    vipt_load_slow_ssf_r,
     // Address and segmentation units
     input  logic                    ds_flat,
     input  logic [31:0]             ind_linear,
@@ -77,6 +80,9 @@ module data_access
     input  logic                    pe,
     input  logic                    vm,
     input  logic                    seg_gp_fault,
+    input  logic                    dir_seg_fault,
+    input  logic                    dir_rmw_fault,
+    input  logic                    ss_segment_fault,
     input  logic                    ss_flat32,
     input  logic [5:0]              seg_readable,     // per segment: a read needs no microcode check
     // Data unit: load writeback and operands
@@ -171,6 +177,7 @@ wire [1:0] d2_vipt_mem_size;
 wire [1:0] d2_vipt_write_size;
 hardwired_load_result_t d2_vipt_result_kind;
 reg        vipt_load_slow_req_r;
+reg        vipt_load_slow_segf_r;
 assign     ret_redirect = vipt_load_wb_valid_r && vipt_load_wb_ret_r;
 reg [31:0] vipt_load_wb_data_r;
 reg        vipt_load_overlap_r;        // Plain-load successor owns EX while load completes
@@ -307,10 +314,11 @@ wire vipt_load_ex_contained =
      (vipt_load_ex_r.lane != 2'd3)) ||
     ((vipt_load_ex_r.mem_size == 2'd2) &&
      (vipt_load_ex_r.lane == 2'd0));
+wire vipt_load_ex_segf = vipt_load_ex_r.valid && dir_seg_fault;
 assign vipt_load_ex_hit = vipt_load_ex_r.valid && vipt_load_ex_probed_r &&
                           vipt_load_ex_contained &&
                           vipt_translation_ok &&
-                          !vipt_tlb_is_vga_mem && !seg_gp_fault &&
+                          !vipt_tlb_is_vga_mem && !vipt_load_ex_segf &&
                           dcache_vipt_resolve_hit;
 // Capture the destination operand from every registered EX token,
 // independently of translation, segmentation, and cache outcome. Plain loads
@@ -409,11 +417,12 @@ end
 wire ucrd_translation_ok = !vipt_page_enabled ||
                            (vipt_tlb_hit && ((ucrd_cpl_r != 2'd3) || vipt_tlb_user));
 assign dcache_vipt_resolve_valid = (((vipt_load_ex_r.valid &&
-                                      vipt_load_ex_probed_r) ||
+                                      vipt_load_ex_probed_r &&
+                                      !vipt_load_ex_segf) ||
                                      (rd_fast_valid_r &&
-                                      rd_fast_probed_r)) &&
+                                      rd_fast_probed_r && !dir_rmw_fault)) &&
                                     vipt_translation_ok &&
-                                    !vipt_tlb_is_vga_mem && !seg_gp_fault) ||
+                                    !vipt_tlb_is_vga_mem) ||
                                    (ucrd_valid_r && ucrd_translation_ok &&
                                     !vipt_tlb_is_vga_mem);
 assign ucrd_hit = ucrd_valid_r && ucrd_translation_ok && !vipt_tlb_is_vga_mem &&
@@ -433,6 +442,8 @@ always_ff @(posedge clk) begin
         vipt_load_replay_r <= '0;
         vipt_load_slow_r <= '0;
         vipt_load_slow_req_r <= 1'b0;
+        vipt_load_slow_segf_r <= 1'b0;
+        vipt_load_slow_ssf_r <= 1'b0;
         vipt_load_slow_wait_r <= 1'b0;
         vipt_slow_phys_ok_r <= 1'b0;
         vipt_slow_phys_r <= 32'd0;
@@ -479,7 +490,7 @@ always_ff @(posedge clk) begin
         if (vipt_load_ex_r.valid) begin
             vipt_slow_phys_ok_r <= vipt_load_ex_probed_r && vipt_load_ex_contained &&
                                    vipt_translation_ok && !vipt_tlb_is_vga_mem &&
-                                   !seg_gp_fault;
+                                   !vipt_load_ex_segf;
             vipt_slow_phys_r <= vipt_resolve_phys;
         end
 
@@ -519,6 +530,10 @@ always_ff @(posedge clk) begin
                 vipt_load_wb_alu_op_r <= vipt_load_ex_r.alu_op;
             end else if (!any_fault) begin
                 vipt_load_slow_req_r <= 1'b1;
+                // The EX stage is the only cycle IND/seg_sel belong to a direct
+                // token, so record its limit verdict and deliver it from here.
+                vipt_load_slow_segf_r <= vipt_load_ex_segf;
+                vipt_load_slow_ssf_r <= ss_segment_fault;
             end
         end
 
@@ -625,7 +640,7 @@ wire rd_fast_page_write_ok = !vipt_page_enabled ||
      (vipt_tlb_writable || ((pg_cpl != 2'd3) && !CR0[16])));
 wire rd_fast_hit = rd_fast_valid_r && rd_fast_probed_r &&
                    rd_fast_contained && rd_fast_page_write_ok &&
-                   !vipt_tlb_is_vga_mem && !seg_gp_fault &&
+                   !vipt_tlb_is_vga_mem && !dir_rmw_fault &&
                    dcache_vipt_resolve_hit;
 assign rd_fast_finish = rd_fast_valid_r && i_first && uc_exec;
 // A microcode read hit writes OPR_R as paging does for a single access: the
@@ -696,7 +711,16 @@ end
 // A pending microcode-read miss is always older than a pending direct-load
 // miss (a microcode read does not start behind one), so it enters paging
 // first: their OPR_R results must arrive in program order.
-assign      vipt_slow_submit = vipt_load_slow_req_r && !mem_servicing && !ucrd_slow_req_r;
+assign      vipt_slow_submit = vipt_load_slow_req_r && !mem_servicing &&
+                               !ucrd_slow_req_r && !vipt_load_slow_segf_r;
+// The slow token is the oldest: deliver its recorded verdict without a bus op.
+assign      vipt_slow_seg_trigger = vipt_load_slow_req_r && !mem_servicing &&
+                                    !ucrd_slow_req_r && vipt_load_slow_segf_r;
+// The direct token's access width for the ungated segment verdict.
+assign dir_access_size = rd_fast_valid_r
+    ? (rd_fast_size_r == 2'd0 ? 2'd0 : rd_fast_size_r == 2'd1 ? 2'd1 : 2'd3)
+    : (vipt_load_ex_r.mem_size == 2'd0 ? 2'd0 :
+       vipt_load_ex_r.mem_size == 2'd1 ? 2'd1 : 2'd3);
 // A fallback token owns stable registered address metadata as soon as it is
 // pending.  Present that address to the live TLB while an older request drains;
 // submission remains idle-gated above.  This keeps mem_servicing out of the
