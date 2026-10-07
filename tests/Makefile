@@ -123,6 +123,8 @@ TB_CACHE_FLUSH_SRCS := tb_cache_flush.sv
 TB_ADDR_UNIT_RELOC_SRCS := tb_addr_unit_reloc_equiv.sv
 TB_RESET_SWEEP_SRCS := tb_reset_sweep.sv
 CPP_RESET_SWEEP_SRCS := sim_main_reset_sweep.cpp
+TB_PC98_MAP_SRCS := tb_pc98_map.sv
+CPP_PC98_MAP_SRCS := sim_main_pc98_map.cpp
 TB_X87_BRIDGE_SRCS := tb_x87_bridge.sv
 CPP_X87_BRIDGE_SRCS := sim_main_x87_bridge.cpp
 TB_X87_SEQ_SRCS := tb_x87_sequencer.sv
@@ -145,7 +147,7 @@ PLA4_RTL := $(Z486_DIR)/protection.sv
 .PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-cache-coherence test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists check-pragmas check-rom-columns check-shift-ucode test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 .PHONY: test-release test-pc98-map test-protected-narrow check-generators test-data-access check-runner test-l1-tags-wide test-reset-restart test-fuzz
-.PHONY: test-addr-unit-reloc test-reset-sweep
+.PHONY: test-addr-unit-reloc test-reset-sweep test-pc98-map-bus
 
 all: build
 
@@ -155,7 +157,7 @@ all: build
 test-release:
 	$(MAKE) -j1 check-reset-lists check-pragmas check-rom-columns check-shift-ucode check-generators check-runner
 	$(MAKE) -j1 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-merge test-gpr-hazard test-data-access test-memmap-template test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-cache-coherence test-reset-restart
-	$(MAKE) -j1 test-addr-unit-reloc test-reset-sweep
+	$(MAKE) -j1 test-addr-unit-reloc test-reset-sweep test-pc98-map-bus
 	$(MAKE) -j1 test-protected test-protected-narrow test-simple test-pc98-map test-l1-tags-wide test-fuzz
 	$(MAKE) -j1 obj_dir_x87/Vtb_protected_mode
 	Z486_ENABLE_X87=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_x87/Vtb_protected_mode ./test_protected_mode.py --strict
@@ -369,6 +371,25 @@ test-reset-sweep: obj_dir_reset_sweep/Vtb_reset_sweep
 		obj_dir_reset_sweep/z486_reset_sweep.out
 	@grep -q "TB_RESET_SWEEP: PASS" obj_dir_reset_sweep/z486_reset_sweep.out \
 		|| (echo "reset-at-cycle sweep FAIL"; exit 1)
+
+# Full-core PC-98 map at the external port: each window's line-fill vs
+# single-beat shape, DIRECT-write I$ invalidation (launch pulse, snoop
+# collision slot) and DIRECT SMC, with immediate and delayed write acceptance.
+obj_dir/Vtb_pc98_map: $(RTL_SRCS) $(RTL_DEPS) $(Z486_DIR)/z486_pc98_preset.svh $(TB_PC98_MAP_SRCS) $(CPP_PC98_MAP_SRCS)
+	@echo "Building full-core PC-98 memory-map port bench with Verilator..."
+	cp -f ../*.hex .
+	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_pc98_map \
+		$(TB_PC98_MAP_SRCS) $(RTL_SRCS) $(CPP_PC98_MAP_SRCS)
+	@echo "Build complete: obj_dir/Vtb_pc98_map"
+
+test-pc98-map-bus: obj_dir/Vtb_pc98_map
+	@echo "Running PC-98 map port bench (immediate, then five-cycle-delayed write accept)..."
+	@./obj_dir/Vtb_pc98_map > obj_dir/z486_pc98_map.out 2>&1 \
+		&& grep -q "PC98 MAP TEST PASS" obj_dir/z486_pc98_map.out \
+		|| (tail -n 30 obj_dir/z486_pc98_map.out; exit 1)
+	@./obj_dir/Vtb_pc98_map +write_wait=5 > obj_dir/z486_pc98_map_wait.out 2>&1 \
+		&& grep -q "PC98 MAP TEST PASS" obj_dir/z486_pc98_map_wait.out \
+		|| (tail -n 30 obj_dir/z486_pc98_map_wait.out; exit 1)
 
 obj_dir/Vtb_x87_bridge: $(X87_DIR)/x87_bridge.sv $(TB_X87_BRIDGE_SRCS) $(CPP_X87_BRIDGE_SRCS)
 	@echo "Building x87 bridge unit test with Verilator..."
@@ -660,6 +681,7 @@ help:
 	@echo "  make test-gpr-hazard - Gate the GPR hazard survey"
 	@echo "  make test-release  - Run all self-contained release gates"
 	@echo "  make test-pc98-map - Execute/modify code in PC-98 DIRECT/NO_ALLOC windows"
+	@echo "  make test-pc98-map-bus - Check each PC-98 window's external-port access shape"
 	@echo "  make test-addr-unit-reloc - address_unit relocation vs independent arithmetic"
 	@echo "  make test-reset-sweep - One-cycle reset at every offset through a program"
 	@echo "  make check-reset-lists - Audit always_ff reset branches"
