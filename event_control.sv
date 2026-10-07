@@ -61,6 +61,7 @@ module event_control
     // Segmentation and protection test unit
     input  seg_desc_t desc_cache [0:7],
     input  logic [31:0] desc_raw_hi,
+    input  logic [15:0] opr_r_low,
     input  logic tss_access_flag,
 
     // Fault requests (segmentation, paging, datapath)
@@ -186,6 +187,19 @@ wire loopne_condition = instr_is_loop ? (countr_will_be_nonzero && zf_check)
                                       : (!countr_will_be_nonzero || zf_check);
 
 
+// A task switch needs a TSS limit of at least 67h (2Bh for a 286 TSS).  The
+// task-switch microcode tests this with JTSSLIM while OPR_R still holds the
+// new TSS descriptor's low dword and desc_raw_hi its high dword; register the
+// compare so it stays off the micro-branch path.
+reg tss_limit_short_r;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        tss_limit_short_r <= 1'b0;
+    else
+        tss_limit_short_r <= !desc_raw_hi[23] && (desc_raw_hi[19:16] == 4'h0) &&
+                             (opr_r_low < (desc_raw_hi[11] ? 16'h0067 : 16'h002B));
+end
+
 always_comb begin
     seq_conditions = '0;
     seq_conditions.jncond = !condition_true(i.branch_condition, eflags_fwd);
@@ -217,6 +231,7 @@ always_comb begin
     seq_conditions.x87_error = x87_on ? !x87_error_n : 1'b0;
     seq_conditions.task_16bit = !desc_cache[6].seg_type[3];
     seq_conditions.desc_accessed = desc_raw_hi[8];
+    seq_conditions.tss_limit_short = tss_limit_short_r;
 end
 
 always_ff @(posedge clk) begin

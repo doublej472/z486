@@ -210,6 +210,7 @@ typedef struct packed {
     logic x87_error;
     logic task_16bit;
     logic desc_accessed;
+    logic tss_limit_short;
 } seq_condition_t;
 
 // Mutually-exclusive architectural behavior applied at an instruction
@@ -677,6 +678,7 @@ localparam ALUJMP_IDIV1 = 7'h19;     // IDIV: correct remainder sign
 localparam ALUJMP_IDIV2 = 7'h1a;     // IDIV: correct quotient sign
 localparam ALUJMP_DIV7 = 7'h1f;      // Division main loop (non-restoring algorithm)
 localparam ALUJMP_JDESCA = 7'h20;    // Optimized ustep: jump if descriptor A bit is set
+localparam ALUJMP_JTSSLIM = 7'h4A;   // Optimized ustep: jump if the new TSS limit is below 67h (2Bh for a 286 TSS)
 localparam ALUJMP_USTEP_AAD_SHIFT = 7'h21; // AAD shift step: barrel result plus CF clear
 localparam ALUJMP_USTEP_FAULT_DONE = 7'h22; // Fault/interrupt delivery completion marker
 localparam ALUJMP_DIV5 = 7'h1d;      // Division final correction

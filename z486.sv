@@ -2828,6 +2828,7 @@ event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
     // Segmentation and protection test unit
     .desc_cache(desc_cache),
     .desc_raw_hi(desc_raw_hi),
+    .opr_r_low(OPR_R[15:0]),
     .tss_access_flag(tss_access_flag),
     // Fault requests (segmentation, paging, datapath)
     .any_fault(any_fault),
