@@ -104,6 +104,67 @@ The Zet98 stale-`OPR_R` gate for a younger direct load is now carried
 `tb_protected_mode`'s whole-line fill model as the bench; `docs/hazard-survey.md`
 records it as A8/B7.
 
+## PC-9821 core local additions (folded 2026-10-07)
+
+The PC-9821 core vendored the fork's pre-rebase tree (8541467) and still
+carried 30 test/doc files that the 4bfdde0 rebase did not bring across, plus a
+`.gitignore` block.  Each was run against this series and either carried as a
+`tests:` commit or dropped:
+
+- **Carried:** `smc_basic`, `smc_same_line`, `smc_store_patch_stress`,
+  `ras_same_line_retf` (protected-runner programs), `tb_addr_unit_reloc_equiv`
+  (`test-addr-unit-reloc`), `tb_reset_sweep` (`test-reset-sweep`),
+  `tb_pc98_map` (`test-pc98-map-bus`), and the `+cpu_speed=N` hook in
+  `tb_protected_mode`.
+- **`int_vec_telemetry`:** its check is `+expect_vec_fetch` on the
+  `dbg_vec_fetch` telemetry this tree does not have; without it the program
+  is a plain real-mode INT/IRET, which other programs already cover.
+- **`tb_cpu_throttle`, `test-throttled.sh`, `test-throttle-liveness.sh`:**
+  written for the fork's old 4-bit OSD-list throttle (`release_request`,
+  `+signal_delay_active`, `+speed_wander`).  The liveness program
+  (`vipt_load_interlocks` throttled) passes here, but it also passes with
+  `throttle_atomic_chain` removed, so it guards nothing on this tree.
+- **`tb_mem_resp`:** fails; see the open defects below.
+- **`tb_perf_kernels` + `tests/perf/`:** a performance harness probing the
+  pre-split `memory.sv` internals and `stall_d2`; a port is a rewrite, and
+  Dhrystone is the cycle regression signal.
+- **`tb_paging_tlb`:** written against the pre-041d0e1 `paging_tlb` (its
+  `live_*` lookup port) and the old sidecar semantics; `tb_paging_tlb_lru`
+  covers the PLRU and subset rules.  Its other property - a reset/CR3/INVLPG
+  edge drops a same-edge insert whole (`tlb_write`'s `!invalidate_all &&
+  !invalidate_page` term) - now has no dedicated bench.
+- **`sim_main_cache_flush.cpp`:** the wrapper of the old memory-level
+  `tb_cache_flush`; this tree's bench builds with `--binary`.
+- **`FOLLOWUP.md`, `docs/pc98-timing-followup.md`:** an unmeasured area wish
+  list for the old area campaign, and lab notes on old commits with
+  out-of-tree evidence and stale numbers.  The DIRECT-write launch timing they
+  describe is in `memmap-template.md`.
+- **`.gitignore` LOCAL ADD:** it ignores `tests/programs/*.asm`/`*.json`,
+  which this tree tracks, for the core's install-over workflow; it stays the
+  core's own local patch.
+
+### Open defects found while folding (RTL unchanged)
+
+- **A line fill cannot take its first response in the accept cycle.**
+  `bus_unit` loads the fill's pending-beat counter on the accept edge and
+  counts `resp_valid`/`line_resp_valid` only while it is non-zero, so a beat
+  (or whole line) presented with `ready` is lost and the fill never
+  completes; a DIRECT read does accept it (`!resp_valid` on its pending
+  set).  The core's `tb_mem_resp` (adapted to the current ports) passes its
+  one-cycle-later responder and fails all eight same-cycle fill cases.  The
+  PC-9821 platform avoids it by responding a cycle after accept; the bus
+  contract is undocumented either way.
+- **The protected suite fails throttled** (`+cpu_speed=1/2/3`; it passes at
+  0): `debug_bp`, `debug_bp2`, `debug_ibp`, `debug_task_ibp` stop on the sim
+  fuse "throttle parked without a resident D2 successor"
+  (`event_control.sv`); `spec_fetch_cpl_leak` reports FAIL at every setting
+  (also on upstream 4bfdde0 at setting 3), i.e. the ring-3 jump ran the
+  CPL-0-buffered line; `smc_spec_buffer` fails case 4 (the store through a
+  linear alias) at 1 and 3; `vipt_rmw_interval` never finishes (TIMEOUT at 20x
+  its budget).  `rep_stos_intr`, `rep_scas_intr_high_eip`, `vipt_alu_intr` and
+  `io_store_out_in` also fail at some settings, but their stimulus counts
+  clock cycles, so those may be harness premises rather than CPU state.
+
 ## Rebase procedure
 
 ```
