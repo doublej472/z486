@@ -29,6 +29,8 @@ module tb_memory_order;
     wire        io;
     reg         resp_valid = 1'b0;
     wire        inta;
+    reg [31:0] snoop_addr = 0;
+    reg snoop_valid = 0;
 
     memory #(
         .DCACHE_SET_BITS(3),
@@ -94,8 +96,8 @@ module tb_memory_order;
         .icache_req_complete(),
         .icache_rdata(),
 
-        .snoop_addr(32'h0),
-        .snoop_valid(1'b0),
+        .snoop_addr(snoop_addr),
+        .snoop_valid(snoop_valid),
 
         .addr(addr),
         .be(be),
@@ -241,6 +243,57 @@ module tb_memory_order;
                      io, write, {addr, 2'b00}, burstcount);
             $fatal(1);
         end
+
+        // A cached store's I-cache patch must survive an unrelated external
+        // invalidate owning the single-address port on its delivery edge.
+        dcache_req_valid = 0;
+        reset_n = 0;
+        repeat (5) @(negedge clk);
+        reset_n = 1;
+        repeat (20) @(negedge clk);
+        dcache_req_phys_addr_raw = 32'h1000;
+        dcache_req_wdata = 32'hCAFE_BABE;
+        dcache_req_write = 1;
+        dcache_req_valid = 1;
+        do @(negedge clk); while (!dcache_req_accepted);
+        dcache_req_valid = 0;
+        if (!dut.cache_unit_inst.dcache_store_patch_valid)
+            $fatal(1, "patch collision setup did not accept a cached store");
+        snoop_addr = 32'h2000;
+        snoop_valid = 1;
+        #1;
+        if (dut.cache_unit_inst.icache_write_patch_valid)
+            $fatal(1, "patch stole the external invalidate port");
+        @(negedge clk);
+        // Keep the patch stranded while a DIRECT-window write queues its
+        // own invalidate behind this external snoop. The MERGED invalidate
+        // port, not just snoop_valid, must keep owning the port on release.
+        dcache_req_phys_addr_raw = 32'hB8000;
+        dcache_req_wdata = 32'h1234_5678;
+        dcache_req_is_vga_mem = 1;
+        dcache_req_valid = 1;
+        ready = 1;
+        do @(negedge clk); while (!dut.bus_unit_inst.icache_direct_inval);
+        @(negedge clk);
+        dcache_req_valid = 0;
+        dcache_req_is_vga_mem = 0;
+        ready = 0;
+        snoop_valid = 0;
+        #1;
+        if (!dut.icache_invalidate_valid ||
+            dut.cache_unit_inst.icache_write_patch_valid)
+            $fatal(1, "patch stole the queued DIRECT invalidate port");
+        @(negedge clk);
+        #1;
+        if (!dut.cache_unit_inst.icache_write_snoop_pending ||
+            !dut.cache_unit_inst.icache_write_patch_valid ||
+            dut.cache_unit_inst.icache_write_patch_addr != 32'h1000 ||
+            dut.cache_unit_inst.icache_write_patch_data != 32'hCAFE_BABE ||
+            dut.cache_unit_inst.icache_write_patch_be != 4'hF)
+            $fatal(1, "colliding patch was lost or corrupted");
+        @(negedge clk);
+        if (dut.cache_unit_inst.icache_write_snoop_pending)
+            $fatal(1, "consumed patch remained pending");
 
         $display("Memory device-ordering unit test PASS");
         $finish;
