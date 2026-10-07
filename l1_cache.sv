@@ -29,6 +29,9 @@ module l1_cache #(
     input         cpu_uncacheable,
     // CR0.NW=1: a write that hits updates only the L1 (no write-through).
     input         cache_nw,
+    // Locked read: never answered by a valid line; one bus read behind every
+    // older store (a 486 locked read cycle).
+    input         cpu_force_bus,
     output        cpu_ready,      // a read may be presented (registered)
     output        cpu_wr_ready,   // a write may be presented (registered)
     output        cpu_resp_valid,
@@ -130,7 +133,9 @@ wire [SET_BITS-1:0] vipt_probe_set = vipt_probe_offset[SET_MSB:SET_LSB];
 wire [WORD_OFFSET_BITS-1:0] vipt_probe_word =
     vipt_probe_offset[LINE_OFFSET_BITS-1:BYTE_OFFSET_BITS];
 wire [SET_BITS-1:0] snoop_set = snoop_addr[SET_MSB:SET_LSB];
-wire request_uncacheable = !cache_enable || cpu_uncacheable;
+// A locked read takes the uncacheable miss path; its preread masks every way
+// (rd_invalidated_r) so the lookup never hits, at no cost to the hit cone.
+wire request_uncacheable = !cache_enable || cpu_uncacheable || cpu_force_bus;
 `ifdef VERILATOR
 // Simulation harness switch: a loaded snapshot whose BIOS keeps state in its
 // shadow (SeaBIOS runs interrupt handlers on a stack at 0xE0000-0xEFFFF)
@@ -666,7 +671,8 @@ always_ff @(posedge clk) begin
         rd_plru_r <= plru_set[preread_set];
         // The clear is set-wide, so a read launched on the same edge returns
         // valid entries for every way of that set.  Mask them next cycle.
-        rd_invalidated_r <= (tag_clear_all && (tag_clear_set == preread_set))
+        rd_invalidated_r <= ((tag_clear_all && (tag_clear_set == preread_set)) ||
+                             (idle_preread && !vipt_probe_fire && cpu_force_bus))
                             ? 4'b1111 : 4'b0000;
     end
 

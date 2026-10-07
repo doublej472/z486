@@ -49,6 +49,7 @@ module tb_protected_mode #(
     reg         nmi = 0;
     wire        inta;
     wire        triple_fault_reset;
+    wire        bus_lock;
     bit win0_unmapped = 1'b0;
     initial win0_unmapped = $test$plusargs("win0_unmapped");
 
@@ -101,7 +102,8 @@ module tb_protected_mode #(
         .dbg_pe(),
         .dbg_vm(),
         .dbg_x87_state(),
-        .triple_fault_reset(triple_fault_reset)
+        .triple_fault_reset(triple_fault_reset),
+        .lock(bus_lock)
     );
 
 `include "m0_profile.svh"
@@ -113,6 +115,17 @@ module tb_protected_mode #(
     // PC-98 test green, and a NO_ALLOC fetch must never install a line.
     longint direct_code_writes = 0;
     longint no_alloc_code_fills = 0;
+    // LOCK#: memory cycles accepted while it is asserted.
+    longint locked_reads = 0;
+    longint locked_writes = 0;
+    longint locked_inta = 0;
+    longint unlocked_inta = 0;
+    always @(posedge clk) begin
+        if (reset_n && bus_lock && valid && ready && !io) begin
+            if (write) locked_writes <= locked_writes + 1;
+            else       locked_reads <= locked_reads + 1;
+        end
+    end
     initial begin
         if ($test$plusargs("expect_pc98_map") && !PC98_MAP)
             $fatal(1, "PC-98 map test requires -GPC98_MAP=1");
@@ -902,7 +915,9 @@ module tb_protected_mode #(
             end
 
             if (inta) begin
-                // INTA bus cycle handling
+                // INTA bus cycle handling.  Both cycles of the pair are locked.
+                if (bus_lock) locked_inta <= locked_inta + 1;
+                else          unlocked_inta <= unlocked_inta + 1;
                 ready <= 1'b0;
                 inta_resp_pending <= 1'b1;
                 if (!inta_first) begin
@@ -991,7 +1006,12 @@ module tb_protected_mode #(
                             ($test$plusargs("expect_direct_code") &&
                              (direct_code_writes == 0)) ||
                             ($test$plusargs("expect_no_alloc_code") &&
-                             (no_alloc_code_fills < 2))) begin
+                             (no_alloc_code_fills < 2)) ||
+                            ($test$plusargs("expect_lock") &&
+                             ((locked_reads == 0) || (locked_writes == 0) ||
+                              bus_lock)) ||
+                            ($test$plusargs("expect_inta_lock") &&
+                             ((locked_inta < 2) || (unlocked_inta != 0)))) begin
                             test_status <= 8'hFF;
                             $display("");
                             $display("========================================");
@@ -1003,6 +1023,12 @@ module tb_protected_mode #(
                                 $display("  No platform level overlapped an INVD/WBINVD");
                             else if ($test$plusargs("expect_platform_flush"))
                                 $display("  Platform flush/DMA poke was not exercised");
+                            else if ($test$plusargs("expect_inta_lock"))
+                                $display("  INTA cycles locked/unlocked %0d/%0d",
+                                         locked_inta, unlocked_inta);
+                            else if ($test$plusargs("expect_lock"))
+                                $display("  LOCK# reads/writes %0d/%0d, still asserted %0b",
+                                         locked_reads, locked_writes, bus_lock);
                             else if ($test$plusargs("expect_stale_walk") &&
                                 (stale_walk_events == 0))
                                 $display("  no prefetch walk spanned a CR3 write");
@@ -1034,6 +1060,9 @@ module tb_protected_mode #(
                             $display("  TEST PASSED!");
                             $display("  Total cycles: %0d", cycle);
                             $display("  Total instructions: %0d", instruction_count);
+                            if ($test$plusargs("expect_lock"))
+                                $display("  LOCK# reads/writes: %0d/%0d",
+                                         locked_reads, locked_writes);
                             if ($test$plusargs("expect_vipt_ea_interlock"))
                                 $display("  VIPT EA interlock cycles: %0d",
                                          vipt_ea_interlock_cycles);

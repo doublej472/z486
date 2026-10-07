@@ -82,10 +82,14 @@ module memory
     input              dcache_req_is_x87,
     input              dcache_req_is_vga_mem,
     input              dcache_req_is_pcd,    // page-level cache disable: a read miss does not allocate
+    input              dcache_req_is_locked, // locked read: memory, never the L1
+    output             dcache_stores_drained_out, // no posted store remains in the CPU
     // CR0.CD: no line allocates.  CR0.NW: write hits stay in the L1 and
     // external invalidations are ignored (486 cache operating modes).
     input              cache_cd,
     input              cache_nw,
+    // LOCK# is asserted: the locked write goes to the bus even under NW=1.
+    input              bus_locked,
     output             dcache_req_accepted, // Request ownership transferred
     output             dcache_req_complete, // Read or write operation completed
     output             dcache_read_complete, // Read data is valid this cycle
@@ -159,6 +163,12 @@ module memory
 // CR0.NW=1 disables external invalidation cycles (486 cache operating modes);
 // the CPU's own DIRECT-write invalidation of the split I-cache is internal.
 wire snoop_valid_eff = snoop_valid && !cache_nw;
+// A locked RMW reads memory, never the L1 (dcache_req_is_locked), so its write
+// must reach memory too: a write hit kept cache-only under NW=1 would be
+// invisible to the next locked read, and a locked sequence on the 486 bus is
+// a locked read cycle followed by a locked write cycle.  While LOCK# is
+// asserted the L1 therefore writes through (a hit still updates the line).
+wire l1_cache_nw = cache_nw && !bus_locked;
 
 wire [31:0] dcache_cpu_dout;
 wire dcache_cpu_ready;
@@ -179,6 +189,7 @@ wire dcache_req_is_uncached;
 wire dcache_req_is_direct;
 wire [31:0] dcache_req_phys_addr;
 wire dcache_stores_drained;
+assign dcache_stores_drained_out = dcache_stores_drained;
 wire [31:0] icache_mem_addr;
 wire [3:0] icache_mem_be;
 wire [7:0] icache_mem_burstcount;
@@ -248,8 +259,9 @@ cache_unit #(
     .dcache_req_is_inta(dcache_req_is_inta),
     .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
     .dcache_req_is_pcd(dcache_req_is_pcd),
+    .dcache_req_is_locked(dcache_req_is_locked),
     .cache_cd(cache_cd),
-    .cache_nw(cache_nw),
+    .cache_nw(l1_cache_nw),
     // Execution core: WR_FAST store and VIPT load/RMW preread
     .fast_store_valid(fast_store_valid),
     .fast_store_phys_addr_raw(fast_store_phys_addr_raw),

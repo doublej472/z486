@@ -19,6 +19,7 @@ module tb_l1_cache;
     reg         flush_req = 0;
     reg         tb_cache_nw = 1'b0;   // CR0.NW for the NW write-hit cases
     reg         tb_uncacheable = 1'b0; // PCD page / CR0.CD read
+    reg         tb_force_bus = 1'b0;   // locked read
     wire        flush_done;
     wire        cpu_resp_valid;
     wire        stores_drained;
@@ -73,6 +74,7 @@ module tb_l1_cache;
         .cpu_valid(cpu_valid),
         .cpu_write(cpu_write),
         .cpu_uncacheable((cpu_addr[31:17] == 15'h5) || tb_uncacheable),
+        .cpu_force_bus(tb_force_bus),
         .cache_nw(tb_cache_nw),
         .cpu_ready(cpu_ready),
         .cpu_wr_ready(cpu_wr_ready),
@@ -365,6 +367,21 @@ module tb_l1_cache;
         cache_read(32'h200, 4'hF, 32'h4444_0200);
         if (mem_request_count != req_before)
             $fatal(1, "D-cache NW write hit did not update the line");
+        // A locked read never takes the valid line: one read behind the
+        // stores, with the line left valid.
+        mem_put32(32'h200, 32'h6666_0200);
+        tb_force_bus = 1'b1;
+        do @(negedge clk); while (!cpu_ready);
+        req_before = mem_request_count;
+        cache_read(32'h200, 4'hF, 32'h6666_0200);
+        if (mem_request_count != req_before + 1)
+            $fatal(1, "D-cache locked read was answered by the line");
+        tb_force_bus = 1'b0;
+        do @(negedge clk); while (!cpu_ready);
+        req_before = mem_request_count;
+        cache_read(32'h200, 4'hF, 32'h4444_0200);         // line still valid
+        if (mem_request_count != req_before)
+            $fatal(1, "D-cache locked read disturbed the line");
         $display("D-cache CD/PCD/NW operating modes PASS");
     end
     endtask

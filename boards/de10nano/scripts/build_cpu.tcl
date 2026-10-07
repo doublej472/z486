@@ -92,7 +92,7 @@ foreach port {
     dbg_pe dbg_vm dbg_x87_state[*] triple_fault_reset
     dbg_gate_read dbg_gate_addr[*] dbg_pf_code[*] dbg_pf_addr[*] dbg_eflags[*]
     dbg_page_fault dbg_walk_pde[*] dbg_walk_pte[*] dbg_cr3[*] dbg_SP[*]
-    dbg_issue dbg_issue_eip[*]
+    dbg_issue dbg_issue_eip[*] lock
     dbg*
 } {
     set_instance_assignment -name VIRTUAL_PIN ON -to $port
