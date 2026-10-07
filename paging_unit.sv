@@ -61,6 +61,7 @@ module paging_unit
     input               mem_rd_ind,        // BUSOP_RD_IND flag
     input               is_write_access,   // Is this a write (for permission check)
     input               mem_check_only,    // CW: check write permission only, no actual bus write
+    input               mem_locked,        // locked read: served from memory, never the L1
     input               pretrans_valid,    // this read is already translated (cache-only miss)
     input        [31:0] pretrans_phys,     //   at this physical address
     input        [1:0]  cpl,               // Current privilege level
@@ -118,6 +119,7 @@ module paging_unit
     output logic        dcache_req_is_x87,    // Registered reserved x87 pseudo-I/O request
     output logic        dcache_req_is_vga_mem,// Physical VGA aperture
     output logic        dcache_req_is_pcd,    // Page-level cache disable (PCD) for this access
+    output logic        dcache_req_is_locked, // Locked read (LOCK#): bypass the L1
 
     input               dcache_req_accepted,  // Demand-side request accepted this cycle
     input               dcache_req_complete,  // Demand-side request complete
@@ -317,6 +319,8 @@ reg        icache_req_valid_r;
 reg [31:0] icache_req_phys_addr_r;
 // PCD of a retained request.  Paging disabled means PCD=0.
 reg        dcache_req_pcd_r;
+reg        dcache_req_locked_r;
+reg        req_locked;
 reg        icache_req_pcd_r;
 
 // Walker bus read/write tracking: prevents re-emission while op is in flight
@@ -566,6 +570,9 @@ assign icache_req_phys_addr = icache_req_valid_r ? icache_req_phys_addr_r : fast
 // early and pretranslated demand paths never carry a PCD page (pretranslated
 // reads come from the sidecar, which rejects PCD pages; early writes do not
 // allocate), and a write's PCD is irrelevant to this write-through L1.
+assign dcache_req_is_locked = early_present ? 1'b0 :
+                              req_mem_present ? req_locked :
+                              dcache_req_locked_r;
 assign dcache_req_is_pcd = early_present ? 1'b0 :
                            req_mem_present ? (pg_enable && tlb_is_pcd) :
                            dcache_req_pcd_r;
@@ -729,6 +736,8 @@ always_ff @(posedge clk or negedge reset_n) begin
         icache_req_valid_r <= 1'b0;
         icache_req_phys_addr_r <= 32'h0;
         dcache_req_pcd_r <= 1'b0;
+        dcache_req_locked_r <= 1'b0;
+        req_locked <= 1'b0;
         icache_req_pcd_r <= 1'b0;
         page_fault <= 1'b0;
         pf_fault <= 1'b0;
@@ -854,6 +863,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                             // IO/INTA fast path data (cannot segment-fault)
                             dcache_req_phys_addr_r <= idle_request_linear;
                             dcache_req_pcd_r <= 1'b0;
+                            dcache_req_locked_r <= 1'b0;
                             dcache_req_write_r <= mem_write;
                             dcache_req_be_r <= mem_be;
                             dcache_io_wdata_r <= shift_write_data(mem_wdata, mem_op_size, idle_request_linear[1:0]);
@@ -872,6 +882,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                             // First half data
                             dcache_req_phys_addr_r <= linear_addr;
                             dcache_req_pcd_r <= 1'b0;
+                            dcache_req_locked_r <= 1'b0;
                             dcache_req_write_r <= mem_write;
                             dcache_req_be_r <= calc_be_first(mem_op_size, linear_addr[1:0]);
                             dcache_req_wdata_r <= split_write_first(mem_wdata, linear_addr[1:0], mem_op_size);
@@ -1162,6 +1173,7 @@ task automatic latch_mem_request(input [31:0] addr, input crossing);
     req_offset <= addr[1:0];
     req_crossing <= crossing;
     req_check_only <= mem_check_only;
+    req_locked <= mem_locked && !mem_write;
     req_linear2 <= {addr[31:2] + 30'd1, 2'b00};
     req_is_io <= 1'b0;
 endtask
@@ -1220,6 +1232,7 @@ task automatic emit_walker_biu_req();
     dcache_req_valid_r <= 1'b1;
     dcache_req_phys_addr_r <= walker_mem_addr;
     dcache_req_pcd_r <= walker_mem_pcd;
+    dcache_req_locked_r <= 1'b0;
     dcache_req_write_r <= walker_mem_wr;
     dcache_req_be_r <= 4'b1111;
     dcache_req_wdata_r <= walker_mem_wdata;
@@ -1236,6 +1249,7 @@ task automatic emit_single(input [31:0] phys_addr, input pcd);
     dcache_req_valid_r <= 1'b1;
     dcache_req_phys_addr_r <= phys_addr;
     dcache_req_pcd_r <= pcd;
+    dcache_req_locked_r <= req_locked;
     dcache_req_write_r <= req_is_write;
     // req_offset == phys_addr[1:0] (paging preserves bits [11:0])
     dcache_req_be_r <= calc_be(req_op_size, req_offset);
@@ -1257,6 +1271,7 @@ task automatic emit_first_half(input [31:0] phys_addr, input pcd);
     dcache_req_valid_r <= 1'b1;
     dcache_req_phys_addr_r <= phys_addr;
     dcache_req_pcd_r <= pcd;
+    dcache_req_locked_r <= req_locked;
     dcache_req_write_r <= req_is_write;
     dcache_req_be_r <= calc_be_first(req_op_size, req_offset);
     dcache_req_wdata_r <= split_write_first(req_wdata, req_offset, req_op_size);
@@ -1278,6 +1293,7 @@ task automatic emit_second_half(input [31:0] phys_addr, input pcd);
     dcache_req_valid_r <= 1'b1;
     dcache_req_phys_addr_r <= phys_addr;
     dcache_req_pcd_r <= pcd;
+    dcache_req_locked_r <= req_locked;
     dcache_req_write_r <= req_is_write;
     dcache_req_be_r <= calc_be_second(req_op_size, req_offset);
     dcache_req_wdata_r <= split_write_second(req_wdata, req_offset, req_op_size);
