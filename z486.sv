@@ -347,7 +347,10 @@ assign dbg_EIP = EIP;
 assign dbg_CS_base = CS_base;
 assign dbg_pe  = pe;
 assign dbg_vm  = vm;
-wire [1:0] cpl = vm ? 2'd3 : !pe ? 2'd0 : CS[1:0];
+// A CR0.PE transition starts at CPL 0 without rewriting the visible CS, so an
+// unreal-mode caller can keep a real-mode selector with non-zero low bits.
+reg        pe_entry_cpl_zero;
+wire [1:0] cpl = vm ? 2'd3 : (!pe || pe_entry_cpl_zero) ? 2'd0 : CS[1:0];
 
 wire [2:0] latched_pf_code;  // Latched page fault error code (for LPCR microcode access)
 wire [31:0] latched_pf_addr;  // Latched faulting linear address (for LPCR microcode access)
@@ -2738,6 +2741,7 @@ always_ff @(posedge clk) begin
     external_dest_value = dest_value;
     if (!reset_n) begin
         CS <= 16'hF000;
+        pe_entry_cpl_zero <= 1'b0;
         DS <= 16'h0000;
         ES <= 16'h0000;
         SS <= 16'h0000;
@@ -2772,10 +2776,12 @@ always_ff @(posedge clk) begin
 
             DEST_CR0: begin
                 CR0 <= external_dest_value;
-                // Entering protected mode makes CPL 0 until a later control
-                // transfer establishes a different visible CS RPL.
+                // Entering protected mode starts at CPL 0 without rewriting the
+                // visible CS; a later control transfer reloads CS.
                 if (external_dest_value[0] && !CR0[0])
-                    CS[1:0] <= 2'b00;
+                    pe_entry_cpl_zero <= 1'b1;
+                else if (!external_dest_value[0])
+                    pe_entry_cpl_zero <= 1'b0;
             end
             DEST_CR2: begin
                 CR2 <= external_dest_value;
@@ -2789,14 +2795,19 @@ always_ff @(posedge clk) begin
 
             // Direct segment register destinations (LDS/LES/LFS/LGS/LSS microcode)
             DEST_CS: begin
-                // Ordinary protected-mode control transfers retain CPL. Task
-                // loading uses DEST_USTEP_TASK_CS to establish a new RPL.
+                // Ordinary protected-mode control transfers establish the new
+                // RPL from the gated CPL; task loading uses
+                // DEST_USTEP_TASK_CS.  Either transfer ends the entry CPL0.
                 if (pe && !vm)
-                    CS[15:2] <= cs_source_value[15:2];
+                    CS <= {cs_source_value[15:2], cpl};
                 else
                     CS <= cs_source_value;
+                pe_entry_cpl_zero <= 1'b0;
             end
-            DEST_USTEP_TASK_CS: CS <= cs_source_value;
+            DEST_USTEP_TASK_CS: begin
+                CS <= cs_source_value;
+                pe_entry_cpl_zero <= 1'b0;
+            end
             DEST_ES: ES <= external_dest_value[15:0];
             DEST_SS: SS <= external_dest_value[15:0];
             DEST_DS: DS <= external_dest_value[15:0];
@@ -2836,9 +2847,13 @@ always_ff @(posedge clk) begin
             default: ; // No write
         endcase
 
-        // COPY_STACK_DPL: commit the transition DPL to CS[1:0].
-        if (prot_transition.copy_stack_dpl && prot_transition.active)
+        // This transition establishes CPL before the final DEST_CS word.
+        // End the PE-entry override here too, or an outer-level IRET made
+        // without an initial far jump validates its new SS at CPL0.
+        if (prot_transition.copy_stack_dpl && prot_transition.active) begin
             CS[1:0] <= prot_transition.copy_dpl;
+            pe_entry_cpl_zero <= 1'b0;
+        end
 
         // WRITE_RPL: write new CPL into SLCTR[1:0] from loaded CS descriptor's DPL
         if (prot_transition.write_rpl)
