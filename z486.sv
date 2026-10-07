@@ -3325,6 +3325,9 @@ data_unit data_unit_inst (
     .any_fault(any_fault_r),
     .clear_rf(clear_rf),
     .set_rf(ibp_fault_taken),
+    .fault_set_rf(uc_exec && ((uc_addr == UADDR_FAULT_SET_RF) ||
+                              (uc_addr == UADDR_DEBUG_GD_FAULT) ||
+                              ((uc_addr == UADDR_FAULT_TSS_SKIP) && tss_access_flag))),
     .gate_detect(gate_detect_now),
     .flags_backup_active(flags_backup_active),
     // Decoder: EX and D2 instruction, operand sizes, stack-operation class (ispval)
