@@ -1,5 +1,6 @@
 # build / sim artifacts
 obj_dir/
+obj_dir_*/
 *.vcd
 *.fst
 *.log

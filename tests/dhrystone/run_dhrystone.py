@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import struct
@@ -283,7 +284,7 @@ def build_core(
         "-O3",
         "--build",
         "-j",
-        "0",
+        os.environ.get("JOBS", "0"),
         f"-I{core_dir}",
         f"-I{THIS_DIR.parent}",
         "-CFLAGS",
