@@ -36,6 +36,8 @@ module tb_paging_walker;
   wire        mem_wr;
   wire [31:0] mem_addr;
   wire [31:0] mem_wdata;
+  wire        mem_locked;
+  wire        ad_lock;
   reg  [31:0] mem_data = 32'h0;
   reg         mem_ready = 1'b0;
 
@@ -62,6 +64,8 @@ module tb_paging_walker;
     .mem_addr(mem_addr),
     .mem_wdata(mem_wdata),
     .mem_pcd(),
+    .mem_locked(mem_locked),
+    .ad_lock(ad_lock),
     .mem_data(mem_data),
     .mem_ready(mem_ready)
   );
@@ -88,6 +92,18 @@ module tb_paging_walker;
   reg [31:0] wr_addr [0:MAXW-1];
   reg [31:0] wr_data [0:MAXW-1];
 
+  // ==== External master model ====
+  // When armed, the first unlocked read of mut_addr is followed by an external
+  // write of mut_val to it, i.e. the entry changes between the walk's read
+  // and its A/D update.  An A/D write must come from a locked read of the
+  // same entry in this walk, with LOCK# (ad_lock) held.
+  bit        mut_armed = 1'b0;
+  reg [31:0] mut_addr;
+  reg [31:0] mut_val;
+  int        locked_rd_count;
+  reg [31:0] locked_rd_addr [0:MAXW-1];
+  int        rd_after_locked;   // unlocked reads issued after a locked read
+
   // ==== One-cycle-latency slave; logs every accepted write ====
   reg pending;
   always @(posedge clk) begin
@@ -102,7 +118,34 @@ module tb_paging_walker;
         pending   <= 1'b1;
         mem_ready <= 1'b1;
         mem_data  <= mem[mi(mem_addr)];
+        if (mem_rd && mem_locked) begin
+          if (!ad_lock) begin
+            $display("PAGING WALKER FAIL [%s]: locked read without LOCK#",
+                     case_name);
+            $fatal(1);
+          end
+          if (locked_rd_count < MAXW)
+            locked_rd_addr[locked_rd_count] = mem_addr;
+          locked_rd_count = locked_rd_count + 1;
+        end else if (mem_rd && locked_rd_count != 0) begin
+          rd_after_locked = rd_after_locked + 1;
+        end
+        if (mem_rd && !mem_locked && mut_armed && mem_addr == mut_addr) begin
+          mut_armed = 1'b0;
+          mem[mi(mem_addr)] <= mut_val;
+        end
         if (mem_wr) begin
+          // (static variable: an initializer would run only once, so after
+          // the first matching write every later write passed unchecked)
+          bit seen;
+          seen = 1'b0;
+          for (int i = 0; i < locked_rd_count && i < MAXW; i = i + 1)
+            if (locked_rd_addr[i] == mem_addr) seen = 1'b1;
+          if (!seen || !ad_lock) begin
+            $display("PAGING WALKER FAIL [%s]: A/D write %08x without a locked read/LOCK#",
+                     case_name, mem_addr);
+            $fatal(1);
+          end
           if (wr_count < MAXW) begin
             wr_addr[wr_count] = mem_addr;
             wr_data[wr_count] = mem_wdata;
@@ -129,6 +172,8 @@ module tb_paging_walker;
   task automatic start_walk(input [31:0] lin, input bit wr, input [1:0] cpl,
                             input bit wp);
     wr_count = 0;
+    locked_rd_count = 0;
+    rd_after_locked = 0;
     linear_addr = lin;
     req_is_write = wr;
     req_cpl = cpl;
@@ -140,7 +185,7 @@ module tb_paging_walker;
     while (!walk_done) begin
       @(negedge clk);
       timeout = timeout + 1;
-      if (timeout > 40) begin
+      if (timeout > 80) begin
         $display("PAGING WALKER FAIL [%s]: timeout", case_name);
         $fatal(1);
       end
@@ -153,6 +198,7 @@ module tb_paging_walker;
     got_user     = result_user;
     got_dirty    = result_dirty;
     @(negedge clk);
+    mut_armed = 1'b0;
   endtask
 
   task automatic expect_writes(input int n, input [31:0] a0, input [31:0] d0,
@@ -397,7 +443,77 @@ module tb_paging_walker;
     expect_no_fault();
     expect_writes(0, 32'h0, 32'h0, 32'h0, 32'h0);
 
-    $display("PAGING WALKER TEST PASS (%0d cases)", 17);
+    // ---- A/D update is a locked read-modify-write --------------------
+    // 18. An external write lands on the PTE after the walk read it: the
+    //     update merges it (AVL bit 9 survives).
+    case_name = "external PTE write before A/D update";
+    setup(entry(1'b1, 1'b1, 1'b1, 1'b0), entry(1'b1, 1'b1, 1'b0, 1'b0));
+    mut_addr = PTE_ADDR;
+    mut_val = pte_val(1'b0, 1'b0) | 32'h200;
+    mut_armed = 1'b1;
+    start_walk(WALK_LIN, 1'b1, 2'd0, 1'b0);
+    expect_no_fault();
+    expect_writes(1, PTE_ADDR, pte_val(1'b1, 1'b1) | 32'h200, 32'h0, 32'h0);
+
+    // 19. The PTE is made not present before the update: #PF (P=0), and the
+    //     entry is not written.
+    case_name = "PTE made not present before A/D update";
+    setup(entry(1'b1, 1'b1, 1'b1, 1'b0), entry(1'b1, 1'b1, 1'b0, 1'b0));
+    mut_addr = PTE_ADDR;
+    mut_val = NOT_PRESENT;
+    mut_armed = 1'b1;
+    start_walk(WALK_LIN, 1'b1, 2'd0, 1'b0);
+    expect_fault(3'b010);
+    if (mem_get(PTE_ADDR) !== NOT_PRESENT) begin
+      $display("PAGING WALKER FAIL [%s]: PTE=%08x", case_name, mem_get(PTE_ADDR));
+      $fatal(1);
+    end
+
+    // 20. The PTE is made read-only before a WP=1 supervisor store's update:
+    //     protection #PF, no write.
+    case_name = "PTE made read-only before A/D update";
+    setup(entry(1'b1, 1'b1, 1'b1, 1'b0), entry(1'b1, 1'b1, 1'b1, 1'b0));
+    mut_addr = PTE_ADDR;
+    mut_val = FRAME | entry(1'b0, 1'b1, 1'b1, 1'b0);
+    mut_armed = 1'b1;
+    start_walk(WALK_LIN, 1'b1, 2'd0, 1'b1);
+    expect_fault(3'b011);
+
+    // 21. The PDE is moved to another page table before its A update: the
+    //     walk uses the new table.
+    case_name = "PDE moved before A update";
+    setup(entry(1'b1, 1'b1, 1'b0, 1'b0), entry(1'b1, 1'b1, 1'b1, 1'b1));
+    mem_put(32'h0000_4000, 32'h0078_9000 | entry(1'b1, 1'b1, 1'b1, 1'b1));
+    mut_addr = PDE_ADDR;
+    mut_val = 32'h0000_4000 | entry(1'b1, 1'b1, 1'b0, 1'b0);
+    mut_armed = 1'b1;
+    start_walk(WALK_LIN, 1'b0, 2'd0, 1'b0);
+    expect_no_fault();
+    expect_writes(1, PDE_ADDR, 32'h0000_4000 | entry(1'b1, 1'b1, 1'b1, 1'b0),
+                  32'h0, 32'h0);
+    if (got_pfn !== 20'h00789) begin
+      $display("PAGING WALKER FAIL [%s]: pfn=%05x", case_name, got_pfn);
+      $fatal(1);
+    end
+
+    // 22. The PDE is made not present before its A update: the locked PDE
+    //     re-read faults (P=0) at once - no PTE is read through the
+    //     not-present PDE - and nothing is written.
+    case_name = "PDE made not present before A update";
+    setup(entry(1'b1, 1'b1, 1'b0, 1'b0), entry(1'b1, 1'b1, 1'b1, 1'b1));
+    mut_addr = PDE_ADDR;
+    mut_val = NOT_PRESENT;
+    mut_armed = 1'b1;
+    start_walk(WALK_LIN, 1'b0, 2'd0, 1'b0);
+    expect_fault(3'b000);
+    expect_writes(0, 32'h0, 32'h0, 32'h0, 32'h0);
+    if (rd_after_locked != 0) begin
+      $display("PAGING WALKER FAIL [%s]: %0d read(s) after the locked PDE read",
+               case_name, rd_after_locked);
+      $fatal(1);
+    end
+
+    $display("PAGING WALKER TEST PASS (%0d cases)", 22);
     $finish;
   end
 endmodule
