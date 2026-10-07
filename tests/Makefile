@@ -117,6 +117,7 @@ TB_MEMMAP_SRCS := tb_memmap_template.sv
 CPP_MEMMAP_SRCS := sim_main_memmap_template.cpp
 TB_INTERRUPT_NMI_SRCS := tb_interrupt_nmi.sv
 TB_PAGING_WALKER_SRCS := tb_paging_walker.sv
+TB_PAGING_TLB_SRCS := tb_paging_tlb.sv
 TB_CACHE_FLUSH_SRCS := tb_cache_flush.sv
 TB_X87_BRIDGE_SRCS := tb_x87_bridge.sv
 CPP_X87_BRIDGE_SRCS := sim_main_x87_bridge.cpp
@@ -137,7 +138,7 @@ CPP_PLA4_SRCS := sim_main_pla4.cpp
 PLA4_RTL := $(Z486_DIR)/protection.sv
 
 # Targets
-.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-cache-coherence test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists check-pragmas check-rom-columns check-shift-ucode test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
+.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-cache-coherence test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists check-pragmas check-rom-columns check-shift-ucode test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 .PHONY: test-release test-pc98-map test-protected-narrow check-generators test-data-access check-runner test-l1-tags-wide test-reset-restart test-fuzz
 
@@ -148,7 +149,7 @@ all: build
 # External SingleStepTests/test386 and vendor timing are separate requirements.
 test-release:
 	$(MAKE) -j1 check-reset-lists check-pragmas check-rom-columns check-shift-ucode check-generators check-runner
-	$(MAKE) -j1 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-merge test-gpr-hazard test-data-access test-memmap-template test-interrupt-nmi test-paging-walker test-cache-flush test-cache-coherence test-reset-restart
+	$(MAKE) -j1 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-merge test-gpr-hazard test-data-access test-memmap-template test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-cache-coherence test-reset-restart
 	$(MAKE) -j1 test-protected test-protected-narrow test-simple test-pc98-map test-l1-tags-wide test-fuzz
 	$(MAKE) -j1 obj_dir_x87/Vtb_protected_mode
 	Z486_ENABLE_X87=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_x87/Vtb_protected_mode ./test_protected_mode.py --strict
@@ -289,6 +290,15 @@ obj_dir/Vtb_interrupt_nmi: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/interrupt_control
 		$(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/interrupt_controller.sv \
 		$(TB_INTERRUPT_NMI_SRCS)
 	@echo "Build complete: obj_dir/Vtb_interrupt_nmi"
+
+obj_dir/Vtb_paging_tlb: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/paging_tlb.sv $(TB_PAGING_TLB_SRCS)
+	@echo "Building paging TLB replacement bench with Verilator..."
+	$(VERILATOR) --timing -Wall -Wno-fatal -Wno-UNOPTFLAT -Wno-SYNCASYNCNET \
+		--binary -O3 -j $(JOBS) -I$(Z486_DIR) \
+		-CFLAGS "-std=c++14 -O3" --top-module tb_paging_tlb \
+		$(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/paging_tlb.sv \
+		$(TB_PAGING_TLB_SRCS)
+	@echo "Build complete: obj_dir/Vtb_paging_tlb"
 
 obj_dir/Vtb_paging_walker: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/paging_walker.sv $(TB_PAGING_WALKER_SRCS)
 	@echo "Building page-walker A/D write-back bench with Verilator..."
@@ -514,6 +524,12 @@ test-paging-walker: obj_dir/Vtb_paging_walker
 	@./obj_dir/Vtb_paging_walker | tee obj_dir/z486_paging_walker.out \
 		| grep -q "PAGING WALKER TEST PASS" \
 		|| (echo "page-walker A/D write-back bench FAIL"; exit 1)
+
+test-paging-tlb: obj_dir/Vtb_paging_tlb
+	@echo "Running paging TLB replacement bench..."
+	@./obj_dir/Vtb_paging_tlb | tee obj_dir/z486_paging_tlb.out \
+		| grep -q "PAGING TLB TEST PASS" \
+		|| (echo "paging TLB replacement bench FAIL"; exit 1)
 
 test-cache-coherence: obj_dir/Vtb_cache_coherence
 	@echo "Running I-cache store/DMA coherence bench..."

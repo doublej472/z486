@@ -201,10 +201,14 @@ always_ff @(posedge clk) begin
     end
 end
 logic [36:0] test_q [4];
-assign test_q[0] = test_copy0[tlbt_set];
-assign test_q[1] = test_copy1[tlbt_set];
-assign test_q[2] = test_copy2[tlbt_set];
-assign test_q[3] = test_copy3[tlbt_set];
+// The test read port also serves the sidecar's replacement refresh (below)
+// whenever no TR6 request is pending; a pending request owns it.
+wire [2:0] vref_set;
+wire [2:0] test_rd_set = tlbt_pend_r ? tlbt_set : vref_set;
+assign test_q[0] = test_copy0[test_rd_set];
+assign test_q[1] = test_copy1[test_rd_set];
+assign test_q[2] = test_copy2[test_rd_set];
+assign test_q[3] = test_copy3[test_rd_set];
 assign {lookup_tag_q[0], lookup_pfn_q[0]} = lookup_copy0[lookup_set];
 assign {live_tag_q[0], live_pfn_q[0]}     = live_copy0[live_set0];
 assign inval_tag_q[0]                      = inval_copy0[invalidate_set];
@@ -270,6 +274,7 @@ wire [VIPT_TLB_INDEX_BITS-1:0] vipt_refill_index =
 wire vipt_refill_write = vipt_refill_valid && !update_valid;
 reg [31:0] vipt_linear_r;
 reg        vipt_hazard_r;
+reg        vipt_fresh_r;
 reg [VIPT_TLB_ENTRIES-1:0] vipt_valid;
 // {VPN tag[19:8], PFN[19:0], writable, user, dirty, VGA}.  A PCD page sets
 // the VGA bit too: every direct-path consumer then rejects the page, and its
@@ -278,6 +283,7 @@ reg [VIPT_TLB_ENTRIES-1:0] vipt_valid;
 reg [35:0] vipt_tlb_q;
 
 always_ff @(posedge clk) begin
+    vipt_fresh_r <= vipt_preread;
     if (vipt_preread) begin
         vipt_linear_r <= vipt_linear_addr;
         // Any simultaneous mutation conservatively poisons this preread. TLB
@@ -293,6 +299,28 @@ end
 wire vipt_match = vipt_valid[vipt_linear_r[19:12]] && !vipt_hazard_r &&
                   (vipt_tlb_q[35:24] == vipt_linear_r[31:20]);
 assign vipt_is_vga_mem = vipt_match && vipt_tlb_q[0];
+
+// THE SIDECAR'S HITS REFRESH THE FOUR-WAY TLB'S REPLACEMENT STATE. A 486
+// refreshes a page's pseudo-LRU state on every access that uses it. A sidecar
+// hit used to bypass the main TLB entirely, so a page served only from the
+// sidecar aged to least-recently-used in its set and was evicted while still
+// in use; the next access that needed the main TLB (a locked RMW, a write, or
+// any access the direct port declined) walked again. That walk is not
+// architecturally free: it rereads the page tables, so software that has
+// rewritten them without INVLPG - legal while the translation is cached -
+// sees the new mapping, and a walk taken with A20 masked reads them from the
+// wrong place (the PC-9821 VEM486 + HSB #PF at 0xFD880, which the real 486
+// never takes; tests/programs/tlb_sidecar_lru). One refresh per preread: the
+// cycle after it, when vipt_linear_r is the preread's address.
+assign vref_set = vipt_linear_r[14:12];
+wire [16:0] vref_tag = vipt_linear_r[31:15];
+wire [3:0] vref_match = {valid_q[vref_set][3] && (test_q[3][36:20] == vref_tag),
+                         valid_q[vref_set][2] && (test_q[2][36:20] == vref_tag),
+                         valid_q[vref_set][1] && (test_q[1][36:20] == vref_tag),
+                         valid_q[vref_set][0] && (test_q[0][36:20] == vref_tag)};
+wire       vref_refresh = vipt_fresh_r && vipt_match && !tlbt_pend_r && (|vref_match);
+wire [1:0] vref_way = vref_match[0] ? 2'd0 : vref_match[1] ? 2'd1 :
+                      vref_match[2] ? 2'd2 : 2'd3;
 
 always_comb begin
     vipt_hit = vipt_match;
@@ -444,6 +472,15 @@ always_ff @(posedge clk or negedge reset_n) begin
                 2'd1: begin plru[lookup_set][0] <= 1'b1; plru[lookup_set][1] <= 1'b0; end
                 2'd2: begin plru[lookup_set][0] <= 1'b0; plru[lookup_set][2] <= 1'b1; end
                 2'd3: begin plru[lookup_set][0] <= 1'b0; plru[lookup_set][2] <= 1'b0; end
+            endcase
+        end
+        // The sidecar's refresh, unless the lookup port updated the same set.
+        if (vref_refresh && !(hit && vref_set == lookup_set)) begin
+            case (vref_way)
+                2'd0: begin plru[vref_set][0] <= 1'b1; plru[vref_set][1] <= 1'b1; end
+                2'd1: begin plru[vref_set][0] <= 1'b1; plru[vref_set][1] <= 1'b0; end
+                2'd2: begin plru[vref_set][0] <= 1'b0; plru[vref_set][2] <= 1'b1; end
+                2'd3: begin plru[vref_set][0] <= 1'b0; plru[vref_set][2] <= 1'b0; end
             endcase
         end
 
