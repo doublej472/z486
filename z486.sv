@@ -44,6 +44,12 @@ module z486
     parameter [31:0] NO_ALLOC_BOUND = 32'h0800_0000,   // L1 tag reach (128 MiB)
     parameter        RAM_BOUND_ENABLE = 0,
 
+    // CR0 after reset.  A real 486 resets with CD=NW=1 (caching disabled until
+    // firmware clears them); the default keeps this core's historical
+    // caches-enabled reset so firmware that never writes CR0.CD keeps its
+    // performance.  Set 1 for the architectural 60000010h.
+    parameter        RESET_CACHE_DISABLED = 0,
+
     parameter [6:0] CLOCK_RATE_MHZ = 7'd85
 )
 (
@@ -2836,7 +2842,7 @@ always_ff @(posedge clk) begin
         ucrd_restart_esp <= 32'h0;
 
         // BOOTUP 9BA-9BB leaves PE/MP/EM/TS/PG clear and sets ET for 80387.
-        CR0 <= 32'h0000_0010;
+        CR0 <= RESET_CACHE_DISABLED ? 32'h6000_0010 : 32'h0000_0010;
         CR2 <= 32'h0;
         DR6 <= 32'hFFFF_0FF0;
         DR7 <= 32'h0000_0400;
@@ -2866,7 +2872,7 @@ always_ff @(posedge clk) begin
             DEST_MDTMP4: ;  // Private multiply/divide registers
 
             DEST_CR0: begin
-                CR0 <= external_dest_value;
+                CR0 <= cr0_value(external_dest_value);
                 // Entering protected mode starts at CPL 0 without rewriting the
                 // visible CS; a later control transfer reloads CS.
                 if (external_dest_value[0] && !CR0[0])
