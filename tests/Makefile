@@ -42,7 +42,7 @@ RTL_SRCS := $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_pkg.sv $(X87_DIR)
 			$(X87_DIR)/x87_ucode_pkg.sv $(Z486_DIR)/z486.sv \
 			$(Z486_DIR)/cpu_throttle.sv $(Z486_DIR)/interrupt_controller.sv \
 			$(Z486_DIR)/ucode_rom.sv $(Z486_DIR)/microsequencer.sv $(Z486_DIR)/event_control.sv $(Z486_DIR)/hardwired_control.sv $(Z486_DIR)/data_access.sv \
-			$(Z486_DIR)/data_unit.sv $(Z486_DIR)/address_unit.sv \
+			$(Z486_DIR)/data_unit.sv $(Z486_DIR)/gpr_write_merge.sv $(Z486_DIR)/address_unit.sv \
 			$(Z486_DIR)/shifter.sv $(Z486_DIR)/mul_div.sv \
 			$(Z486_DIR)/decoder.sv \
 			$(Z486_DIR)/alu.sv $(Z486_DIR)/prefetch.sv \
@@ -106,9 +106,11 @@ TB_LOAD_WAW_SRCS := tb_load_waw.sv
 CPP_LOAD_WAW_SRCS := sim_main_load_waw.cpp
 TB_GPR_HAZARD_SRCS := tb_gpr_hazard.sv
 CPP_GPR_HAZARD_SRCS := sim_main_gpr_hazard.cpp
+TB_GPR_MERGE_SRCS := tb_gpr_write_merge.sv
+CPP_GPR_MERGE_SRCS := sim_main_gpr_write_merge.cpp
 # data_unit plus its sub-units; the bench drives the deferred GPR write ports
 # directly and needs no cache, bus or sequencer.
-LOAD_WAW_RTL := $(Z486_DIR)/data_unit.sv $(Z486_DIR)/alu.sv $(Z486_DIR)/shifter.sv \
+LOAD_WAW_RTL := $(Z486_DIR)/data_unit.sv $(Z486_DIR)/gpr_write_merge.sv $(Z486_DIR)/alu.sv $(Z486_DIR)/shifter.sv \
 			$(Z486_DIR)/mul_div.sv $(Z486_DIR)/dsp_mul.sv
 TB_MEMMAP_SRCS := tb_memmap_template.sv
 CPP_MEMMAP_SRCS := sim_main_memmap_template.cpp
@@ -134,7 +136,7 @@ CPP_PLA4_SRCS := sim_main_pla4.cpp
 PLA4_RTL := $(Z486_DIR)/protection.sv
 
 # Targets
-.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-hazard test-memmap-template test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
+.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists check-pragmas check-rom-columns check-shift-ucode test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 all: build
 
@@ -216,6 +218,12 @@ obj_dir/Vtb_gpr_hazard: $(Z486_DIR)/z486_pkg.sv $(LOAD_WAW_RTL) $(TB_GPR_HAZARD_
 	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_gpr_hazard $(TB_GPR_HAZARD_SRCS) \
 		$(Z486_DIR)/z486_pkg.sv $(LOAD_WAW_RTL) $(CPP_GPR_HAZARD_SRCS)
 	@echo "Build complete: obj_dir/Vtb_gpr_hazard"
+
+obj_dir/Vtb_gpr_write_merge: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/gpr_write_merge.sv $(TB_GPR_MERGE_SRCS) $(CPP_GPR_MERGE_SRCS)
+	@echo "Building GPR write-merge unit bench with Verilator..."
+	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_gpr_write_merge $(TB_GPR_MERGE_SRCS) \
+		$(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/gpr_write_merge.sv $(CPP_GPR_MERGE_SRCS)
+	@echo "Build complete: obj_dir/Vtb_gpr_write_merge"
 
 obj_dir/Vtb_memmap_template: $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/z486_pc98_preset.svh $(TB_MEMMAP_SRCS) $(CPP_MEMMAP_SRCS)
 	@echo "Building memory-map template unit test with Verilator..."
@@ -385,10 +393,30 @@ test-load-waw: obj_dir/Vtb_load_waw
 	@./obj_dir/Vtb_load_waw | tee obj_dir/z486_load_waw.out | grep -q "LOAD WAW TEST PASS" \
 		|| (echo "load write-arbitration test FAIL"; exit 1)
 
+# Static checks revived from the fork: they guard the microcode/PLA images and
+# the synthesis pragmas, none of which any RTL bench covers.
+check-pragmas:
+	@echo "Checking synthesis translate_off/translate_on balance..."
+	@./check_pragmas.py $(Z486_DIR)
+
+check-rom-columns:
+	@echo "Scanning ROM images for constant (foldable) bit columns..."
+	@./check_rom_columns.py $(Z486_DIR)
+
+check-shift-ucode:
+	@echo "Scanning ucode.hex for unrecognized SHIFT source pairings..."
+	@./check_shift_ucode.py $(Z486_DIR)/ucode.hex
+
 # The survey's old findings were fixed; a new finding must fail the gate.
 test-gpr-hazard: obj_dir/Vtb_gpr_hazard
 	@./obj_dir/Vtb_gpr_hazard | tee obj_dir/z486_gpr_hazard.out
 	@grep -q 'GPR HAZARD SURVEY: no hazards observed' obj_dir/z486_gpr_hazard.out
+
+# The shared producer arbitration: one order for the commit and all views.
+test-gpr-merge: obj_dir/Vtb_gpr_write_merge
+	@echo "Running GPR write-merge unit bench..."
+	@./obj_dir/Vtb_gpr_write_merge | tee obj_dir/z486_gpr_merge.out | grep -q "GPR WRITE MERGE TEST PASS" \
+		|| (echo "GPR write-merge test FAIL"; exit 1)
 
 test-memmap-template: obj_dir/Vtb_memmap_template
 	@echo "Running memory-map template unit test..."
