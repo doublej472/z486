@@ -216,20 +216,26 @@ wire [1:0] hit_way = hit0 ? 2'd0 :
                      hit3 ? 2'd3 : 2'd0;
 
 // The D2 port uses one synchronous RAM read followed by an EX tag compare.
-// It is maintained as an independent TLB: retaining a translation after the
-// four-way TLB replaces it is valid until software executes INVLPG or reloads
-// CR3, just as retaining it in any other TLB entry would be.
+// It holds a SUBSET of the four-way TLB: a walker refill that replaces a
+// valid entry also drops the victim's sidecar slot. Retaining the victim
+// would be architecturally legal, but a 486 has only the 32-entry TLB, so an
+// evicted page is walked again on its next use - and software can depend on
+// WHEN that walk happens: under VEM486, HSB masks A20 and then reads a BIOS
+// page it read just before, which a 486 still has in its TLB; with the
+// sidecar serving that earlier read the main TLB missed instead, walked with
+// A20 masked (VEM486's tables sit above 1 MiB) and faulted.
 // 256 entries, direct-mapped on VPN[19:12]: one M10K, and no way select on
 // the hit path (it feeds D2 issue through a direct load's hit). Fewer
 // entries let a program's read and write pages collide (Quake: 32 entries
 // cost 1.9%).
 // Validity is an epoch tag stored with each entry, so the RAM holds it and no
 // flip-flop array or 256:1 select does: an entry is valid when its epoch
-// equals vipt_epoch. A CR3 write advances the epoch; INVLPG writes the
-// INVALID code to its index. Live epochs run 0-14, so a wrap could revive an
-// entry from 15 flushes earlier: a wrap (and reset, since the RAM keeps its
-// contents) starts a scrub that writes INVALID to every index, and the
-// sidecar reports misses until the scrub completes.
+// equals vipt_epoch. A CR3 write (or a TR6 write, which may rewrite a
+// translation the sidecar holds) advances the epoch; INVLPG and the eviction
+// rule above write the INVALID code to one index. Live epochs run 0-14, so a
+// wrap could revive an entry from 15 flushes earlier: a wrap (and reset, since
+// the RAM keeps its contents) starts a scrub that writes INVALID to every
+// index, and the sidecar reports misses until the scrub completes.
 localparam integer VIPT_TLB_INDEX_BITS = 8;
 localparam integer VIPT_TLB_ENTRIES = 1 << VIPT_TLB_INDEX_BITS;
 localparam logic [3:0] VIPT_EPOCH_INVALID = 4'hF;
@@ -245,16 +251,33 @@ reg [3:0]  vipt_epoch;
 reg        vipt_scrub;                 // sweeping INVALID over every index
 reg [VIPT_TLB_INDEX_BITS-1:0] vipt_scrub_index;
 wire       vipt_flush_all = invalidate_all || tlbt_write;
-// The write port: INVLPG, then a walker update, then a refill, then the scrub.
-wire vipt_scrub_write = vipt_scrub && !invalidate_page && !update_valid &&
-                        !vipt_refill_write;
+// THE SIDECAR IS A SUBSET OF THE FOUR-WAY TLB. A walker refill that replaces
+// a valid entry evicts that page from the four-way TLB, so its sidecar slot
+// must go too. On a refill the lookup port reads update_set, so its tag copy
+// at the victim way is the evicted page's tag. The RAM's one write port takes
+// the refill's own entry in that cycle, so the eviction's INVALID write is
+// queued for the next cycle, ahead of every other write but INVLPG's; a
+// preread in either cycle is poisoned (vipt_mutation). A shared index keeps
+// the new page.
+wire       vipt_evict = tlb_write && update_valid && !(hit0 | hit1 | hit2 | hit3) &&
+                        valid_q[update_set][victim_way];
+wire [VIPT_TLB_INDEX_BITS-1:0] vipt_evict_index = {lookup_tag_q[victim_way][4:0], update_set};
+reg        vipt_evict_pend_r;
+reg [VIPT_TLB_INDEX_BITS-1:0] vipt_evict_index_r;
+// The write port: INVLPG, then a queued eviction, then a walker update, then
+// a refill, then the scrub.
+wire vipt_evict_write = vipt_evict_pend_r && !invalidate_page;
+wire vipt_update_write = update_valid && !invalidate_page && !vipt_evict_pend_r;
+wire vipt_refill_wr = vipt_refill_write && !invalidate_page && !vipt_evict_pend_r;
+wire vipt_scrub_write = vipt_scrub && !invalidate_page && !vipt_evict_pend_r &&
+                        !update_valid && !vipt_refill_write;
 // {epoch, VPN tag[19:8], PFN[19:0], writable, user, dirty, VGA}.  A PCD page
 // sets the VGA bit too: every direct-path consumer then rejects the page, and
 // its accesses take the demand path, which carries the page's PCD.
 `Z486_BLOCK_RAM_NO_RW_CHECK reg [39:0] vipt_tlb [0:VIPT_TLB_ENTRIES-1];
 reg [39:0] vipt_tlb_q;
-wire       vipt_mutation = invalidate_all || invalidate_page || update_valid ||
-                           vipt_refill_write || vipt_scrub_write;
+wire       vipt_mutation = vipt_flush_all || invalidate_page || update_valid ||
+                           vipt_refill_write || vipt_scrub_write || vipt_evict_pend_r;
 
 always_ff @(posedge clk) begin
     vipt_fresh_r <= vipt_preread;
@@ -277,6 +300,8 @@ always_ff @(posedge clk or negedge reset_n) begin
         vipt_epoch <= 4'd0;
         vipt_scrub <= 1'b1;
         vipt_scrub_index <= '0;
+        vipt_evict_pend_r <= 1'b0;
+        vipt_evict_index_r <= '0;
     end else begin
         if (vipt_flush_all) begin
             vipt_epoch <= (vipt_epoch == 4'd14) ? 4'd0 : vipt_epoch + 4'd1;
@@ -291,6 +316,17 @@ always_ff @(posedge clk or negedge reset_n) begin
             vipt_scrub_index <= vipt_scrub_index + 1'b1;
             if (&vipt_scrub_index)
                 vipt_scrub <= 1'b0;
+        end
+        // An eviction while the queue holds one replaces it only when the held
+        // one is written this cycle; INVLPG blocks the refill (tlb_write), so
+        // a new eviction never meets a blocked one.
+        if (vipt_flush_all) begin
+            vipt_evict_pend_r <= 1'b0;
+        end else if (vipt_evict && (vipt_evict_index != update_vpn[7:0])) begin
+            vipt_evict_pend_r <= 1'b1;
+            vipt_evict_index_r <= vipt_evict_index;
+        end else if (vipt_evict_write) begin
+            vipt_evict_pend_r <= 1'b0;
         end
     end
 end
@@ -339,13 +375,15 @@ end
 always_ff @(posedge clk) begin
     if (invalidate_page)
         vipt_tlb[invalidate_vpn[7:0]] <= {VIPT_EPOCH_INVALID, 36'd0};
-    else if (update_valid)
+    else if (vipt_evict_write)
+        vipt_tlb[vipt_evict_index_r] <= {VIPT_EPOCH_INVALID, 36'd0};
+    else if (vipt_update_write)
         vipt_tlb[update_vpn[7:0]] <= {vipt_epoch, update_vpn[19:8], update_pfn,
                                       update_writable, update_user,
                                       update_dirty,
                                       update_pcd ||
                                       z486_page_in_window(update_pfn, VGA_BASE, VGA_TOP)};
-    else if (vipt_refill_write)
+    else if (vipt_refill_wr)
         vipt_tlb[vipt_refill_index] <= {vipt_epoch, vipt_refill_linear[31:20],
                                         vipt_refill_pfn,
                                         vipt_refill_writable,
@@ -358,9 +396,10 @@ always_ff @(posedge clk) begin
 end
 
 // synthesis translate_off
-// Reference: the flip-flop valid bits the epoch tag replaces. A hit the
-// reference rejects is a bug; an extra miss (a scrub overwrote a fresh entry,
-// or INVLPG won the write port over an update) is allowed.
+// Reference: flip-flop valid bits with the inclusion rule applied on the
+// refill's own edge. A hit the reference rejects is a bug; an extra miss (a
+// scrub overwrote a fresh entry, or a write lost the port) is allowed. And a
+// sidecar hit on a page the four-way TLB does not hold breaks inclusion.
 reg [VIPT_TLB_ENTRIES-1:0] vipt_valid_ref;
 reg                        vipt_valid_ref_q;
 always_ff @(posedge clk) begin
@@ -371,14 +410,19 @@ always_ff @(posedge clk) begin
         vipt_valid_ref <= '0;
     else if (invalidate_page)
         vipt_valid_ref[invalidate_vpn[7:0]] <= 1'b0;
-    else if (update_valid)
+    else if (update_valid) begin
+        if (vipt_evict)
+            vipt_valid_ref[vipt_evict_index] <= 1'b0;
         vipt_valid_ref[update_vpn[7:0]] <= 1'b1;
-    else if (vipt_refill_write)
+    end else if (vipt_refill_write)
         vipt_valid_ref[vipt_refill_index] <= 1'b1;
     if (vipt_preread)
         vipt_valid_ref_q <= vipt_valid_ref[vipt_preread_index];
     if (reset_n && vipt_match && !vipt_valid_ref_q)
         $fatal(1, "sidecar hit on an entry the valid-bit reference rejects (linear %08x)",
+               vipt_linear_r);
+    if (reset_n && vipt_fresh_r && vipt_match && !tlbt_pend_r && !(|vref_match))
+        $fatal(1, "sidecar hit on a page the four-way TLB does not hold (linear %08x)",
                vipt_linear_r);
 end
 // synthesis translate_on
