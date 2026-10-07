@@ -452,7 +452,8 @@ assign vipt_resolve_hit = vipt_resolve_valid && cache_enable && !flush_block &&
                             vipt_resolve_phys_addr[SET_MSB:SET_LSB])) &&
                           (|vipt_hit_vec);
 wire [BRAM_ADDR_BITS-1:0] req_bram_addr = {req_set_r, req_word_r};
-wire can_accept_cpu = (state == S_IDLE) && !reset && (!cpu_write || cpu_protect_write || storeq_can_accept);
+wire can_accept_cpu = (state == S_IDLE) && !reset &&
+    (!cpu_write || (!store_patch_busy && (cpu_protect_write || storeq_can_accept)));
 wire ready_when_idle = !reset && !flush_block && storeq_can_accept;
 // Store pipelining, like the i486 write buffer taking one store per clock:
 // while a store enqueues in S_LOOKUP, accept the next store and preread its
@@ -473,7 +474,9 @@ wire lookup_store_busy = (state == S_LOOKUP) && req_valid_r &&
                          req_write_r && !req_protect_write_r;
 wire lookup_wr_open = lookup_store_busy && lookup_wr_room_r &&
                       !store_patch_busy && !flush_block;
-assign cpu_wr_ready = ready_r || lookup_wr_open;
+// The one-entry downstream patch slot can stay stranded across idle cycles.
+// Hold ALL stores, not just the pipelined LOOKUP opening, until it can drain.
+assign cpu_wr_ready = (cpu_ready && !store_patch_busy) || lookup_wr_open;
 wire lookup_wr_accept = cpu_valid && cpu_write && lookup_wr_open;
 wire accept_cpu = (cpu_valid && cpu_ready && can_accept_cpu) || lookup_wr_accept;
 wire [29:0] req_addr_dw = req_addr_r[31:2];

@@ -14,6 +14,7 @@ module tb_l1_cache;
     reg         cpu_write = 1'b0;
     wire        cpu_ready;
     wire        cpu_wr_ready;
+    reg         store_patch_busy = 0;
     reg         flush_req = 0;
     wire        flush_done;
     wire        cpu_resp_valid;
@@ -97,7 +98,7 @@ module tb_l1_cache;
 
         .snoop_addr(snoop_addr),
         .snoop_valid(snoop_valid),
-        .store_patch_busy(1'b0),
+        .store_patch_busy(store_patch_busy),
 
         .flush_req(flush_req),
         .flush_busy(),
@@ -232,7 +233,7 @@ module tb_l1_cache;
 
     task automatic cache_write(input [31:0] addr, input [3:0] be, input [31:0] data);
     begin
-        do @(negedge clk); while (!cpu_ready);
+        do @(negedge clk); while (!cpu_wr_ready);
         cpu_addr = addr;
         cpu_be = be;
         cpu_din = data;
@@ -470,6 +471,26 @@ module tb_l1_cache;
         vipt_resolve_valid = 0;
         do @(negedge clk); while (!flush_done);
         cache_read(32'h2C0, 4'hF, 32'hCAFE_BABE);
+
+        // An unconsumed I-cache patch blocks idle stores as well as pipelined
+        // stores. Otherwise a new store overwrites the one-entry patch slot.
+        do @(negedge clk); while (!cpu_ready);
+        store_patch_busy = 1;
+        cpu_addr = 32'h1C0;
+        cpu_write = 1;
+        cpu_din = 32'h8765_4321;
+        cpu_valid = 1;
+        repeat (3) begin
+            #1;
+            if (cpu_wr_ready || dut.state != 3'd1)
+                $fatal(1, "idle store accepted while an older I-cache patch is held");
+            @(negedge clk);
+        end
+        store_patch_busy = 0;
+        @(negedge clk);
+        cpu_valid = 0;
+        cpu_write = 0;
+        cache_read(32'h1C0, 4'hF, 32'h8765_4321);
 
         $display("L1 PIPT cache unit test PASS");
         $finish;
