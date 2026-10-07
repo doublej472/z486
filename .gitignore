@@ -5,6 +5,7 @@ obj_dir/
 *.log
 # test outputs
 tests/*.lst
+tests/programs/*.lst
 tests/protected_mode_tests/*.lst
 tests/protected_mode_tests/traces/
 tests/result.txt
@@ -17,3 +18,4 @@ __pycache__/
 # microcode/rom copied into tests/ by prepare.sh
 tests/ucode*.hex
 tests/pla_entry_rom.hex
+tests/pla_group_entry.hex
