@@ -40,6 +40,7 @@ module gen_pla_entry_rom;
         if (mism == 0)
             $display("PASS: ROM image == pla_entry_lookup for ALL %0d {addr,d32,pe}", N*4);
         else
-            $display("FAIL: ROM image does NOT match the PLA");
+            $fatal(1, "ROM image does NOT match the PLA");
+        $finish;
     end
 endmodule
