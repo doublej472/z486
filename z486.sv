@@ -748,6 +748,18 @@ wire [7:0] vipt_pending_dst_mask =
     vipt_load_wb_alu_dst_mask;
 assign d2_vipt_ea_hazard = |(d2_ea_read_mask & vipt_pending_dst_mask);
 
+// An optimistic ROM load releases its DLY in the D$ lookup (grace) cycle, and a
+// younger VIPT successor can issue in that cycle.  If the read then misses or is
+// uncached, mem_opt_wait holds the sequencer, but the deferred memory token
+// still forwards stale OPR_R until the data returns.  A successor whose
+// destination (M3 ALU operand / partial merge base) is that register must not
+// capture the stale value: route it through the slow path, which captures after
+// the fill.  ("mov eax,[upper RAM]; and eax,[ebp-12]" used the previous OPR_R.)
+// Ported from the sibling Zet98 port; the structure and the exact mask terms
+// are the same in both trees.
+wire vipt_load_ex_token_pending = recipe_mem_write.valid && mem_opt_wait &&
+    ((vipt_load_ex_r.dst_onehot & gpr_wr_expand(recipe_mem_write.dst)) != 8'h00);
+
 // A dead slot takes port B's word only when the instruction can issue now.
 wire       pb_load_ready = !x87_direct_candidate && !d2_vipt_ea_hazard &&
     (!vipt_load_ex_r.valid || d2_vipt_candidate ||
@@ -2062,6 +2074,7 @@ data_access data_access_inst (
     .vipt_load_wb_valid_r(vipt_load_wb_valid_r),
     // D2 instruction and issue
     .d2_vipt_ea_hazard(d2_vipt_ea_hazard),
+    .vipt_load_ex_token_pending(vipt_load_ex_token_pending),
     .EIP(EIP),
     .hardwired_off(hardwired_off),
     .i_bus(i_bus),
