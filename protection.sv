@@ -1288,6 +1288,17 @@ always_comb begin
             pla_test_flags = 4'b0000;
         end
     endcase
+
+    // The descriptor-load tails 5D5/5DA set the Accessed bit with a locked
+    // read-modify-write.  A 486 writes the descriptor only when that bit of a
+    // code/data descriptor is clear; otherwise continue at the same tail
+    // without the write.  (a, u: the descriptor's type bit 0 and S bit.)
+    if (a || !u) begin
+        if (pla_test_addr == 12'h5D5)
+            pla_test_addr = UADDR_DESC_SKIP_DATA;
+        else if (pla_test_addr == 12'h5DA)
+            pla_test_addr = UADDR_DESC_SKIP_CS;
+    end
 end
 
 assign pla_test_output = {pla_test_flags, pla_test_addr, 2'b00};
