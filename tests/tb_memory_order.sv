@@ -44,6 +44,10 @@ module tb_memory_order;
         .device_mmio_base(32'hd000_0000),
         .win0_unmapped(1'b0),
         .ram_cache_top(32'hffff_ffff),
+        .cache_flush(1'b0),
+        .cache_flush_insn(1'b0),
+        .cache_flush_busy(),
+        .cache_flush_done(),
 
         .dcache_req_valid(dcache_req_valid),
         .dcache_req_phys_addr_raw(dcache_req_phys_addr_raw),

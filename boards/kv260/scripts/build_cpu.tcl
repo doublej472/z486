@@ -41,8 +41,8 @@ set constraints [open $constraints_file w]
 puts $constraints [format {create_clock -name cpu_clk -period %.6f [get_ports clk]} \
     $period_ns]
 puts $constraints {set_false_path -from [get_ports reset_n]}
-puts $constraints {set_input_delay -clock cpu_clk 0.0 [get_ports {din[*] ready resp_valid intr nmi snoop_addr[*] snoop_valid a20_enable win0_unmapped ram_cache_top[*] cpu_speed_sel[*] single_step}]}
-puts $constraints {set_output_delay -clock cpu_clk 0.0 [get_ports {addr[*] be[*] burstcount[*] dout[*] valid write io inta dbg_CS[*] dbg_EIP[*] dbg_CS_base[*] dbg_pe dbg_vm dbg_x87_state[*] triple_fault_reset}]}
+puts $constraints {set_input_delay -clock cpu_clk 0.0 [get_ports {din[*] ready resp_valid intr nmi snoop_addr[*] snoop_valid a20_enable cache_flush win0_unmapped ram_cache_top[*] cpu_speed_sel[*] single_step}]}
+puts $constraints {set_output_delay -clock cpu_clk 0.0 [get_ports {addr[*] be[*] burstcount[*] dout[*] valid write io inta cache_flush_busy cache_flush_done dbg_CS[*] dbg_EIP[*] dbg_CS_base[*] dbg_pe dbg_vm dbg_x87_state[*] triple_fault_reset}]}
 close $constraints
 read_xdc $constraints_file
 

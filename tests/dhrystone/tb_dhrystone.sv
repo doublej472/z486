@@ -89,6 +89,9 @@ module tb_dhrystone;
 `endif
         .snoop_addr(32'h0),
         .snoop_valid(1'b0),
+        .cache_flush(1'b0),
+        .cache_flush_busy(),
+        .cache_flush_done(),
         .a20_enable(1'b1),
         .win0_unmapped(1'b0),
         .ram_cache_top(32'hffff_ffff),

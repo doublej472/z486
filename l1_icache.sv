@@ -37,6 +37,13 @@ module l1_icache #(
     input         patch_valid,
     input  [31:0] invalidate_addr,
     input         invalidate_valid,
+    // Native whole-L1 invalidate.  flush_req is a one-cycle request (a held
+    // level is also accepted: one walk per release); flush_busy is high for the
+    // walk and flush_done pulses once when it completes.
+    input         flush_req,
+    output        flush_busy,
+    output        flush_done,
+
     input         cache_enable,
     // NO_ALLOC fill: answer the fetch but do not install a line, so an
     // unmapped/uncached window never evicts or aliases a cacheable line.
@@ -154,12 +161,36 @@ reg fill_tag_wait_r;
 // tag write cannot reinstate it (the live and registered snoops alone miss it).
 reg fill_line_snooped_r;
 
+// Whole-L1 invalidate state; see l1_cache.sv for the contract.  The request is
+// consumed once (a held level is re-armed only after it is released), and
+// flush_block holds new fetches off from the cycle it is observed.
+//
+// The sweep is an INDEPENDENT walk over the sets, not a service of the
+// fill/lookup FSM: a fill in flight can be blocked indefinitely behind an
+// unrelated bus transaction, and the platform that asked for the flush may be
+// holding that very transaction until the flush completes.  Waiting for the
+// cache to fall idle would deadlock the machine, so instead any fill in flight
+// is marked (fill_killed_r) and cannot install after the sweep; the sweep then
+// runs concurrently with it and always completes in SETS+2 cycles.  The sweep
+// clears only the tag/valid arrays: the PLRU is replacement state, and giving
+// it a second write address would cost the block-RAM inference for plru_set.
+reg  flush_req_seen_r;
+reg  flush_pending_r;
+reg  flush_busy_r;
+reg  flush_done_r;
+reg  [SET_BITS-1:0] flush_set_r;
+reg  fill_killed_r;
+wire flush_req_new = flush_req & ~flush_req_seen_r;
+wire flush_block = flush_req_new | flush_pending_r | flush_busy_r;
+
+assign flush_busy = flush_busy_r;
+assign flush_done = flush_done_r;
 
 reg [127:0] line_r;
 reg resp_valid_r;
 reg ready_r;
 
-assign cpu_ready = ready_r;
+assign cpu_ready = ready_r && !flush_block;
 
 function automatic [1:0] way_encode(input [3:0] hit_vec);
 begin
@@ -290,7 +321,12 @@ wire lookup_snoop_conflict = req_snoop_conflict_r ||
     (patch_valid && (patch_tag == req_tag_r) && (patch_set == req_set_r));
 wire lookup_hit_usable = lookup_hit && !lookup_snoop_conflict;
 wire can_accept_cpu = (state == S_IDLE) && !reset;
-wire accept_cpu = cpu_valid && ready_r && can_accept_cpu;
+wire accept_cpu = cpu_valid && cpu_ready && can_accept_cpu;
+// The sweep starts one cycle after the request is observed, when ready_r has
+// already been forced low so no fetch can be accepted in the same cycle.  It
+// waits only for the internal reset walk, which never touches the bus.
+wire flush_launch = (flush_req_new | flush_pending_r) &&
+                    (state != S_RESET_INIT) && !reset;
 wire lookup_read_hit_now = (state == S_LOOKUP) && req_valid_r &&
                            !req_uncacheable_r && !req_no_alloc_r &&
                            lookup_hit_usable;
@@ -348,6 +384,14 @@ assign cpu_line = lookup_read_hit_now ? lookup_way_line : line_r;
 assign cpu_resp_valid = lookup_read_hit_now || resp_valid_r;
 
 wire tag_reset_write = (state == S_RESET_INIT);
+// The flush sweep yields to a registered snoop, whose clear writes a different
+// index through the same way RAMs: it re-issues that set one cycle later.
+wire flush_sweep_w = flush_busy_r && !snoop_valid_r;
+// The three tag-clear owners (the internal reset walk, a tag-matched snoop and
+// the flush sweep) share one address expression, so a way RAM needs only a
+// fill-vs-clear address select instead of one mux input per owner.
+wire [SET_BITS-1:0] tag_clear_set_now = tag_reset_write ? init_set :
+                                        flush_sweep_w ? flush_set_r : snoop_set_r;
 wire fill_last_beat = mem_line_resp_valid ||
                       (mem_resp_valid &&
                        fill_count == {WORD_OFFSET_BITS{1'b1}});
@@ -390,7 +434,7 @@ wire registered_snoop_fill_conflict = snoop_valid_r &&
 wire snoop_clears_fill_line = registered_snoop_fill_conflict;
 wire fill_install_allowed = !fill_uncached_r && !live_snoop_fill_conflict &&
                             !registered_snoop_fill_conflict &&
-                            !fill_line_snooped_r;
+                            !fill_line_snooped_r && !fill_killed_r;
 wire data_fill_write = tag_fill_write && fill_install_allowed;
 // A deferred install writes the line gathered at the last beat, not the stale
 // bus inputs still present on the following cycle.
@@ -447,20 +491,20 @@ always_ff @(posedge clk) begin
     end else begin
         if (tag_fill_write && fill_install_allowed && (fill_way == 2'd0))
             tag_way0[fill_set] <= tag_fill_entry;
-        else if (tag_snoop_match0)
-            tag_way0[snoop_set_r] <= '0;
+        else if (flush_sweep_w || tag_snoop_match0)
+            tag_way0[tag_clear_set_now] <= '0;
         if (tag_fill_write && fill_install_allowed && (fill_way == 2'd1))
             tag_way1[fill_set] <= tag_fill_entry;
-        else if (tag_snoop_match1)
-            tag_way1[snoop_set_r] <= '0;
+        else if (flush_sweep_w || tag_snoop_match1)
+            tag_way1[tag_clear_set_now] <= '0;
         if (tag_fill_write && fill_install_allowed && (fill_way == 2'd2))
             tag_way2[fill_set] <= tag_fill_entry;
-        else if (tag_snoop_match2)
-            tag_way2[snoop_set_r] <= '0;
+        else if (flush_sweep_w || tag_snoop_match2)
+            tag_way2[tag_clear_set_now] <= '0;
         if (tag_fill_write && fill_install_allowed && (fill_way == 2'd3))
             tag_way3[fill_set] <= tag_fill_entry;
-        else if (tag_snoop_match3)
-            tag_way3[snoop_set_r] <= '0;
+        else if (flush_sweep_w || tag_snoop_match3)
+            tag_way3[tag_clear_set_now] <= '0;
     end
 end
 
@@ -480,6 +524,7 @@ always_ff @(posedge clk) begin
         fill_requested <= 1'b0;
         fill_tag_wait_r <= 1'b0;
         fill_line_snooped_r <= 1'b0;
+        fill_killed_r <= 1'b0;
         snoop_tag_r <= {TAG_BITS{1'b0}};
         snoop_set_r <= {SET_BITS{1'b0}};
         snoop_word_r <= {WORD_OFFSET_BITS{1'b0}};
@@ -491,9 +536,16 @@ always_ff @(posedge clk) begin
         patchq_head <= {PATCHQ_IDX_BITS{1'b0}};
         for (integer p = 0; p < PATCHQ_DEPTH; p = p + 1)
             patchq_valid[p] <= 1'b0;
+        flush_req_seen_r <= 1'b0;
+        flush_pending_r <= 1'b0;
     end else begin
-        ready_r <= (state == S_IDLE);
+        ready_r <= (state == S_IDLE) && !flush_block;
         resp_valid_r <= 1'b0;
+        flush_req_seen_r <= flush_req;
+        if (flush_launch)
+            flush_pending_r <= 1'b0;
+        else if (flush_req_new)
+            flush_pending_r <= 1'b1;
         snoop_valid_r <= invalidate_valid || patch_valid;
         if (invalidate_valid) begin
             snoop_tag_r <= invalidate_addr[TAG_MSB:TAG_LSB];
@@ -517,11 +569,19 @@ always_ff @(posedge clk) begin
             mem_valid_r <= 1'b0;
 
         // A snoop that clears the line being filled is remembered for the rest
-        // of the fill, so the deferred install cannot reinstate it.
-        if (state != S_FILL)
+        // of the fill, so the deferred install cannot reinstate it.  A fill in
+        // flight when a flush is armed is remembered the same way: the sweep
+        // runs concurrently with it, so the install must be suppressed rather
+        // than waited out.  Both marks stick until the fill ends.
+        if (state != S_FILL) begin
             fill_line_snooped_r <= 1'b0;
-        else if (snoop_clears_fill_line)
+            fill_killed_r <= 1'b0;
+        end else begin
+            if (snoop_clears_fill_line)
                 fill_line_snooped_r <= 1'b1;
+            if (flush_req_new || flush_pending_r || flush_busy_r)
+                fill_killed_r <= 1'b1;
+        end
 
         if (snoop_valid_r) begin
             // CPU stores can race ahead of an instruction-cache line fill.
@@ -656,6 +716,43 @@ always_ff @(posedge clk) begin
 
             default: state <= S_IDLE;
         endcase
+
+        // Hold cpu_ready low for the whole flush window.  The state-transition
+        // arms above restore readiness for their next state; a request must
+        // never see a ready cache while a walk is pending.
+        if (flush_block)
+            ready_r <= 1'b0;
+    end
+end
+
+//=============================================================================
+// Whole-L1 sweep
+//=============================================================================
+// One set per cycle, independent of the fill/lookup FSM, so the flush completes
+// even while a fill is blocked on the bus.  A registered snoop's clear writes a
+// different index through the same way RAMs, so the sweep yields that cycle and
+// re-issues the same set; the reset walk clears everything and never touches
+// the bus, so the sweep may simply wait for it.
+always_ff @(posedge clk) begin
+    if (reset) begin
+        flush_busy_r <= 1'b0;
+        flush_done_r <= 1'b0;
+        flush_set_r  <= {SET_BITS{1'b0}};
+    end else begin
+        flush_done_r <= 1'b0;
+        if (!flush_busy_r) begin
+            if (flush_launch) begin
+                flush_busy_r <= 1'b1;
+                flush_set_r  <= {SET_BITS{1'b0}};
+            end
+        end else if (!snoop_valid_r) begin
+            if (flush_set_r == LAST_SET) begin
+                flush_busy_r <= 1'b0;
+                flush_done_r <= 1'b1;
+            end else begin
+                flush_set_r <= flush_set_r + 1'b1;
+            end
+        end
     end
 end
 
