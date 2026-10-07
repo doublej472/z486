@@ -1,10 +1,5 @@
-; ts_short_limit - a task switch to a TSS whose limit is below 67h raises
-; #TS(TSS selector) in the old task's context (486 PRM 9.9.10 / Table 9-5:
-; "TSS segment limit less than 67H" -> #TS, error code = TSS selector;
-; Table 7-1 step 4).  Fail 0x16xx: TR changed (xx = TR), 0x17xx: the new
-; TSS descriptor type became xx (busy).  Sites: 1 JMP to the TSS, 2 JMP
-; through a task gate, 3 CALL, 4 JMP to a 286 TSS with limit 2Ah (< 2Bh).
-; (derived from fault_rf_classes)
+; far_xfer_restart - far CALL/RET/IRET faults on the target CS restore ESP
+; (fail code site*16+8 = ESP not restored; derived from fault_rf_classes)
 ;
 ; Intel486 PRM 11.3.1.1: "The processor sets the RF flag in the copy of the
 ; EFLAGS register pushed on the stack before entry into any fault handler",
@@ -27,9 +22,9 @@ SEL_STACK equ 0x18
 SEL_RO    equ 0x20
 SEL_NP    equ 0x28
 SEL_TSS   equ 0x40
+SEL_NPCODE equ 0x30
+SEL_NPGATE equ 0x38
 SEL_TSSSH equ 0x48
-SEL_GATE  equ 0x30
-SEL_TSS286 equ 0x38
 
 align 8
 gdt:
@@ -39,15 +34,16 @@ gdt:
     dq 0x004093010000FFFF       ; 18 stack, base 10000h, byte limit FFFFh, B=1
     dq 0x00CF91010000FFFF       ; 20 read-only data
     dq 0x00CF13010000FFFF       ; 28 data, not present
-    dw 0, SEL_TSSSH, 0x8500, 0  ; 30 task gate -> 48
-    dw 0x002a, tss_b            ; 38 286 TSS, limit 2Ah (< 2Bh)
-    db 0x01, 0x81, 0x00, 0x00
+    dq 0x00CF1B010000FFFF       ; 30 code, not present (SEL_NPCODE)
+    dw 0, SEL_NPCODE            ; 38 386 call gate -> not-present code (SEL_NPGATE)
+    db 0, 0x8c
+    dw 0
 tss_desc:                       ; 40 available 386 TSS
     dw 0x0067
     dw tss_a
     db 0x01, 0x89, 0x00, 0x00
-tss_short:                      ; 48 386 TSS, limit 20h (< 67h)
-    dw 0x0020
+tss_short:                      ; 48 386 TSS, available (not busy)
+    dw 0x0067
     dw tss_b
     db 0x01, 0x89, 0x00, 0x00
 gdt_end:
@@ -82,6 +78,7 @@ last_err: dd 0
 last_eip: dd 0
 last_efl: dd 0
 rf_bad: dd 0
+esp_before: dd 0
 bnds: dd 0, 10
 
 hcommon:
@@ -175,25 +172,37 @@ start:
     push dword 0x2
     popfd
 
-    ; 1: JMP to a TSS whose descriptor limit is 20h (< 67h) -> #TS(sel),
-    ; raised in the old task's context: TR unchanged, new TSS not busy
-    SITE 1, 10, SEL_TSSSH, 1, jmp SEL_TSSSH:0
-    SITE 2, 10, SEL_TSSSH, 1, jmp SEL_GATE:0
-    SITE 3, 10, SEL_TSSSH, 1, call SEL_TSSSH:0
-    SITE 4, 10, SEL_TSS286, 1, jmp SEL_TSS286:0
-    str ax
-    movzx eax, ax
-    or eax, 0x1600
-    cmp ax, 0x1600 | SEL_TSS
+%macro ESPSITE 4+
+    mov [ss:esp_before], esp
+    SITE %1, %2, %3, 1, %4
+    mov eax, %1*16+8
+    cmp esp, [ss:esp_before]
     jne fail
-    movzx eax, byte [tss_short+5]
-    or eax, 0x1700
-    cmp eax, 0x1789
-    jne fail
-    movzx eax, byte [gdt+0x38+5]
-    or eax, 0x1700
-    cmp eax, 0x1781
-    jne fail
+%endmacro
+    ; 1: far CALL to a not-present code segment -> #NP(sel), ESP unchanged
+    ESPSITE 1, 11, SEL_NPCODE, call SEL_NPCODE:0
+    ; 2: far CALL to a data selector -> #GP(sel)
+    ESPSITE 2, 13, SEL_DATA, call SEL_DATA:0
+    ; 3: RETF to a not-present code segment: the frame stays on the stack
+    push dword SEL_NPCODE
+    push dword 0
+    ESPSITE 3, 11, SEL_NPCODE, retf
+    add esp, 8
+    ; 4: IRETD to a not-present code segment
+    push dword 0x2
+    push dword SEL_NPCODE
+    push dword 0
+    ESPSITE 4, 11, SEL_NPCODE, iretd
+    add esp, 12
+    ; 5: RETF 8 popping a null CS -> #GP(0)
+    push dword 0
+    push dword 0
+    push dword 0
+    push dword 0
+    ESPSITE 5, 13, 0, retf 8
+    add esp, 16
+    ; 6: CALL through a call gate whose target CS is not present
+    ESPSITE 6, 11, SEL_NPCODE, call SEL_NPGATE:0
     mov eax, [ss:rf_bad]
     test eax, eax
     jz pass
