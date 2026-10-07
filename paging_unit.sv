@@ -692,6 +692,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         req_linear <= 32'h0;
         req_op_size <= 2'b0;
         req_is_write <= 1'b0;
+        req_is_io <= 1'b0;
         req_wdata <= 32'h0;
         req_cpl <= 2'b0;
         req_offset <= 2'b0;

@@ -262,9 +262,10 @@ end
 reg [VIPT_TLB_ENTRIES-1:0] vipt_valid_ref;
 reg                        vipt_valid_ref_q;
 always_ff @(posedge clk) begin
-    if (!reset_n)
+    if (!reset_n) begin
         vipt_valid_ref <= '0;
-    else if (invalidate_all)
+        vipt_valid_ref_q <= 1'b0;
+    end else if (invalidate_all)
         vipt_valid_ref <= '0;
     else if (invalidate_page)
         vipt_valid_ref[invalidate_vpn[7:0]] <= 1'b0;

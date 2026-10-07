@@ -90,6 +90,7 @@ always_ff @(posedge clk) begin
         idiv_dividend_neg   <= 1'b0;
         idiv_divisor_neg    <= 1'b0;
         div_first_cycle     <= 1'b0;
+        div_flags_r         <= 6'd0;
     end else begin
         if (instr_start)
             dsp_completed <= 1'b0;
