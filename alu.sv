@@ -360,7 +360,8 @@ always @* begin
         end else if (is_addfam) begin
             cf_cand = cout_msb;
         end else if (is_subfam) begin
-            if (op == ALU_NEG) cf_cand = (dst[31:0] != 32'h0000_0000);  // NEG: CF=1 if original != 0
+            // NEG: CF=1 iff the sized operand is non-zero (ignore dirty upper bits)
+            if (op == ALU_NEG) cf_cand = is_byte ? (|dst[7:0]) : is_word ? (|dst[15:0]) : (|dst[31:0]);
             else               cf_cand = ~cout_msb;
         end
         f2[0] = update_carry ? cf_cand : flags[0];
