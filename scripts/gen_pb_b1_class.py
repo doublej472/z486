@@ -90,7 +90,9 @@ initial begin
         else if (!f && (op == 8'hE8))
             e.rel_branch_kind = REL_BRANCH_CALL;
         e.entry_point = final_e[11:0];
-        if (f && (op[7:3] == 5'b11001)) e.entry_point = UADDR_BSWAP;
+        if (f && ((op == 8'h24) || (op == 8'h26)) && (m[5:3] >= 3'd3))
+            e.entry_point = op[1] ? UADDR_MOV_TR_TO : UADDR_MOV_TR_FROM;
+        else if (f && (op[7:3] == 5'b11001)) e.entry_point = UADDR_BSWAP;
         else if (f && (op[7:1] == 7'b1100000))
             e.entry_point = (m[7:6] == 2'b11) ? UADDR_XADD_R : UADDR_XADD_M;
         else if (f && (op[7:1] == 7'b1011000))

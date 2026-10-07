@@ -36,6 +36,8 @@ module segmentation_unit
     output     [31:0]  lar_result,         // LAR combinational readback (keyed by seg_target)
     output logic [31:0] llim_result,       // LLIM combinational readback (keyed by seg_target)
     output     [31:0]  lbas_result,        // LBAS combinational readback (keyed by seg_target)
+    input              xreg_read_sel,      // the executing MOV r,DRn reads xreg_read_value instead
+    input      [31:0]  xreg_read_value,
 
     // Segment state (set by commands, used by address translation and z486)
     output reg [3:0]   seg_sel,            // Active segment for memory ops
@@ -741,7 +743,9 @@ address_unit address_unit_inst (
     .eff_mask_pending(eff_mask_exec),
     .lar_result(lar_result),
     .llim_result(llim_result),
-    .lbas_result(lbas_result),
+    // MOV r,DRn / MOV r,TRn read IND through the LBAS path (the ROM predecode
+    // folds the MOV r,TRn LPCR word into LBAS).
+    .lbas_result(xreg_read_sel ? xreg_read_value : lbas_result),
     .fault_code(au_fault_code),
     .fault_addr(au_fault_addr),
     .cr3(au_cr3),

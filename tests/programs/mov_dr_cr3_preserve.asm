@@ -54,10 +54,11 @@ start:
     jne .fail_4
 
     ; DR6/DR7 use dedicated microcode destinations and readback paths.
+    ; DR6 bits 31-16 and 11-4 read as one and bit 12 as zero (486).
     mov eax, 0x13579BDF
     mov dr6, eax
     mov ecx, dr6
-    cmp ecx, eax
+    cmp ecx, 0xFFFF8FFF
     jne .fail_5
 
     ; Keep breakpoint enables and GD clear; bit 10 is the inert fixed-one bit.

@@ -1072,6 +1072,8 @@ localparam [11:0] UADDR_RPTI_RNI       = 12'h20F;  // REP interrupt restart boun
 localparam [11:0] UADDR_PAGE_FAULT     = 12'h8E9;  // #PF(14) - page fault
 localparam [11:0] UADDR_INVALID_LOCK   = 12'h82B;  // #UD for invalid LOCK usage
 localparam [11:0] UADDR_BSWAP          = 12'h9C4;  // Optimizer-owned 486 BSWAP entry
+localparam [11:0] UADDR_MOV_TR_TO      = 12'h391;  // CROM MOV TRn,r (TR3-TR7 on the 486)
+localparam [11:0] UADDR_MOV_TR_FROM    = 12'h3B6;  // CROM MOV r,TRn
 localparam [11:0] UADDR_XADD_R         = 12'h9D9;  // Optimizer-owned 486 XADD r,r
 localparam [11:0] UADDR_XADD_M         = 12'h9DC;  // Optimizer-owned 486 XADD m,r
 localparam [11:0] UADDR_CMPXCHG_R      = 12'h9E2;  // Optimizer-owned 486 CMPXCHG r,r
@@ -1284,6 +1286,31 @@ function automatic logic even_parity(input [31:0] value, input use32);
         even_parity = ~^value;
     else
         even_parity = ~^value[15:0];
+endfunction
+
+// The original microcode's internal register file (IRF) holds the general
+// registers (low three index bits), the segment slots 0x20-0x27 and, at
+// 0x70-0x7F, the debug and test registers.  MOV DRn/TRn address that last
+// range; only the first is backed by the GPR file here.
+function automatic logic irf_is_gpr(input [31:0] countr);
+    irf_is_gpr = (countr[5:3] != 3'b100) && (countr[7:4] != 4'h7);
+endfunction
+
+// POPA/POPAD discard the popped ESP slot (their eSP words set the pointer); a
+// task switch's IRF loads do write ESP.
+function automatic logic irf_writes_gpr(input [31:0] countr, input logic has_0f,
+                                        input logic [7:0] opcode);
+    irf_writes_gpr = irf_is_gpr(countr) &&
+                     !(countr[2:0] == 3'd4 && !has_0f && opcode == 8'h61);
+endfunction
+
+// 486 debug-register fixed bits.  DR6: bits 31-16 and 11-4 read as one, bit
+// 12 as zero.  DR7: bit 10 reads as one, bits 15-14 and 12-11 as zero.
+function automatic [31:0] dr6_value(input [31:0] value);
+    dr6_value = (value | 32'hFFFF_0FF0) & ~32'h0000_1000;
+endfunction
+function automatic [31:0] dr7_value(input [31:0] value);
+    dr7_value = (value & ~32'h0000_D800) | 32'h0000_0400;
 endfunction
 
 // LOCK prefix validation
