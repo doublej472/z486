@@ -56,7 +56,8 @@ module tb_l1_icache;
         .patch_valid(patch_valid),
         .invalidate_addr(invalidate_addr),
         .invalidate_valid(invalidate_valid),
-        .cache_enable(1'b1)
+        .cache_enable(1'b1),
+        .cpu_no_alloc(1'b0)
     );
 
     reg [7:0] mem [0:4095];
@@ -157,7 +158,7 @@ module tb_l1_icache;
     initial begin
         fork
             begin
-                repeat (2000) @(posedge clk);
+                repeat (4000) @(posedge clk);
                 $display("L1 ICACHE TIMEOUT state=%0d ready=%0b resp=%0b",
                          dut.state, cpu_ready, cpu_resp_valid);
                 $fatal(1);
@@ -402,6 +403,46 @@ module tb_l1_icache;
         if (mem_request_count != mem_request_before + 1) begin
             $display("L1 ICACHE WIDE FILL request count before=%0d after=%0d",
                      mem_request_before, mem_request_count);
+            $fatal(1);
+        end
+
+        // A snoop presented EARLY in a fill (not on the last beat) clears the
+        // line, but the fill's later tag write must not re-install it.  The
+        // backing store is updated before the invalidate, so a re-installed
+        // (stale) line would make the next read hit and return the old data.
+        reset = 1'b1;
+        wide_mode = 1'b0;
+        repeat (5) @(posedge clk);
+        reset = 1'b0;
+        repeat (20) @(posedge clk);
+        mem_put32(32'h180, 32'h1111_0000);
+        mem_put32(32'h184, 32'h3333_2222);
+        mem_put32(32'h188, 32'h5555_4444);
+        mem_put32(32'h18C, 32'h7777_6666);
+        do @(negedge clk); while (!cpu_ready);
+        cpu_addr = 32'h180;
+        cpu_valid = 1'b1;
+        @(negedge clk);
+        cpu_valid = 1'b0;
+        do @(negedge clk); while (!(dut.state == 3'd3 &&
+                                    dut.fill_count == 2'd1 &&
+                                    mem_resp_valid));
+        mem_put32(32'h180, 32'hBEEF_F00D);
+        invalidate_addr = 32'h180;
+        invalidate_valid = 1'b1;
+        @(negedge clk);
+        invalidate_valid = 1'b0;
+        if (!cpu_resp_valid)
+            do @(negedge clk); while (!cpu_resp_valid);
+        if (cpu_line !== 128'h7777_6666_5555_4444_3333_2222_1111_0000) begin
+            $display("L1 ICACHE MID-FILL RESPONSE FAIL got=%032x", cpu_line);
+            $fatal(1);
+        end
+        repeat (2) @(negedge clk);
+        mem_request_before = mem_request_count;
+        cache_read(32'h180, 128'h7777_6666_5555_4444_3333_2222_BEEF_F00D);
+        if (mem_request_count == mem_request_before) begin
+            $display("L1 ICACHE MID-FILL SNOOP EXPOSED: fill re-installed the invalidated line (no re-fetch)");
             $fatal(1);
         end
 
