@@ -10,6 +10,7 @@ tests/programs/*.lst
 tests/protected_mode_tests/*.lst
 tests/protected_mode_tests/traces/
 tests/result.txt
+tests/test_output.txt
 tests/real.log
 tests/singlestep_real/
 tests/singlestep_protected/
