@@ -6,7 +6,13 @@
 module tb_protected_mode #(
     parameter ENABLE_X87 = 0,
     parameter MEM_SIZE = 1 << 19,
-    parameter DCACHE_SET_BITS = 7
+    parameter DCACHE_SET_BITS = 7,
+    // Answer a cache-line fill request (burstcount==4 from an L1) with one
+    // 16-byte line_resp_valid beat instead of four narrow resp_valid DWORDs.
+    // Upstream tied line_din/line_resp_valid low, so the whole-line fill path -
+    // and the optimistic-miss (mem_opt_wait) path behind it - had no CPU-level
+    // coverage at all.  LINE_FILL=0 restores the narrow-only model for A/B.
+    parameter LINE_FILL = 1
 );
     // Segment cache array indices (from z486_pkg)
     localparam SEG_ES = 0, SEG_CS = 1, SEG_SS = 2, SEG_DS = 3;
@@ -31,6 +37,11 @@ module tb_protected_mode #(
     reg  [31:0] din;        // Data input to CPU
     reg         ready;
     reg         resp_valid;
+    // Whole-line fill response (the core asserts line_read for a 4-DWORD L1 read)
+    wire        line_read;
+    reg         line_resp_valid = 1'b0;
+    reg [127:0] line_din = 128'd0;
+    bit         line_fill_en = 1'b1;
     reg         intr = 0;
     reg         nmi = 0;
     wire        inta;
@@ -46,16 +57,16 @@ module tb_protected_mode #(
         .addr(addr),
         .be(be),
         .burstcount(burstcount),
-        .line_read(),
+        .line_read(line_read),
         .din(din),
-        .line_din(128'd0),
+        .line_din(line_din),
         .dout(dout),
         .valid(valid),
         .write(write),
         .io(io),
         .ready(ready),
         .resp_valid(resp_valid),
-        .line_resp_valid(1'b0),
+        .line_resp_valid(line_resp_valid),
         .intr(intr),
         .nmi(nmi),
         .inta(inta),
@@ -654,7 +665,15 @@ module tb_protected_mode #(
     reg [7:0] rd_remaining = 8'd0;
     reg [7:0] rd_index = 8'd0;
     reg rd_io_pending = 1'b0;
-    wire rd_busy = (rd_wait_count != 0) || (rd_remaining != 0) || inta_resp_pending;
+    // Whole-line fill: one pending 16-byte beat, held off by mem_latency.
+    int  line_wait_count = 0;
+    reg [31:0] line_byte_addr = 32'h0;
+    wire line_pending = (line_wait_count != 0);
+    // A line response and a narrow burst never overlap: rd_busy blocks a new
+    // request until the pending beat has been delivered.
+    wire rd_busy = (rd_wait_count != 0) || (rd_remaining != 0) ||
+                   inta_resp_pending || line_pending;
+
     // Platform cache-flush and DMA model (PC-98 IOBus analog).
     //   0xC0: write requests the native whole-L1 flush (cache_flush) and the
     //         testbench reports the request-to-done latency; a read returns
@@ -783,10 +802,29 @@ module tb_protected_mode #(
 
         ready <= !rd_busy && (async_stall <= 1);
         resp_valid <= 1'b0;
+        line_resp_valid <= 1'b0;
         // Don't clear din - hold it stable for page walker timing
 
-        // Handle pending read with latency countdown, then return one DWORD per cycle.
-        if (inta_resp_pending) begin
+        // Pending whole-line fill: one 16-byte beat, then done.  The core's
+        // S_FILL captures line_din on this pulse and installs all four words.
+        if (line_pending) begin
+            if (line_wait_count == 1) begin
+                reg [127:0] lv;
+                reg [31:0]  lbase;
+                lbase = line_byte_addr;
+                if (lbase >= MEM_SIZE) lbase = lbase & (MEM_SIZE - 1);
+                for (int i = 0; i < 16; i++)
+                    lv[i*8 +: 8] = mem[(lbase + i) & (MEM_SIZE - 1)];
+                line_din        <= lv;
+                line_resp_valid <= 1'b1;
+                line_wait_count <= 0;
+                if ($test$plusargs("trace_mem"))
+                    $display("MEM LINE RESP @%08x = %032x", line_byte_addr, lv);
+            end else begin
+                line_wait_count <= line_wait_count - 1;
+            end
+        end else if (inta_resp_pending) begin
+            // Narrow path: latency countdown, then one DWORD per cycle.
             resp_valid <= 1'b1;
             din <= inta_resp_data;
             inta_resp_pending <= 1'b0;
@@ -845,6 +883,15 @@ module tb_protected_mode #(
                     if ($test$plusargs("trace_io"))
                         $display("INTA cycle 2: vector=0x%02X", intr_vector);
                 end
+            end else if (LINE_FILL && line_fill_en && line_read && !write && !io) begin
+                // Whole-line fill request from an L1: answer with one 16-byte
+                // beat.  Deliberately does NOT start the narrow burst, so the
+                // core must complete the fill from line_din alone.
+                line_byte_addr  <= {addr, 2'b00};
+                line_wait_count <= (mem_latency <= 1) ? 1 : mem_latency;
+                ready           <= 1'b0;
+                if ($test$plusargs("trace_mem"))
+                    $display("MEM LINE RD @%08x count=%0d", {addr, 2'b00}, burstcount);
             end else if (!write) begin
                 // Read
                 reg [7:0] burst_len;
@@ -1308,6 +1355,12 @@ module tb_protected_mode #(
             $display("[TB] Max cycles: %0d", max_cycles);
         if ($value$plusargs("mem_latency=%d", mem_latency))
             $display("[TB] Memory latency: %0d cycles", mem_latency);
+        // A/B switch: +no_line_fill restores the narrow-only (upstream) model.
+        if ($test$plusargs("no_line_fill")) begin
+            line_fill_en = 1'b0;
+            $display("[TB] Whole-line fill: DISABLED (narrow-only model)");
+        end else if (LINE_FILL)
+            $display("[TB] Whole-line fill: ENABLED (16-byte line_resp_valid)");
         if ($test$plusargs("continue_on_hlt"))
             stop_on_hlt = 1'b0;
 
