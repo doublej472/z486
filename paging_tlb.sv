@@ -465,6 +465,20 @@ always_ff @(posedge clk or negedge reset_n) begin
         if (inval_match2) valid_q[invalidate_set][2] <= 1'b0;
         if (inval_match3) valid_q[invalidate_set][3] <= 1'b0;
     end else begin
+        // The sidecar's refresh. It always lands: when the lookup port hits
+        // the same set this cycle, the hit's touch below is applied on top of
+        // it (later nonblocking assignments win), so the hit way is the most
+        // recent and the sidecar's way keeps the half-tree bit that points
+        // away from it. Yielding to a same-set hit instead lost every refresh
+        // while a loop's code page in that set kept the lookup port hitting.
+        if (vref_refresh) begin
+            case (vref_way)
+                2'd0: begin plru[vref_set][0] <= 1'b1; plru[vref_set][1] <= 1'b1; end
+                2'd1: begin plru[vref_set][0] <= 1'b1; plru[vref_set][1] <= 1'b0; end
+                2'd2: begin plru[vref_set][0] <= 1'b0; plru[vref_set][2] <= 1'b1; end
+                2'd3: begin plru[vref_set][0] <= 1'b0; plru[vref_set][2] <= 1'b0; end
+            endcase
+        end
         // Update PLRU on hit (point away from accessed way in the hit set)
         if (hit) begin
             case (hit_way)
@@ -472,15 +486,6 @@ always_ff @(posedge clk or negedge reset_n) begin
                 2'd1: begin plru[lookup_set][0] <= 1'b1; plru[lookup_set][1] <= 1'b0; end
                 2'd2: begin plru[lookup_set][0] <= 1'b0; plru[lookup_set][2] <= 1'b1; end
                 2'd3: begin plru[lookup_set][0] <= 1'b0; plru[lookup_set][2] <= 1'b0; end
-            endcase
-        end
-        // The sidecar's refresh, unless the lookup port updated the same set.
-        if (vref_refresh && !(hit && vref_set == lookup_set)) begin
-            case (vref_way)
-                2'd0: begin plru[vref_set][0] <= 1'b1; plru[vref_set][1] <= 1'b1; end
-                2'd1: begin plru[vref_set][0] <= 1'b1; plru[vref_set][1] <= 1'b0; end
-                2'd2: begin plru[vref_set][0] <= 1'b0; plru[vref_set][2] <= 1'b1; end
-                2'd3: begin plru[vref_set][0] <= 1'b0; plru[vref_set][2] <= 1'b0; end
             endcase
         end
 

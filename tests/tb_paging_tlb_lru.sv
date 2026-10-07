@@ -17,6 +17,12 @@
 // and finally checks that P is still in the main TLB. Without the refresh the
 // fourth install evicts P (its way is the pseudo-LRU victim, having never been
 // touched since it was installed).
+//
+// The second scenario parks the main lookup port on L, another page of P's
+// set, as a loop's code page does: the lookup port then hits set 5 on every
+// cycle, and a refresh that yields to a same-set lookup hit never lands (the
+// PC-9821 hardware run with the first fix still took VEM486's #GP). Both L and
+// P are in use, so neither may be the victim of Q5..Q8.
 
 `default_nettype none
 
@@ -69,7 +75,12 @@ module tb_paging_tlb_lru;
   localparam [31:0] Q1 = 32'h0002_D000, Q2 = 32'h0003_5000,
                     Q3 = 32'h0003_D000, Q4 = 32'h0004_5000;
 
+  localparam [31:0] L  = 32'h0000_5000, P2 = 32'h0004_D000;
+  localparam [31:0] Q5 = 32'h0005_5000, Q6 = 32'h0005_D000,
+                    Q7 = 32'h0006_5000, Q8 = 32'h0006_D000;
+
   integer errors = 0;
+  reg [31:0] park = OTHER;
 
   // A walker refill: paging_unit always presents the walked page on the lookup
   // port (update_vpn == the registered lookup VPN).
@@ -79,7 +90,7 @@ module tb_paging_tlb_lru;
     update_valid = 1'b1; update_vpn = addr[31:12]; update_pfn = addr[31:12];
     @(posedge clk); #1;
     update_valid = 1'b0;
-    linear_addr = OTHER;
+    linear_addr = park;
     @(posedge clk); #1;
   endtask
 
@@ -120,6 +131,33 @@ module tb_paging_tlb_lru;
     #1;
     if (hit) begin
       $display("FAIL: Q1 should have been the victim of Q4's install");
+      errors = errors + 1;
+    end
+
+    // Scenario 2: the lookup port parked on L in P2's set.
+    reset_n = 1'b0;
+    repeat (2) @(posedge clk); #1;
+    reset_n = 1'b1;
+    park = L;
+    linear_addr = L;
+    @(posedge clk); #1;
+    install(L);
+    install(P2);
+    sidecar_read(P2); install(Q5);
+    sidecar_read(P2); install(Q6);
+    sidecar_read(P2); install(Q7);
+    sidecar_read(P2); install(Q8);
+    sidecar_read(P2);
+    linear_addr = P2;
+    #1;
+    if (!hit) begin
+      $display("FAIL: P2 (%08x), read from the sidecar before every install while the lookup port hit L in the same set, was evicted", P2);
+      errors = errors + 1;
+    end
+    linear_addr = L;
+    #1;
+    if (!hit) begin
+      $display("FAIL: L (%08x), hit by the lookup port on every cycle, was evicted", L);
       errors = errors + 1;
     end
 
