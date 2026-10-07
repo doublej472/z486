@@ -459,6 +459,11 @@ wire        pf_fault;
 wire [2:0]  pf_fault_code;
 wire [31:0] pf_fault_addr;
 wire        ifetch_page_fault;
+wire        ifetch_limit_fault;     // fetch beyond the CS limit: #GP(0) before the instruction
+// A fetch-side fault (page fault, or #GP(0) for a CS-limit violation) replaces
+// the next instruction: both take the same boundary and sequencer gating.
+wire        frontend_fault;
+wire [5:0]  fetch_limit_rem;        // bytes from EIP through the CS limit (saturated)
 wire [2:0]  ifetch_fault_code;
 wire [31:0] ifetch_fault_addr;
 wire        decoder_fetch_blocked;
@@ -714,7 +719,7 @@ wire        throttle_release_cycle = throttle_parked_r && throttle_release_ready
 // An instruction occupies D2 exactly when ROM port B holds its first word.
 wire       d2_resident = pb_valid;
 // A trap, NMI or interrupt taken at this boundary cancels the D2 issue.
-wire       boundary_take = i_rni_delay && !stall && !page_fault &&
+wire       boundary_take = i_rni_delay && !stall && !frontend_fault &&
     ((tf_trap_pending && !single_step) ||
      (nmi_request_active && !single_step) ||
      (intr_pending && EFLAGS[9] && !single_step && !inhibit_interrupts));
@@ -1078,6 +1083,8 @@ prefetch prefetch_inst (
     .ifetch_fault(ifetch_page_fault),
     .ifetch_fault_code(ifetch_fault_code),
     .ifetch_fault_addr(ifetch_fault_addr),
+    .fetch_limit_rem(fetch_limit_rem),
+    .ifetch_limit_fault(ifetch_limit_fault),
     // Control
     .pf_suspend(page_fault),
     .halt_speculative(decq_has_jmp_call),
@@ -2128,7 +2135,7 @@ wire db_data_access = mem_op_eligible && uc_data_busreq && uc_is_mem_busop &&
 reg  [3:0] db_data_hit_r;
 reg        db_data_trap_r;        // registered: keeps the trap off the issue cone
 assign db_data_trap = db_data_trap_r;
-wire db_trap_taken = i_rni_delay && !stall && !page_fault && tf_trap_pending &&
+wire db_trap_taken = i_rni_delay && !stall && !frontend_fault && tf_trap_pending &&
                      !single_step;
 wire [3:0] db_data_hit_next = (!db_mode_r || any_fault || db_trap_taken) ? 4'd0 :
                               ((i_issue ? 4'd0 : db_data_hit_r) |
@@ -2177,7 +2184,7 @@ assign ibp_issue_hold = !ibp_ok_r;
 // RF=1 (set by IRET from the debug handler) lets the instruction run once.
 assign ibp_fault_now = ibp_fault_ready_r && pb_valid && !uc_active && !halted &&
                        !interrupt_entry && !fault_suppress_delay_slot;
-wire ibp_fault_taken = ibp_fault_now && !stall && !page_fault;
+wire ibp_fault_taken = ibp_fault_now && !stall && !frontend_fault;
 
 // Deferred GPR commits cancel on any_fault_issue only: a divide overflow fires
 // deep inside DIV's microcode, never while a load or hardwired recipe commits.
@@ -2188,7 +2195,7 @@ always @(posedge clk)
         $fatal(1, "divide overflow coincides with a deferred GPR commit");
 // synthesis translate_on
 // div_overflow fires only at the first DIV7/PREDIV word
-assign any_fault_issue = gp_fault_trigger || page_fault;
+assign any_fault_issue = gp_fault_trigger || frontend_fault;
 assign any_fault = any_fault_issue || div_overflow;
 // Registered any_fault is used for deferred SIGMA/TMPeSP writes.
 always_ff @(posedge clk) begin
@@ -2206,6 +2213,20 @@ wire [2:0]  pg_fault_code = data_page_fault ? data_fault_code
                                             : {cpl == 2'd3, 1'b0, ifetch_fault_code[0]};
 wire [31:0] pg_cr2_out = data_page_fault ? data_cr2_out : ifetch_fault_addr;
 assign page_fault = data_page_fault || ifetch_page_fault;
+assign frontend_fault = page_fault || ifetch_limit_fault;
+
+// CS limit for instruction fetch.  EIP is the pop cursor's offset (it names
+// the oldest unissued instruction), so the bytes still inside the code segment
+// are limit + 1 - EIP.  Saturate at 63: the prefetch queue holds 32 bytes.
+// limit + 1 reaches 2^32 for a 4 GB segment, so the difference needs 34 bits
+// (bit 33 is the sign).
+wire [33:0] cs_fetch_limit = desc_cache[SEG_CS].G
+                           ? {2'b0, desc_cache[SEG_CS].limit, 12'hFFF}
+                           : {14'd0, desc_cache[SEG_CS].limit};
+wire [33:0] cs_fetch_rem_w = cs_fetch_limit + 34'd1 - {2'b0, EIP};
+assign fetch_limit_rem = cs_fetch_rem_w[33]        ? 6'd0  :
+                         (|cs_fetch_rem_w[32:6])   ? 6'd63 :
+                         cs_fetch_rem_w[5:0];
 
 // CR3 write detection for TLB flush
 assign cr3_write = uc_exec && uc_buscode == BUSOP_SPCR && uc_dest == DEST_PDBR;
@@ -2843,6 +2864,7 @@ event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
     .ss_fault_r(ss_fault_r),
     .ss_fault_newstack_r(ss_fault_newstack_r),
     .page_fault(page_fault),
+    .ifetch_limit_fault(ifetch_limit_fault),
     .data_page_fault(data_page_fault),
     .pg_fault_code(pg_fault_code),
     .pg_cr2_out(pg_cr2_out),
@@ -3006,7 +3028,7 @@ microsequencer microsequencer_inst (
     .macro_active(uc_active),
     .instr_eip_written(instr_eip_written),
     .any_fault(any_fault),
-    .page_fault(page_fault),
+    .page_fault(frontend_fault),
     // Micro-branch conditions and redirect sources (protection, recipes, divide, faults, boundaries)
     .conditions(seq_conditions),
     .pe(pe),
@@ -3115,14 +3137,13 @@ always_ff @(posedge clk) begin
             automatic logic [31:0] tgt = is_dword
                                        ? eip_source_value
                                        : {16'h0, eip_source_value[15:0]};
-            if (D)
-                EIP <= tgt + {27'b0, i_bus.length};
-            else
-                EIP <= {16'h0, tgt[15:0] + {11'b0, i_bus.length}};
-        end else if (D)
+            // Sequential EIP is 32 bits in every mode: 16-bit code does not
+            // wrap at 0FFFFh, it reaches 10000h and the next fetch is then
+            // beyond the CS limit (#GP(0)).  Only control transfers truncate
+            // to the operand size (tgt above).
+            EIP <= tgt + {27'b0, i_bus.length};
+        end else
             EIP <= EIP + {27'b0, i_bus.length};
-        else
-            EIP <= {16'h0, EIP[15:0] + {11'b0, i_bus.length}};
     end else if (uc_exec && (uc_dest == DEST_EIP || uc_dest == DEST_eIP ||
                             uc_dest == DEST_IP || uc_dest == DEST_USTEP_RPTI_EIP)) begin
         // Microcode destination write to EIP.
@@ -3399,9 +3420,10 @@ always_ff @(posedge clk) begin
         if (vipt_load_slow_r.restore_esp)
             TMPeSP <= vipt_load_slow_r.esp_restore;
     end
-    else if (ifetch_page_fault) begin
-        // A cross-page instruction can fault before i_issue captures its restart
-        // state. The architectural registers still describe that boundary.
+    else if (ifetch_page_fault || ifetch_limit_fault) begin
+        // A cross-page (or past-the-limit) instruction can fault before i_issue
+        // captures its restart state. The architectural registers still
+        // describe that boundary.
         TMPeIP <= EIP;
         TMPeSP <= ESP;
     end
@@ -3504,7 +3526,7 @@ data_unit data_unit_inst (
     .instr_start(i_issue),
     .uc_active(uc_active),
     .halted(halted),
-    .ifetch_page_fault(ifetch_page_fault),
+    .ifetch_page_fault(ifetch_page_fault || ifetch_limit_fault),
     .interrupt_entry(interrupt_entry),
     .any_fault(any_fault_r),
     .clear_rf(clear_rf),
@@ -3685,7 +3707,7 @@ x87_unit #(.ENABLE_X87(ENABLE_X87)) x87 (
     .mem_servicing(mem_servicing),
     .mem_rdata((ucrd_hit && ucrd_x87_r) ? dcache_vipt_resolve_data : dcache_rdata),
     .split_rdata(OPR_R),
-    .cancel(gp_fault_trigger || page_fault || interrupt_entry || q_flush),
+    .cancel(gp_fault_trigger || frontend_fault || interrupt_entry || q_flush),
     .busy_n(x87_busy_n),
     .pereq(x87_pereq),
     .error_n(x87_error_n),
@@ -3697,7 +3719,7 @@ x87_unit #(.ENABLE_X87(ENABLE_X87)) x87 (
 // Miscellaneous control modules
 //=============================================================================
 
-wire nmi_accept_boundary = i_rni_delay && !stall && !page_fault &&
+wire nmi_accept_boundary = i_rni_delay && !stall && !frontend_fault &&
                            nmi_request_active && !single_step;
 
 interrupt_controller interrupts (
