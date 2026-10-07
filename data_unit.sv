@@ -1269,6 +1269,14 @@ end
 assign branch_condition_true = condition_true(instr.branch_condition,
                                               eflags_fwd);
 
+// 486 MOV CR0: NW=1 with CD=0 is an invalid cache mode.  The original MOV
+// CRn routine already rejects PG=1 with PE=0 by testing COUNTR == 1 (its
+// {PG,PE} pair) and taking #GP(0) before CR0 is written; route this case the
+// same way.  TMPB holds the new value from the routine's first word.
+wire cr0_cache_mode_reject = instr.has_0f && (instr.opcode == 8'h22) &&
+                             (instr.modrm[5:3] == 3'd0) &&
+                             tmpb[29] && !tmpb[30];
+
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         countr <= 32'd0;
@@ -1287,7 +1295,7 @@ always_ff @(posedge clk) begin
         else if (dest == DEST_COUNT5)
             countr <= {27'd0, dest_value[4:0]};
         else if (dest == DEST_COUNTR)
-            countr <= dest_value;
+            countr <= cr0_cache_mode_reject ? 32'd1 : dest_value;
         else if (repeat_active &&
                  (aluop == ALUJMP_DIV7 || aluop == ALUJMP_IMUL3 ||
                   aluop == ALUJMP_IMUL4 || aluop == ALUJMP_PREDIV))

@@ -1315,6 +1315,12 @@ function automatic [31:0] dr7_value(input [31:0] value);
     dr7_value = (value & ~32'h0000_D800) | 32'h0000_0400;
 endfunction
 
+// 486 CR0: PE MP EM TS ET NE WP AM NW CD PG are implemented; ET is hardwired
+// to one and the reserved bits read as zero.
+function automatic [31:0] cr0_value(input [31:0] value);
+    cr0_value = (value & 32'hE005_003F) | 32'h0000_0010;
+endfunction
+
 // LOCK prefix validation
 // LOCK is valid if and only if: instruction performs read-modify-write on memory operand
 // Returns 1 if LOCK prefix is INVALID (should trigger #UD)
