@@ -50,6 +50,10 @@ module tb_protected_mode #(
     wire        inta;
     wire        triple_fault_reset;
     wire        bus_lock;
+    // Audit: +xdma_snoop pulses the external-invalidate port with the
+    // external master's write (a 486 EADS# cycle).
+    reg  [31:0] xdma_snoop_addr = 32'h0;
+    reg         xdma_snoop_valid = 1'b0;
     bit win0_unmapped = 1'b0;
     initial win0_unmapped = $test$plusargs("win0_unmapped");
 
@@ -84,8 +88,8 @@ module tb_protected_mode #(
         .intr(intr),
         .nmi(nmi),
         .inta(inta),
-        .snoop_addr(32'h0),
-        .snoop_valid(1'b0),
+        .snoop_addr(xdma_snoop_addr),
+        .snoop_valid(xdma_snoop_valid),
         .cache_flush(cache_flush_platform),
         .cache_flush_busy(cache_flush_busy),
         .cache_flush_done(cache_flush_done),
@@ -822,6 +826,65 @@ module tb_protected_mode #(
             dut.uc_active && (dut.uc_addr == 12'h9D9))
             flush_overlap_cycles <= flush_overlap_cycles + 1;
 
+    // ---- Audit: lock-honouring external bus master (DMA-like) -------------
+    // +xdma_trig=<hex> arms on the +xdma_trig_n=<n>'th (default 1) memory read
+    // accepted at that dword address; +xdma_delay=<n> cycles later, once no
+    // read is outstanding and (unless +xdma_ignore_lock) LOCK# is low, it
+    // writes +xdma_data=<hex> under +xdma_be=<hex> to +xdma_addr=<hex> straight
+    // into RAM (no snoop), as a DMA write between two CPU cycles would.
+    bit         xdma_en = 1'b0;
+    bit         xdma_ignore_lock = 1'b0;
+    reg  [31:0] xdma_trig = 32'h0, xdma_addr = 32'h0, xdma_data = 32'h0;
+    reg  [31:0] xdma_be_arg = 32'hF;
+    int         xdma_trig_n = 1, xdma_delay = 0, xdma_seen = 0;
+    bit         xdma_armed = 1'b0, xdma_done = 1'b0;
+    int         xdma_arm_cycle = 0;
+    longint     xdma_lock_wait = 0;
+    initial begin
+        xdma_en = $value$plusargs("xdma_trig=%h", xdma_trig);
+        void'($value$plusargs("xdma_addr=%h", xdma_addr));
+        void'($value$plusargs("xdma_data=%h", xdma_data));
+        void'($value$plusargs("xdma_be=%h", xdma_be_arg));
+        void'($value$plusargs("xdma_trig_n=%d", xdma_trig_n));
+        void'($value$plusargs("xdma_delay=%d", xdma_delay));
+        xdma_ignore_lock = $test$plusargs("xdma_ignore_lock");
+    end
+    // +count_rd=<hex>/+expect_rd_count=<n>: memory reads accepted on the bus at
+    // that dword address must number exactly n (one per RMW on a 486).
+    reg  [31:0] count_rd_addr = 32'h0;
+    bit         count_rd_en = 1'b0;
+    int         expect_rd_count = -1;
+    longint     rd_count_seen = 0;
+    initial begin
+        count_rd_en = $value$plusargs("count_rd=%h", count_rd_addr);
+        void'($value$plusargs("expect_rd_count=%d", expect_rd_count));
+    end
+    always @(posedge clk)
+        if (reset_n && count_rd_en && valid && ready && !rd_busy && !write && !io &&
+            ({addr, 2'b00} == {count_rd_addr[31:2], 2'b00}))
+            rd_count_seen <= rd_count_seen + 1;
+    // +max_lock_run=<n>: fail a PASS if LOCK# was ever held for more than n
+    // consecutive cycles (an over-long lock holds every other master off).
+    int         max_lock_run = 0;
+    int         lock_run = 0, lock_run_max = 0;
+    initial void'($value$plusargs("max_lock_run=%d", max_lock_run));
+    always @(posedge clk) if (reset_n) begin
+        lock_run <= bus_lock ? lock_run + 1 : 0;
+        if (bus_lock && (lock_run + 1 > lock_run_max)) lock_run_max <= lock_run + 1;
+    end
+    // +trace_lock: every LOCK# edge and every bus cycle accepted while high.
+    reg bus_lock_q = 1'b0;
+    always @(posedge clk) if (reset_n && $test$plusargs("trace_lock")) begin
+        bus_lock_q <= bus_lock;
+        if (bus_lock != bus_lock_q)
+            $display("LOCK# %0d @cycle %0d eip=%08x uc=%03h", bus_lock, cycle, dut.EIP, dut.uc_addr);
+        if (dut.dcache_req_valid && dut.dcache_req_accepted)
+            $display("DREQ %s @%08x locked=%0d uc=%03h cycle=%0d", dut.dcache_req_write ? "WR" : "RD",
+                     dut.dcache_req_phys_addr_raw, dut.dcache_req_is_locked, dut.uc_addr, cycle);
+        if (valid && ready && !rd_busy)
+            $display("BUS %s%s @%08x be=%b lock=%0d cycle=%0d", io ? "IO" : "MEM",
+                     write ? "WR" : "RD", {addr, 2'b00}, be, bus_lock, cycle);
+    end
 
     // Memory behavior with configurable latency (ready/valid protocol)
     // Note: din is held stable (not cleared) to allow paging unit to sample it
@@ -831,6 +894,7 @@ module tb_protected_mode #(
         // below re-asserts this assignment for the request cycle, and the cache
         // unit latches it internally for the walk.
         cache_flush_req <= 1'b0;
+        xdma_snoop_valid <= 1'b0;
         if (async_flush_in > 1)
             async_flush_in <= async_flush_in - 1;
         else if (async_flush_in == 1) begin
@@ -842,6 +906,34 @@ module tb_protected_mode #(
         end
         if (async_stall > 0)
             async_stall <= async_stall - 1;
+        if (xdma_en && reset_n && !xdma_done) begin
+            if (!xdma_armed && valid && ready && !rd_busy && !write && !io && !inta &&
+                ({addr, 2'b00} == {xdma_trig[31:2], 2'b00})) begin
+                xdma_seen <= xdma_seen + 1;
+                if (xdma_seen + 1 == xdma_trig_n) begin
+                    xdma_armed <= 1'b1;
+                    xdma_arm_cycle <= cycle;
+                end
+            end
+            if (xdma_armed && !rd_busy && (cycle - xdma_arm_cycle) > xdma_delay) begin
+                if (bus_lock && !xdma_ignore_lock) begin
+                    xdma_lock_wait <= xdma_lock_wait + 1;
+                end else begin
+                    if (xdma_be_arg[0]) mem[xdma_addr+0] <= xdma_data[7:0];
+                    if (xdma_be_arg[1]) mem[xdma_addr+1] <= xdma_data[15:8];
+                    if (xdma_be_arg[2]) mem[xdma_addr+2] <= xdma_data[23:16];
+                    if (xdma_be_arg[3]) mem[xdma_addr+3] <= xdma_data[31:24];
+                    xdma_done <= 1'b1;
+                    if ($test$plusargs("xdma_snoop")) begin
+                        xdma_snoop_addr <= xdma_addr;
+                        xdma_snoop_valid <= 1'b1;
+                    end
+                    $display("XDMA write @%08x be=%x data=%08x cycle=%0d (armed %0d, waited %0d locked cycles, lock=%0d)",
+                             xdma_addr, xdma_be_arg[3:0], xdma_data, cycle, xdma_arm_cycle,
+                             xdma_lock_wait, bus_lock);
+                end
+            end
+        end
         if (ENABLE_X87 && reset_n && valid && io &&
             (dut.i.opcode >= 8'hd8) && (dut.i.opcode <= 8'hdf))
             $fatal(1, "x87 transaction escaped to external I/O: addr=%08x write=%b",
@@ -1007,6 +1099,10 @@ module tb_protected_mode #(
                              (direct_code_writes == 0)) ||
                             ($test$plusargs("expect_no_alloc_code") &&
                              (no_alloc_code_fills < 2)) ||
+                            ($test$plusargs("expect_xdma") && !xdma_done) ||
+                            ((max_lock_run != 0) && (lock_run_max > max_lock_run)) ||
+                            (count_rd_en && (expect_rd_count >= 0) &&
+                             (rd_count_seen != expect_rd_count)) ||
                             ($test$plusargs("expect_lock") &&
                              ((locked_reads == 0) || (locked_writes == 0) ||
                               bus_lock)) ||
@@ -1023,6 +1119,15 @@ module tb_protected_mode #(
                                 $display("  No platform level overlapped an INVD/WBINVD");
                             else if ($test$plusargs("expect_platform_flush"))
                                 $display("  Platform flush/DMA poke was not exercised");
+                            else if (count_rd_en && (expect_rd_count >= 0) &&
+                                     (rd_count_seen != expect_rd_count))
+                                $display("  %0d bus reads of %08x (expected %0d)",
+                                         rd_count_seen, count_rd_addr, expect_rd_count);
+                            else if ((max_lock_run != 0) && (lock_run_max > max_lock_run))
+                                $display("  LOCK# held %0d consecutive cycles (limit %0d)",
+                                         lock_run_max, max_lock_run);
+                            else if ($test$plusargs("expect_xdma") && !xdma_done)
+                                $display("  external master write never happened");
                             else if ($test$plusargs("expect_inta_lock"))
                                 $display("  INTA cycles locked/unlocked %0d/%0d",
                                          locked_inta, unlocked_inta);
