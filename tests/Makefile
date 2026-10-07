@@ -426,6 +426,13 @@ check-shift-ucode:
 	@echo "Scanning ucode.hex for unrecognized SHIFT source pairings..."
 	@./check_shift_ucode.py $(Z486_DIR)/ucode.hex
 
+# Static audit: an always_ff that assigns state its reset branch never resets.
+# Three live defects had this shape; new ones fail here.
+check-reset-lists:
+	@echo "Running reset-list audit..."
+	@python3 test_reset_lists.py
+	@python3 $(Z486_DIR)/scripts/check_reset_lists.py
+
 # The survey's old findings were fixed; a new finding must fail the gate.
 test-gpr-hazard: obj_dir/Vtb_gpr_hazard
 	@./obj_dir/Vtb_gpr_hazard | tee obj_dir/z486_gpr_hazard.out
@@ -529,6 +536,7 @@ help:
 	@echo "  make test-memory-order - Run device/store ordering unit test"
 	@echo "  make test-load-waw  - Run same-cycle GPR write-arbitration unit test"
 	@echo "  make test-gpr-hazard - Gate the GPR hazard survey"
+	@echo "  make check-reset-lists - Audit always_ff reset branches"
 	@echo "  make test-memmap-template - Run memory-map template unit test"
 	@echo "  make test-interrupt-nmi - Run interrupt-controller NMI deferred-delivery bench"
 	@echo "  make test-x87-bridge - Run x87 protocol bridge unit test"
