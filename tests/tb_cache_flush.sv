@@ -94,6 +94,7 @@ module tb_cache_flush;
     .dcache_req_is_inta(1'b0),
     .dcache_req_is_x87(1'b0),
     .dcache_req_is_vga_mem(1'b0),
+    .dcache_req_is_pcd(1'b0), .cache_cd(1'b0), .cache_nw(1'b0),
     .dcache_req_accepted(req_accepted),
     .dcache_req_complete(req_complete),
     .dcache_read_complete(read_complete),
@@ -122,7 +123,7 @@ module tb_cache_flush;
     .x87_rdata(32'h0),
 
     .icache_req_valid(icache_valid),
-    .icache_req_phys_addr_raw(icache_addr),
+    .icache_req_phys_addr_raw(icache_addr), .icache_req_is_pcd(1'b0),
     .icache_req_accepted(icache_accepted),
     .icache_req_complete(icache_complete),
     .icache_rdata(icache_line),

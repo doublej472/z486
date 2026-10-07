@@ -55,10 +55,12 @@ module tb_paging_walker;
     .result_writable(result_writable),
     .result_user(result_user),
     .result_dirty(result_dirty),
+    .result_pcd(),
     .mem_rd(mem_rd),
     .mem_wr(mem_wr),
     .mem_addr(mem_addr),
     .mem_wdata(mem_wdata),
+    .mem_pcd(),
     .mem_data(mem_data),
     .mem_ready(mem_ready)
   );

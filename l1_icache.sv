@@ -47,7 +47,10 @@ module l1_icache #(
     input         cache_enable,
     // NO_ALLOC fill: answer the fetch but do not install a line, so an
     // unmapped/uncached window never evicts or aliases a cacheable line.
-    input         cpu_no_alloc
+    input         cpu_no_alloc,
+    // 486 non-cacheable fetch (PTE.PCD or CR0.CD): a valid line still
+    // answers, but a miss is not allocated.
+    input         cpu_no_fill
 );
 
 localparam integer WORD_OFFSET_BITS = 2;
@@ -122,6 +125,7 @@ reg        req_valid_r;
 reg [31:0] req_addr_r;
 reg        req_uncacheable_r;
 reg        req_no_alloc_r;
+reg        req_no_fill_r;
 reg [TAG_BITS-1:0] req_tag_r;
 reg        req_snoop_conflict_r;   // the request's tag read raced a snoop's tag clear
 reg [SET_BITS-1:0] req_set_r;
@@ -438,7 +442,10 @@ wire registered_snoop_fill_conflict = snoop_valid_r &&
 wire snoop_clears_fill_line = registered_snoop_fill_conflict;
 // A snoop owns the tag port while the completed fill waits. Data and tag
 // install together after the event; a snoop of the fill's own line instead
-wire fill_install_allowed = !fill_uncached_r && !live_snoop_fill_conflict &&
+// leaves it uncached for the remainder of that fill.  A fill for a disabled
+// cache (fill_uncached_r) or a no-allocate fetch delivers without installing.
+wire fill_install_allowed = !fill_uncached_r && !req_no_alloc_r && !req_no_fill_r &&
+                            !live_snoop_fill_conflict &&
                             !registered_snoop_fill_conflict &&
                             !fill_line_snooped_r && !fill_killed_r;
 wire data_fill_write = tag_fill_write && fill_install_allowed;
@@ -633,6 +640,7 @@ always_ff @(posedge clk) begin
                     req_addr_r <= cpu_addr;
                     req_uncacheable_r <= cpu_uncacheable;
                     req_no_alloc_r <= cpu_no_alloc;
+                    req_no_fill_r <= cpu_no_fill;
                     req_tag_r <= cpu_tag;
                     // A matching snoop clears its tag on this edge, while this
                     // request reads the old one.
@@ -646,7 +654,10 @@ always_ff @(posedge clk) begin
             S_LOOKUP: begin
                 req_valid_r <= 1'b0;
 
-                if (lookup_hit_usable && !req_uncacheable_r) begin
+                // A disabled cache (req_uncacheable_r) or a no-allocate fetch
+                // (req_no_alloc_r) never hits: it reads the whole line as a
+                // pass-through fill that is delivered but not installed.
+                if (lookup_hit_usable && !req_uncacheable_r && !req_no_alloc_r) begin
                     plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
                     state <= S_IDLE;
                     ready_r <= 1'b1;
