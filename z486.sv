@@ -2320,7 +2320,19 @@ always_ff @(posedge clk) begin
         endcase
     end
 end
-assign lock = bus_lock_r || (inta_lock_r != 2'd0);
+// The page walker sets A/D with a locked read-modify-write: LOCK# from its
+// locked read until its write has left the CPU.
+wire walk_lock;
+reg  walk_lock_hold_r;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        walk_lock_hold_r <= 1'b0;
+    else if (walk_lock)
+        walk_lock_hold_r <= 1'b1;
+    else if (dcache_stores_drained_top)
+        walk_lock_hold_r <= 1'b0;
+end
+assign lock = bus_lock_r || (inta_lock_r != 2'd0) || walk_lock || walk_lock_hold_r;
 
 wire        paging_mem_rd_ind = !x87_direct_mem_req && !paging_owned_submit &&
                                 (uc_buscode == BUSOP_RD_IND);
@@ -2498,6 +2510,7 @@ data_access data_access_inst (
 paging_unit #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) paging_inst (
     .dbg_walk_pde       (dbg_walk_pde),
     .dbg_walk_pte       (dbg_walk_pte),
+    .walk_lock          (walk_lock),
     .clk                (clk),
     .reset_n            (reset_n),
     .cr0                (CR0),

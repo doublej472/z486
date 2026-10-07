@@ -35,6 +35,8 @@ module paging_walker
     output reg   [31:0] mem_addr,
     output reg   [31:0] mem_wdata,
     output reg          mem_pcd,        // PCD for this table access (CR3 for the PDE, PDE for the PTE)
+    output reg          mem_locked,     // Locked read (LOCK#): bypass the L1, read memory
+    output reg          ad_lock,        // Hold LOCK# for an A/D read-modify-write
     input        [31:0] mem_data,
     input               mem_ready,
     // PC-98 debug taps: the last directory and table entries read
@@ -55,7 +57,11 @@ typedef enum logic [3:0] {
     PW_WRITE_PTE,       // Write back PTE with ACCESSED (+ DIRTY if write)
     PW_WAIT_WR_PTE,     // Wait for PTE write completion
     PW_DONE,            // Walk complete (success, after write-back)
-    PW_FAULT            // Walk complete (fault, no write-back)
+    PW_FAULT,           // Walk complete (fault, no write-back)
+    PW_LOCK_PDE,        // Issue locked re-read of the PDE before setting A
+    PW_WAIT_LOCK_PDE,
+    PW_LOCK_PTE,        // Issue locked re-read of the PTE before setting A/D
+    PW_WAIT_LOCK_PTE
 } pw_state_t;
 
 pw_state_t state, next_state;
@@ -70,6 +76,15 @@ reg        saved_wp;
 // Page directory entry and page table entry
 reg [31:0] pde;
 reg [31:0] pte;
+// A 486 sets A/D with a locked read-modify-write.  The entries above are first
+// read unlocked (possibly from the L1); an entry that needs an A/D update is
+// re-read with a locked read and re-checked before it is written, so an
+// external write between the walk and the update is neither lost nor
+// overridden.  *_fresh marks an entry that holds the locked read's value,
+// LOCK# being held (ad_lock) from that read until the walk ends.
+reg        pde_fresh;
+reg        pte_fresh;
+
 // Debug taps: the two entries the current (or last) walk read.
 assign dbg_pde = pde;
 assign dbg_pte = pte;
@@ -129,8 +144,17 @@ always_ff @(posedge clk or negedge reset_n) begin
         saved_wp <= 1'b0;
         pde <= 32'h0;
         pte <= 32'h0;
+        pde_fresh <= 1'b0;
+        pte_fresh <= 1'b0;
+        ad_lock <= 1'b0;
     end else begin
         state <= next_state;
+
+        // LOCK# from the first locked read until the walk ends.
+        if (next_state == PW_LOCK_PDE || next_state == PW_LOCK_PTE)
+            ad_lock <= 1'b1;
+        else if (state == PW_DONE || state == PW_FAULT)
+            ad_lock <= 1'b0;
 
         // Latch request parameters at start
         if (state == PW_IDLE && walk_request) begin
@@ -139,6 +163,8 @@ always_ff @(posedge clk or negedge reset_n) begin
             saved_cpl <= cpl;
             saved_cr3 <= cr3;
             saved_wp <= wp_enable;
+            pde_fresh <= 1'b0;
+            pte_fresh <= 1'b0;
         end
 
         // Latch PDE when memory returns
@@ -149,6 +175,31 @@ always_ff @(posedge clk or negedge reset_n) begin
         // Latch PTE when memory returns
         if (state == PW_WAIT_PTE && mem_ready) begin
             pte <= mem_data;
+        end
+
+        // Locked re-reads replace the entry and are re-checked.  The PTE is
+        // re-read (unlocked) after a locked PDE read, which may have moved
+        // the page table.
+        if (state == PW_WAIT_LOCK_PDE && mem_ready) begin
+            pde <= mem_data;
+            pde_fresh <= 1'b1;
+        end
+        if (state == PW_WAIT_LOCK_PTE && mem_ready) begin
+            pte <= mem_data;
+            pte_fresh <= 1'b1;
+        end
+
+        // A written entry now holds its A/D bits; the next update of the
+        // other entry (or a re-check) must not repeat it.
+        if (state == PW_WAIT_WR_PDE && mem_ready) begin
+            pde[PTE_A] <= 1'b1;
+            pde_fresh <= 1'b0;
+        end
+        if (state == PW_WAIT_WR_PTE && mem_ready) begin
+            pte[PTE_A] <= 1'b1;
+            if (saved_is_write)
+                pte[PTE_D] <= 1'b1;
+            pte_fresh <= 1'b0;
         end
     end
 end
@@ -190,15 +241,38 @@ always_comb begin
         end
 
         PW_CHECK_PERM: begin
-            // Permission check: only write back A/D bits if access is permitted
-            if (!user_access_ok || !write_access_ok)
-                next_state = PW_FAULT;          // Protection fault, no write-back
+            // Permission check: only write back A/D bits if access is
+            // permitted.  Presence is re-checked for a locked re-read.
+            if (!pde_present || !pte_present || !user_access_ok || !write_access_ok)
+                next_state = PW_FAULT;          // Fault, no write-back
             else if (pde_update_required)       // Permissions OK, set A
-                next_state = PW_WRITE_PDE;      // Permissions OK, write back A bit
+                next_state = pde_fresh ? PW_WRITE_PDE : PW_LOCK_PDE;
             else if (pte_update_required)       // PDE unchanged, set PTE A/D
-                next_state = PW_WRITE_PTE;      // PDE unchanged, write back PTE A/D
+                next_state = pte_fresh ? PW_WRITE_PTE : PW_LOCK_PTE;
             else
                 next_state = PW_DONE;           // Nothing to update
+        end
+
+        PW_LOCK_PDE: begin
+            next_state = PW_WAIT_LOCK_PDE;
+        end
+
+        PW_WAIT_LOCK_PDE: begin
+            if (mem_ready) begin
+                if (!mem_data[PTE_P])
+                    next_state = PW_FAULT;      // PDE became not present
+                else
+                    next_state = PW_READ_PTE;   // re-read the PTE, re-check
+            end
+        end
+
+        PW_LOCK_PTE: begin
+            next_state = PW_WAIT_LOCK_PTE;
+        end
+
+        PW_WAIT_LOCK_PTE: begin
+            if (mem_ready)
+                next_state = PW_CHECK_PERM;     // re-check the fresh PTE
         end
 
         PW_WRITE_PDE: begin
@@ -207,7 +281,7 @@ always_comb begin
 
         PW_WAIT_WR_PDE: begin
             if (mem_ready)
-                next_state = pte_update_required ? PW_WRITE_PTE : PW_DONE;
+                next_state = pte_update_required ? PW_LOCK_PTE : PW_DONE;
         end
 
         PW_WRITE_PTE: begin
@@ -241,6 +315,7 @@ always_comb begin
     mem_wr = 1'b0;
     mem_addr = 32'h0;
     mem_wdata = 32'h0;
+    mem_locked = 1'b0;
     result_pfn = 20'h0;
     result_writable = 1'b0;
     result_user = 1'b0;
@@ -250,6 +325,7 @@ always_comb begin
     // 486: CR3.PCD qualifies the page-directory access, PDE.PCD the page-table
     // access (the PTE's own PCD qualifies the translated page).
     mem_pcd = (state == PW_READ_PDE || state == PW_WAIT_PDE ||
+               state == PW_LOCK_PDE || state == PW_WAIT_LOCK_PDE ||
                state == PW_WRITE_PDE || state == PW_WAIT_WR_PDE)
             ? saved_cr3[PTE_PCD] : pde[PTE_PCD];
 
@@ -275,6 +351,18 @@ always_comb begin
 
         PW_WAIT_PTE: begin
             mem_rd = 1'b1;
+            mem_addr = pte_addr;
+        end
+
+        PW_LOCK_PDE, PW_WAIT_LOCK_PDE: begin
+            mem_rd = 1'b1;
+            mem_locked = 1'b1;
+            mem_addr = pde_addr;
+        end
+
+        PW_LOCK_PTE, PW_WAIT_LOCK_PTE: begin
+            mem_rd = 1'b1;
+            mem_locked = 1'b1;
             mem_addr = pte_addr;
         end
 
