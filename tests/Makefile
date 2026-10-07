@@ -121,6 +121,8 @@ TB_PAGING_WALKER_SRCS := tb_paging_walker.sv
 TB_PAGING_TLB_SRCS := tb_paging_tlb_lru.sv
 TB_CACHE_FLUSH_SRCS := tb_cache_flush.sv
 TB_ADDR_UNIT_RELOC_SRCS := tb_addr_unit_reloc_equiv.sv
+TB_RESET_SWEEP_SRCS := tb_reset_sweep.sv
+CPP_RESET_SWEEP_SRCS := sim_main_reset_sweep.cpp
 TB_X87_BRIDGE_SRCS := tb_x87_bridge.sv
 CPP_X87_BRIDGE_SRCS := sim_main_x87_bridge.cpp
 TB_X87_SEQ_SRCS := tb_x87_sequencer.sv
@@ -143,7 +145,7 @@ PLA4_RTL := $(Z486_DIR)/protection.sv
 .PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-cache-coherence test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists check-pragmas check-rom-columns check-shift-ucode test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 .PHONY: test-release test-pc98-map test-protected-narrow check-generators test-data-access check-runner test-l1-tags-wide test-reset-restart test-fuzz
-.PHONY: test-addr-unit-reloc
+.PHONY: test-addr-unit-reloc test-reset-sweep
 
 all: build
 
@@ -153,7 +155,7 @@ all: build
 test-release:
 	$(MAKE) -j1 check-reset-lists check-pragmas check-rom-columns check-shift-ucode check-generators check-runner
 	$(MAKE) -j1 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-merge test-gpr-hazard test-data-access test-memmap-template test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-cache-coherence test-reset-restart
-	$(MAKE) -j1 test-addr-unit-reloc
+	$(MAKE) -j1 test-addr-unit-reloc test-reset-sweep
 	$(MAKE) -j1 test-protected test-protected-narrow test-simple test-pc98-map test-l1-tags-wide test-fuzz
 	$(MAKE) -j1 obj_dir_x87/Vtb_protected_mode
 	Z486_ENABLE_X87=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_x87/Vtb_protected_mode ./test_protected_mode.py --strict
@@ -345,6 +347,28 @@ test-addr-unit-reloc: obj_dir/Vtb_addr_unit_reloc_equiv
 	@./obj_dir/Vtb_addr_unit_reloc_equiv | tee obj_dir/z486_addr_unit_reloc_equiv.out \
 		| grep -q "TB_ADDR_UNIT_RELOC_EQUIV: PASS" \
 		|| (echo "address_unit relocation equivalence bench FAIL"; exit 1)
+
+# A one-cycle reset at every offset through a short program must restart from
+# the reset vector and reach the same result.  A private --Mdir keeps this
+# bench's -DVL_USER_STOP/-DVL_USER_FATAL verilated.o (mid-reset sim-check trips
+# are tolerated; the sweep's own verdict decides) out of the shared obj_dir.
+obj_dir_reset_sweep/Vtb_reset_sweep: $(RTL_SRCS) $(RTL_DEPS) $(TB_RESET_SWEEP_SRCS) $(CPP_RESET_SWEEP_SRCS)
+	@echo "Building reset-at-cycle sweep bench with Verilator..."
+	cp -f ../*.hex .
+	$(VERILATOR) --timing -Wall -Wno-fatal -Wno-UNOPTFLAT -Wno-SYNCASYNCNET \
+		-O3 -j $(JOBS) -I$(Z486_DIR) -I$(X87_DIR) -I$(X87_REF_DIR) \
+		--Mdir obj_dir_reset_sweep --top-module tb_reset_sweep --cc --exe --build \
+		-CFLAGS "-std=c++14 -O3 -DVL_USER_STOP -DVL_USER_FATAL" \
+		$(TB_RESET_SWEEP_SRCS) $(CPP_RESET_SWEEP_SRCS) $(RTL_SRCS)
+	@echo "Build complete: obj_dir_reset_sweep/Vtb_reset_sweep"
+
+test-reset-sweep: obj_dir_reset_sweep/Vtb_reset_sweep
+	@echo "Running reset-at-cycle sweep bench..."
+	@./obj_dir_reset_sweep/Vtb_reset_sweep > obj_dir_reset_sweep/z486_reset_sweep.out 2>&1 || true
+	@grep -v -e '%Fatal' -e 'Verilog $$stop' -e '%Warning: ignoring' \
+		obj_dir_reset_sweep/z486_reset_sweep.out
+	@grep -q "TB_RESET_SWEEP: PASS" obj_dir_reset_sweep/z486_reset_sweep.out \
+		|| (echo "reset-at-cycle sweep FAIL"; exit 1)
 
 obj_dir/Vtb_x87_bridge: $(X87_DIR)/x87_bridge.sv $(TB_X87_BRIDGE_SRCS) $(CPP_X87_BRIDGE_SRCS)
 	@echo "Building x87 bridge unit test with Verilator..."
@@ -607,6 +631,7 @@ dhrystone:
 # Clean build artifacts
 clean:
 	rm -rf obj_dir_tags32
+	rm -rf obj_dir_reset_sweep
 	rm -rf obj_dir_pc98
 	rm -rf obj_dir_x87_testfloat
 	rm -rf obj_dir_x87_fifo
@@ -636,6 +661,7 @@ help:
 	@echo "  make test-release  - Run all self-contained release gates"
 	@echo "  make test-pc98-map - Execute/modify code in PC-98 DIRECT/NO_ALLOC windows"
 	@echo "  make test-addr-unit-reloc - address_unit relocation vs independent arithmetic"
+	@echo "  make test-reset-sweep - One-cycle reset at every offset through a program"
 	@echo "  make check-reset-lists - Audit always_ff reset branches"
 	@echo "  make test-memmap-template - Run memory-map template unit test"
 	@echo "  make test-interrupt-nmi - Run interrupt-controller NMI deferred-delivery bench"
