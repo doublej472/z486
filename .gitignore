@@ -22,3 +22,4 @@ __pycache__/
 tests/ucode*.hex
 tests/pla_entry_rom.hex
 tests/pla_group_entry.hex
+tests/singlestep_result.txt
