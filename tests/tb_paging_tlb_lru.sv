@@ -23,6 +23,13 @@
 // cycle, and a refresh that yields to a same-set lookup hit never lands (the
 // PC-9821 hardware run with the first fix still took VEM486's #GP). Both L and
 // P are in use, so neither may be the victim of Q5..Q8.
+//
+// The third scenario evicts a page from the four-way TLB without touching it,
+// then reads it through the sidecar: the sidecar must miss. A 486 has only the
+// 32-entry TLB, so an evicted page is walked again on its next use; a sidecar
+// that kept serving it let the main TLB miss later instead, at a moment the
+// guest had changed what the walk reads (HSB masks A20 under VEM486, whose
+// page tables sit above 1 MiB: the #GP survived both PLRU fixes on hardware).
 
 `default_nettype none
 
@@ -162,6 +169,42 @@ module tb_paging_tlb_lru;
     #1;
     if (!hit) begin
       $display("FAIL: L (%08x), hit by the lookup port on every cycle, was evicted", L);
+      errors = errors + 1;
+    end
+
+    // Scenario 3: P3 evicted from the four-way TLB must leave the sidecar too.
+    reset_n = 1'b0;
+    repeat (2) @(posedge clk); #1;
+    reset_n = 1'b1;
+    // The sidecar's epoch scrub sweeps its 256 entries after reset and
+    // reports misses meanwhile; start each scenario once it is done.
+    wait (!dut.vipt_scrub);
+    park = OTHER;
+    linear_addr = OTHER;
+    @(posedge clk); #1;
+    install(OTHER);
+    install(P);
+    install(Q1); install(Q2); install(Q3); install(Q4);
+    linear_addr = P;
+    #1;
+    if (hit) begin
+      $display("FAIL: scenario 3 set-up: P is still in the four-way TLB after four other installs");
+      errors = errors + 1;
+    end
+    linear_addr = OTHER;
+    vipt_preread = 1'b1; vipt_linear_addr = P;
+    @(posedge clk); #1;
+    vipt_preread = 1'b0;
+    if (vipt_hit) begin
+      $display("FAIL: the sidecar still serves P (%08x) after the four-way TLB evicted it", P);
+      errors = errors + 1;
+    end
+    // Q4, the most recent install, is in both.
+    vipt_preread = 1'b1; vipt_linear_addr = Q4;
+    @(posedge clk); #1;
+    vipt_preread = 1'b0;
+    if (!vipt_hit) begin
+      $display("FAIL: the sidecar does not hold Q4 (%08x), the last install", Q4);
       errors = errors + 1;
     end
 
