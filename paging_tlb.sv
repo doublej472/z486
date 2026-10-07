@@ -81,8 +81,10 @@ module paging_tlb
 
 // 8 sets x 4 ways, one lookup port as on the i486: the registered lookup
 // address carries walker, demand and prefetch requests in that priority. Tags
-// and PFNs live in MLAB; the small per-entry flags, valid bits and PLRU state
-// stay in registers.
+// and PFNs live in MLAB, one copy per read port (the registered lookup,
+// INVLPG's tag compare, and the TR6/TR7 test port that also serves the
+// sidecar's replacement refresh); the small per-entry flags, valid bits and
+// PLRU state stay in registers.
 // MLABs have one write port and asynchronous reads, so each copy costs about
 // 20 ALMs where the register array cost a flip-flop per bit plus an 8:1 read
 // mux per bit and port.
@@ -172,10 +174,14 @@ always_ff @(posedge clk) begin
     end
 end
 logic [36:0] test_q [4];
-assign test_q[0] = test_copy0[tlbt_set];
-assign test_q[1] = test_copy1[tlbt_set];
-assign test_q[2] = test_copy2[tlbt_set];
-assign test_q[3] = test_copy3[tlbt_set];
+// The test read port also serves the sidecar's replacement refresh (below)
+// whenever no TR6 request is pending; a pending request owns it.
+wire [2:0] vref_set;
+wire [2:0] test_rd_set = tlbt_pend_r ? tlbt_set : vref_set;
+assign test_q[0] = test_copy0[test_rd_set];
+assign test_q[1] = test_copy1[test_rd_set];
+assign test_q[2] = test_copy2[test_rd_set];
+assign test_q[3] = test_copy3[test_rd_set];
 assign {lookup_tag_q[0], lookup_pfn_q[0]} = lookup_copy0[lookup_set];
 assign inval_tag_q[0]                      = inval_copy0[invalidate_set];
 assign {lookup_tag_q[1], lookup_pfn_q[1]} = lookup_copy1[lookup_set];
@@ -234,6 +240,7 @@ wire [VIPT_TLB_INDEX_BITS-1:0] vipt_refill_index =
 wire vipt_refill_write = vipt_refill_valid && !update_valid;
 reg [31:0] vipt_linear_r;
 reg        vipt_hazard_r;
+reg        vipt_fresh_r;
 reg [3:0]  vipt_epoch;
 reg        vipt_scrub;                 // sweeping INVALID over every index
 reg [VIPT_TLB_INDEX_BITS-1:0] vipt_scrub_index;
@@ -250,6 +257,7 @@ wire       vipt_mutation = invalidate_all || invalidate_page || update_valid ||
                            vipt_refill_write || vipt_scrub_write;
 
 always_ff @(posedge clk) begin
+    vipt_fresh_r <= vipt_preread;
     if (vipt_preread) begin
         vipt_linear_r <= vipt_linear_addr;
         // Any simultaneous mutation conservatively poisons this preread. TLB
@@ -291,6 +299,28 @@ wire vipt_match = !vipt_hazard_r && !vipt_scrub &&
                   (vipt_tlb_q[39:36] == vipt_epoch) &&
                   (vipt_tlb_q[35:24] == vipt_linear_r[31:20]);
 assign vipt_is_vga_mem = vipt_match && vipt_tlb_q[0];
+
+// THE SIDECAR'S HITS REFRESH THE FOUR-WAY TLB'S REPLACEMENT STATE. A 486
+// refreshes a page's pseudo-LRU state on every access that uses it. A sidecar
+// hit used to bypass the main TLB entirely, so a page served only from the
+// sidecar aged to least-recently-used in its set and was evicted while still
+// in use; the next access that needed the main TLB (a locked RMW, a write, or
+// any access the direct port declined) walked again. That walk is not
+// architecturally free: it rereads the page tables, so software that has
+// rewritten them without INVLPG - legal while the translation is cached -
+// sees the new mapping, and a walk taken with A20 masked reads them from the
+// wrong place (the PC-9821 VEM486 + HSB #PF at 0xFD880, which the real 486
+// never takes; tests/programs/tlb_sidecar_lru). One refresh per preread: the
+// cycle after it, when vipt_linear_r is the preread's address.
+assign vref_set = vipt_linear_r[14:12];
+wire [16:0] vref_tag = vipt_linear_r[31:15];
+wire [3:0] vref_match = {valid_q[vref_set][3] && (test_q[3][36:20] == vref_tag),
+                         valid_q[vref_set][2] && (test_q[2][36:20] == vref_tag),
+                         valid_q[vref_set][1] && (test_q[1][36:20] == vref_tag),
+                         valid_q[vref_set][0] && (test_q[0][36:20] == vref_tag)};
+wire       vref_refresh = vipt_fresh_r && vipt_match && !tlbt_pend_r && (|vref_match);
+wire [1:0] vref_way = vref_match[0] ? 2'd0 : vref_match[1] ? 2'd1 :
+                      vref_match[2] ? 2'd2 : 2'd3;
 
 always_comb begin
     vipt_hit = vipt_match;
@@ -423,6 +453,20 @@ always_ff @(posedge clk or negedge reset_n) begin
         if (inval_match2) valid_q[invalidate_set][2] <= 1'b0;
         if (inval_match3) valid_q[invalidate_set][3] <= 1'b0;
     end else begin
+        // The sidecar's refresh. It always lands: when the lookup port hits
+        // the same set this cycle, the hit's touch below is applied on top of
+        // it (later nonblocking assignments win), so the hit way is the most
+        // recent and the sidecar's way keeps the half-tree bit that points
+        // away from it. Yielding to a same-set hit instead lost every refresh
+        // while a loop's code page in that set kept the lookup port hitting.
+        if (vref_refresh) begin
+            case (vref_way)
+                2'd0: begin plru[vref_set][0] <= 1'b1; plru[vref_set][1] <= 1'b1; end
+                2'd1: begin plru[vref_set][0] <= 1'b1; plru[vref_set][1] <= 1'b0; end
+                2'd2: begin plru[vref_set][0] <= 1'b0; plru[vref_set][2] <= 1'b1; end
+                2'd3: begin plru[vref_set][0] <= 1'b0; plru[vref_set][2] <= 1'b0; end
+            endcase
+        end
         // Update PLRU on hit (point away from accessed way in the hit set)
         if (hit) begin
             case (hit_way)
