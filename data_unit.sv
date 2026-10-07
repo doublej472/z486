@@ -816,6 +816,8 @@ always_ff @(posedge clk) begin
         tmpd   <= 32'd0;
         tmpe   <= 32'd0;
         tmpf   <= 32'd0;
+        tmpg   <= 32'd0;
+        tmph   <= 32'd0;
         csopcd <= 32'd0;
         fsveip <= 32'd0;
         oproff <= 32'd0;
@@ -1536,6 +1538,7 @@ wire next_rep_flag_string = !next_instr.has_0f && next_instr.rep_lock[1] &&
 always_ff @(posedge clk) begin
     flags_backup_refresh <= reset_n && instr_start && !halted && !interrupt_entry;
     if (!reset_n) begin
+        flags_backup_refresh <= 1'b0;
         flags_backup_active <= 1'b0;
         flags_backup <= 32'd0;
     end else if (ifetch_page_fault) begin

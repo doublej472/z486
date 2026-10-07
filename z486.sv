@@ -1277,6 +1277,8 @@ always_ff @(posedge clk) begin
         d2_ea_split_done_r <= 1'b0;
         throttle_parked_r <= 1'b0;
         stack_init_pending <= 1'b0;
+        // Pulse state: never reset, so it starts X in simulation.
+        i_first <= 1'b0;
     end else begin
         if (q_flush || any_fault)
             d2_ea_split_done_r <= 1'b0;
@@ -1867,7 +1869,10 @@ always @(posedge clk)
 assign any_fault_issue = gp_fault_trigger || page_fault;
 assign any_fault = any_fault_issue || div_overflow;
 // Registered any_fault is used for deferred SIGMA/TMPeSP writes.
-always_ff @(posedge clk) any_fault_r <= any_fault;
+always_ff @(posedge clk) begin
+    if (!reset_n) any_fault_r <= 1'b0;
+    else          any_fault_r <= any_fault;
+end
 wire [2:0]  data_fault_code;
 wire [31:0] data_cr2_out;
 // The executing instruction is older than a blocked frontend fetch. If both
@@ -2679,6 +2684,10 @@ always_ff @(posedge clk) begin
         op_size_du <= 2'd1;
         op_size_dw <= 2'd1;
         srcreg_size_src <= 2'd1;
+        op_size_decode <= 2'd1;
+        op_size_src_decode <= 2'd1;
+        srcreg_size_decode <= 2'd1;
+        srcreg_size_src_decode <= 2'd1;
     end else if (i_issue && !halted) begin
         // Instruction start: widths have already been resolved in D1.
         op_size <= i_bus.operand_size;
@@ -2724,6 +2733,8 @@ always_ff @(posedge clk) begin
         LDTR <= 16'h0000;
         TR <= 16'h0000;
         SLCTR <= 32'h0;
+        ucrd_restart_eip <= 32'h0000_fff0;
+        ucrd_restart_esp <= 32'h0;
 
         // BOOTUP 9BA-9BB leaves PE/MP/EM/TS/PG clear and sets ET for 80387.
         CR0 <= 32'h0000_0010;

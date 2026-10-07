@@ -514,6 +514,7 @@ always_ff @(posedge clk) begin
         init_set <= {SET_BITS{1'b0}};
         req_valid_r <= 1'b0;
         req_snoop_conflict_r <= 1'b0;
+        fill_uncached_r <= 1'b0;
         ready_r <= 1'b0;
         resp_valid_r <= 1'b0;
         line_r <= 128'h0;
