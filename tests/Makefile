@@ -137,8 +137,20 @@ PLA4_RTL := $(Z486_DIR)/protection.sv
 
 # Targets
 .PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists check-pragmas check-rom-columns check-shift-ucode test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
+.PHONY: test-release test-pc98-map test-protected-narrow check-generators test-data-access check-runner test-l1-tags-wide test-reset-restart
 
 all: build
+
+# The local release gate is deliberately serial: several Verilator targets
+# share obj_dir and compile common support objects with different trace flags.
+# External SingleStepTests/test386 and vendor timing are separate requirements.
+test-release:
+	$(MAKE) -j1 check-reset-lists check-pragmas check-rom-columns check-shift-ucode check-generators check-runner
+	$(MAKE) -j1 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-merge test-gpr-hazard test-data-access test-memmap-template test-interrupt-nmi test-paging-walker test-cache-flush test-reset-restart
+	$(MAKE) -j1 test-protected test-protected-narrow test-simple test-pc98-map test-l1-tags-wide
+	$(MAKE) -j1 obj_dir_x87/Vtb_protected_mode
+	Z486_ENABLE_X87=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_x87/Vtb_protected_mode ./test_protected_mode.py --strict
+	$(MAKE) -j1 dhrystone
 
 check-runner:
 	python3 test_runner_contract.py
@@ -402,6 +414,9 @@ test-protected: obj_dir/Vtb_protected_mode
 	@echo "Running protected mode tests..."
 	./test_protected_mode.py --strict
 
+test-protected-narrow: obj_dir/Vtb_protected_mode
+	SIM_PLUSARGS=+no_line_fill ./test_protected_mode.py --strict
+
 test-pc98-map: obj_dir_pc98/Vtb_protected_mode
 	Z486_PC98_MAP=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_pc98/Vtb_protected_mode ./test_protected_mode.py --strict pc98_direct_code pc98_noalloc_code pc98_high_alias
 	SIM_PLUSARGS=+no_line_fill Z486_PC98_MAP=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_pc98/Vtb_protected_mode ./test_protected_mode.py --strict pc98_direct_code pc98_noalloc_code pc98_high_alias
@@ -562,6 +577,7 @@ help:
 	@echo "  make test-memory-order - Run device/store ordering unit test"
 	@echo "  make test-load-waw  - Run same-cycle GPR write-arbitration unit test"
 	@echo "  make test-gpr-hazard - Gate the GPR hazard survey"
+	@echo "  make test-release  - Run all self-contained release gates"
 	@echo "  make test-pc98-map - Execute/modify code in PC-98 DIRECT/NO_ALLOC windows"
 	@echo "  make check-reset-lists - Audit always_ff reset branches"
 	@echo "  make test-memmap-template - Run memory-map template unit test"
