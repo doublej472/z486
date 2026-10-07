@@ -2200,6 +2200,16 @@ wire uc_data_busreq = !prot_redirect_prev &&
                        io_busop_rd || io_busop_wr);
 assign uc_busreq = uc_data_busreq || iack_busop;
 assign mem_req_current = mem_op_eligible && uc_busreq;  // drives paging unit
+// synthesis translate_off
+// Hazard-inventory monitor (A8, +monitor_hazards): a direct-load EX token
+// resolving while an older deferred token still owns its destination.
+bit monitor_hazards_a8;
+initial monitor_hazards_a8 = $test$plusargs("monitor_hazards");
+always @(posedge clk)
+    if (reset_n && monitor_hazards_a8 && vipt_load_ex_r.valid &&
+        vipt_load_ex_token_pending)
+        $display("HAZARD A8: direct token behind a pending older token");
+// synthesis translate_on
 // Delay prefetch on upcoming demand memory
 wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || d2_resident);
 
