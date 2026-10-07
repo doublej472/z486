@@ -304,10 +304,10 @@ end
 endfunction
 
 wire [3:0] lookup_hit_vec = {
-    rd_valid3_r && (rd_tag3_r == req_tag_r),
-    rd_valid2_r && (rd_tag2_r == req_tag_r),
-    rd_valid1_r && (rd_tag1_r == req_tag_r),
-    rd_valid0_r && (rd_tag0_r == req_tag_r)
+    rd_valid3_r && !rd_invalidated_r[3] && (rd_tag3_r == req_tag_r),
+    rd_valid2_r && !rd_invalidated_r[2] && (rd_tag2_r == req_tag_r),
+    rd_valid1_r && !rd_invalidated_r[1] && (rd_tag1_r == req_tag_r),
+    rd_valid0_r && !rd_invalidated_r[0] && (rd_tag0_r == req_tag_r)
 };
 wire lookup_hit = |lookup_hit_vec;
 wire [1:0] lookup_way = way_encode(lookup_hit_vec);
@@ -320,6 +320,7 @@ wire lookup_snoop_conflict = req_snoop_conflict_r ||
     (snoop_valid_r && (snoop_tag_r == req_tag_r) && (snoop_set_r == req_set_r)) ||
     (patch_valid && (patch_tag == req_tag_r) && (patch_set == req_set_r));
 wire lookup_hit_usable = lookup_hit && !lookup_snoop_conflict;
+
 wire can_accept_cpu = (state == S_IDLE) && !reset;
 wire accept_cpu = cpu_valid && cpu_ready && can_accept_cpu;
 // The sweep starts one cycle after the request is observed, when ready_r has
@@ -442,6 +443,18 @@ logic [127:0] fill_install_line;
 assign fill_install_line = fill_tag_wait_r ? fill_line :
                            mem_line_resp_valid ? wide_line_next : fill_line_next;
 
+// Ways whose tag was captured on an edge that also cleared them.  The tag RAM
+// read is synchronous and returns the OLD entry, so a demand accepted in the
+// clearing cycle would otherwise hit a line this very clear invalidated.  A
+// flush sweep clears every way of its set; a tag-matched snoop clears only the
+// way holding its line.
+reg  [3:0] rd_invalidated_r;
+wire [3:0] tag_clear_ways = flush_sweep_w
+                          ? 4'b1111
+                          : {tag_snoop_match3, tag_snoop_match2,
+                             tag_snoop_match1, tag_snoop_match0};
+wire tag_clear_in_preread_set = (flush_sweep_w || snoop_valid_r) &&
+                                (tag_clear_set_now == cpu_set);
 
 always_ff @(posedge clk) begin
     if (accept_cpu) begin
@@ -454,6 +467,7 @@ always_ff @(posedge clk) begin
         rd_line2_r <= data_way2[cpu_set];
         rd_line3_r <= data_way3[cpu_set];
         rd_plru_r <= plru_set[cpu_set];
+        rd_invalidated_r <= tag_clear_in_preread_set ? tag_clear_ways : 4'b0000;
     end
 
     // Keep each data RAM's synchronous read and write in the same process.

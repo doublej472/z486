@@ -71,6 +71,22 @@ module tb_l1_icache;
         .cpu_no_alloc(1'b0)
     );
 
+    // Instrumentation for the same-way fill/snoop investigation: does a fill
+    // tag install ever share a way RAM write port with a tag-matched snoop
+    // clear in the same cycle?  (tag_fill_write requires !snoop_valid_r, so
+    // this is expected to stay 0.)
+    integer same_way_cycles = 0;
+    always @(posedge clk) begin
+        if (!reset && dut.tag_fill_write && dut.fill_install_allowed) begin
+            if ((dut.fill_way == 2'd0 && dut.tag_snoop_match0) ||
+                (dut.fill_way == 2'd1 && dut.tag_snoop_match1) ||
+                (dut.fill_way == 2'd2 && dut.tag_snoop_match2) ||
+                (dut.fill_way == 2'd3 && dut.tag_snoop_match3)) begin
+                same_way_cycles = same_way_cycles + 1;
+            end
+        end
+    end
+
     reg [7:0] mem [0:4095];
     reg [31:0] rd_addr = 32'h0;
     reg [7:0] rd_left = 8'd0;
@@ -368,9 +384,12 @@ module tb_l1_icache;
             $fatal(1);
         end
 
-        // If the snoop and a different-line fill need the same way RAM, the
-        // fill tag may win: replacing the old tag also invalidates the snooped
-        // line, so both operations are satisfied by the single RAM write.
+        // If the snoop and a different-line fill need the same way RAM, our
+        // fill tag write is deferred while the snoop is live, so both the fill
+        // install and the snoop's clear must complete.  The backing store is
+        // updated first, so a dropped invalidation would leave the old line
+        // valid and the next read would return stale data.
+        mem_put32(32'h200, 32'hBEEF_5A5A);
         do @(negedge clk); while (!cpu_ready);
         cpu_addr = 32'h220;
         cpu_valid = 1'b1;
@@ -394,6 +413,15 @@ module tb_l1_icache;
         cache_read(32'h220, 128'h2200_0003_2200_0002_2200_0001_2200_0000);
         if (mem_request_count != mem_request_before) begin
             $display("L1 ICACHE SAME-WAY COLLISION lost fill tag");
+            $fatal(1);
+        end
+        // Fail-first: the snooped line itself must be gone.  A re-read has to
+        // miss, refetch and return the updated backing store rather than the
+        // stale cached line.
+        mem_request_before = mem_request_count;
+        cache_read(32'h200, 128'h2000_0003_2000_0002_2000_0001_BEEF_5A5A);
+        if (mem_request_count == mem_request_before) begin
+            $display("L1 ICACHE SAME-WAY COLLISION exposed stale snoop target (no re-fetch)");
             $fatal(1);
         end
 
@@ -516,7 +544,48 @@ module tb_l1_icache;
             $fatal(1);
         end
 
-        $display("L1 PIPT instruction cache unit test PASS");
+        // A registered external invalidation must not be defeated by a tag read
+        // launched on the clearing edge: the synchronous tag RAM returns its
+        // old entry, so a demand accepted in that cycle would hit the line the
+        // clear just removed.  The backing store is updated first, so a stale
+        // hit returns the old bytes and takes no refetch.
+        reset = 1'b1;
+        wide_mode = 1'b0;
+        stall_mem = 1'b0;
+        flush_req = 1'b0;
+        repeat (5) @(posedge clk);
+        reset = 1'b0;
+        repeat (20) @(posedge clk);
+        mem_put_line(32'h240, 32'h2400_0000, 32'h2400_0001,
+                     32'h2400_0002, 32'h2400_0003);
+        cache_read(32'h240, 128'h2400_0003_2400_0002_2400_0001_2400_0000);
+        mem_put32(32'h240, 32'hBEEF_2400);
+        @(negedge clk);
+        invalidate_addr = 32'h240;
+        invalidate_valid = 1'b1;
+        @(negedge clk);
+        invalidate_valid = 1'b0;
+        // Demand accepted on the CLEARING edge: drive the port directly so the
+        // accept lands in the snoop's registered cycle (cache_read's ready wait
+        // would push it one cycle later, past the clear).
+        mem_request_before = mem_request_count;
+        cpu_addr = 32'h240;
+        cpu_valid = 1'b1;
+        @(negedge clk);
+        cpu_valid = 1'b0;
+        if (!cpu_resp_valid)
+            do @(negedge clk); while (!cpu_resp_valid);
+        if (cpu_line !== 128'h2400_0003_2400_0002_2400_0001_BEEF_2400) begin
+            $display("L1 ICACHE REGISTERED SNOOP RACE exposed stale hit got=%032x", cpu_line);
+            $fatal(1);
+        end
+        if (mem_request_count == mem_request_before) begin
+            $display("L1 ICACHE REGISTERED SNOOP RACE no re-fetch");
+            $fatal(1);
+        end
+
+        $display("L1 PIPT instruction cache unit test PASS (same-way fill/snoop write-port cycles: %0d)",
+                 same_way_cycles);
         $finish;
     end
 endmodule
