@@ -54,7 +54,7 @@ module prefetch
                                      // the spec target BY CONSTRUCTION (same
                                      // adder inputs), so no address compare
     input             spec_store_valid,
-    input      [31:0] spec_store_linear,
+    input      [11:4] spec_store_line, // page-offset line bits of the store
     input             spec_global_kill
 );
 
@@ -97,11 +97,14 @@ reg [127:0] spec_b_line;
 // Normal 386 self-modifying code performs a frontend-flushing branch after
 // the store. Keep the buffered target coherent for that branch without
 // discarding it for unrelated data stores. Global events remain conservative.
+// Only the page-offset bits are compared: they are untranslated, so a store
+// through any linear alias of the buffered line's physical page matches (an
+// unrelated store with the same offset merely costs a refetch).
 wire spec_store_hit = spec_store_valid &&
-                      (spec_addr == spec_store_linear[31:4]);
+                      (spec_addr[11:4] == spec_store_line);
 wire spec_kill = spec_global_kill || spec_store_hit;
 wire spec_b_store_hit = spec_store_valid &&
-                        (spec_b_addr == spec_store_linear[31:4]);
+                        (spec_b_addr[11:4] == spec_store_line);
 
 // synthesis translate_off
 bit TRACE_FLUSH_EN;
