@@ -3,6 +3,8 @@
 
 /* verilator lint_off SYNCASYNCNET */
 
+`include "z486_pc98_preset.svh"
+
 module tb_protected_mode #(
     parameter ENABLE_X87 = 0,
     parameter MEM_SIZE = 1 << 19,
@@ -61,7 +63,7 @@ module tb_protected_mode #(
     z486 #(
         .ENABLE_X87(ENABLE_X87),
         .DCACHE_SET_BITS(DCACHE_SET_BITS),
-        .A20_MASK_OFF(PC98_MAP ? 32'h000f_ffff : 32'hffef_ffff),
+        .A20_MASK_OFF(PC98_MAP ? `Z486_PC98_A20_MASK_OFF : 32'hffef_ffff),
         .VGA_ENABLE(PC98_MAP),
         .VGA_PRE_WRAP(!PC98_MAP),
         .APERTURE_ENABLE(PC98_MAP),
@@ -93,7 +95,7 @@ module tb_protected_mode #(
         .cache_flush(cache_flush_platform),
         .cache_flush_busy(cache_flush_busy),
         .cache_flush_done(cache_flush_done),
-        .a20_enable(1'b1),
+        .a20_enable(tb_a20),
         .win0_unmapped(win0_unmapped),
         .ram_cache_top(PC98_MAP ? MEM_SIZE : 32'hffff_ffff),
         .cpu_speed_sel(2'd0),
@@ -112,6 +114,14 @@ module tb_protected_mode #(
     // The regular tests use 512KB. Snapshot replay overrides this parameter
     // with the captured physical-memory size.
     reg [7:0] mem [0:MEM_SIZE-1];
+    // The A20 input, driven by I/O writes (0xF0 = mask, 0xF4 = unmask), and two
+    // counts of memory writes by bus address, read back with IN: writes with
+    // address bit 21 set (0xD0), and writes with bit 20 set while A20 was
+    // masked (0xD4). The memory model wraps at MEM_SIZE, so data alone cannot
+    // show which address a masked write was driven to; the bus address can.
+    reg        tb_a20 = 1'b1;
+    reg [31:0] a20_bit21_writes = 32'd0;
+    reg [31:0] a20_masked_bit20_writes = 32'd0;
 
     // Instrument the feature itself: an ordinary-map binary must not make a
     // PC-98 test green, and a NO_ALLOC fetch must never install a line.
@@ -965,7 +975,10 @@ module tb_protected_mode #(
 
             resp_valid <= 1'b1;
             if (rd_io_pending) begin
-                din <= (rd_byte_addr[15:0] == 16'h00FC) ? cycle : 32'hFFFFFFFF;
+                din <= (rd_byte_addr[15:0] == 16'h00FC) ? cycle :
+                       (rd_byte_addr[15:0] == 16'h00D0) ? a20_bit21_writes :
+                       (rd_byte_addr[15:0] == 16'h00D4) ? a20_masked_bit20_writes :
+                       32'hFFFFFFFF;
             end else begin
                 din <= {mem[byte_addr+3], mem[byte_addr+2],
                         mem[byte_addr+1], mem[byte_addr+0]};
@@ -1052,6 +1065,8 @@ module tb_protected_mode #(
                     resp_valid <= 1'b1;
                     din <= ({addr[15:2], 2'b00} == 16'h00FC) ? cycle :
                            ({addr[15:2], 2'b00} == 16'h00C0) ? {31'h0, flush_complete} :
+                           ({addr[15:2], 2'b00} == 16'h00D0) ? a20_bit21_writes :
+                           ({addr[15:2], 2'b00} == 16'h00D4) ? a20_masked_bit20_writes :
                            32'hFFFFFFFF;
                 end
                 rd_remaining <= (mem_latency <= 1 && burst_len > 8'd1) ?
@@ -1208,6 +1223,9 @@ module tb_protected_mode #(
                                  poke, dout, be);
                 end
 
+                if (port == 16'h00F0) tb_a20 <= 1'b0;
+                if (port == 16'h00F4) tb_a20 <= 1'b1;
+
                 // Data port (0xE4) - debug/verification data
                 if (port == 16'h00E4) begin
                     test_data <= dout;
@@ -1292,6 +1310,9 @@ module tb_protected_mode #(
                 // Memory writes
                 reg [31:0] byte_addr;
                 byte_addr = {addr, 2'b00};
+                if (byte_addr[21]) a20_bit21_writes <= a20_bit21_writes + 1;
+                if (byte_addr[20] && !tb_a20)
+                    a20_masked_bit20_writes <= a20_masked_bit20_writes + 1;
 
                 if (byte_addr < MEM_SIZE) begin
                     if (be[0]) mem[byte_addr+0] <= dout[7:0];

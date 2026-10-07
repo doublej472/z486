@@ -118,7 +118,8 @@ z486 #(`Z486_PC98_MAP_PARAMS, .CLOCK_RATE_MHZ(CLOCK_RATE_MHZ)) cpu ( ...
     .win0_unmapped(win0_overlay_is_not_ram), ... );
 ```
 
-It sets `A20_MASK_OFF = 0x000F_FFFF` (1 MiB wrap), `VGA_PRE_WRAP = 0`, and
+It sets `A20_MASK_OFF = 0xFFEF_FFFF` (bit 20 cleared, exported as
+`` `Z486_PC98_A20_MASK_OFF ``), `VGA_PRE_WRAP = 0`, and
 enables the aperture (`A0000-FFFFF`), the three aliases, window-0, and the
 no-allocate bound. The bound defaults to the 128 MiB tag reach, which keeps the
 `0xFFFx_xxxx` aliases out while all RAM below 128 MiB stays cacheable. A
