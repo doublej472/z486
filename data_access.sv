@@ -145,8 +145,7 @@ module data_access
     input  logic                    stall_wio,
     input  logic                    stall_x87_direct,
     input  logic                    uc_active,
-    input  logic [11:0]             uc_addr,
-    input  logic [11:0]             uc_addr_mem_r,
+    input  logic                    rmw_fallback_release,
     input  logic [5:0]              uc_buscode,
     input  logic                    uc_busreq,
     input  logic                    uc_data_busreq,
@@ -692,11 +691,11 @@ always_ff @(posedge clk) begin
         end
 
         // Keep the overlay inert while its registered rejection redirects the
-        // two-stage ROM pipeline. The target word is held for one cycle and
-        // executes normally after this token is cleared.
-        if (rmw_fallback_delay_r &&
-            (uc_addr == recipe_fallback_entry(i_ex.entry_point)) &&
-            (uc_addr_mem_r == recipe_fallback_entry(i_ex.entry_point)))
+        // two-stage ROM pipeline. z486 releases the token once the target
+        // word sits in both ROM stages and the ROM advances, steering port A
+        // to the following word on that edge, so the target executes exactly
+        // once after this token is cleared.
+        if (rmw_fallback_release)
             rmw_fallback_delay_r <= 1'b0;
 
         if (rmw_store_accepted)

@@ -871,6 +871,21 @@ wire [8:0]  uc_ind_ctrl;
 wire        uc_fpu_f8;
 wire        uc_force_word;
 wire        microcode_rom_ce;
+// A refused RMW_FAST overlay redirects to its original routine while
+// rmw_fallback_delay_r keeps every word inert (uc_exec low, no bus cycle).
+// The redirect holds port A on the target, so the target word fills both
+// ROM stages; it is released on an advancing edge with port A steered to the
+// word after the target (the fallback entries 04A/04E are even, so the OR is
+// +1). Releasing with port A still on the target would execute the target
+// twice: a second bus read of the RMW operand.
+wire        rmw_fallback_release = rmw_fallback_delay_r && microcode_rom_ce &&
+    (uc_addr == recipe_fallback_entry(i.entry_point)) &&
+    (uc_addr_mem_r == recipe_fallback_entry(i.entry_point));
+// synthesis translate_off
+always_ff @(posedge clk)
+    if (reset_n && rmw_fallback_release && recipe_fallback_entry(i.entry_point)[0])
+        $fatal(1, "RMW fallback entry %h is odd", recipe_fallback_entry(i.entry_point));
+// synthesis translate_on
 wire [2:0]  d2_kind;
 
 // Decode the shifter source one cycle ahead (q_mem leads the executing uop).
@@ -2197,9 +2212,12 @@ wire io_busop_wr = uc_p_io_wr && mem_is_io;
 
 wire iack_busop = uc_p_iack;        // IACK bus operation (interrupt acknowledge)
 
-// A stale slot word (a dead slot that issued nothing) starts no bus cycle.
+// A stale slot word (a dead slot that issued nothing) starts no bus cycle,
+// nor does the redirected fallback word of a refused RMW_FAST overlay while
+// rmw_fallback_delay_r keeps it inert (uc_exec is low): its bus operation
+// belongs to the execution that follows.
 assign mem_op_eligible = core_live && !mem_servicing && !recipe_slot_stale && !stall_ucrd &&
-                         !throttle_parked_r && !vipt_load_exec_block &&
+                         !throttle_parked_r && !vipt_load_exec_block && !rmw_fallback_delay_r &&
                          !(i_rni_delay && d2_vipt_candidate);
 // A failed protection test blocks bus operations in its delay slots.
 wire uc_data_busreq = !prot_redirect_prev &&
@@ -2498,8 +2516,7 @@ data_access data_access_inst (
     .stall_wio(stall_wio),
     .stall_x87_direct(stall_x87_direct),
     .uc_active(uc_active),
-    .uc_addr(uc_addr),
-    .uc_addr_mem_r(uc_addr_mem_r),
+    .rmw_fallback_release(rmw_fallback_release),
     .uc_buscode(uc_buscode),
     .uc_busreq(uc_busreq),
     .uc_data_busreq(uc_data_busreq),
@@ -2983,7 +3000,8 @@ microsequencer microsequencer_inst (
     .prot_redirect_valid(prot_redirect_taken),
     .prot_redirect_target(prot_jump_addr),
     .recipe_redirect_valid(recipe_fallback_taken),
-    .recipe_redirect_target(recipe_fallback_entry(i.entry_point)),
+    .recipe_redirect_target(recipe_fallback_entry(i.entry_point) |
+                            {11'd0, rmw_fallback_release}),
     .set_rpl_redirect(prot_transition.set_rpl_redirect),
     .div_redirect_valid(div_overflow),
     .div_redirect_target(double_fault_start ? UADDR_DOUBLE_FAULT : UADDR_DIVIDE_ERROR),
