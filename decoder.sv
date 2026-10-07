@@ -357,13 +357,20 @@ always_ff @(posedge clk or negedge reset_n) begin
                 unique case (opcode)
                     8'h66: prefix_66 <= 1'b1;
                     8'h67: prefix_67 <= 1'b1;
+                    // LOCK is sticky against a REP/REPNE in the same
+                    // prefix run: the group shares one field, and LOCK on a
+                    // string instruction must still raise #UD (Intel486 PRM,
+                    // LOCK: "#UD if LOCK is used with an instruction not
+                    // listed"), whichever prefix comes last.
                     8'hf0: prefix_rep_lock <= PREFIX_LOCK;
                     8'hf2: begin
-                        prefix_rep_lock <= PREFIX_REPNE;
+                        if (prefix_rep_lock != PREFIX_LOCK)
+                            prefix_rep_lock <= PREFIX_REPNE;
                         prefix_rep <= 1'b1;
                     end
                     8'hf3: begin
-                        prefix_rep_lock <= PREFIX_REP;
+                        if (prefix_rep_lock != PREFIX_LOCK)
+                            prefix_rep_lock <= PREFIX_REP;
                         prefix_rep <= 1'b1;
                     end
                     8'h26, 8'h2e, 8'h36, 8'h3e, 8'h64, 8'h65:
