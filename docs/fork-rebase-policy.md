@@ -130,6 +130,7 @@ make test-release            # preferred: all self-contained gates, serialized
 make test-protected          # strict directed programs, x87/PC-98 profiles separate
 make test-protected-narrow   # same programs with narrow responses
 make test-pc98-map           # actual PC-98 windows, both response widths
+make test-pc98-map-bus       # each window's external-port shape, DIRECT I$ invalidate
 make test-l1-cache           # D$ snoop/fill/VIPT/patch-backpressure
 make test-simple             # tb_z486
 make test-memmap-template    # z486_cache_map_pkg
