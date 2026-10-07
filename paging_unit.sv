@@ -135,7 +135,12 @@ module paging_unit
 
     output reg          page_fault,        // Page fault occurred (mem/IO requests only)
     output reg   [2:0]  fault_code,        // Error code for page fault
-    output reg   [31:0] cr2_out            // Faulting address (written to CR2)
+    output reg   [31:0] cr2_out,           // Faulting address (written to CR2)
+
+    // PC-98 debug taps: the page walker's last PDE/PTE reads
+    output       [31:0] dbg_walk_pde,
+    output       [31:0] dbg_walk_pte,
+    output       [3:0]  dbg_state            // current FSM state (PG_*)
 );
 
 reg                 rd_ind_active;     // BUSOP_RD_IND active (internal; demoted from output)
@@ -201,6 +206,7 @@ typedef enum logic [3:0] {
 } pg_state_t;
 
 pg_state_t state;
+assign dbg_state = state;
 
 // TLB lookup address for prefetch/walker and other registered slow paths.
 wire [31:0] tlb_lookup_addr;
@@ -336,7 +342,9 @@ paging_walker walker_inst (
     .mem_addr       (walker_mem_addr),
     .mem_wdata      (walker_mem_wdata),
     .mem_data       (dcache_rdata),
-    .mem_ready      (walker_feed_ready)
+    .mem_ready      (walker_feed_ready),
+    .dbg_pde        (dbg_walk_pde),
+    .dbg_pte        (dbg_walk_pte)
 );
 
 // Permission Checking
