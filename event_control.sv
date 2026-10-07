@@ -83,6 +83,8 @@ module event_control
     input  logic interrupt_pending,
     input  logic inhibit_interrupts,
     input  logic tf_trap_pending,
+    input  logic trap_single_step,    // the boundary debug trap includes TF (sets DR6.BS)
+    input  logic ibp_fault_now,       // instruction-breakpoint #DB from an idle sequencer
     input  logic single_step,
 
     // FPU handshake
@@ -299,7 +301,8 @@ always_comb begin
     if (i_rni_delay && !stall && !page_fault) begin
         if (tf_trap_pending && !single_step) begin
             seq_boundary_redirect.valid = 1'b1;
-            seq_boundary_redirect.target = UADDR_SINGLE_STEP;
+            seq_boundary_redirect.target = trap_single_step ? UADDR_SINGLE_STEP
+                                                            : UADDR_DEBUG_TRAP;
         end else if (nmi_request_active && !single_step) begin
             seq_boundary_redirect.valid = 1'b1;
             seq_boundary_redirect.target = UADDR_NMI;
@@ -308,6 +311,11 @@ always_comb begin
             seq_boundary_redirect.valid = 1'b1;
             seq_boundary_redirect.target = UADDR_HARDWARE_IRQ;
         end
+    end else if (ibp_fault_now && !stall && !page_fault) begin
+        // A code breakpoint is a fault before the instruction: EIP still
+        // names it, and the shared #DB body takes it from there.
+        seq_boundary_redirect.valid = 1'b1;
+        seq_boundary_redirect.target = UADDR_DEBUG_TRAP;
     end
 end
 
@@ -475,6 +483,10 @@ always_ff @(posedge clk) begin
             uc_active <= 1'b1;
             latched_pf_code <= pg_fault_code;
             latched_pf_addr <= pg_cr2_out;
+        end
+        if (ibp_fault_now && !stall && !page_fault) begin
+            uc_active <= 1'b1;
+            interrupt_entry <= 1'b1;
         end
 
         // Interrupt recognition is last so it overrides speculative successor state.
