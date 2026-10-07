@@ -1264,6 +1264,12 @@ task automatic select_register_fields(
             dst_reg_sel_out = modrm_in[2:0];
             if (opcode_in == 8'h22 || opcode_in == 8'h23 || opcode_in == 8'h26)
                 src_reg_sel_out = modrm_in[2:0];
+            // UMOV r,r/m (0F 12/13) is MOV 8A/8B: the D bit makes ModRM.reg
+            // the destination.
+            if (opcode_in == 8'h12 || opcode_in == 8'h13) begin
+                src_reg_sel_out = modrm_in[2:0];
+                dst_reg_sel_out = modrm_in[5:3];
+            end
         end else if (!has_0f_in) begin
             unique casez (opcode_in)
                 8'b00???10?: begin
