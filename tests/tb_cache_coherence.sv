@@ -16,6 +16,8 @@
 //           the fill reads memory).
 //   CASE 5  a snooped DMA write clears the I$ patch-queue entry of an older
 //           CPU store to the same line.
+//   CASE 6  a whole-L1 (platform) flush retires the I$ patch queue: a CPU
+//           store's bytes must not be merged over DMA data written after it.
 // Each case prints PASS/FAIL; the bench fails if any case fails.
 module tb_cache_coherence;
     reg clk = 1'b0;
@@ -298,6 +300,25 @@ module tb_cache_coherence;
         repeat (4) @(negedge clk);
         iread(32'h4c00, line);
         check(5, line[31:0], 32'hEEEE_EEEE);
+
+        // ---------------- CASE 6 ----------------
+        // The PC-98 platform keeps coherence with DMA by a whole-L1 flush (its
+        // snoop input is tied off).  A CPU store leaves a copy in the I$'s
+        // 3-entry patch queue; DMA then rewrites that memory (no snoop) and the
+        // platform flushes both L1s.  A later fetch must see the DMA data.
+        do_reset();
+        for (int i = 0; i < 16384; i++) ram[i] = 32'h1111_1111;
+        dstore(32'h4800, 32'hDDDD_DDDD);       // e.g. CPU clears/prepares a buffer
+        while (!dut.dcache_stores_drained_out) @(negedge clk);
+        repeat (4) @(negedge clk);
+        ram[32'h4800 >> 2] = 32'hEEEE_EEEE;    // disk DMA loads new code, no snoop
+        cache_flush = 1;                        // platform flush on DMA completion
+        while (!cache_flush_done) @(negedge clk);
+        @(negedge clk);
+        cache_flush = 0;
+        repeat (4) @(negedge clk);
+        iread(32'h4800, line);                  // jump into the loaded code
+        check(6, line[31:0], 32'hEEEE_EEEE);
 
         if (fails != 0) begin
             $display("tb_cache_coherence: %0d case(s) FAILED", fails);
