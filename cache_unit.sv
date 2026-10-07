@@ -384,6 +384,13 @@ logic  [3:0] icache_write_snoop_be_r;
 wire icache_write_patch_valid = !icache_invalidate_valid &&
                                 (icache_write_snoop_pending ||
                                  dcache_store_patch_valid);
+// A store patch held behind the invalidate (the arriving one or the slot's):
+// the I$ cannot see its address, so a lookup must not hit any line until it
+// is delivered, or a jump to the stored code would run the old bytes.  Only an
+// invalidate (external snoop or DIRECT write) can hold a patch.
+wire icache_write_patch_held = icache_invalidate_valid &&
+                               (icache_write_snoop_pending ||
+                                dcache_store_patch_valid);
 wire [31:0] icache_write_patch_addr = icache_write_snoop_pending
                                     ? icache_write_snoop_addr_r
                                     : dcache_store_patch_addr;
@@ -655,6 +662,7 @@ l1_icache #(
     .patch_valid(icache_write_patch_valid),
     .invalidate_addr(icache_invalidate_addr),
     .invalidate_valid(icache_invalidate_valid),
+    .patch_held(icache_write_patch_held),
     .flush_req(cf_start_r),
     .flush_busy(icache_flush_busy),
     .flush_done(icache_flush_done),
