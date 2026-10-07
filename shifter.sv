@@ -66,6 +66,12 @@ logic        eq_width;
 logic        eq_width_cf;
 logic        set_zsp;
 logic [1:0]  shift1_size;
+// SHIFT2 captures the barrel result and its operand size into a private pair.
+// The architectural Z/S/P must not be read live from SIGMA: a stack instruction
+// chained in the SHIFT2 cycle overwrites SIGMA with its new SP, and a following
+// SHIFT1 setup can change shift1_size, before the deferred retirement reads it.
+logic [31:0] flags_result;
+logic [1:0]  flags_size;
 logic [2:0]  operation;
 logic [31:0] source_value;
 logic [31:0] alu_value;
@@ -226,19 +232,23 @@ assign result = overflow ? (is_sar ? sar_overflow_result : 32'd0) : shifted[31:0
 // therefore the selected low-word bit; do not route the full 64-bit barrel
 // result back into the architectural flag write path.
 assign bit_test_cf = alu_value[count[4:0]];
-// SHIFT2 registers the barrel result on the edge that starts the one-cycle
-// deferred flag retirement; Z/S/P are derived from that register during the
-// retirement cycle, keeping the barrel, width selection and zero reduction
-// out of the flag flops. A private copy, not SIGMA: an instruction issued
-// into the shift's dead slot (a PUSH's ESP update) may write SIGMA on the
-// same edge. shift1_size is the operand size captured by the SHIFT1 setup.
-logic [31:0] flags_value_r;
-assign flags_pf = ~^flags_value_r[7:0];
-assign flags_zf = shift1_size == 2'd0 ? flags_value_r[7:0] == 8'd0 :
-                  shift1_size == 2'd1 ? flags_value_r[15:0] == 16'd0 :
-                                             flags_value_r[31:0] == 32'd0;
-assign flags_sf = shift1_size == 2'd0 ? flags_value_r[7] :
-                  shift1_size == 2'd1 ? flags_value_r[15] : flags_value_r[31];
+// SHIFT2 captures the barrel result on the same edge that starts the existing
+// one-cycle deferred flag retirement.  Derive Z/S/P from that private copy
+// during the retirement cycle: SIGMA is a shared bus that other producers
+// (stack pushes, SERECO, MUL/DIV) drive, so reading it live would pick up
+// whoever won that edge instead of the shift result.
+always_ff @(posedge clk) begin
+    if (exec && is_shift2 && count_nonzero) begin
+        flags_result <= result;
+        flags_size   <= shift1_size;
+    end
+end
+assign flags_pf = ~^flags_result[7:0];
+assign flags_zf = flags_size == 2'd0 ? flags_result[7:0] == 8'd0 :
+                  flags_size == 2'd1 ? flags_result[15:0] == 16'd0 :
+                                       flags_result[31:0] == 32'd0;
+assign flags_sf = flags_size == 2'd0 ? flags_result[7] :
+                  flags_size == 2'd1 ? flags_result[15] : flags_result[31];
 
 always_comb begin
     setup_result = alu_dst;
@@ -344,7 +354,6 @@ always_ff @(posedge clk) begin
     end else begin
         flags_commit <= exec && is_shift2 && count_nonzero;
         if (exec && is_shift2 && count_nonzero) begin
-            flags_value_r <= result;
             flags_we_zsp <= set_zsp;
             flags_we_of <= 1'b0;
             if (instr_is_shxd) begin
