@@ -72,6 +72,13 @@ module l1_cache #(
     input  [31:0] snoop_addr,
     input         snoop_valid,
 
+    // Native whole-L1 invalidate.  flush_req is a one-cycle request (a held
+    // level is also accepted: one walk per release); flush_busy is high for the
+    // walk and flush_done pulses once when it completes.
+    input         flush_req,
+    output        flush_busy,
+    output        flush_done,
+
     input         cache_enable
 );
 
@@ -228,7 +235,30 @@ reg [31:0] dout_r;
 reg resp_valid_r;
 reg ready_r;
 
-assign cpu_ready = ready_r;
+// Whole-L1 invalidate state.  A request is consumed once (a held level is
+// re-armed only after it is released), and flush_block holds new requests off
+// from the cycle it is first observed.
+//
+// The sweep is an INDEPENDENT walk over the sets, not a service of the fill
+// FSM: a fill in flight can be blocked indefinitely behind an unrelated bus
+// transaction, and the platform that asked for the flush may be holding that
+// very transaction until the flush completes.  Waiting for the cache to fall
+// idle would deadlock the machine, so instead any fill in flight is marked
+// (fill_killed_r) and cannot install after the sweep; the sweep then runs
+// concurrently with it and always completes in SETS+2 cycles.
+reg  flush_req_seen_r;
+reg  flush_pending_r;
+reg  flush_busy_r;
+reg  flush_done_r;
+reg  [SET_BITS-1:0] flush_set_r;
+reg  fill_killed_r;
+wire flush_req_new = flush_req & ~flush_req_seen_r;
+wire flush_block = flush_req_new | flush_pending_r | flush_busy_r;
+
+assign flush_busy = flush_busy_r;
+assign flush_done = flush_done_r;
+
+assign cpu_ready = ready_r && !flush_block;
 assign store_patch_addr = req_addr_r;
 assign store_patch_data = req_din_r;
 assign store_patch_be = req_be_r;
@@ -394,25 +424,34 @@ wire vipt_lookup_store_match = (state == S_LOOKUP) && req_valid_r &&
 assign vipt_resolve_data = vipt_lookup_store_match
                          ? merge32(vipt_way_data, req_din_r, req_be_r)
                          : vipt_way_data;
-assign vipt_resolve_hit = vipt_resolve_valid && cache_enable &&
+assign vipt_resolve_hit = vipt_resolve_valid && cache_enable && !flush_block &&
                           (vipt_resolve_phys_addr[31:17] != 15'h5) &&
                           (|vipt_hit_vec);
 wire [BRAM_ADDR_BITS-1:0] req_bram_addr = {req_set_r, req_word_r};
 wire can_accept_cpu = (state == S_IDLE) && !reset && (!cpu_write || cpu_protect_write || storeq_can_accept);
-wire ready_when_idle = !reset && storeq_can_accept;
+wire ready_when_idle = !reset && !flush_block && storeq_can_accept;
 // Store pipelining, like the i486 write buffer taking one store per clock:
 // while a store enqueues in S_LOOKUP, accept the next store and preread its
 // set on the free RAM read port. lookup_wr_room_r holds the queue capacity for
 // that store, computed when the current store was accepted. The opening is
 // registered state only: requesters see it through cpu_wr_ready without any
 // address, TLB or request-type term.
+// The walk starts one cycle after the request is observed, when ready_r has
+// already been forced low: a low ready_r means no demand request can be
+// accepted this cycle, and it also disables the preread/probe arms, so the
+// launch cannot collide with an accept or a VIPT probe resolve.  Testing
+// ready_r (a register) instead of accept_cpu keeps the request-classification
+// cone behind cpu_valid out of this decision.
+wire flush_launch = (flush_req_new | flush_pending_r) &&
+                    (state != S_RESET_INIT) && !reset;
 reg  lookup_wr_room_r;
 wire lookup_store_busy = (state == S_LOOKUP) && req_valid_r &&
                          req_write_r && !req_protect_write_r;
-wire lookup_wr_open = lookup_store_busy && lookup_wr_room_r && !store_patch_busy;
+wire lookup_wr_open = lookup_store_busy && lookup_wr_room_r &&
+                      !store_patch_busy && !flush_block;
 assign cpu_wr_ready = ready_r || lookup_wr_open;
 wire lookup_wr_accept = cpu_valid && cpu_write && lookup_wr_open;
-wire accept_cpu = (cpu_valid && ready_r && can_accept_cpu) || lookup_wr_accept;
+wire accept_cpu = (cpu_valid && cpu_ready && can_accept_cpu) || lookup_wr_accept;
 wire [29:0] req_addr_dw = req_addr_r[31:2];
 wire [29:0] fill_addr_dw = {req_addr_r[31:4], fill_count};
 logic [31:0] lookup_forward_data;
@@ -475,7 +514,7 @@ end
 // no request is accepted the preread results are garbage that S_LOOKUP never
 // sees (it is only entered on accept_cpu).  This keeps the TLB-hit cone off
 // the wide rd_*_r register enables.
-wire idle_preread = (state == S_IDLE) && ready_r;
+wire idle_preread = (state == S_IDLE) && cpu_ready;
 // The store-pipelining preread, likewise ungated by the late accept.
 wire lookup_wr_preread = lookup_wr_open;
 // A posted store patches at most one data way during S_LOOKUP.  The inferred
@@ -485,7 +524,7 @@ wire lookup_wr_preread = lookup_wr_open;
 // tag, and a probe that misses falls back to the paging path, which chooses
 // any victim from current PLRU state.
 wire store_lookup_preread = (state == S_LOOKUP) && req_valid_r &&
-                            req_write_r && !req_protect_write_r;
+                            req_write_r && !req_protect_write_r && !flush_block;
 // Store hits patch the cache before it can accept another probe; store misses
 // have no matching line, and later fills are patched before the tag is valid.
 // Capacity is a registered-state fact. Demand arbitration must not feed back
@@ -516,7 +555,7 @@ wire [BRAM_ADDR_BITS-1:0] preread_bram_addr = {preread_set, preread_word};
 // cache stays coherent and can be re-enabled without a flush.
 wire data_store_write = (state == S_LOOKUP) && req_valid_r && req_write_r &&
                         !req_protect_write_r && lookup_hit;
-wire data_fill_write = (state == S_FILL) &&
+wire data_fill_write = (state == S_FILL) && !fill_killed_r &&
                        (mem_resp_valid || wide_fill_install);
 wire [1:0] data_write_way = data_store_write ? lookup_way : fill_way;
 
@@ -549,12 +588,14 @@ wire [31:0] data_write_value = data_store_write ?
 // Keep each tag array in one conventional synchronous-read/synchronous-write
 // process. Quartus 17 will not infer a block RAM when the packed valid bit is
 // written from the snoop, reset-init, and fill branches of the cache FSM.
-wire tag_fill_write = (state == S_FILL) &&
+wire tag_fill_write = (state == S_FILL) && !fill_killed_r &&
                       (mem_resp_valid || wide_fill_install) &&
                       (fill_count == {WORD_OFFSET_BITS{1'b1}});
-wire tag_clear_all = (state == S_RESET_INIT) || snoop_valid_r;
-wire [SET_BITS-1:0] tag_clear_set = (state == S_RESET_INIT) ?
-                                    init_set : snoop_set_r;
+// registered snoop, and the flush sweep.  The sweep yields to a snoop (whose
+wire flush_sweep_w = flush_busy_r && !snoop_valid_r;
+wire tag_clear_all = (state == S_RESET_INIT) || snoop_valid_r || flush_sweep_w;
+wire [SET_BITS-1:0] tag_clear_set = (state == S_RESET_INIT) ? init_set :
+                                    snoop_valid_r ? snoop_set_r : flush_set_r;
 wire [TAG_RAM_BITS-1:0] tag_fill_entry =
     {{(TAG_RAM_BITS-TAG_BITS-1){1'b0}}, 1'b1, fill_tag};
 wire tag_fill_way0 = tag_fill_write && (fill_way == 2'd0);
@@ -624,19 +665,36 @@ always_ff @(posedge clk) begin
         fill_target_returned <= 1'b0;
         wide_fill_line <= 128'd0;
         wide_fill_install <= 1'b0;
+        fill_killed_r <= 1'b0;
         snoop_set_r <= {SET_BITS{1'b0}};
         snoop_valid_r <= 1'b0;
         for (integer i = 0; i < STOREQ_DEPTH; i = i + 1)
             storeq_valid[i] <= 1'b0;
+        flush_req_seen_r <= 1'b0;
+        flush_pending_r <= 1'b0;
     end else begin
         ready_r <= (state == S_IDLE) && ready_when_idle;
         resp_valid_r <= 1'b0;
+        flush_req_seen_r <= flush_req;
+        if (flush_launch)
+            flush_pending_r <= 1'b0;
+        else if (flush_req_new)
+            flush_pending_r <= 1'b1;
         snoop_valid_r <= snoop_valid;
         if (snoop_valid)
             snoop_set_r <= snoop_set;
 
         if (mem_valid_r && mem_ready)
             mem_valid_r <= 1'b0;
+
+        // A fill in flight when a flush is armed must not install after the
+        // sweep: the sweep runs concurrently with it (it may be blocked on the
+        // bus), so the install is suppressed rather than waited out.  The mark
+        // sticks until the fill ends.
+        if (state != S_FILL)
+            fill_killed_r <= 1'b0;
+        else if (flush_req_new || flush_pending_r || flush_busy_r)
+                fill_killed_r <= 1'b1;
 
         if (storeq_draining && mem_ready) begin
             storeq_valid[storeq_tail] <= 1'b0;
@@ -827,6 +885,43 @@ always_ff @(posedge clk) begin
 
             default: state <= S_IDLE;
         endcase
+
+        // Hold cpu_ready low for the whole flush window.  The state-transition
+        // arms above restore readiness for their next state; a request must
+        // never see a ready cache while a walk is pending.
+        if (flush_block)
+            ready_r <= 1'b0;
+    end
+end
+
+//=============================================================================
+// Whole-L1 sweep
+//=============================================================================
+// One set per cycle, independent of the fill FSM, so the flush completes even
+// while a fill is blocked on the bus.  A registered snoop's clear writes a
+// different index through the same way RAMs, so the sweep yields that cycle and
+// re-issues the same set; the reset walk clears everything and never touches
+// the bus, so the sweep may simply wait for it.
+always_ff @(posedge clk) begin
+    if (reset) begin
+        flush_busy_r <= 1'b0;
+        flush_done_r <= 1'b0;
+        flush_set_r  <= {SET_BITS{1'b0}};
+    end else begin
+        flush_done_r <= 1'b0;
+        if (!flush_busy_r) begin
+            if (flush_launch) begin
+                flush_busy_r <= 1'b1;
+                flush_set_r  <= {SET_BITS{1'b0}};
+            end
+        end else if (!snoop_valid_r) begin
+            if (flush_set_r == LAST_SET) begin
+                flush_busy_r <= 1'b0;
+                flush_done_r <= 1'b1;
+            end else begin
+                flush_set_r <= flush_set_r + 1'b1;
+            end
+        end
     end
 end
 

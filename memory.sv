@@ -126,6 +126,13 @@ module memory
     input      [31:0]  snoop_addr,
     input              snoop_valid,          // External writer invalidates this line
 
+    // Native whole-L1 invalidate (486 INVD/WBINVD): the platform's held-level
+    // request and the instruction path's request, arbitrated in the cache unit.
+    input              cache_flush,
+    input              cache_flush_insn,
+    output             cache_flush_busy,
+    output             cache_flush_done,
+
     // External memory bus
     output     [31:2]  addr,
     output      [3:0]  be,
@@ -290,6 +297,10 @@ cache_unit #(
     // invalidation from the bus unit.
     .snoop_addr(snoop_addr),
     .snoop_valid(snoop_valid),
+    .cache_flush(cache_flush),
+    .cache_flush_insn(cache_flush_insn),
+    .cache_flush_busy(cache_flush_busy),
+    .cache_flush_done(cache_flush_done),
     .icache_invalidate_addr(icache_invalidate_addr),
     .icache_invalidate_valid(icache_invalidate_valid)
 );

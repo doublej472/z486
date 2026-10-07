@@ -13,6 +13,9 @@ module tb_l1_cache;
     reg         cpu_valid = 1'b0;
     reg         cpu_write = 1'b0;
     wire        cpu_ready;
+    wire        cpu_wr_ready;
+    reg         flush_req = 0;
+    wire        flush_done;
     wire        cpu_resp_valid;
     wire        stores_drained;
     reg  [11:0] vipt_probe_offset = 12'd0;
@@ -67,7 +70,7 @@ module tb_l1_cache;
         .cpu_write(cpu_write),
         .cpu_uncacheable(cpu_addr[31:17] == 15'h5),
         .cpu_ready(cpu_ready),
-        .cpu_wr_ready(),
+        .cpu_wr_ready(cpu_wr_ready),
         .cpu_resp_valid(cpu_resp_valid),
         .stores_drained(stores_drained),
         .vipt_probe_offset(vipt_probe_offset),
@@ -95,6 +98,10 @@ module tb_l1_cache;
         .snoop_addr(snoop_addr),
         .snoop_valid(snoop_valid),
         .store_patch_busy(1'b0),
+
+        .flush_req(flush_req),
+        .flush_busy(),
+        .flush_done(flush_done),
         .cache_enable(1'b1)
     );
 
@@ -364,6 +371,36 @@ module tb_l1_cache;
             $display("L1 WIDE FILL was not installed after one line response");
             $fatal(1);
         end
+
+        // The flush arm must close the pipelined write opening immediately,
+        // not only ready_r. The older accepted store still completes.
+        do @(negedge clk); while (!cpu_wr_ready);
+        cpu_addr = 32'h2C0;
+        cpu_din = 32'hCAFE_BABE;
+        cpu_write = 1;
+        cpu_valid = 1;
+        vipt_probe_offset = 12'h040; // shares set/word with the store preread
+        vipt_probe_valid = 1;
+        #1;
+        if (!vipt_probe_accepted)
+            $fatal(1, "flush/probe setup did not accept a shared preread");
+        @(negedge clk);
+        cpu_valid = 0;
+        cpu_write = 0;
+        vipt_probe_valid = 0;
+        vipt_resolve_valid = 1;
+        vipt_resolve_phys_addr = 32'h40;
+        flush_req = 1;
+        #1;
+        if (cpu_wr_ready)
+            $fatal(1, "pipelined store opening survived the flush arm");
+        if (vipt_probe_ready || vipt_resolve_hit)
+            $fatal(1, "VIPT lookup remained usable after the flush arm");
+        @(negedge clk);
+        flush_req = 0;
+        vipt_resolve_valid = 0;
+        do @(negedge clk); while (!flush_done);
+        cache_read(32'h2C0, 4'hF, 32'hCAFE_BABE);
 
         $display("L1 PIPT cache unit test PASS");
         $finish;
