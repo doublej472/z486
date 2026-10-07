@@ -412,26 +412,24 @@ wire [TAG_BITS-1:0] snoop_capture_tag = invalidate_valid ?
 wire live_snoop_fill_conflict = snoop_capture &&
                                 (snoop_capture_set == fill_set) &&
                                 (snoop_capture_tag == fill_tag);
-wire tag_snoop_match0 = snoop_tag_entry0_r[TAG_VALID_BIT] &&
+// The tag read is held after the event. Only the registered event cycle may
+// clear a way, or a later refill of that way would be cleared again.
+wire tag_snoop_match0 = snoop_valid_r && snoop_tag_entry0_r[TAG_VALID_BIT] &&
                         (snoop_tag_entry0_r[TAG_BITS-1:0] == snoop_tag_r);
-wire tag_snoop_match1 = snoop_tag_entry1_r[TAG_VALID_BIT] &&
+wire tag_snoop_match1 = snoop_valid_r && snoop_tag_entry1_r[TAG_VALID_BIT] &&
                         (snoop_tag_entry1_r[TAG_BITS-1:0] == snoop_tag_r);
-wire tag_snoop_match2 = snoop_tag_entry2_r[TAG_VALID_BIT] &&
+wire tag_snoop_match2 = snoop_valid_r && snoop_tag_entry2_r[TAG_VALID_BIT] &&
                         (snoop_tag_entry2_r[TAG_BITS-1:0] == snoop_tag_r);
-wire tag_snoop_match3 = snoop_tag_entry3_r[TAG_VALID_BIT] &&
+wire tag_snoop_match3 = snoop_valid_r && snoop_tag_entry3_r[TAG_VALID_BIT] &&
                         (snoop_tag_entry3_r[TAG_BITS-1:0] == snoop_tag_r);
 wire registered_snoop_fill_conflict = snoop_valid_r &&
                                       (snoop_set_r == fill_set) &&
                                       (snoop_tag_r == fill_tag);
-// Each way is a separate RAM and can accept its own write.  A snoop matching
-// another way must not suppress the fill tag: doing so while still writing the
-// fill data leaves the victim's old valid tag paired with the new line.  If
-// both operations need the same way RAM for different lines, the fill may
-// win: replacing the old tag also invalidates the snooped line.  Only a snoop
-// targeting the line being filled must leave that fill uncached.
 // A snoop that clears the line this fill is installing.  A tag-matched clear
 // is the only kind here (there is no set-wide external invalidate).
 wire snoop_clears_fill_line = registered_snoop_fill_conflict;
+// A snoop owns the tag port while the completed fill waits. Data and tag
+// install together after the event; a snoop of the fill's own line instead
 wire fill_install_allowed = !fill_uncached_r && !live_snoop_fill_conflict &&
                             !registered_snoop_fill_conflict &&
                             !fill_line_snooped_r && !fill_killed_r;
@@ -479,10 +477,8 @@ always_ff @(posedge clk) begin
         snoop_tag_entry3_r <= tag_way3[snoop_capture_set];
     end
 
-    // Keep each tag array in one write process so Quartus can retain the tag
-    // memories as M10Ks.  An unrelated snoop and fill can update different
-    // way RAMs together.  For a same-way/different-line collision the fill
-    // replaces the snooped tag, satisfying both operations with one write.
+    // One write process per tag array preserves M10K inference. A fill waits
+    // out the registered snoop, including a same-way/different-set collision.
     if (tag_reset_write) begin
         tag_way0[init_set] <= '0;
         tag_way1[init_set] <= '0;
