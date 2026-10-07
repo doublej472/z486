@@ -2249,6 +2249,7 @@ event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
     .x87_off(x87_off),
     // Microsequencer and E-stage lifecycle (current microword and its enables)
     .uc_addr(uc_addr),
+    .uaddr(uaddr),
     .uc_aluop(uc_aluop),
     .uc_buscode(uc_buscode),
     .uc_dest(uc_dest),
