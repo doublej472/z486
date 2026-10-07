@@ -316,7 +316,7 @@ always_ff @(posedge clk) begin
             i_rni_delay_ea_r <= 1'b0;
         if ((uc_exec || load_wb_retire) && i_rni && macro_active &&
             (!instr_eip_written || (uc_addr == UADDR_RPTI_RNI)) &&
-            !any_fault && !i_issue) begin
+            !any_fault && !i_issue && !i_rni_delay) begin // no re-arm while armed
             i_rni_delay <= 1'b1;
             i_rni_delay_ea_r <= 1'b1;
         end
