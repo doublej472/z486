@@ -145,6 +145,7 @@ make check-reset-lists       # checker self-tests plus named reset exceptions
 make check-generators        # microcode/recipes and committed PLA equivalence
 make test-interrupt-nmi      # NMI latch
 make test-addr-unit-reloc    # address_unit relocation vs independent arithmetic
+make test-reset-sweep        # one-cycle reset at every offset of a program
 make dhrystone               # must PASS; cycles are a regression signal
 ```
 
