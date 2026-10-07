@@ -3360,7 +3360,11 @@ assign alu_op5 = uc_alu_op_sel[6] ? i.decoded_alu_op :
 
 // IMUL: F6.5, F7.5, 0FAF, 69, 6B; MUL: F6.4 and F7.4.
 wire is_signed_mul = i.mul_signed;
-wire clear_rf = (i_rni_delay &&
+// RF clears when an instruction completes, except after POPF/IRET, which
+// load it.  i_rni_delay misses a retire that overlaps the next issue (the
+// direct load/RMW paths), so the next issue also clears it: on that edge
+// i still names the completed instruction.
+wire clear_rf = ((i_rni_delay || i_issue) &&
                  i.boundary_action != BOUNDARY_ACTION_PRESERVE_RF) ||
                 (recipe_rni && uc_exec);
 
