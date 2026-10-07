@@ -443,8 +443,8 @@ test-protected-narrow: obj_dir/Vtb_protected_mode
 	SIM_PLUSARGS=+no_line_fill ./test_protected_mode.py --strict
 
 test-pc98-map: obj_dir_pc98/Vtb_protected_mode
-	Z486_PC98_MAP=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_pc98/Vtb_protected_mode ./test_protected_mode.py --strict pc98_direct_code pc98_noalloc_code pc98_high_alias lock_window rmw_device_reads
-	SIM_PLUSARGS=+no_line_fill Z486_PC98_MAP=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_pc98/Vtb_protected_mode ./test_protected_mode.py --strict pc98_direct_code pc98_noalloc_code pc98_high_alias lock_window rmw_device_reads
+	Z486_PC98_MAP=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_pc98/Vtb_protected_mode ./test_protected_mode.py --strict pc98_direct_code pc98_noalloc_code pc98_high_alias lock_window rmw_device_reads pc98_a20_bit20
+	SIM_PLUSARGS=+no_line_fill Z486_PC98_MAP=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_pc98/Vtb_protected_mode ./test_protected_mode.py --strict pc98_direct_code pc98_noalloc_code pc98_high_alias lock_window rmw_device_reads pc98_a20_bit20
 
 test-386: obj_dir/Vtb_test386
 	@echo "Running test386.asm..."
