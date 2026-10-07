@@ -1110,6 +1110,14 @@ localparam [4:0] ALU_SIGN = 5'b01111; // Get sign of alu_dst
 
 localparam [4:0] ALU_PASS = 5'b10000;
 localparam [4:0] ALU_PASS2= 5'b10001;  // PASS with swapped src/dst operands
+
+// Deferred register-write merge mode: which byte lanes of a destination a
+// producer owns.  Shared by data_unit and gpr_write_merge so the commit path and
+// the forwarding views cannot disagree about a producer's width.
+localparam [1:0] EA_FWD_BLO = 2'd0;  // AL / low byte
+localparam [1:0] EA_FWD_BHI = 2'd1;  // AH / second byte
+localparam [1:0] EA_FWD_W   = 2'd2;  // word
+localparam [1:0] EA_FWD_D   = 2'd3;  // dword
 localparam [4:0] ALU_ZEXT = 5'b10010;  // Zero extension: op_size=dest, extends (dest-1)
 localparam [4:0] ALU_SEXT = 5'b10011;  // Sign extension: op_size=dest, extends (dest-1)
 localparam [4:0] ALU_ZEXT_B= 5'b10100;  // Zero extension: always extends byte

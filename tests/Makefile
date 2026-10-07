@@ -102,6 +102,14 @@ TB_L1I_SRCS := tb_l1_icache.sv
 CPP_L1I_SRCS := sim_main_l1_icache.cpp
 TB_MEMORY_ORDER_SRCS := tb_memory_order.sv
 CPP_MEMORY_ORDER_SRCS := sim_main_memory_order.cpp
+TB_LOAD_WAW_SRCS := tb_load_waw.sv
+CPP_LOAD_WAW_SRCS := sim_main_load_waw.cpp
+TB_GPR_HAZARD_SRCS := tb_gpr_hazard.sv
+CPP_GPR_HAZARD_SRCS := sim_main_gpr_hazard.cpp
+# data_unit plus its sub-units; the bench drives the deferred GPR write ports
+# directly and needs no cache, bus or sequencer.
+LOAD_WAW_RTL := $(Z486_DIR)/data_unit.sv $(Z486_DIR)/alu.sv $(Z486_DIR)/shifter.sv \
+			$(Z486_DIR)/mul_div.sv $(Z486_DIR)/dsp_mul.sv
 TB_MEMMAP_SRCS := tb_memmap_template.sv
 CPP_MEMMAP_SRCS := sim_main_memmap_template.cpp
 TB_INTERRUPT_NMI_SRCS := tb_interrupt_nmi.sv
@@ -126,7 +134,7 @@ CPP_PLA4_SRCS := sim_main_pla4.cpp
 PLA4_RTL := $(Z486_DIR)/protection.sv
 
 # Targets
-.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-memmap-template test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
+.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-hazard test-memmap-template test-interrupt-nmi test-paging-walker test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 all: build
 
@@ -196,6 +204,18 @@ obj_dir/Vtb_memory_order: $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/z486_pkg
 	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_memory_order $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_pkg.sv $(TB_MEMORY_ORDER_SRCS) \
 		$(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv $(CPP_MEMORY_ORDER_SRCS)
 	@echo "Build complete: obj_dir/Vtb_memory_order"
+
+obj_dir/Vtb_load_waw: $(Z486_DIR)/z486_pkg.sv $(LOAD_WAW_RTL) $(TB_LOAD_WAW_SRCS) $(CPP_LOAD_WAW_SRCS)
+	@echo "Building same-cycle load write-arbitration unit test with Verilator..."
+	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_load_waw $(TB_LOAD_WAW_SRCS) \
+		$(Z486_DIR)/z486_pkg.sv $(LOAD_WAW_RTL) $(CPP_LOAD_WAW_SRCS)
+	@echo "Build complete: obj_dir/Vtb_load_waw"
+
+obj_dir/Vtb_gpr_hazard: $(Z486_DIR)/z486_pkg.sv $(LOAD_WAW_RTL) $(TB_GPR_HAZARD_SRCS) $(CPP_GPR_HAZARD_SRCS)
+	@echo "Building GPR hazard survey bench with Verilator..."
+	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_gpr_hazard $(TB_GPR_HAZARD_SRCS) \
+		$(Z486_DIR)/z486_pkg.sv $(LOAD_WAW_RTL) $(CPP_GPR_HAZARD_SRCS)
+	@echo "Build complete: obj_dir/Vtb_gpr_hazard"
 
 obj_dir/Vtb_memmap_template: $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/z486_pc98_preset.svh $(TB_MEMMAP_SRCS) $(CPP_MEMMAP_SRCS)
 	@echo "Building memory-map template unit test with Verilator..."
@@ -358,6 +378,18 @@ test-memory-order: obj_dir/Vtb_memory_order
 	@echo "Running device/store ordering unit test..."
 	./obj_dir/Vtb_memory_order
 
+# A younger direct load's write-back must win the GPR bytes it writes against
+# an older hardwired load's deferred MEM token retiring in the same cycle.
+test-load-waw: obj_dir/Vtb_load_waw
+	@echo "Running same-cycle load write-arbitration unit test..."
+	@./obj_dir/Vtb_load_waw | tee obj_dir/z486_load_waw.out | grep -q "LOAD WAW TEST PASS" \
+		|| (echo "load write-arbitration test FAIL"; exit 1)
+
+# The survey's old findings were fixed; a new finding must fail the gate.
+test-gpr-hazard: obj_dir/Vtb_gpr_hazard
+	@./obj_dir/Vtb_gpr_hazard | tee obj_dir/z486_gpr_hazard.out
+	@grep -q 'GPR HAZARD SURVEY: no hazards observed' obj_dir/z486_gpr_hazard.out
+
 test-memmap-template: obj_dir/Vtb_memmap_template
 	@echo "Running memory-map template unit test..."
 	./obj_dir/Vtb_memmap_template
@@ -448,6 +480,8 @@ help:
 	@echo "  make test-l1-cache  - Run PIPT L1 cache unit test"
 	@echo "  make test-l1-icache - Run PIPT L1 instruction cache unit test"
 	@echo "  make test-memory-order - Run device/store ordering unit test"
+	@echo "  make test-load-waw  - Run same-cycle GPR write-arbitration unit test"
+	@echo "  make test-gpr-hazard - Gate the GPR hazard survey"
 	@echo "  make test-memmap-template - Run memory-map template unit test"
 	@echo "  make test-interrupt-nmi - Run interrupt-controller NMI deferred-delivery bench"
 	@echo "  make test-x87-bridge - Run x87 protocol bridge unit test"
