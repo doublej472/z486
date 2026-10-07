@@ -1,0 +1,25 @@
+{
+  "asm": "seg_limit_edge.asm",
+  "start_mode": "protected",
+  "cr0": "0x00000001",
+  "cr3": 0,
+  "eip": "0x200",
+  "initial_selectors": {
+    "CS": "0x0008",
+    "DS": "0x0010",
+    "SS": "0x0010",
+    "ES": "0x0010",
+    "FS": "0x0010",
+    "GS": "0x0010"
+  },
+  "d_init": 1,
+  "cycles": 20000,
+  "seg_cache": {
+    "CS": { "base": "0x00010000", "limit": "0xfffff", "flags": "0xa9e0" },
+    "DS": { "base": 0, "limit": "0xfffff", "flags": "0x29e0" },
+    "SS": { "base": 0, "limit": "0xfffff", "flags": "0x29e0" },
+    "ES": { "base": 0, "limit": "0xfffff", "flags": "0x29e0" },
+    "FS": { "base": 0, "limit": "0xfffff", "flags": "0x29e0" },
+    "GS": { "base": 0, "limit": "0xfffff", "flags": "0x29e0" }
+  }
+}
