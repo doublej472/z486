@@ -29,6 +29,7 @@ DEST_USTEP_RPTI_EIP = 0x6D # Optimizer-owned: restart EIP write.
 DEST_USTEP_TASK_CS = 0x6E  # Optimizer-owned: task load establishes CS RPL.
 DEST_USTEP_FAULT_DONE = 0x6F # Optimizer-owned: fault delivery completion.
 DEST_USTEP_INVLPG = 0x70   # Optimizer-owned: invalidate one TLB page.
+DEST_USTEP_CACHE_FLUSH = 0x72 # Optimizer-owned: invalidate both L1 caches.
 DEST_USTEP_X87_STORE = 0x71 # Optimizer-owned: x87 store command and result read.
 DEST_USTEP_ALU = 0x7E       # Optimizer-owned: commit this word's ALU result to DSTREG.
 DEST_USTEP_BSWAP = 0x7C     # Optimizer-owned: byte-swap SRCREG into itself.
@@ -94,6 +95,7 @@ class RecipeAction(IntEnum):
     X87_OVERLAY = 1
     INVLPG = 2
     RMW_FAST = 3
+    CACHE_FLUSH = 4
 
 
 @dataclass(frozen=True)
@@ -208,12 +210,17 @@ PATCHES = [
           copy_from=0x030, fields=dict(op=0, sub=0)),
     Patch(0x9F2, "CMPXCHG m,r not equal: OPR_R -> eAX_AL in the RNI delay slot",
           copy_from=0x030, fields=dict(src=0x2D, dst=0x28)),
-    # INVD/WBINVD (0F 08/09): CPL 0 only (as CLTS); the L1 caches are
-    # write-through and coherent with every bus master, so there is nothing
-    # to write back and discarding lines is not architecturally visible.
-    Patch(0x9F3, "INVD/WBINVD: LJMPNP NO_PRIVILEGE (as CLTS)",
-          copy_from=0x0DC),
-    Patch(0x9F4, "INVD/WBINVD: RNI in the jump delay slot",
+    # INVD/WBINVD (0F 08/09): a native whole-L1 flush.  The platform does not
+    # snoop DMA (PC-98), so the flush is the only coherence event for
+    # DMA-written data and cannot be a no-op.  The CPU sidecar checks CPL,
+    # drains the posted store queue and invalidates every set of both L1s;
+    # the microcode holds on the first word (op left non-RNI) until the fabric
+    # pulses done.  That word carries the DEST_USTEP_CACHE_FLUSH marker the
+    # validator and the entry-action table agree on; the second retires; the
+    # third is its blank delay slot.
+    Patch(0x9F3, "INVD/WBINVD: native whole-L1 invalidate, hold",
+          fields=dict(dst=DEST_USTEP_CACHE_FLUSH)),
+    Patch(0x9F4, "INVD/WBINVD: blank RNI word after the flush",
           copy_from=0x030, fields=dict(op=0)),
     Patch(0x9F5, "INVD/WBINVD: blank RNI delay slot",
           copy_from=0x030),
@@ -588,6 +595,7 @@ OVERLAY_RECIPES = [
 # and consumes only the action.
 ENTRY_ACTIONS = {
     0x9C7: RecipeAction.INVLPG,
+    0x9F3: RecipeAction.CACHE_FLUSH,
 }
 
 
@@ -732,6 +740,11 @@ def validate_recipes(words: list[int]) -> None:
             raise ValueError(
                 f"entry action 0x{entry:03X}: INVLPG marker is missing from microcode"
             )
+        if (action == RecipeAction.CACHE_FLUSH and
+                get_field(words[entry], "dst") != DEST_USTEP_CACHE_FLUSH):
+            raise ValueError(
+                f"entry action 0x{entry:03X}: CACHE_FLUSH marker is missing from microcode"
+            )
 
 
 def render_recipe_manifest(words: list[int]) -> str:
@@ -814,12 +827,12 @@ def render_recipe_svh(words: list[int]) -> str:
         "localparam logic [2:0] RECIPE_EARLY_BRANCH = 3'd6;",
         "localparam logic [2:0] RECIPE_EARLY_STACK  = 3'd7;",
         "",
-        f"localparam logic [1:0] RECIPE_ACTION_NONE = 2'd{int(RecipeAction.NONE)};",
+        f"localparam logic [2:0] RECIPE_ACTION_NONE = 3'd{int(RecipeAction.NONE)};",
     ]
     for action in RecipeAction:
         if action != RecipeAction.NONE:
             lines.append(
-                f"localparam logic [1:0] RECIPE_ACTION_{action.name} = 2'd{int(action)};"
+                f"localparam logic [2:0] RECIPE_ACTION_{action.name} = 3'd{int(action)};"
             )
     lines += [
         "",
@@ -862,7 +875,7 @@ def render_recipe_svh(words: list[int]) -> str:
         "    endcase",
         "endfunction",
         "",
-        "function automatic logic [1:0] recipe_action(input logic [11:0] entry);",
+        "function automatic logic [2:0] recipe_action(input logic [11:0] entry);",
         "    unique case (entry)",
     ]
     for recipe in OVERLAY_RECIPES:

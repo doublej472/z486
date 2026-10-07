@@ -258,7 +258,7 @@ typedef struct packed {
     logic        has_rep;
     logic [3:0]  prefix_count;       // Count of prefix bytes (4 bits for up to 15 prefixes)
     logic [11:0] entry_point;
-    logic [1:0]  ucode_action;       // Optimizer-generated semantic entry action
+    logic [2:0]  ucode_action;       // Optimizer-generated semantic entry action
     boundary_action_t boundary_action; // Architectural retirement behavior
     logic [31:0] immediate;
     logic [31:0] displacement;
@@ -866,6 +866,7 @@ localparam DEST_USTEP_RPTI_EIP = 7'h6D; // RPTI restart EIP write
 localparam DEST_USTEP_TASK_CS = 7'h6E;  // Task load establishes full CS selector
 localparam DEST_USTEP_FAULT_DONE = 7'h6F; // Fault delivery completion marker
 localparam DEST_USTEP_INVLPG = 7'h70;    // 486 single-page TLB invalidation
+localparam DEST_USTEP_CACHE_FLUSH = 7'h72; // 486 whole-L1 invalidate (INVD/WBINVD)
 localparam DEST_USTEP_X87_STORE = 7'h71; // x87 store overlay: command + result read into OPR_R
 localparam DEST_LATTTF = 7'h78;  // Faulting linear address (page fault)
 localparam DEST_PFERRC = 7'h7A;  // Page fault error code
