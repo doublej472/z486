@@ -639,6 +639,48 @@ module tb_l1_icache;
             $fatal(1, "I-cache no-fill fetch allocated its miss");
         tb_no_fill = 1'b0;
 
+        // A store patch registered in the very cycle a whole-L1 flush launches
+        // is a younger store: the flush retires the older patch-queue entries
+        // but must allocate this one fresh (patchq_snoop_match excludes
+        // flush_launch), not merge it into an entry the flush is clearing.  A
+        // later fill of its line (memory not yet updated) must return it.
+        reset = 1'b1;
+        wide_mode = 1'b0;
+        stall_mem = 1'b0;
+        flush_req = 1'b0;
+        repeat (5) @(negedge clk);
+        reset = 1'b0;
+        repeat (20) @(negedge clk);
+        mem_put_line(32'h300, 32'h0300_0000, 32'h0300_0001,
+                     32'h0300_0002, 32'h0300_0003);
+        patch_addr = 32'h300;                   // older patch: queue entry
+        patch_data = 32'hD1D1_D1D1;
+        patch_be = 4'hF;
+        patch_valid = 1'b1;
+        @(negedge clk);
+        patch_valid = 1'b0;
+        repeat (4) @(negedge clk);
+        patch_data = 32'hD2D2_D2D2;             // younger patch, same dword
+        patch_valid = 1'b1;
+        @(negedge clk);
+        patch_valid = 1'b0;
+        flush_req = 1'b1;                       // launches while it is registered
+        #1;
+        if (!(dut.flush_launch && dut.snoop_valid_r && dut.snoop_patch_r))
+            $fatal(1, "L1 ICACHE FLUSH/PATCH setup: no coincidence (launch=%b snoop=%b)",
+                   dut.flush_launch, dut.snoop_valid_r);
+        @(negedge clk);
+        flush_req = 1'b0;
+        flush_wait = 0;
+        while (!flush_done && flush_wait < 400) begin
+            @(negedge clk);
+            flush_wait = flush_wait + 1;
+        end
+        if (!flush_done)
+            $fatal(1, "L1 ICACHE FLUSH/PATCH: no flush_done");
+        repeat (4) @(negedge clk);
+        cache_read(32'h300, 128'h0300_0003_0300_0002_0300_0001_D2D2_D2D2);
+
         $display("L1 PIPT instruction cache unit test PASS (same-way fill/snoop write-port cycles: %0d)",
                  same_way_cycles);
         $finish;

@@ -359,7 +359,8 @@ logic [127:0] wide_line_next;
 always_comb begin
     patchq_snoop_match = {PATCHQ_DEPTH{1'b0}};
     for (int p = 0; p < PATCHQ_DEPTH; p++)
-        patchq_snoop_match[p] = patchq_valid[p] && patchq_addr[p] == snoop_addr_dw_r;
+        patchq_snoop_match[p] = patchq_valid[p] && !flush_launch &&
+                                patchq_addr[p] == snoop_addr_dw_r;
     patchq_snoop_hit = |patchq_snoop_match;
 end
 
@@ -614,6 +615,17 @@ always_ff @(posedge clk) begin
             if (flush_req_new || flush_pending_r || flush_busy_r)
                 fill_killed_r <= 1'b1;
         end
+
+        // The patch queue covers stores that a fill in flight read memory
+        // ahead of.  A whole-L1 flush is launched only once the posted stores
+        // have drained (cache_unit's CF_DRAIN) and it cancels every fill in
+        // flight, so no older entry can still be needed - and keeping one
+        // would merge stale CPU bytes over memory written by DMA before the
+        // flush.  Retire them at the sweep start; a patch registered in this
+        // very cycle is a younger store and is allocated fresh below.
+        if (flush_launch)
+            for (int p = 0; p < PATCHQ_DEPTH; p++)
+                patchq_valid[p] <= 1'b0;
 
         if (snoop_valid_r) begin
             // CPU stores can race ahead of an instruction-cache line fill.
