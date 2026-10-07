@@ -63,6 +63,8 @@ logic [11:0] ctl;
 logic [6:0] grp;
 logic [15:0] first, final_e;
 logic has_modrm;
+logic xadd, cmpxchg, f_e;
+logic [7:0] op_e;
 initial begin
     $readmemh("pla_entry_rom.hex", entry_rom);
     $readmemh("pla_group_entry.hex", group_entry_rom);
@@ -72,33 +74,39 @@ initial begin
     for (int d = 0; d < 2; d++)
     for (int pe = 0; pe < 2; pe++)
     for (int m = 0; m < 256; m++) begin
-        // As decoder.sv build_struct_work, without prefixes.
-        ctl = pla_control_opcode_lookup(f[0], op[7:0]);
+        // As decoder.sv build_struct_work, without prefixes. XADD (0F C0/C1)
+        // and CMPXCHG (0F B0/B1) decode their structure as ADD/CMP r/m,r
+        // (00/01, 38/39) without the 0F prefix and enter their own routines;
+        // the entry keeps the raw 0F bit and the structural opcode.
+        xadd = f[0] && (op[7:1] == 7'b1100000);
+        cmpxchg = f[0] && (op[7:1] == 7'b1011000);
+        op_e = xadd ? {7'b0000000, op[0]} : cmpxchg ? {7'b0011100, op[0]} : op[7:0];
+        f_e = (xadd || cmpxchg) ? 1'b0 : f[0];
+        ctl = pla_control_opcode_lookup(f_e, op_e);
         has_modrm = ctl[2] & ~ctl[0];
         first = entry_rom[{op[7:0], 1'b0, f[0]}][{d[0], pe[0]}*16 +: 16];
-        grp = pla_group_lookup({d[0], op[7:0], pe[0], f[0]});
+        grp = pla_group_lookup({d[0], op_e, pe[0], f_e});
         final_e = (grp[6] && has_modrm)
             ? group_entry_rom[{grp[5:0], m[5:3], (m[7:6] != 2'b11)}] : first;
         e = '0;
-        e.has_0f = f[0]; e.opcode = op[7:0]; e.modrm = m[7:0];
+        e.has_0f = f[0]; e.opcode = op_e; e.modrm = m[7:0];
         e.has_modrm = has_modrm; e.data32 = d[0];
         e.rep_lock = PREFIX_NOREPLOCK;
-        if ((!f && op[7:4] == 4'h7) || (f && op[7:4] == 4'h8))
+        if ((!f_e && op_e[7:4] == 4'h7) || (f_e && op_e[7:4] == 4'h8))
             e.rel_branch_kind = REL_BRANCH_JCC;
-        else if (!f && ((op == 8'hEB) || (op == 8'hE9)))
+        else if (!f_e && ((op_e == 8'hEB) || (op_e == 8'hE9)))
             e.rel_branch_kind = REL_BRANCH_JMP;
-        else if (!f && (op == 8'hE8))
+        else if (!f_e && (op_e == 8'hE8))
             e.rel_branch_kind = REL_BRANCH_CALL;
         e.entry_point = final_e[11:0];
-        if (f && (op[7:3] == 5'b11001)) e.entry_point = UADDR_BSWAP;
-        else if (f && (op[7:1] == 7'b1100000))
-            e.entry_point = (m[7:6] == 2'b11) ? UADDR_XADD_R : UADDR_XADD_M;
-        else if (f && (op[7:1] == 7'b1011000))
-            e.entry_point = (m[7:6] == 2'b11) ? UADDR_CMPXCHG_R : UADDR_CMPXCHG_M;
-        else if (f && (op[7:1] == 7'b0000100)) e.entry_point = UADDR_INVD;
+        if (f_e && (op_e[7:3] == 5'b11001)) e.entry_point = UADDR_BSWAP;
+        else if (xadd)
+            e.entry_point = (m[7:6] != 2'b11) ? UADDR_XADD_M : UADDR_XADD_R;
+        else if (cmpxchg)
+            e.entry_point = (m[7:6] != 2'b11) ? UADDR_CMPXCHG_M : UADDR_CMPXCHG_R;
         e.entry_point = recipe_effective_entry(e.entry_point, e.opcode, e.modrm);
         r = recipe_metadata(e);
-        $fwrite(fo, "%0d %0d %0d %0d %0d %0d%0d%0d%0d\n", f, op, d, pe, m,
+        $fwrite(fo, "%0d %0d %0d %0d %0d %0d%0d%0d%0d\n", f, op_e, d, pe, m,
                 pb_b1_type(e, r), r.reads_flags, r.uses_ea, r.jcc);
     end
     $fclose(fo);
@@ -140,7 +148,8 @@ def main() -> int:
             cls = 0
         old = table[(f, op)].setdefault(key, cls)
         if old != cls:
-            sys.exit(f"class depends on operand size, PE or ModR/M.rm: "
+            sys.exit(f"class depends on operand size, PE, ModR/M.rm or a "
+                     f"0F opcode decoded as this one: "
                      f"0f={f} op={op:02x} modrm={m:02x}")
 
     rows = []

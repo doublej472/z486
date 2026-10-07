@@ -22,6 +22,10 @@ from pathlib import Path
 
 ROM_DEPTH = 2560
 UCODE_BITS = 37
+# Base of the 486 XADD/CMPXCHG routines.  0x9D1-0x9D8 is upstream's x87 direct
+# overlay and 0x9D9-0x9DB is the INVD/WBINVD flush, so the routines sit above
+# them; everything internal to the block is expressed relative to this address.
+XADD_BASE = 0x9DC
 ROM_BITS = 40
 SRC_TMPC = 0x0C            # Canonical CROM source encoding.
 DEST_SRCREG = 0x3E         # Canonical CROM destination encoding.
@@ -29,6 +33,7 @@ DEST_USTEP_RPTI_EIP = 0x6D # Optimizer-owned: restart EIP write.
 DEST_USTEP_TASK_CS = 0x6E  # Optimizer-owned: task load establishes CS RPL.
 DEST_USTEP_FAULT_DONE = 0x6F # Optimizer-owned: fault delivery completion.
 DEST_USTEP_INVLPG = 0x70   # Optimizer-owned: invalidate one TLB page.
+DEST_USTEP_CACHE_FLUSH = 0x72 # Optimizer-owned: invalidate both L1 caches.
 DEST_USTEP_X87_STORE = 0x71 # Optimizer-owned: x87 store command and result read.
 DEST_USTEP_ALU = 0x7E       # Optimizer-owned: commit this word's ALU result to DSTREG.
 DEST_USTEP_BSWAP = 0x7C     # Optimizer-owned: byte-swap SRCREG into itself.
@@ -52,6 +57,74 @@ def set_fields(word: int, **kw: int) -> int:
         mask = ((1 << width) - 1) << shift
         word = (word & ~mask) | ((val << shift) & mask)
     return word
+
+# Field values used by the 486 XADD/CMPXCHG routines.
+SRC_DSTREG = 0x3D
+SRC_SRCREG = 0x3E
+SRC_SIGMA = 0x1E
+SRC_OPR_R = 0x2D
+SRC_COUNTR = 0x14
+SRC_EFLAGS = 0x09
+SRC_EAX_AL = 0x28          # Size-aware accumulator (AL/AX/EAX).
+DEST_DSTREG = 0x3D
+DEST_COUNTR = 0x32
+DEST_OPR_W = 0x2D
+DEST_FLAGSB = 0x10
+DEST_EAX_AL = 0x28
+ALUSRC_SRCREG = 0x3E
+ALUSRC_DSTREG = 0x3D
+ALUSRC_OPR_R = 0x0F
+ALUJMP_ALU = 0x00          # Decoded operation (XADD decodes as ADD 00/01).
+ALUJMP_CMP = 0x0F          # Explicit SUB-flags compare, retires EFLAGS.
+ALUJMP_FLGSBA = 0x38
+ALUJMP_JNCOND = 0x41       # Jump if the decoded condition is false.
+BUSOP_RD = 0x16
+BUSOP_WR = 0x12
+OP_RNI = 0
+SUB_DLY = 0
+SUB_UNL = 1
+
+
+def uword(*, alusrc: int = 0x3F, dst: int = 0x7F, src: int = 0x3F,
+          aluop: int = 0x7F, bus: int = 0x3F, op: int = 7, sub: int = 3) -> int:
+    """Compose a native word; omitted fields keep the blank-word encoding."""
+    return set_fields((1 << UCODE_BITS) - 1, alusrc=alusrc, dst=dst, src=src,
+                      aluop=aluop, bus=bus, op=op, sub=sub)
+
+
+# Field values used by the 486 XADD/CMPXCHG routines.
+SRC_DSTREG = 0x3D
+SRC_SRCREG = 0x3E
+SRC_SIGMA = 0x1E
+SRC_OPR_R = 0x2D
+SRC_COUNTR = 0x14
+SRC_EFLAGS = 0x09
+SRC_EAX_AL = 0x28          # Size-aware accumulator (AL/AX/EAX).
+DEST_DSTREG = 0x3D
+DEST_COUNTR = 0x32
+DEST_OPR_W = 0x2D
+DEST_FLAGSB = 0x10
+DEST_EAX_AL = 0x28
+ALUSRC_SRCREG = 0x3E
+ALUSRC_DSTREG = 0x3D
+ALUSRC_OPR_R = 0x0F
+ALUJMP_ALU = 0x00          # Decoded operation (XADD decodes as ADD 00/01).
+ALUJMP_CMP = 0x0F          # Explicit SUB-flags compare, retires EFLAGS.
+ALUJMP_FLGSBA = 0x38
+ALUJMP_JNCOND = 0x41       # Jump if the decoded condition is false.
+BUSOP_RD = 0x16
+BUSOP_WR = 0x12
+OP_RNI = 0
+SUB_DLY = 0
+SUB_UNL = 1
+
+def reljump(src_addr: int, target: int) -> int:
+    """Six-bit relative micro-jump offset (target = word + 1 + offset)."""
+    off = target - (src_addr + 1)
+    if not -32 <= off <= 31:
+        raise ValueError(f"micro-jump 0x{src_addr:03X}->0x{target:03X} out of range")
+    return off & 0x3F
+
 
 
 @dataclass
@@ -94,6 +167,7 @@ class RecipeAction(IntEnum):
     X87_OVERLAY = 1
     INVLPG = 2
     RMW_FAST = 3
+    CACHE_FLUSH = 4
 
 
 @dataclass(frozen=True)
@@ -142,82 +216,6 @@ PATCHES = [
     Patch(0x9C4, "BSWAP r32 extension: SRCREG -> byte-swapped SRCREG + RNI",
           copy_from=0x003, fields=dict(dst=DEST_USTEP_BSWAP)),
 
-    # XADD (0F C0/C1) and CMPXCHG (0F B0/B1) have no 80386 PLA entry; the
-    # decoder selects these words by ModR/M form. Operands follow ALU r/m,r:
-    # DSTREG is r/m, SRCREG is reg; the decoder supplies ADD for XADD, CMP for
-    # CMPXCHG's CMPTST and condition Z for its JNcond.
-    # XADD r,r: SRC gets the old DEST before DEST gets the sum, so XADD r,r
-    # with one register leaves the sum.
-    Patch(0x9D9, "XADD r,r: DSTREG -> TMPB, ALU DSTREG + SRCREG (flags)",
-          copy_from=0x030, fields=dict(src=0x3D, dst=0x0B, alusrc=0x3E, aluop=0x00)),
-    Patch(0x9DA, "XADD r,r: TMPB -> SRCREG + RNI",
-          copy_from=0x030, fields=dict(src=0x0B, dst=0x3E, op=0)),
-    Patch(0x9DB, "XADD r,r: SIGMA -> DSTREG in the RNI delay slot",
-          copy_from=0x030, fields=dict(src=0x1E, dst=0x3D)),
-    # XADD m,r: read for write (as ALU m,r), write the sum, and update SRC from
-    # OPR_R only after the write has completed, as XCHG m,r does (an RNI delay
-    # slot GPR write takes SIGMA, OPR_R, COUNTR or -1).
-    Patch(0x9DC, "XADD m,r: flags backup + RD for write",
-          copy_from=0x04A),
-    Patch(0x9DD, "XADD m,r: DLY for the read",
-          copy_from=0x030, fields=dict(sub=0)),
-    Patch(0x9DE, "XADD m,r: ALU OPR_R + SRCREG (flags)",
-          copy_from=0x030, fields=dict(src=0x2D, alusrc=0x3E, aluop=0x00)),
-    Patch(0x9DF, "XADD m,r: SIGMA -> OPR_W + WR",
-          copy_from=0x030, fields=dict(src=0x1E, dst=0x2D, bus=0x12)),
-    Patch(0x9E0, "XADD m,r: RNI + DLY for the write",
-          copy_from=0x030, fields=dict(op=0, sub=0)),
-    Patch(0x9E1, "XADD m,r: OPR_R -> SRCREG + UNL in the RNI delay slot",
-          copy_from=0x030, fields=dict(src=0x2D, dst=0x3E, sub=1)),
-    # CMPXCHG r,r: compare the accumulator with DEST; equal stores SRC in
-    # DEST, otherwise the accumulator takes DEST.
-    Patch(0x9E2, "CMPXCHG r,r: CMPTST eAX_AL - DSTREG (flags)",
-          copy_from=0x030, fields=dict(src=0x28, alusrc=0x3D, aluop=0x03)),
-    Patch(0x9E3, "CMPXCHG r,r: JNcond (not equal) -> 9E7",
-          copy_from=0x030, fields=dict(aluop=0x41, alusrc=0x03)),
-    Patch(0x9E4, "CMPXCHG r,r: blank jump delay slot",
-          copy_from=0x030),
-    Patch(0x9E5, "CMPXCHG r,r equal: SRCREG -> DSTREG + RNI",
-          copy_from=0x030, fields=dict(src=0x3E, dst=0x3D, op=0)),
-    Patch(0x9E6, "CMPXCHG r,r equal: blank RNI delay slot",
-          copy_from=0x030),
-    Patch(0x9E7, "CMPXCHG r,r not equal: DSTREG -> eAX_AL + RNI",
-          copy_from=0x030, fields=dict(src=0x3D, dst=0x28, op=0)),
-    Patch(0x9E8, "CMPXCHG r,r not equal: blank RNI delay slot",
-          copy_from=0x030),
-    # CMPXCHG m,r always writes the destination: SRC when equal, the old
-    # value otherwise (as the 486 does); the accumulator is updated only
-    # after that write has completed.
-    Patch(0x9E9, "CMPXCHG m,r: flags backup + RD for write",
-          copy_from=0x04A),
-    Patch(0x9EA, "CMPXCHG m,r: DLY for the read",
-          copy_from=0x030, fields=dict(sub=0)),
-    Patch(0x9EB, "CMPXCHG m,r: CMPTST eAX_AL - OPR_R (flags) + UNL (as ALU m,r 04C)",
-          copy_from=0x030, fields=dict(src=0x28, alusrc=0x0F, aluop=0x03, sub=1)),
-    Patch(0x9EC, "CMPXCHG m,r: SRCREG -> OPR_W, JNcond (not equal) -> 9F0",
-          copy_from=0x030, fields=dict(src=0x3E, dst=0x2D, aluop=0x41, alusrc=0x03)),
-    Patch(0x9ED, "CMPXCHG m,r: blank jump delay slot",
-          copy_from=0x030),
-    Patch(0x9EE, "CMPXCHG m,r equal: WR + RNI",
-          copy_from=0x030, fields=dict(bus=0x12, op=0)),
-    Patch(0x9EF, "CMPXCHG m,r equal: DLY for the write in the RNI delay slot",
-          copy_from=0x030, fields=dict(sub=0)),
-    Patch(0x9F0, "CMPXCHG m,r not equal: OPR_R -> OPR_W + WR",
-          copy_from=0x030, fields=dict(src=0x2D, dst=0x2D, bus=0x12)),
-    Patch(0x9F1, "CMPXCHG m,r not equal: RNI + DLY for the write",
-          copy_from=0x030, fields=dict(op=0, sub=0)),
-    Patch(0x9F2, "CMPXCHG m,r not equal: OPR_R -> eAX_AL in the RNI delay slot",
-          copy_from=0x030, fields=dict(src=0x2D, dst=0x28)),
-    # INVD/WBINVD (0F 08/09): CPL 0 only (as CLTS); the L1 caches are
-    # write-through and coherent with every bus master, so there is nothing
-    # to write back and discarding lines is not architecturally visible.
-    Patch(0x9F3, "INVD/WBINVD: LJMPNP NO_PRIVILEGE (as CLTS)",
-          copy_from=0x0DC),
-    Patch(0x9F4, "INVD/WBINVD: RNI in the jump delay slot",
-          copy_from=0x030, fields=dict(op=0)),
-    Patch(0x9F5, "INVD/WBINVD: blank RNI delay slot",
-          copy_from=0x030),
-
     # 0F 01 /7 uses an address operand but performs no data transfer. The CPU
     # sidecar serializes this RNI word with the paging unit and invalidates the
     # addressed TLB entry; the following blank word is its architectural delay
@@ -233,6 +231,22 @@ PATCHES = [
     Patch(0x9C9, "NOP extension: blank hardwired RNI word",
           copy_from=0x030, fields=dict(op=0)),
     Patch(0x9CA, "NOP extension: blank RNI delay slot",
+          copy_from=0x030),
+
+    # 486 INVD (0F 08) / WBINVD (0F 09).  Both are a native whole-L1 flush:
+    # the CPU sidecar drains the posted store queue and then invalidates every
+    # set of both L1s, so the microcode only has to hold the instruction until
+    # the fabric pulses done and then retire.  The first word is a hold (op is
+    # left non-RNI) carrying the DEST_USTEP_CACHE_FLUSH marker the validator
+    # and the entry-action table agree on; the second retires; the third is its
+    # blank architectural delay slot.  These three words sit in ROM space no
+    # other entry references (the old x87-register overlay at 0x9D1 is left
+    # untouched, unlike the fork's layout).
+    Patch(0x9D9, "INVD/WBINVD extension: native whole-L1 invalidate, hold",
+          fields=dict(dst=DEST_USTEP_CACHE_FLUSH)),
+    Patch(0x9DA, "INVD/WBINVD extension: blank RNI word after the flush",
+          copy_from=0x030, fields=dict(op=0)),
+    Patch(0x9DB, "INVD/WBINVD extension: blank RNI delay slot",
           copy_from=0x030),
 
     # D8 m32 arithmetic and D9 /0 FLD use a paging-owned demand read and post
@@ -452,6 +466,79 @@ PATCHES = [
           fields=dict(aluop=0x5A, alusrc=0x0B)),
     Patch(0x03B, "ALU m,i 6->4: 03B = OPR_R,IMM +-&|^ in jump delay slot (03C unreached)",
           copy_from=0x03C, fields=dict(src=0x2D)),
+    # 0F C0/C1 XADD r/m,r. D1 decodes the structure as ADD r/m,r (00/01),
+    # so ALU selects ADD and flags follow ADD; reg = SRCREG, r/m = DSTREG.
+    # Register form: the old destination is parked in COUNTR (the XCHG r,r
+    # routine 0B6 uses the same scratch), SRCREG takes it at RNI and DSTREG
+    # takes the sum in the delay slot, so XADD r,r with one register leaves
+    # the sum (the architectural DEST <- TEMP is last).
+    Patch((XADD_BASE + 0x00), "XADD r,r: COUNTR <- DSTREG; SIGMA = DSTREG + SRCREG (flags)",
+          word=uword(src=SRC_DSTREG, dst=DEST_COUNTR, aluop=ALUJMP_ALU,
+                     alusrc=ALUSRC_SRCREG)),
+    Patch((XADD_BASE + 0x01), "XADD r,r: SRCREG <- old DSTREG + RNI",
+          word=uword(src=SRC_COUNTR, dst=0x3E, op=OP_RNI)),
+    Patch((XADD_BASE + 0x02), "XADD r,r: delay slot DSTREG <- SIGMA",
+          word=uword(src=SRC_SIGMA, dst=DEST_DSTREG)),
+    # Memory form: the ALU m,r read/modify/write shape (04A/04B/04C/046)
+    # followed by the XCHG m,r tail (0B3/0B4/0B5): SRCREG receives the old
+    # memory value (still in OPR_R) only in the RNI delay slot, after the
+    # write's DLY has completed, so a faulting write restarts with every
+    # register intact (EFLAGS from the FLGSBA backup).
+    Patch((XADD_BASE + 0x03), "XADD m,r: FLGSBA + RD destination",
+          copy_from=0x04A),
+    Patch((XADD_BASE + 0x04), "XADD m,r: DLY for read data",
+          word=uword(sub=SUB_DLY)),
+    Patch((XADD_BASE + 0x05), "XADD m,r: SIGMA = OPR_R + SRCREG (flags)",
+          word=uword(src=SRC_OPR_R, aluop=ALUJMP_ALU, alusrc=ALUSRC_SRCREG)),
+    Patch((XADD_BASE + 0x06), "XADD m,r: OPR_W <- SIGMA + WR",
+          word=uword(src=SRC_SIGMA, dst=DEST_OPR_W, bus=BUSOP_WR)),
+    Patch((XADD_BASE + 0x07), "XADD m,r: DLY for the write + RNI",
+          word=uword(sub=SUB_DLY, op=OP_RNI)),
+    Patch((XADD_BASE + 0x08), "XADD m,r: delay slot SRCREG <- old memory value (OPR_R)",
+          word=uword(src=SRC_OPR_R, dst=0x3E, sub=SUB_UNL)),
+
+    # 0F B0/B1 CMPXCHG r/m,r. D1 decodes the structure as CMP r/m,r (38/39)
+    # and sets the Jcc condition to E, so JNcond (taken when the condition
+    # is false) branches on ZF=0 from the preceding CMP through the
+    # registered flag forwarding. CMP computes accumulator - destination.
+    Patch((XADD_BASE + 0x09), "CMPXCHG r,r: flags = eAX - DSTREG",
+          word=uword(src=SRC_EAX_AL, aluop=ALUJMP_CMP, alusrc=ALUSRC_DSTREG)),
+    Patch((XADD_BASE + 0x0A), "CMPXCHG r,r: jump to the not-equal path if ZF=0",
+          word=uword(aluop=ALUJMP_JNCOND, alusrc=reljump((XADD_BASE + 0x0A), (XADD_BASE + 0x0E)))),
+    Patch((XADD_BASE + 0x0B), "CMPXCHG r,r: blank jump delay slot",
+          copy_from=0x030),
+    Patch((XADD_BASE + 0x0C), "CMPXCHG r,r equal: DSTREG <- SRCREG + RNI",
+          word=uword(src=SRC_SRCREG, dst=DEST_DSTREG, op=OP_RNI)),
+    Patch((XADD_BASE + 0x0D), "CMPXCHG r,r equal: blank RNI delay slot",
+          copy_from=0x030),
+    Patch((XADD_BASE + 0x0E), "CMPXCHG r,r not equal: eAX <- DSTREG + RNI",
+          word=uword(src=SRC_DSTREG, dst=DEST_EAX_AL, op=OP_RNI)),
+    Patch((XADD_BASE + 0x0F), "CMPXCHG r,r not equal: blank RNI delay slot",
+          copy_from=0x030),
+    # Memory form: the destination is always written, like the 486 (the
+    # old value when not equal). The accumulator changes only in the RNI
+    # delay slot after the write completed (XCHG m,r tail), so both paths
+    # restart cleanly from a faulting write.
+    Patch((XADD_BASE + 0x10), "CMPXCHG m,r: FLGSBA + RD destination",
+          copy_from=0x04A),
+    Patch((XADD_BASE + 0x11), "CMPXCHG m,r: DLY for read data",
+          word=uword(sub=SUB_DLY)),
+    Patch((XADD_BASE + 0x12), "CMPXCHG m,r: flags = eAX - OPR_R",
+          word=uword(src=SRC_EAX_AL, aluop=ALUJMP_CMP, alusrc=ALUSRC_OPR_R)),
+    Patch((XADD_BASE + 0x13), "CMPXCHG m,r: jump to the not-equal path if ZF=0",
+          word=uword(aluop=ALUJMP_JNCOND, alusrc=reljump((XADD_BASE + 0x13), (XADD_BASE + 0x17)))),
+    Patch((XADD_BASE + 0x14), "CMPXCHG m,r: blank jump delay slot",
+          copy_from=0x030),
+    Patch((XADD_BASE + 0x15), "CMPXCHG m,r equal: OPR_W <- SRCREG + WR + RNI",
+          word=uword(src=SRC_SRCREG, dst=DEST_OPR_W, bus=BUSOP_WR, op=OP_RNI)),
+    Patch((XADD_BASE + 0x16), "CMPXCHG m,r equal: DLY for the write in the delay slot",
+          word=uword(sub=SUB_DLY)),
+    Patch((XADD_BASE + 0x17), "CMPXCHG m,r not equal: OPR_W <- OPR_R (write back) + WR",
+          word=uword(src=SRC_OPR_R, dst=DEST_OPR_W, bus=BUSOP_WR)),
+    Patch((XADD_BASE + 0x18), "CMPXCHG m,r not equal: DLY for the write + RNI",
+          word=uword(sub=SUB_DLY, op=OP_RNI)),
+    Patch((XADD_BASE + 0x19), "CMPXCHG m,r not equal: delay slot eAX <- OPR_R",
+          word=uword(src=SRC_OPR_R, dst=DEST_EAX_AL, sub=SUB_UNL)),
 ]
 
 
@@ -588,6 +675,7 @@ OVERLAY_RECIPES = [
 # and consumes only the action.
 ENTRY_ACTIONS = {
     0x9C7: RecipeAction.INVLPG,
+    0x9D9: RecipeAction.CACHE_FLUSH,
 }
 
 
@@ -732,6 +820,11 @@ def validate_recipes(words: list[int]) -> None:
             raise ValueError(
                 f"entry action 0x{entry:03X}: INVLPG marker is missing from microcode"
             )
+        if (action == RecipeAction.CACHE_FLUSH and
+                get_field(words[entry], "dst") != DEST_USTEP_CACHE_FLUSH):
+            raise ValueError(
+                f"entry action 0x{entry:03X}: CACHE_FLUSH marker is missing from microcode"
+            )
 
 
 def render_recipe_manifest(words: list[int]) -> str:
@@ -814,12 +907,12 @@ def render_recipe_svh(words: list[int]) -> str:
         "localparam logic [2:0] RECIPE_EARLY_BRANCH = 3'd6;",
         "localparam logic [2:0] RECIPE_EARLY_STACK  = 3'd7;",
         "",
-        f"localparam logic [1:0] RECIPE_ACTION_NONE = 2'd{int(RecipeAction.NONE)};",
+        f"localparam logic [2:0] RECIPE_ACTION_NONE = 3'd{int(RecipeAction.NONE)};",
     ]
     for action in RecipeAction:
         if action != RecipeAction.NONE:
             lines.append(
-                f"localparam logic [1:0] RECIPE_ACTION_{action.name} = 2'd{int(action)};"
+                f"localparam logic [2:0] RECIPE_ACTION_{action.name} = 3'd{int(action)};"
             )
     lines += [
         "",
@@ -862,7 +955,7 @@ def render_recipe_svh(words: list[int]) -> str:
         "    endcase",
         "endfunction",
         "",
-        "function automatic logic [1:0] recipe_action(input logic [11:0] entry);",
+        "function automatic logic [2:0] recipe_action(input logic [11:0] entry);",
         "    unique case (entry)",
     ]
     for recipe in OVERLAY_RECIPES:

@@ -258,7 +258,7 @@ typedef struct packed {
     logic        has_rep;
     logic [3:0]  prefix_count;       // Count of prefix bytes (4 bits for up to 15 prefixes)
     logic [11:0] entry_point;
-    logic [1:0]  ucode_action;       // Optimizer-generated semantic entry action
+    logic [2:0]  ucode_action;       // Optimizer-generated semantic entry action
     boundary_action_t boundary_action; // Architectural retirement behavior
     logic [31:0] immediate;
     logic [31:0] displacement;
@@ -866,6 +866,7 @@ localparam DEST_USTEP_RPTI_EIP = 7'h6D; // RPTI restart EIP write
 localparam DEST_USTEP_TASK_CS = 7'h6E;  // Task load establishes full CS selector
 localparam DEST_USTEP_FAULT_DONE = 7'h6F; // Fault delivery completion marker
 localparam DEST_USTEP_INVLPG = 7'h70;    // 486 single-page TLB invalidation
+localparam DEST_USTEP_CACHE_FLUSH = 7'h72; // 486 whole-L1 invalidate (INVD/WBINVD)
 localparam DEST_USTEP_X87_STORE = 7'h71; // x87 store overlay: command + result read into OPR_R
 localparam DEST_LATTTF = 7'h78;  // Faulting linear address (page fault)
 localparam DEST_PFERRC = 7'h7A;  // Page fault error code
@@ -1071,13 +1072,15 @@ localparam [11:0] UADDR_RPTI_RNI       = 12'h20F;  // REP interrupt restart boun
 localparam [11:0] UADDR_PAGE_FAULT     = 12'h8E9;  // #PF(14) - page fault
 localparam [11:0] UADDR_INVALID_LOCK   = 12'h82B;  // #UD for invalid LOCK usage
 localparam [11:0] UADDR_BSWAP          = 12'h9C4;  // Optimizer-owned 486 BSWAP entry
-localparam [11:0] UADDR_XADD_R         = 12'h9D9;  // Optimizer-owned 486 XADD r,r
-localparam [11:0] UADDR_XADD_M         = 12'h9DC;  // Optimizer-owned 486 XADD m,r
-localparam [11:0] UADDR_CMPXCHG_R      = 12'h9E2;  // Optimizer-owned 486 CMPXCHG r,r
-localparam [11:0] UADDR_CMPXCHG_M      = 12'h9E9;  // Optimizer-owned 486 CMPXCHG m,r
-localparam [11:0] UADDR_INVD           = 12'h9F3;  // Optimizer-owned 486 INVD/WBINVD
 localparam [11:0] UADDR_CALL_GATE_386  = 12'h5BE;  // 386 call-gate handler
 localparam [11:0] UADDR_MORE_PRIVILEGE = 12'h5FB;  // Cross-privilege call path
+// Optimizer-owned 486 XADD/CMPXCHG routines (see scripts/ucode_optimize.py,
+// XADD_BASE).  Above the x87 direct overlays (0x9D1-0x9D8) and the INVD/WBINVD
+// flush (0x9D9-0x9DB).
+localparam [11:0] UADDR_XADD_R     = 12'h9DC;  // XADD r,r
+localparam [11:0] UADDR_XADD_M     = 12'h9DF;  // XADD m,r
+localparam [11:0] UADDR_CMPXCHG_R  = 12'h9E5;  // CMPXCHG r,r
+localparam [11:0] UADDR_CMPXCHG_M  = 12'h9EC;  // CMPXCHG m,r
 
 // Group 2 instructions
 localparam ROL = 3'b000;

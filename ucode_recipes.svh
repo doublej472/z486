@@ -8,10 +8,11 @@ localparam logic [2:0] RECIPE_EARLY_RMW    = 3'd5;
 localparam logic [2:0] RECIPE_EARLY_BRANCH = 3'd6;
 localparam logic [2:0] RECIPE_EARLY_STACK  = 3'd7;
 
-localparam logic [1:0] RECIPE_ACTION_NONE = 2'd0;
-localparam logic [1:0] RECIPE_ACTION_X87_OVERLAY = 2'd1;
-localparam logic [1:0] RECIPE_ACTION_INVLPG = 2'd2;
-localparam logic [1:0] RECIPE_ACTION_RMW_FAST = 2'd3;
+localparam logic [2:0] RECIPE_ACTION_NONE = 3'd0;
+localparam logic [2:0] RECIPE_ACTION_X87_OVERLAY = 3'd1;
+localparam logic [2:0] RECIPE_ACTION_INVLPG = 3'd2;
+localparam logic [2:0] RECIPE_ACTION_RMW_FAST = 3'd3;
+localparam logic [2:0] RECIPE_ACTION_CACHE_FLUSH = 3'd4;
 
 // Resolve opcode-qualified overlays during D1 structural decode.
 function automatic logic [11:0] recipe_effective_entry(
@@ -60,7 +61,7 @@ function automatic logic [11:0] recipe_fallback_entry(input logic [11:0] entry);
     endcase
 endfunction
 
-function automatic logic [1:0] recipe_action(input logic [11:0] entry);
+function automatic logic [2:0] recipe_action(input logic [11:0] entry);
     unique case (entry)
         12'h9C5: recipe_action = RECIPE_ACTION_X87_OVERLAY;
         12'h9D1: recipe_action = RECIPE_ACTION_X87_OVERLAY;
@@ -68,6 +69,7 @@ function automatic logic [1:0] recipe_action(input logic [11:0] entry);
         12'h9CB: recipe_action = RECIPE_ACTION_RMW_FAST;
         12'h9CE: recipe_action = RECIPE_ACTION_RMW_FAST;
         12'h9C7: recipe_action = RECIPE_ACTION_INVLPG;
+        12'h9D9: recipe_action = RECIPE_ACTION_CACHE_FLUSH;
         default: recipe_action = RECIPE_ACTION_NONE;
     endcase
 endfunction
