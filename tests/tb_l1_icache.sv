@@ -66,6 +66,7 @@ module tb_l1_icache;
         .patch_valid(patch_valid),
         .invalidate_addr(invalidate_addr),
         .invalidate_valid(invalidate_valid),
+        .patch_held(1'b0),
         .flush_req(flush_req),
         .flush_busy(flush_busy),
         .flush_done(flush_done),
