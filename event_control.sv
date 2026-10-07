@@ -72,6 +72,7 @@ module event_control
     input  logic ac_fault_r,       // the registered #GP-path fault is an alignment check
     input  logic ss_segment_fault,
     input  logic ss_fault_r,
+    input  logic ss_fault_newstack_r, // that #SS hit the new stack of a privilege switch
     input  logic page_fault,
     input  logic data_page_fault,     // the executing instruction's access (not a fetch)
     input  logic [2:0] pg_fault_code,
@@ -289,6 +290,11 @@ assign seq_advance = (((i_issue | uc_exec |
                        (fault_suppress_delay_slot & !stall)) &
                       !halted && !repeat_active);
 
+// A CALL through a gate whose new stack is too small raises #SS(new SS
+// selector); INT n and exceptions raise #SS(0).  The CALL dispatch (5B9h) set
+// interrupt_hw without external_event.
+wire ss_call_newstack = ss_fault_newstack_r && interrupt_hw && !external_event;
+
 // Fault redirects override the port-B continuation. A page fault has priority over a
 // simultaneous segment/general-protection fault, matching the original tree.
 always_comb begin
@@ -296,8 +302,9 @@ always_comb begin
     if (gp_fault_r) begin
         seq_fault_redirect.valid = 1'b1;
         seq_fault_redirect.target = gp_fault_double_r ? UADDR_DOUBLE_FAULT :
-                                    (ss_fault_r ? UADDR_STACK_FAULT :
                                     ac_fault_r ? UADDR_ALIGN_FAULT :
+                                    (ss_fault_r ? (ss_call_newstack ? UADDR_CALL_STACK_FAULT
+                                                                    : UADDR_STACK_FAULT) :
                                                   UADDR_GENERAL_FAULT1);
     end
     if (page_fault) begin
