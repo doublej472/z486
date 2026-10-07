@@ -35,10 +35,15 @@ LOADALL_FREE = 0x8F8
 DESC_SKIP_DATA = LOADALL_FREE + 0x00     # descriptor-load tail without the write
 DESC_SKIP_CS = LOADALL_FREE + 0x02       # CS-type tail without the write
 DESC_SET_ACCESSED = LOADALL_FREE + 0x04  # locked Accessed-bit RMW (8 words)
+TASK_SET_BUSY = LOADALL_FREE + 0x0C      # task switch: locked busy-bit RMW (8 words)
+LTR_SET_BUSY = LOADALL_FREE + 0x14       # LTR: locked busy-bit RMW (5 words)
 ALUSRC_CONST_8 = 0x19
 ALUSRC_CONST_4 = 0x33
 ALUSRC_CONST_NEG4 = 0x37
 ALUSRC_CONST_100 = 0x0A    # z486 addition: 0x100, the descriptor Accessed bit
+ALUSRC_CONST_200 = 0x0E    # z486 addition: 0x200, the TSS descriptor Busy bit
+DEST_TMP_TR = 0x13
+SRC_TMPG = 0x12
 ALUJMP_OR = 0x09
 ALUJMP_LCALL = 0x70
 ALUJMP_LJUMP = 0x71
@@ -396,6 +401,52 @@ PATCHES = [
                      sub=SUB_DLY)),
     Patch(DESC_SET_ACCESSED + 7, "A-bit RMW: blank return delay slot",
           word=uword()),
+    # Setting a TSS descriptor's Busy bit (task switch 74C, LTR 6CB) was an
+    # unlocked write of the descriptor's high dword as read earlier, so
+    # another bus master's write in between was lost.  Read the dword locked
+    # (RD_OPR_WORD, as the outgoing task's busy clear at 78E already does), set
+    # B and write it back.  The task switch now sets B after saving the
+    # outgoing task (the Intel486 order); both of its paths, with (73F) and
+    # without (74E) the save, reach the RMW, which re-establishes the
+    # descriptor address because the save moved IND.
+    Patch(0x741, "task switch, after the save: join the busy-bit RMW at 74E",
+          fields=dict(bus=0x3F, dst=0x7F, src=0x3F, alusrc=reljump(0x741, 0x74E))),
+    Patch(0x742, "task switch, after the save: blank jump delay slot",
+          word=uword()),
+    Patch(0x74E, "task switch: call the locked busy-bit RMW",
+          word=uword(**longjump(TASK_SET_BUSY, ALUJMP_LCALL))),
+    Patch(0x74F, "task switch: blank call delay slot",
+          word=uword()),
+    Patch(TASK_SET_BUSY + 0, "busy RMW: SLCTR <- the new TSS selector (TMPG)",
+          word=uword(src=SRC_TMPG, dst=DEST_TMP_TR)),
+    Patch(TASK_SET_BUSY + 1, "busy RMW: IND -> TSS descriptor high dword (= 74B)",
+          copy_from=0x74B),
+    Patch(TASK_SET_BUSY + 2, "busy RMW: locked read of the high dword",
+          word=uword(bus=BUSOP_RD_OPR_WORD)),
+    Patch(TASK_SET_BUSY + 3, "busy RMW: DLY for the read data",
+          word=uword(sub=SUB_DLY)),
+    Patch(TASK_SET_BUSY + 4, "busy RMW: SIGMA = OPR_R | 0x200",
+          word=uword(src=SRC_OPR_R, aluop=ALUJMP_OR, alusrc=ALUSRC_CONST_200)),
+    Patch(TASK_SET_BUSY + 5, "busy RMW: write the high dword back",
+          word=uword(src=SRC_SIGMA, dst=DEST_OPR_W, bus=BUSOP_WR_WORD)),
+    Patch(TASK_SET_BUSY + 6, "busy RMW: 74E (DLY, SDEH DES_TR) + return",
+          copy_from=0x74E, fields=dict(aluop=ALUJMP_RETURN)),
+    Patch(TASK_SET_BUSY + 7, "busy RMW: return delay slot = 74F (SDES, SLCTR <- TMPG)",
+          copy_from=0x74F),
+    Patch(0x6CA, "LTR: go to the locked busy-bit RMW",
+          word=uword(**longjump(LTR_SET_BUSY))),
+    Patch(0x6CB, "LTR: blank jump delay slot",
+          word=uword()),
+    Patch(LTR_SET_BUSY + 0, "LTR busy RMW: locked read of the high dword",
+          word=uword(bus=BUSOP_RD_OPR_WORD)),
+    Patch(LTR_SET_BUSY + 1, "LTR busy RMW: DLY for the read data",
+          word=uword(sub=SUB_DLY)),
+    Patch(LTR_SET_BUSY + 2, "LTR busy RMW: SIGMA = OPR_R | 0x200",
+          word=uword(src=SRC_OPR_R, aluop=ALUJMP_OR, alusrc=ALUSRC_CONST_200)),
+    Patch(LTR_SET_BUSY + 3, "LTR busy RMW: write back + RNI (= 6CB)",
+          copy_from=0x6CB),
+    Patch(LTR_SET_BUSY + 4, "LTR busy RMW: RNI delay slot (= 6CC)",
+          copy_from=0x6CC),
     # A null selector loaded by a task switch reaches 7E5 after reading GDT[0];
     # 7E6 wrote that dword back to GDT[0]+4.  A 486 does not touch GDT[0].
     Patch(0x7E6, "null selector in a task switch: no write-back to GDT[0]",
