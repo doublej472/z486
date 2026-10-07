@@ -7,6 +7,7 @@ obj_dir_*/
 # test outputs
 tests/*.lst
 tests/programs/*.lst
+tests/programs/.fuzz/
 tests/protected_mode_tests/*.lst
 tests/protected_mode_tests/traces/
 tests/result.txt
