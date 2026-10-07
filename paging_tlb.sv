@@ -109,6 +109,7 @@ wire [16:0] lookup_tag = lookup_vpn[19:3];       // Tag: VPN[19:3]
 wire [2:0]  update_set = update_vpn[2:0];
 wire [16:0] update_tag = update_vpn[19:3];
 wire [2:0]  invalidate_set = invalidate_vpn[2:0];
+wire [16:0] invalidate_tag = invalidate_vpn[19:3];
 // A TR6 request waits for a cycle without a walker update or invalidation.
 reg         tlbt_pend_r;
 reg  [31:0] tlbt_tr6_r, tlbt_tr7_r;
@@ -131,13 +132,18 @@ wire [19:0] write_pfn = tlbt_write ? tlbt_tr7_r[31:12] : update_pfn;
 
 logic [16:0] lookup_tag_q [4];
 logic [19:0] lookup_pfn_q [4];
+logic [16:0] inval_tag_q  [4];
 
 // Quartus 17 does not apply ramstyle to memories declared inside a generate
-// block (they stay as registers), so the four copies are written out flat.
+// block (they stay as registers), so the copies are written out flat.
 `Z486_DISTRIBUTED_RAM reg [36:0] lookup_copy0 [0:7];
+`Z486_DISTRIBUTED_RAM reg [16:0] inval_copy0  [0:7];
 `Z486_DISTRIBUTED_RAM reg [36:0] lookup_copy1 [0:7];
+`Z486_DISTRIBUTED_RAM reg [16:0] inval_copy1  [0:7];
 `Z486_DISTRIBUTED_RAM reg [36:0] lookup_copy2 [0:7];
+`Z486_DISTRIBUTED_RAM reg [16:0] inval_copy2  [0:7];
 `Z486_DISTRIBUTED_RAM reg [36:0] lookup_copy3 [0:7];
+`Z486_DISTRIBUTED_RAM reg [16:0] inval_copy3  [0:7];
 // TR6/TR7 lookup read port.
 `Z486_DISTRIBUTED_RAM reg [36:0] test_copy0   [0:7];
 `Z486_DISTRIBUTED_RAM reg [36:0] test_copy1   [0:7];
@@ -146,18 +152,22 @@ logic [19:0] lookup_pfn_q [4];
 always_ff @(posedge clk) begin
     if (tlb_write && write_way == 2'd0) begin
         lookup_copy0[write_set] <= {write_tag, write_pfn};
+        inval_copy0[write_set]  <= write_tag;
         test_copy0[write_set]   <= {write_tag, write_pfn};
     end
     if (tlb_write && write_way == 2'd1) begin
         lookup_copy1[write_set] <= {write_tag, write_pfn};
+        inval_copy1[write_set]  <= write_tag;
         test_copy1[write_set]   <= {write_tag, write_pfn};
     end
     if (tlb_write && write_way == 2'd2) begin
         lookup_copy2[write_set] <= {write_tag, write_pfn};
+        inval_copy2[write_set]  <= write_tag;
         test_copy2[write_set]   <= {write_tag, write_pfn};
     end
     if (tlb_write && write_way == 2'd3) begin
         lookup_copy3[write_set] <= {write_tag, write_pfn};
+        inval_copy3[write_set]  <= write_tag;
         test_copy3[write_set]   <= {write_tag, write_pfn};
     end
 end
@@ -167,9 +177,13 @@ assign test_q[1] = test_copy1[tlbt_set];
 assign test_q[2] = test_copy2[tlbt_set];
 assign test_q[3] = test_copy3[tlbt_set];
 assign {lookup_tag_q[0], lookup_pfn_q[0]} = lookup_copy0[lookup_set];
+assign inval_tag_q[0]                      = inval_copy0[invalidate_set];
 assign {lookup_tag_q[1], lookup_pfn_q[1]} = lookup_copy1[lookup_set];
+assign inval_tag_q[1]                      = inval_copy1[invalidate_set];
 assign {lookup_tag_q[2], lookup_pfn_q[2]} = lookup_copy2[lookup_set];
+assign inval_tag_q[2]                      = inval_copy2[invalidate_set];
 assign {lookup_tag_q[3], lookup_pfn_q[3]} = lookup_copy3[lookup_set];
+assign inval_tag_q[3]                      = inval_copy3[invalidate_set];
 
 // Hit detection - combinational, parallel comparison within selected set
 wire hit0 = valid_q[lookup_set][0] && (lookup_tag_q[0] == lookup_tag);
@@ -374,6 +388,10 @@ always @(posedge clk)
                update_vpn, lookup_vpn);
 // synthesis translate_on
 
+wire inval_match0 = valid_q[invalidate_set][0] && inval_tag_q[0] == invalidate_tag;
+wire inval_match1 = valid_q[invalidate_set][1] && inval_tag_q[1] == invalidate_tag;
+wire inval_match2 = valid_q[invalidate_set][2] && inval_tag_q[2] == invalidate_tag;
+wire inval_match3 = valid_q[invalidate_set][3] && inval_tag_q[3] == invalidate_tag;
 
 // TLB state update and PLRU management. Tag/PFN writes are in the MLAB
 // copies above, enabled by tlb_write and victim_way.
@@ -398,12 +416,12 @@ always_ff @(posedge clk or negedge reset_n) begin
             plru[s] <= 3'b000;
         end
     end else if (invalidate_page) begin
-        // INVLPG clears the whole set: dropping extra translations is always
-        // legal, and it needs no tag compare (or tag copy) for a rare event.
-        valid_q[invalidate_set][0] <= 1'b0;
-        valid_q[invalidate_set][1] <= 1'b0;
-        valid_q[invalidate_set][2] <= 1'b0;
-        valid_q[invalidate_set][3] <= 1'b0;
+        // Multiple matching ways are not expected, but clear every match so
+        // INVLPG also repairs any duplicate left by an earlier implementation.
+        if (inval_match0) valid_q[invalidate_set][0] <= 1'b0;
+        if (inval_match1) valid_q[invalidate_set][1] <= 1'b0;
+        if (inval_match2) valid_q[invalidate_set][2] <= 1'b0;
+        if (inval_match3) valid_q[invalidate_set][3] <= 1'b0;
     end else begin
         // Update PLRU on hit (point away from accessed way in the hit set)
         if (hit) begin
