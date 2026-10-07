@@ -2796,6 +2796,10 @@ always_ff @(posedge clk) begin
         LDTR <= 16'h0000;
         TR <= 16'h0000;
         SLCTR <= 32'h0;
+        TMPeIP <= 32'h0000_fff0;
+        TMPeSP <= 32'h0;
+        wr_restart_eip <= 32'h0000_fff0;
+        wr_restart_esp <= 32'h0;
         ucrd_restart_eip <= 32'h0000_fff0;
         ucrd_restart_esp <= 32'h0;
 
@@ -2906,8 +2910,9 @@ always_ff @(posedge clk) begin
             SLCTR[1:0] <= desc_raw_hi[14:13];
 
         end
-    end
 
+    // Keep captures in the non-reset arm: old i_first/page_fault levels can
+    // otherwise override reset on the very edge that clears those levels.
     // TMPeIP/TMPeSP: save EIP/ESP at instruction start and fault entry
     if (i_issue) begin
         TMPeIP <= EIP;
@@ -2950,6 +2955,7 @@ always_ff @(posedge clk) begin
     else if (vipt_slow_seg_trigger)
         // A page fault wins over the slow token's #GP (seq_fault_redirect).
         TMPeIP <= vipt_load_slow_r.restart_eip;
+    end
 end
 
 //=============================================================================
