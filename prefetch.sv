@@ -41,6 +41,11 @@ module prefetch
     output reg        ifetch_fault,  // registered one-shot architectural fault
     output     [2:0]  ifetch_fault_code,
     output     [31:0] ifetch_fault_addr,
+    // Bytes from the pop cursor (EIP) through the CS limit, saturated at 63:
+    // decode never sees a byte beyond the limit, and an instruction that needs
+    // one takes #GP(0) once it is the oldest unissued instruction.
+    input      [5:0]  fetch_limit_rem,
+    output reg        ifetch_limit_fault, // registered one-shot #GP(0)
 
     // Control
     input             pf_suspend,    // external suspend (e.g. page fault handler active)
@@ -71,6 +76,7 @@ reg [1:0]  k1p_boff;                  // D1 cursor byte offset
 reg [1:0]  pf_fetch_word_start;      // First word to keep from next fetched line
 reg        pf_suspended;             // Prefetch suspended (page fault until flush)
 reg        pf_fault_reported;        // retained fault has been sent to the core
+reg        pf_limit_reported;        // CS-limit fault has been sent to the core
 reg [2:0]  pf_fault_code_r;
 reg [31:0] pf_fault_addr_r;
 reg        pf_drop_inflight;         // Drop next prefetch result (flush during in-flight)
@@ -136,7 +142,13 @@ wire [3:0] k1p_lead_words = k1p_word - pf_rptr;
 wire [6:0] k1p_lead = {1'b0, k1p_lead_words, 2'b00} + {5'b00000, k1p_boff} -
                      {5'b00000, pf_byte_offset};
 wire [7:0] k1q_avail_s = {2'b00, pf_byte_count} - {1'b0, k1p_lead};
-assign k1q_avail = k1q_avail_s[7] ? 6'd0 : k1q_avail_s[5:0];
+wire [5:0] k1q_avail_raw = k1q_avail_s[7] ? 6'd0 : k1q_avail_s[5:0];
+// The CS limit bounds both decode windows (Intel486 PRM: an instruction any
+// byte of which lies beyond the code-segment limit raises #GP(0); in real
+// mode the limit is 0FFFFh and the fault is interrupt 13).
+wire [7:0] k1_lim_s = {2'b00, fetch_limit_rem} - {1'b0, k1p_lead};
+wire [5:0] k1_lim   = k1_lim_s[7] ? 6'd0 : k1_lim_s[5:0];
+assign k1q_avail = (k1q_avail_raw > k1_lim) ? k1_lim : k1q_avail_raw;
 
 // D2 literal window: pop_cursor + k2p_off, over REGISTERED queue words.
 wire [5:0] k2p_sum  = {4'b0000, pf_byte_offset} + {1'b0, k2p_off};
@@ -149,7 +161,14 @@ assign k2q =
     k2p_sum[1:0] == 2'd2 ? {k2p_word_nxt[15:0], k2p_word_cur[31:16]} :
                            {k2p_word_nxt[23:0], k2p_word_cur[31:24]};
 wire [6:0] k2q_avail_s = {1'b0, pf_byte_count} - {2'b00, k2p_off};
-assign k2q_avail = k2q_avail_s[6] ? 6'd0 : k2q_avail_s[5:0];
+wire [5:0] k2q_avail_raw = k2q_avail_s[6] ? 6'd0 : k2q_avail_s[5:0];
+wire [6:0] k2_lim_s = {1'b0, fetch_limit_rem} - {2'b00, k2p_off};
+wire [5:0] k2_lim   = k2_lim_s[6] ? 6'd0 : k2_lim_s[5:0];
+assign k2q_avail = (k2q_avail_raw > k2_lim) ? k2_lim : k2q_avail_raw;
+// Every byte up to the limit is buffered: a blocked decode then needs a byte
+// beyond it.  The limit check precedes paging, so this also keeps a retained
+// prefetch page fault on a line past the limit from being reported.
+wire limit_reached = (pf_byte_count >= fetch_limit_rem);
 
 wire pf_inflight = (pf_req_toggle != pf_ack_toggle);
 
@@ -460,6 +479,8 @@ always_ff @(posedge clk or negedge reset_n) begin
         pf_suspended <= 1'b0;
         ifetch_fault <= 1'b0;
         pf_fault_reported <= 1'b0;
+        ifetch_limit_fault <= 1'b0;
+        pf_limit_reported <= 1'b0;
         pf_fault_code_r <= 3'b000;
         pf_fault_addr_r <= 32'h0;
         pf_drop_inflight <= 1'b0;
@@ -482,6 +503,7 @@ always_ff @(posedge clk or negedge reset_n) begin
     end else begin
         pf_ack_prev <= pf_ack_toggle;
         ifetch_fault <= 1'b0;
+        ifetch_limit_fault <= 1'b0;
 
         pf_rptr <= rptr_next;
         pf_wptr <= wptr_next;
@@ -498,6 +520,7 @@ always_ff @(posedge clk or negedge reset_n) begin
             pf_linear_addr <= {pf_flush_addr[31:4], 4'b0000};
             pf_suspended <= 1'b0;
             pf_fault_reported <= 1'b0;
+            pf_limit_reported <= 1'b0;
             if (spec_flush_hit) begin
                 // Target line already buffered (or arriving right now): the
                 // queue was seeded combinationally; continue sequentially.
@@ -575,9 +598,14 @@ always_ff @(posedge clk or negedge reset_n) begin
             end
         end
 
-        if (pf_suspended && !pf_fault_reported && fetch_blocked && !q_flush) begin
+        if (pf_suspended && !pf_fault_reported && fetch_blocked && !q_flush &&
+            !limit_reached) begin
             ifetch_fault <= 1'b1;
             pf_fault_reported <= 1'b1;
+        end
+        if (limit_reached && !pf_limit_reported && fetch_blocked && !q_flush) begin
+            ifetch_limit_fault <= 1'b1;
+            pf_limit_reported <= 1'b1;
         end
 
         if (spec_req && !q_flush) begin
