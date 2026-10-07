@@ -28,6 +28,9 @@ UCODE_BITS = 37
 XADD_BASE = 0x9DC
 # Free words after the XADD/CMPXCHG block.
 ALIGN_FAULT_ENTRY = 0x9F6     # 486 #AC fault entry (two words)
+CALL_STACK_FAULT = 0x9F8      # #SS(new SS selector) for a CALL gate's new stack (three words)
+SRC_SLCTR = 0x35
+ALUJMP_AND = 0x08
 # The 80386 LOADALL routine (entry 0x8F6, words 0x8F7-0x931) is reached only
 # from 0F 07, which the decoder sends to #UD on the 486, and nothing else
 # jumps into it, so the words after its entry pair are free.
@@ -709,6 +712,20 @@ PATCHES = [
           copy_from=0x85B),
     Patch(ALIGN_FAULT_ENTRY + 1, "#AC entry: delay slot - error code 0, SIGMA = 17 - 9",
           copy_from=0x85C, fields=dict(alusrc=ALUSRC_CONST_8)),
+
+    # A CALL through a gate to a more privileged level whose new stack has no
+    # room for the parameters plus the return frame raises #SS(new SS
+    # selector) (i486 PRM, CALL), where INT n raises #SS(0).  The new SS
+    # selector is still in SLCTR (loaded at 607h) while the parameter copy and
+    # frame pushes run; event_control enters here for the stack-limit fault
+    # of such a CALL.  The #SS(0) entry 863h/864h passes SIGMA into TMPE, so
+    # form SIGMA = SLCTR & ~3 (EXT = 0) first, as the #TS entry does with TR.
+    Patch(CALL_STACK_FAULT, "#SS(new SS selector): SIGMA = SLCTR & ~3",
+          word=uword(src=SRC_SLCTR, aluop=ALUJMP_AND, alusrc=ALUSRC_CONST_NEG4)),
+    Patch(CALL_STACK_FAULT + 1, "#SS(new SS selector): long jump into the shared fault body",
+          copy_from=0x863),
+    Patch(CALL_STACK_FAULT + 2, "#SS(new SS selector): delay slot - TMPE = SIGMA, SIGMA = 12 - 9",
+          copy_from=0x864),
 ]
 
 
