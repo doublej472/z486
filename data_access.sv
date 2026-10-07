@@ -107,6 +107,10 @@ module data_access
     output logic                    vipt_load_wb_valid_r,
     // D2 instruction and issue
     input  logic                    d2_vipt_ea_hazard,
+    // An older deferred memory token owns this load's destination and its
+    // optimistic read already missed (mem_opt_wait), so OPR_R is stale until the
+    // fill returns: route the younger direct load through the slow path.
+    input  logic                    vipt_load_ex_token_pending,
     input  logic [31:0]             EIP,
     input  logic                    hardwired_off,
     input  dec_entry_t              i_bus,
@@ -318,6 +322,7 @@ assign vipt_load_ex_hit = vipt_load_ex_r.valid && vipt_load_ex_probed_r &&
                           vipt_load_ex_contained &&
                           vipt_translation_ok &&
                           !vipt_tlb_is_vga_mem && !vipt_load_ex_segf &&
+                          !vipt_load_ex_token_pending &&
                           dcache_vipt_resolve_hit;
 // Capture the destination operand from every registered EX token,
 // independently of translation, segmentation, and cache outcome. Plain loads

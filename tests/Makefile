@@ -382,6 +382,13 @@ test-l1-icache: obj_dir/Vtb_l1_icache
 	@echo "Running L1 instruction cache unit test..."
 	./obj_dir/Vtb_l1_icache
 
+obj_dir/Vtb_data_access: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/data_access.sv $(RTL_DEPS) tb_data_access.sv
+	$(VERILATOR) --binary --timing -Wno-fatal -j $(JOBS) -I$(Z486_DIR) --top-module tb_data_access \
+		$(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/data_access.sv tb_data_access.sv
+
+test-data-access: obj_dir/Vtb_data_access
+	./obj_dir/Vtb_data_access
+
 test-memory-order: obj_dir/Vtb_memory_order
 	@echo "Running device/store ordering unit test..."
 	./obj_dir/Vtb_memory_order
