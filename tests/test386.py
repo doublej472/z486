@@ -212,6 +212,11 @@ def run_test386(args):
         desc = POST_DESCRIPTIONS.get(last_post, "Unknown test")
         print(f"\n  Last POST reached: 0x{last_post:02X} ({desc})")
 
+    if char_mismatches:
+        # POST 0xEE checks nothing itself: its printed flag/result lines are the
+        # test, so any line that differs from the reference is a failure.
+        print(f"✗ POST 0xEE output differs from the reference in {char_mismatches} line(s)")
+        return 1
     if "TEST386 PASSED" in output:
         print("✓ All tests passed!")
         return 0
@@ -230,7 +235,8 @@ def run_test386(args):
         # reach in simulation; the test loops at 0xEE ("unverified arith/logic
         # opcodes"), so reaching 0xEE and timing out is the expected success result.
         if last_post is not None and last_post >= 0xEE:
-            print("✓ Reached POST 0x{:02X} (success)".format(last_post))
+            print("✓ Reached POST 0x{:02X} (success; {} POST 0xEE lines matched "
+                  "the reference)".format(last_post, char_line_num))
             return 0
         else:
             print("✗ Test timed out before POST 0xEE")
@@ -261,6 +267,10 @@ def main():
                         help='Enable protection unit trace')
 
     args = parser.parse_args()
+    if args.cycles is not None and not (0 < args.cycles <= 0x7FFFFFFF):
+        # tb_test386 takes +cycles as a 32-bit int: a larger limit wraps
+        # negative and ends the run at once.
+        parser.error("--cycles must be between 1 and 2147483647")
 
     # Change to tests directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
