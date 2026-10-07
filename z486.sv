@@ -1713,6 +1713,21 @@ wire [1:0] gp_access_adj = uc_is_word_op ? 2'd1 :
                            (srcreg_size == 2'd0) ? 2'd0 : (srcreg_size == 2'd2) ? 2'd3 : 2'd1;
 
 wire        mem_op_eligible, gp_fault_mem_op, gp_fault_wr_op, ss_segment_fault;
+// 486 alignment checking: CR0.AM, EFLAGS.AC and CPL3 (protected or V86 mode).
+// While it is on, the direct load/RMW pipeline is held off (as for single
+// stepping) so every data access takes the microcode path and its check.
+wire        ac_check_mode = CR0[18] && EFLAGS[18] && (cpl == 2'd3);
+// Registered so the D2 direct-path candidates see a flop, not this cone.
+reg         direct_hold_r;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        direct_hold_r <= 1'b0;
+    else
+        direct_hold_r <= ac_check_mode;
+end
+wire        seg_align_fault;
+wire [1:0]  mem_eff_size;            // data access width (0 byte, 1 word, 2 dword)
+reg         ac_fault_r;
 prot_transition_t prot_transition;
 
 segmentation_unit seg_unit (
@@ -1770,6 +1785,9 @@ segmentation_unit seg_unit (
     .seg_base_exec    (seg_base_exec),
     .eff_mask_exec    (eff_mask_exec),
     .seg_fault        (seg_gp_fault),
+    .ac_check         (ac_check_mode),
+    .align_size       (mem_eff_size),
+    .align_fault      (seg_align_fault),
     .is_stack_fault   (ss_segment_fault),
     // Decoder D2: issuing instruction, EA recipe, displacement and D2 segment base (ISLA/IESSEG, K2Q)
     .au_instr_issue(i_issue),
@@ -1900,7 +1918,7 @@ end
 
 // Access width: |IND_DELTA| for RD W/WR W, else the source width.
 wire ind_delta_dword = (IND_DELTA == 32'd4) || (IND_DELTA == -32'd4);
-wire [1:0] mem_eff_size = uc_is_word_op
+assign mem_eff_size = uc_is_word_op
                           ? ((ind_delta_dword && !uc_force_word) ? 2'd2 : 2'd1) :
                           uc_is_dword_op ? 2'd2 : srcreg_size;
 
@@ -2169,6 +2187,7 @@ data_access data_access_inst (
     .i_bus(i_bus),
     .i_issue(i_issue),
     .single_step(single_step),
+    .direct_hold(direct_hold_r),
     .d2_plain_load_overlap_ready(d2_plain_load_overlap_ready),
     .d2_vipt_candidate(d2_vipt_candidate),
     .d2_vipt_load(d2_vipt_load),
@@ -2334,8 +2353,15 @@ always_ff @(posedge clk) begin
     if (!reset_n) begin
         gp_fault_r <= 1'b0;
         ss_fault_r <= 1'b0;
+        ac_fault_r <= 1'b0;
     end else begin
         gp_fault_r <= gp_fault_trigger;
+        // A segment fault on the same access has priority over #AC.
+        // seg_gp_fault includes #AC; a limit/write fault on the same access,
+        // or another #GP source, has priority.
+        ac_fault_r <= seg_align_fault && !rd_fast_valid_r &&
+                      !vipt_slow_seg_trigger && !invlpg_priv_fault &&
+                      !cache_flush_priv_fault;
         // is_stack_fault names the segment of the current access; it selects
         // #SS only for a segment-check fault, never for a privilege #GP(0).
         ss_fault_r <= vipt_slow_seg_trigger ? vipt_load_slow_ssf_r
@@ -2486,6 +2512,7 @@ event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
     .any_fault_r(any_fault_r),
     .gp_fault_trigger(gp_fault_trigger),
     .gp_fault_r(gp_fault_r),
+    .ac_fault_r(ac_fault_r),
     .ss_segment_fault(ss_segment_fault),
     .ss_fault_r(ss_fault_r),
     .page_fault(page_fault),

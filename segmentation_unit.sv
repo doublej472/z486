@@ -67,6 +67,11 @@ module segmentation_unit
     output             dir_seg_fault,
     output             dir_rmw_fault,      // as above plus the write check (RD_FAST)
     output             seg_fault,          // Segment limit/protection fault
+    // 486 alignment check (#AC): CR0.AM, EFLAGS.AC and CPL3 qualify ac_check;
+    // align_size is the access width (0=byte, 1=word, 2=dword).
+    input              ac_check,
+    input      [1:0]   align_size,
+    output             align_fault,
     output             is_stack_fault,     // Fault is on SS (→ #SS not #GP)
 
     // Decoder D2: issuing instruction, EA recipe, displacement and D2 segment base (ISLA/IESSEG, K2Q)
@@ -350,9 +355,35 @@ assign dir_seg_fault = (seg_sel != SEG_IO) && (dir_rm_limit_fault || dir_pm_limi
 assign dir_rmw_fault = dir_seg_fault ||
     ((seg_sel != SEG_IO) && pe && !seg_writable && !is_dtable);
 
+// #AC shares the #GP fault path and its qualification: folding the alignment
+// term in here keeps the fault request one OR wide (align_fault tells z486
+// which entry to take).
+wire align_violation;
 assign seg_fault = check_en && is_mem_op &&
                    (seg_sel != SEG_IO) &&
-                   (rm_limit_fault || pm_limit_fault || write_fault || read_fault);
+                   (rm_limit_fault || pm_limit_fault || write_fault || read_fault ||
+                    align_violation);
+
+// The check is on the linear address.  Implicit supervisor references
+// (descriptor tables, the TSS and LDT) never raise #AC, even from CPL3, and
+// neither do the pushes of a transfer to a more privileged level: CPL is
+// still 3 while interrupt/gate microcode writes the new stack, which is
+// either addressed through the stack switch (descsw_mode) or already loaded
+// into SS with DPL < 3.  (V86 SS caches carry DPL 3, so V86 stack accesses
+// stay checked.)
+wire [1:0] align_linear_low = seg_base_r[1:0] + eff_offset[1:0];
+wire       align_misaligned = (align_size == 2'd1) ? align_linear_low[0] :
+                              (align_size == 2'd2) ? (align_linear_low != 2'd0) :
+                                                     1'b0;
+wire       align_priv_stack = (seg_sel == SEG_SS) &&
+                              (descsw_mode || (desc_cache[SEG_SS].DPL != 2'd3));
+assign align_violation = ac_check && !is_dtable && (seg_sel != SEG_TR) &&
+                         (seg_sel != SEG_LDT) && !align_priv_stack &&
+                         align_misaligned;
+// A limit, write or read fault on the same access has priority over #AC.
+assign align_fault = check_en && is_mem_op && (seg_sel != SEG_IO) &&
+                     align_violation &&
+                     !(rm_limit_fault || pm_limit_fault || write_fault || read_fault);
 
 function automatic [31:0] seg_base_for(input [3:0] sel, input dsw);
     case (sel)

@@ -116,6 +116,9 @@ module data_access
     input  dec_entry_t              i_bus,
     input  logic                    i_issue,
     input  logic                    single_step,
+    // Alignment checking or a debug breakpoint needs every data access on
+    // the microcode path: hold the direct load and RMW pipelines off.
+    input  logic                    direct_hold,
     output logic                    d2_plain_load_overlap_ready,
     output logic                    d2_vipt_candidate,
     output logic                    d2_vipt_load,
@@ -889,7 +892,7 @@ assign d2_vipt_candidate = d2_seg_readable && !hardwired_off &&
                              i_bus.has_modrm && (i_bus.modrm[7:6] != 2'b11) &&
                              !i_bus.has_moffs && !i_bus.stack_op) ||
                             d2_vipt_moffs || d2_vipt_pop || d2_vipt_ret) &&
-                           !single_step;
+                           !single_step && !direct_hold;
 // A direct load or RMW waits while an older microcode read resolves or misses:
 // its own miss must not reach paging (and OPR_R) ahead of the older read.
 assign d2_vipt_load = d2_vipt_candidate && dcache_vipt_probe_ready && !ucrd_route_pre && !ucrd_busy &&
@@ -914,7 +917,7 @@ assign d2_vipt_rmw_candidate = d2_seg_readable && !hardwired_off &&
                            i_bus.has_modrm &&
                            (i_bus.modrm[7:6] != 2'b11) &&
                            !i_bus.has_moffs && !i_bus.stack_op &&
-                           !single_step;
+                           !single_step && !direct_hold;
 assign d2_vipt_rmw = d2_vipt_rmw_candidate &&
                      dcache_vipt_probe_ready && !ucrd_route_pre && !ucrd_busy &&
                      !vipt_load_replay_r.valid && !vipt_load_slow_busy &&

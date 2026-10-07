@@ -22,6 +22,9 @@ from pathlib import Path
 
 ROM_DEPTH = 2560
 UCODE_BITS = 37
+# Free words after upstream's XADD/CMPXCHG/INVD block (0x9D9-0x9F5).
+ALIGN_FAULT_ENTRY = 0x9F6     # 486 #AC fault entry (two words)
+ALUSRC_CONST_8 = 0x19
 ROM_BITS = 40
 SRC_TMPC = 0x0C            # Canonical CROM source encoding.
 DEST_SRCREG = 0x3E         # Canonical CROM destination encoding.
@@ -459,6 +462,14 @@ PATCHES = [
           fields=dict(aluop=0x5A, alusrc=0x0B)),
     Patch(0x03B, "ALU m,i 6->4: 03B = OPR_R,IMM +-&|^ in jump delay slot (03C unreached)",
           copy_from=0x03C, fields=dict(src=0x2D)),
+    # 486 alignment-check fault (#AC, vector 17, error code 0).  The 80386
+    # CROM has no #AC entry.  Reuse the #GP(0) entry shape at 85B/85C: a long
+    # jump into the shared fault body whose delay slot zeroes the error code
+    # (TMPE) and leaves vector - 9 in SIGMA (8 for vector 17).
+    Patch(ALIGN_FAULT_ENTRY, "#AC entry: long jump into the shared fault body",
+          copy_from=0x85B),
+    Patch(ALIGN_FAULT_ENTRY + 1, "#AC entry: delay slot - error code 0, SIGMA = 17 - 9",
+          copy_from=0x85C, fields=dict(alusrc=ALUSRC_CONST_8)),
 ]
 
 
