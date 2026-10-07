@@ -2319,8 +2319,11 @@ always_ff @(posedge clk) begin
         ss_fault_r <= 1'b0;
     end else begin
         gp_fault_r <= gp_fault_trigger;
+        // is_stack_fault names the segment of the current access; it selects
+        // #SS only for a segment-check fault, never for a privilege #GP(0).
         ss_fault_r <= vipt_slow_seg_trigger ? vipt_load_slow_ssf_r
-                                            : ss_segment_fault;
+                                            : (ss_segment_fault && seg_gp_fault &&
+                                               !rd_fast_valid_r);
     end
 end
 
