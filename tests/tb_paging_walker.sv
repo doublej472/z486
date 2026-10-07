@@ -56,6 +56,7 @@ module tb_paging_walker;
     .result_user(result_user),
     .result_dirty(result_dirty),
     .result_pcd(),
+    .result_pwt(),
     .mem_rd(mem_rd),
     .mem_wr(mem_wr),
     .mem_addr(mem_addr),
