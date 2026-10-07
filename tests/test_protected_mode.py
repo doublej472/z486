@@ -492,6 +492,16 @@ Examples:
         tests_to_run = [name for name in tests_to_run
                         if not TESTS[name].get("requires_x87", False)]
 
+    if os.environ.get("Z486_PC98_MAP") != "1":
+        requested_pc98 = [name for name in tests_to_run
+                          if TESTS[name].get("requires_pc98_map", False)]
+        if args.tests and requested_pc98:
+            print("Error: PC-98 map tests require `make test-pc98-map`: "
+                  + ", ".join(requested_pc98))
+            return 1
+        tests_to_run = [name for name in tests_to_run
+                       if not TESTS[name].get("requires_pc98_map", False)]
+
     if args.strict:
         expected = [name for name in tests_to_run if TESTS[name].get('expect_fail')]
         if expected:
