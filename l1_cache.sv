@@ -87,7 +87,7 @@ localparam integer BYTE_OFFSET_BITS = 2;
 localparam integer LINE_OFFSET_BITS = WORD_OFFSET_BITS + BYTE_OFFSET_BITS;
 localparam integer NUM_SETS = 1 << SET_BITS;
 localparam integer BRAM_ADDR_BITS = SET_BITS + WORD_OFFSET_BITS;
-localparam integer PHYS_ADDR_BITS = 27; // maximum supported RAM is 128MB
+localparam integer PHYS_ADDR_BITS = `Z486_L1_PHYS_ADDR_BITS; // default tag reach: 128 MiB
 localparam integer TAG_BITS = PHYS_ADDR_BITS - LINE_OFFSET_BITS - SET_BITS;
 localparam integer SET_LSB = LINE_OFFSET_BITS;
 localparam integer SET_MSB = SET_LSB + SET_BITS - 1;
@@ -101,6 +101,14 @@ localparam integer STOREQ_CNT_BITS = $clog2(STOREQ_DEPTH + 1);
 localparam [STOREQ_CNT_BITS-1:0] STOREQ_DEPTH_VALUE = STOREQ_CNT_BITS'(STOREQ_DEPTH);
 localparam [STOREQ_IDX_BITS-1:0] STOREQ_LAST_IDX = STOREQ_IDX_BITS'(STOREQ_DEPTH - 1);
 localparam [SET_BITS-1:0] LAST_SET = SET_BITS'(NUM_SETS - 1);
+
+// synthesis translate_off
+initial begin
+    if (SET_BITS < 1 || SET_BITS > 8 || PHYS_ADDR_BITS > 32 ||
+        PHYS_ADDR_BITS <= LINE_OFFSET_BITS + SET_BITS)
+        $fatal(1, "Invalid L1 D-cache index/tag width (VIPT indexes must stay in page offset)");
+end
+// synthesis translate_on
 
 // Address decomposition. Include the complete physical tag so larger SDRAM
 // configurations cannot alias cache lines at 32MB boundaries.
