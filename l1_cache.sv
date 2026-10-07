@@ -24,7 +24,11 @@ module l1_cache #(
     input   [3:0] cpu_be,
     input         cpu_valid,
     input         cpu_write,
+    // A read that may hit but must not allocate on a miss: a PCD page or
+    // CR0.CD=1.  The miss is one exact-size bus read behind every older store.
     input         cpu_uncacheable,
+    // CR0.NW=1: a write that hits updates only the L1 (no write-through).
+    input         cache_nw,
     output        cpu_ready,      // a read may be presented (registered)
     output        cpu_wr_ready,   // a write may be presented (registered)
     output        cpu_resp_valid,
@@ -183,6 +187,8 @@ reg [31:0] req_din_r;
 reg  [3:0] req_be_r;
 reg        req_write_r;
 reg        req_uncacheable_r;
+reg        req_nw_r;            // CR0.NW sampled with the request
+reg        nw_hit_r;            // S_NW_WRITE: the NW store hit (stays cache-only)
 reg        req_protect_write_r;
 reg [TAG_BITS-1:0] req_tag_r;
 reg [SET_BITS-1:0] req_set_r;
@@ -204,7 +210,8 @@ wire storeq_can_accept = !storeq_full || (storeq_draining && mem_ready);
 // Device transactions are serializing.  The memory fabric uses this status to
 // keep I/O and other direct accesses behind every older posted store.
 assign stores_drained = storeq_empty && !storeq_draining &&
-                        !(req_valid_r && req_write_r && !req_protect_write_r);
+                        !(req_valid_r && req_write_r && !req_protect_write_r) &&
+                        (state != S_NW_WRITE);
 
 // Memory-side registers.
 reg        mem_valid_r;
@@ -227,6 +234,7 @@ localparam [2:0] S_IDLE        = 3'd1;
 localparam [2:0] S_LOOKUP      = 3'd2;
 localparam [2:0] S_FILL        = 3'd3;
 localparam [2:0] S_BYPASS_WAIT = 3'd4;
+localparam [2:0] S_NW_WRITE    = 3'd5;  // NW=1 store: enqueue only a miss
 
 reg [2:0] state;
 reg [SET_BITS-1:0] init_set;
@@ -478,6 +486,7 @@ wire ready_when_idle = !reset && !flush_block && storeq_can_accept;
 wire flush_launch = (flush_req_new | flush_pending_r) &&
                     (state != S_RESET_INIT) && !reset;
 reg  lookup_wr_room_r;
+// CR0.NW=1 stores never pipeline: lookup_wr_room_r is cleared for them.
 wire lookup_store_busy = (state == S_LOOKUP) && req_valid_r &&
                          req_write_r && !req_protect_write_r;
 wire lookup_wr_open = lookup_store_busy && lookup_wr_room_r &&
@@ -493,8 +502,9 @@ logic [31:0] lookup_forward_data;
 logic [31:0] fill_word_data;
 logic [31:0] bypass_forward_data;
 logic [127:0] wide_line_data;
+// An uncacheable (PCD/CD) read still hits a valid line: only a miss bypasses.
 wire lookup_read_hit_now = (state == S_LOOKUP) && req_valid_r &&
-                           !req_write_r && !req_uncacheable_r && lookup_hit;
+                           !req_write_r && lookup_hit;
 
 assign cpu_dout = lookup_read_hit_now ? lookup_forward_data : dout_r;
 assign cpu_resp_valid = lookup_read_hit_now || resp_valid_r;
@@ -506,7 +516,7 @@ assign cpu_resp_valid = lookup_read_hit_now || resp_valid_r;
 wire drain_block_state = (state == S_RESET_INIT) || (state == S_FILL) ||
                          (state == S_BYPASS_WAIT) ||
                          ((state == S_LOOKUP) && !req_protect_write_r && !req_write_r &&
-                          (req_uncacheable_r ? storeq_empty : !lookup_hit));
+                          !req_uncacheable_r && !lookup_hit);
 wire drain_issue_now = !storeq_empty && !storeq_draining && !mem_valid_r &&
                        !mem_busy && !drain_block_state;
 
@@ -518,7 +528,7 @@ wire storeq_merge_lookup = !storeq_empty && storeq_valid[storeq_prev] &&
 // The S_LOOKUP write merging into the very entry the drain is launching
 // this cycle: fold the incoming bytes into the launch latch too.
 wire storeq_merge_wr_now = (state == S_LOOKUP) && req_write_r &&
-                           !req_protect_write_r && storeq_merge_lookup;
+                           !req_protect_write_r && !req_nw_r && storeq_merge_lookup;
 wire drain_merge_now = storeq_merge_wr_now && (storeq_prev == storeq_tail);
 // Store-queue count after this cycle's enqueue, including a simultaneously
 // completing drain.  Drives the post-write ready_r so a full queue is seen
@@ -796,6 +806,7 @@ always_ff @(posedge clk) begin
                     req_be_r <= cpu_be;
                     req_write_r <= cpu_write;
                     req_uncacheable_r <= request_uncacheable;
+                    req_nw_r <= cache_nw;
                     req_protect_write_r <= cpu_protect_write;
                     req_tag_r <= cpu_tag;
                     req_set_r <= cpu_set;
@@ -806,7 +817,8 @@ always_ff @(posedge clk) begin
                     req_valid_r <= 1'b1;
                     state <= S_LOOKUP;
                 end
-                lookup_wr_room_r <= (storeq_count <= STOREQ_CNT_BITS'(STOREQ_DEPTH - 2));
+                lookup_wr_room_r <= (storeq_count <= STOREQ_CNT_BITS'(STOREQ_DEPTH - 2)) &&
+                                    !cache_nw;
             end
 
             S_LOOKUP: begin
@@ -815,6 +827,14 @@ always_ff @(posedge clk) begin
                 if (req_protect_write_r) begin
                     state <= S_IDLE;
                     ready_r <= ready_when_idle;
+                end else if (req_write_r && req_nw_r) begin
+                    // CR0.NW=1: a hit is written to the line above
+                    // (data_store_write) and never reaches memory; only a
+                    // miss is queued, one cycle later from registered state.
+                    if (lookup_hit)
+                        plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
+                    nw_hit_r <= lookup_hit;
+                    state <= S_NW_WRITE;
                 end else if (req_write_r) begin
                     // Store-queue enqueue, moved here from the accept cycle so
                     // its enables come from registered request state instead of
@@ -842,13 +862,15 @@ always_ff @(posedge clk) begin
                         req_be_r <= cpu_be;
                         req_write_r <= cpu_write;
                         req_uncacheable_r <= request_uncacheable;
+                        req_nw_r <= cache_nw;
                         req_protect_write_r <= cpu_protect_write;
                         req_tag_r <= cpu_tag;
                         req_set_r <= cpu_set;
                         req_word_r <= cpu_word;
                     end
                     lookup_wr_room_r <= (storeq_count_wr_next <=
-                                         STOREQ_CNT_BITS'(STOREQ_DEPTH - 2));
+                                         STOREQ_CNT_BITS'(STOREQ_DEPTH - 2)) &&
+                                        !cache_nw;
                     if (lookup_wr_accept) begin
                         req_valid_r <= 1'b1;
                         ready_r <= 1'b0;
@@ -856,6 +878,10 @@ always_ff @(posedge clk) begin
                         state <= S_IDLE;
                         ready_r <= (storeq_count_wr_next != STOREQ_DEPTH_VALUE);
                     end
+                end else if (lookup_hit) begin
+                    plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
+                    state <= S_IDLE;
+                    ready_r <= ready_when_idle;
                 end else if (req_uncacheable_r) begin
                     if (storeq_empty && !storeq_draining && !mem_valid_r && !mem_busy) begin
                         mem_valid_r <= 1'b1;
@@ -866,10 +892,6 @@ always_ff @(posedge clk) begin
                         mem_burstcount_r <= 8'd1;
                         state <= S_BYPASS_WAIT;
                     end
-                end else if (lookup_hit) begin
-                    plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
-                    state <= S_IDLE;
-                    ready_r <= ready_when_idle;
                 end else begin
                     fill_set <= req_set_r;
                     fill_tag <= req_tag_r;
@@ -944,6 +966,27 @@ always_ff @(posedge clk) begin
                 end
             end
 
+            S_NW_WRITE: begin
+                // The store was accepted with queue capacity reserved, and
+                // nothing else enqueues before it.  No coalescing here.
+                if (!nw_hit_r) begin
+                    storeq_addr[storeq_head] <= req_addr_r[31:2];
+                    storeq_data[storeq_head] <= req_din_r;
+                    storeq_be[storeq_head] <= req_be_r;
+                    storeq_valid[storeq_head] <= 1'b1;
+                    storeq_head <= storeq_next_idx(storeq_head);
+                    storeq_count <= storeq_dequeuing ? storeq_count
+                                                     : storeq_count + 1'b1;
+                    ready_r <= !flush_block &&
+                               ((storeq_dequeuing ? storeq_count
+                                                  : storeq_count + 1'b1) !=
+                                STOREQ_DEPTH_VALUE);
+                end else begin
+                    ready_r <= ready_when_idle;
+                end
+                state <= S_IDLE;
+            end
+
             S_BYPASS_WAIT: begin
                 if (mem_resp_valid) begin
                     dout_r <= bypass_forward_data;
@@ -1006,7 +1049,8 @@ always_ff @(posedge clk) begin
     // protected (ROM-window) store leaves S_LOOKUP without touching the RAM
     // and is not forwarded, so the probe reads the unchanged data.
     if (!reset && vipt_resolve_valid && state != S_IDLE &&
-        !(state == S_LOOKUP && req_valid_r && req_write_r))
+        !(state == S_LOOKUP && req_valid_r && req_write_r) &&
+        !(state == S_NW_WRITE))
         $fatal(1, "VIPT resolve while cache is not idle");
 end
 // synthesis translate_on

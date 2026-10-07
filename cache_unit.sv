@@ -81,6 +81,9 @@ module cache_unit
     input  logic dcache_req_is_io,
     input  logic dcache_req_is_inta,
     input  logic dcache_req_is_vga_mem,
+    input  logic dcache_req_is_pcd,
+    input  logic cache_cd,
+    input  logic cache_nw,
 
     // Execution core: WR_FAST store and VIPT load/RMW preread
     input  logic fast_store_valid,
@@ -101,6 +104,7 @@ module cache_unit
     // Paging unit: instruction line request (prefetch)
     input  logic icache_req_valid,
     input  logic [31:0] icache_req_phys_addr_raw,
+    input  logic icache_req_is_pcd,
     output logic icache_req_accepted,
     output logic icache_req_complete,
     output logic [127:0] icache_rdata,
@@ -579,8 +583,11 @@ l1_cache #(
     .cpu_write(dcache_cpu_write),
     // I/O, INTA, x87, and VGA/device transactions are routed around this
     // cache above, so accepted D-cache requests need no physical-address
-    // aperture decode on their register inputs.
-    .cpu_uncacheable(1'b0),
+    // aperture decode on their register inputs.  A demand read of a PCD page,
+    // or any read while CR0.CD=1, may hit but does not allocate.  Writes never
+    // allocate in this write-through cache.
+    .cpu_uncacheable(!dcache_cpu_write && (dcache_req_is_pcd || cache_cd)),
+    .cache_nw(cache_nw),
     .cpu_ready(dcache_cpu_ready),
     .cpu_wr_ready(dcache_cpu_wr_ready),
     .store_patch_busy(icache_invalidate_valid || icache_write_snoop_pending),
@@ -650,7 +657,8 @@ l1_icache #(
     .flush_busy(icache_flush_busy),
     .flush_done(icache_flush_done),
     .cache_enable(cache_enable),
-    .cpu_no_alloc(icache_req_is_no_alloc)
+    .cpu_no_alloc(icache_req_is_no_alloc),
+    .cpu_no_fill(icache_req_is_pcd || cache_cd)
 );
 
 endmodule

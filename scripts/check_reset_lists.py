@@ -40,7 +40,11 @@ ALLOW = {
        for f in ("req_addr_r", "req_set_r", "req_tag_r", "req_uncacheable_r")},
     **{("l1_cache.sv", f): "request captured before S_LOOKUP; req_valid_r resets to 0"
        for f in ("req_be_r", "req_din_r", "req_protect_write_r", "req_word_r", "req_write_r")},
-    ("l1_icache.sv", "req_no_alloc_r"): "request captured before S_LOOKUP",
+    **{("l1_icache.sv", f): "request captured before S_LOOKUP"
+       for f in ("req_no_alloc_r", "req_no_fill_r")},
+    **{("l1_cache.sv", f): "request captured before S_LOOKUP; req_valid_r resets to 0"
+       for f in ("req_nw_r",)},
+    ("l1_cache.sv", "nw_hit_r"): "written in S_LOOKUP on entry to S_NW_WRITE, its only reader",
     **{("l1_cache.sv", f): "storeq_valid and count reset; enqueue writes payload"
        for f in ("storeq_addr", "storeq_be", "storeq_data")},
     **{("l1_icache.sv", f): "patchq_valid resets to 0; patch capture writes payload"
@@ -48,7 +52,7 @@ ALLOW = {
     **{("mul_div.sv", f): "microcode setup writes scratch before MUL/DIV iterations"
        for f in ("divtmp", "multmp", "result_r")},
     **{("paging_tlb.sv", f): "valid_q resets to 0; TLB insertion writes attributes"
-       for f in ("dirty_q", "user_q", "vga_mem", "writable_q")},
+       for f in ("dirty_q", "pcd_q", "user_q", "vga_mem", "writable_q")},
     ("prefetch.sv", "prefetch_queue"): "queue_count resets to 0; fill writes bytes",
     ("prefetch.sv", "spec_line"): "spec_valid resets to 0; speculative fill writes line",
     ("prefetch.sv", "spec_b_line"): "spec_b_valid resets to 0; speculative fill writes line",

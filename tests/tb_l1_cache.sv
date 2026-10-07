@@ -17,6 +17,8 @@ module tb_l1_cache;
     wire        cpu_wr_ready;
     reg         store_patch_busy = 0;
     reg         flush_req = 0;
+    reg         tb_cache_nw = 1'b0;   // CR0.NW for the NW write-hit cases
+    reg         tb_uncacheable = 1'b0; // PCD page / CR0.CD read
     wire        flush_done;
     wire        cpu_resp_valid;
     wire        stores_drained;
@@ -70,7 +72,8 @@ module tb_l1_cache;
         .cpu_be(cpu_be),
         .cpu_valid(cpu_valid),
         .cpu_write(cpu_write),
-        .cpu_uncacheable(cpu_addr[31:17] == 15'h5),
+        .cpu_uncacheable((cpu_addr[31:17] == 15'h5) || tb_uncacheable),
+        .cache_nw(tb_cache_nw),
         .cpu_ready(cpu_ready),
         .cpu_wr_ready(cpu_wr_ready),
         .cpu_resp_valid(cpu_resp_valid),
@@ -322,6 +325,49 @@ module tb_l1_cache;
     end
     endtask
 
+
+    // 486 cache operating modes.  A PCD/CD read may hit a valid line; its miss
+    // is one exact-size bus read that does not allocate.  With CR0.NW=1 a
+    // write that hits stays in the L1; a write miss still reaches memory.
+    task automatic cache_modes();
+        integer req_before;
+    begin
+        mem_put32(32'h200, 32'h0bad_0200);
+        cache_read(32'h200, 4'hF, 32'h0bad_0200);         // allocate
+        mem_put32(32'h200, 32'h1111_0200);                // behind the line
+        tb_uncacheable = 1'b1;
+        do @(negedge clk); while (!cpu_ready);
+        req_before = mem_request_count;
+        cache_read(32'h200, 4'hF, 32'h0bad_0200);
+        if (mem_request_count != req_before)
+            $fatal(1, "D-cache uncacheable read did not take the valid line");
+        mem_put32(32'h300, 32'h2222_0300);
+        do @(negedge clk); while (!cpu_ready);
+        req_before = mem_request_count;
+        cache_read(32'h300, 4'hF, 32'h2222_0300);
+        if (mem_request_count != req_before + 1 || narrow_response_count == 0)
+            $fatal(1, "D-cache uncacheable miss was not one bus read");
+        tb_uncacheable = 1'b0;
+        mem_put32(32'h300, 32'h3333_0300);
+        cache_read(32'h300, 4'hF, 32'h3333_0300);         // still a miss
+        // CR0.NW=1: the hit is cache-only, the miss is written through.
+        tb_cache_nw = 1'b1;
+        cache_write(32'h200, 4'hF, 32'h4444_0200);
+        cache_write(32'h500, 4'hF, 32'h5555_0500);
+        tb_cache_nw = 1'b0;
+        do @(negedge clk); while (!dut.stores_drained || !cpu_ready);
+        if (mem_get32(32'h200) != 32'h1111_0200)
+            $fatal(1, "D-cache NW write hit reached memory");
+        if (mem_get32(32'h500) != 32'h5555_0500)
+            $fatal(1, "D-cache NW write miss did not reach memory");
+        do @(negedge clk); while (!cpu_ready);
+        req_before = mem_request_count;
+        cache_read(32'h200, 4'hF, 32'h4444_0200);
+        if (mem_request_count != req_before)
+            $fatal(1, "D-cache NW write hit did not update the line");
+        $display("D-cache CD/PCD/NW operating modes PASS");
+    end
+    endtask
     initial begin
         fork
             begin
@@ -498,6 +544,7 @@ module tb_l1_cache;
         cpu_valid = 0;
         cpu_write = 0;
         cache_read(32'h1C0, 4'hF, 32'h8765_4321);
+        cache_modes();
 
         $display("L1 PIPT cache unit test PASS");
         $finish;

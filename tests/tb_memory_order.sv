@@ -63,6 +63,7 @@ module tb_memory_order;
         .dcache_req_is_inta(1'b0),
         .dcache_req_is_x87(1'b0),
         .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
+    .dcache_req_is_pcd(1'b0), .cache_cd(1'b0), .cache_nw(1'b0),
         .dcache_req_accepted(dcache_req_accepted),
         .dcache_req_complete(dcache_req_complete),
         .dcache_read_complete(dcache_read_complete),
@@ -91,7 +92,7 @@ module tb_memory_order;
         .x87_rdata(32'h0),
 
         .icache_req_valid(1'b0),
-        .icache_req_phys_addr_raw(32'h0),
+        .icache_req_phys_addr_raw(32'h0), .icache_req_is_pcd(1'b0),
         .icache_req_accepted(),
         .icache_req_complete(),
         .icache_rdata(),

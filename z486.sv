@@ -441,6 +441,7 @@ wire [31:0] pf_linear_addr;
 wire        pf_redirect_queued;
 wire        pf_ack_toggle;
 wire [127:0] pf_rdata;
+wire         pf_nocache;
 wire        pf_fault;
 wire [2:0]  pf_fault_code;
 wire [31:0] pf_fault_addr;
@@ -463,6 +464,8 @@ wire        dcache_req_is_io;
 wire        dcache_req_is_inta;
 wire        dcache_req_is_x87;
 wire        dcache_req_is_vga_mem;
+wire        dcache_req_is_pcd;
+wire        icache_req_is_pcd;
 wire        dcache_req_accepted;
 wire        dcache_req_complete;
 wire        dcache_read_complete;
@@ -931,6 +934,9 @@ memory #(
     .dcache_req_is_inta(dcache_req_is_inta),
     .dcache_req_is_x87(dcache_req_is_x87),
     .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
+    .dcache_req_is_pcd(dcache_req_is_pcd),
+    .cache_cd(CR0[30]),
+    .cache_nw(CR0[29]),
     .dcache_req_accepted(dcache_req_accepted),
     .dcache_req_complete(dcache_req_complete),
     .dcache_read_complete(dcache_read_complete),
@@ -959,6 +965,7 @@ memory #(
 
     .icache_req_valid(icache_req_valid),
     .icache_req_phys_addr_raw(icache_req_phys_addr_raw),
+    .icache_req_is_pcd(icache_req_is_pcd),
     .icache_req_accepted(icache_req_accepted),
     .icache_req_complete(icache_req_complete),
     .icache_rdata(icache_rdata),
@@ -1012,6 +1019,7 @@ prefetch prefetch_inst (
     .pf_redirect_queued(pf_redirect_queued),
     .pf_ack_toggle(pf_ack_toggle),
     .pf_rdata(pf_rdata),
+    .pf_nocache(pf_nocache),
     .pf_fault(pf_fault),
     .pf_fault_code(pf_fault_code),
     .pf_fault_addr(pf_fault_addr),
@@ -2290,6 +2298,7 @@ paging_unit #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) paging_inst (
     .pf_redirect_queued (pf_redirect_queued),
     .pf_linear_addr     (pf_linear_addr),
     .pf_rdata           (pf_rdata),
+    .pf_nocache         (pf_nocache),
     .pf_fault           (pf_fault),
     .pf_fault_code      (pf_fault_code),
     .pf_fault_addr      (pf_fault_addr),
@@ -2308,6 +2317,7 @@ paging_unit #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) paging_inst (
     .dcache_req_is_inta (dcache_req_is_inta),
     .dcache_req_is_x87  (dcache_req_is_x87),
     .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
+    .dcache_req_is_pcd(dcache_req_is_pcd),
     .dcache_req_accepted(dcache_req_accepted),
     .dcache_req_complete(dcache_req_complete),
     .dcache_read_complete(dcache_read_complete),
@@ -2316,6 +2326,7 @@ paging_unit #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) paging_inst (
     // Instruction-prefetch physical request interface
     .icache_req_valid   (icache_req_valid),
     .icache_req_phys_addr(icache_req_phys_addr_raw),
+    .icache_req_is_pcd(icache_req_is_pcd),
     .icache_req_accepted(icache_req_accepted),
     .icache_req_complete(icache_req_complete),
     .icache_rdata       (icache_rdata),
