@@ -147,6 +147,13 @@ reg [1:0] fill_way;
 reg [127:0] fill_line;
 reg [2:0] fill_plru_r;
 reg fill_requested;
+// A snoop clear owns the shared way write port for its cycle, so the fill
+// install waits (fill_tag_wait_r) rather than being dropped as a miss.
+reg fill_tag_wait_r;
+// A snoop that cleared this fill's line, held for the rest of the fill so the
+// tag write cannot reinstate it (the live and registered snoops alone miss it).
+reg fill_line_snooped_r;
+
 
 reg [127:0] line_r;
 reg resp_valid_r;
@@ -341,10 +348,14 @@ assign cpu_line = lookup_read_hit_now ? lookup_way_line : line_r;
 assign cpu_resp_valid = lookup_read_hit_now || resp_valid_r;
 
 wire tag_reset_write = (state == S_RESET_INIT);
-wire tag_fill_write = (state == S_FILL) &&
-                      (mem_line_resp_valid ||
-                       (mem_resp_valid &&
-                        fill_count == {WORD_OFFSET_BITS{1'b1}}));
+wire fill_last_beat = mem_line_resp_valid ||
+                      (mem_resp_valid &&
+                       fill_count == {WORD_OFFSET_BITS{1'b1}});
+// A snoop clear owns the shared way write port this cycle, so the install is
+// deferred (fill_tag_wait_r) rather than racing the clear; and a deferred
+// install must not start while the snoop is still live.
+wire tag_fill_write = (state == S_FILL) && !snoop_valid_r &&
+                      (fill_tag_wait_r || fill_last_beat);
 wire [TAG_RAM_BITS-1:0] tag_fill_entry =
     {{(TAG_RAM_BITS-TAG_BITS-1){1'b0}}, 1'b1, fill_tag};
 wire snoop_capture = invalidate_valid || patch_valid;
@@ -374,9 +385,19 @@ wire registered_snoop_fill_conflict = snoop_valid_r &&
 // both operations need the same way RAM for different lines, the fill may
 // win: replacing the old tag also invalidates the snooped line.  Only a snoop
 // targeting the line being filled must leave that fill uncached.
+// A snoop that clears the line this fill is installing.  A tag-matched clear
+// is the only kind here (there is no set-wide external invalidate).
+wire snoop_clears_fill_line = registered_snoop_fill_conflict;
 wire fill_install_allowed = !fill_uncached_r && !live_snoop_fill_conflict &&
-                            !registered_snoop_fill_conflict;
+                            !registered_snoop_fill_conflict &&
+                            !fill_line_snooped_r;
 wire data_fill_write = tag_fill_write && fill_install_allowed;
+// A deferred install writes the line gathered at the last beat, not the stale
+// bus inputs still present on the following cycle.
+logic [127:0] fill_install_line;
+assign fill_install_line = fill_tag_wait_r ? fill_line :
+                           mem_line_resp_valid ? wide_line_next : fill_line_next;
+
 
 always_ff @(posedge clk) begin
     if (accept_cpu) begin
@@ -396,14 +417,10 @@ always_ff @(posedge clk) begin
     // flip-flops instead of inferring simple dual-port block RAMs.
     if (data_fill_write) begin
         case (fill_way)
-            2'd0: data_way0[fill_set] <= mem_line_resp_valid ?
-                                              wide_line_next : fill_line_next;
-            2'd1: data_way1[fill_set] <= mem_line_resp_valid ?
-                                              wide_line_next : fill_line_next;
-            2'd2: data_way2[fill_set] <= mem_line_resp_valid ?
-                                              wide_line_next : fill_line_next;
-            default: data_way3[fill_set] <= mem_line_resp_valid ?
-                                              wide_line_next : fill_line_next;
+            2'd0: data_way0[fill_set] <= fill_install_line;
+            2'd1: data_way1[fill_set] <= fill_install_line;
+            2'd2: data_way2[fill_set] <= fill_install_line;
+            default: data_way3[fill_set] <= fill_install_line;
         endcase
     end
 
@@ -461,6 +478,8 @@ always_ff @(posedge clk) begin
         mem_burstcount_r <= 8'h0;
         fill_line <= 128'h0;
         fill_requested <= 1'b0;
+        fill_tag_wait_r <= 1'b0;
+        fill_line_snooped_r <= 1'b0;
         snoop_tag_r <= {TAG_BITS{1'b0}};
         snoop_set_r <= {SET_BITS{1'b0}};
         snoop_word_r <= {WORD_OFFSET_BITS{1'b0}};
@@ -496,6 +515,13 @@ always_ff @(posedge clk) begin
 
         if (mem_valid_r && mem_ready)
             mem_valid_r <= 1'b0;
+
+        // A snoop that clears the line being filled is remembered for the rest
+        // of the fill, so the deferred install cannot reinstate it.
+        if (state != S_FILL)
+            fill_line_snooped_r <= 1'b0;
+        else if (snoop_clears_fill_line)
+                fill_line_snooped_r <= 1'b1;
 
         if (snoop_valid_r) begin
             // CPU stores can race ahead of an instruction-cache line fill.
@@ -580,14 +606,31 @@ always_ff @(posedge clk) begin
                     fill_requested <= 1'b1;
                 end
 
-                if (mem_line_resp_valid) begin
+                if (fill_tag_wait_r) begin
+                    // The line is gathered; only the shared-way install is
+                    // left.  Still S_FILL, so ready stays low and no lookup
+                    // can see the victim tag paired with the new data.
+                    if (!snoop_valid_r) begin
+                        if (fill_install_allowed)
+                            plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                        fill_tag_wait_r <= 1'b0;
+                        state <= S_IDLE;
+                        ready_r <= 1'b1;
+                    end
+                end else if (mem_line_resp_valid) begin
                     fill_line <= wide_line_next;
                     line_r <= wide_line_next;
                     resp_valid_r <= 1'b1;
+                    // A snoop clear owns the way write port this cycle; defer
+                    // the install instead of dropping the line.
+                    if (snoop_valid_r) begin
+                        fill_tag_wait_r <= 1'b1;
+                    end else begin
                         if (fill_install_allowed)
-                        plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
-                    state <= S_IDLE;
-                    ready_r <= 1'b1;
+                            plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                        state <= S_IDLE;
+                        ready_r <= 1'b1;
+                    end
                 end else if (mem_resp_valid) begin
                     fill_line <= fill_line_next;
 
@@ -597,12 +640,17 @@ always_ff @(posedge clk) begin
                         // Only the tag-RAM fill write sets valid for fill_way.
                         // Do not restore any other way from the fill-start
                         // snapshot: a snoop during this fill must survive.
+                        if (snoop_valid_r) begin
+                            fill_tag_wait_r <= 1'b1;
+                        end else begin
                             if (fill_install_allowed)
-                            plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
-                        state <= S_IDLE;
-                        ready_r <= 1'b1;
+                                plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
+                            state <= S_IDLE;
+                            ready_r <= 1'b1;
+                        end
+                    end else begin
+                        fill_count <= fill_count + 1'b1;
                     end
-                    fill_count <= fill_count + 1'b1;
                 end
             end
 
