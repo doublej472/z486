@@ -245,7 +245,6 @@ wire [1:0]   vipt_load_alu_dst_capture_size;
 wire [4:0]   vipt_load_wb_alu_op_r;
 wire [31:0]  vipt_load_wb_data;
 wire [7:0]   vipt_load_wb_dst_onehot_r;
-wire [7:0]   vipt_load_wb_fwd_mask_r;
 wire [2:0]   vipt_load_wb_dst_r;
 wire         vipt_load_wb_is_alu_r;
 wire [1:0]   vipt_load_wb_size_r;
@@ -2051,7 +2050,6 @@ data_access data_access_inst (
     .vipt_load_wb_alu_op_r(vipt_load_wb_alu_op_r),
     .vipt_load_wb_data(vipt_load_wb_data),
     .vipt_load_wb_dst_onehot_r(vipt_load_wb_dst_onehot_r),
-    .vipt_load_wb_fwd_mask_r(vipt_load_wb_fwd_mask_r),
     .vipt_load_wb_dst_r(vipt_load_wb_dst_r),
     .vipt_load_wb_is_alu_r(vipt_load_wb_is_alu_r),
     .vipt_load_wb_size_r(vipt_load_wb_size_r),
@@ -2992,7 +2990,6 @@ data_unit data_unit_inst (
     .load_wb_size(vipt_load_wb_size_r),
     .load_wb_data(vipt_load_wb_data),
     .load_wb_is_alu(vipt_load_wb_is_alu_r),
-    .load_wb_fwd_mask(vipt_load_wb_fwd_mask_r),
     .load_wb_alu_op(vipt_load_wb_alu_op_r),
     .load_alu_dst_capture(vipt_load_alu_dst_capture),
     .load_alu_dst_capture_dst(vipt_load_alu_dst_capture_dst),
@@ -3034,6 +3031,9 @@ data_unit data_unit_inst (
     .cs_source_value(cs_source_value),
     // Cache and bus unit: memory operand in (R bus) and write data out
     .opr_r(OPR_R),
+    // A younger fast read (or the x87 m32 store) replacing OPR_R invalidates a
+    // deferred load token: OPR_R is that token's only data source.
+    .opr_fast_commit(fast_opr_commit || x87_store_opr_commit),
     .opr_w(OPR_W),
     .memory_write_source_value(memory_write_source_value),
     // Control registers and restart state read as microcode sources

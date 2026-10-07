@@ -100,7 +100,6 @@ module data_access
     output logic [4:0]              vipt_load_wb_alu_op_r,
     output logic [31:0]             vipt_load_wb_data,
     output logic [7:0]              vipt_load_wb_dst_onehot_r,
-    output logic [7:0]              vipt_load_wb_fwd_mask_r,   // forwarded GPR (not an M3 ALU load)
     output logic [2:0]              vipt_load_wb_dst_r,
     output logic                    vipt_load_wb_is_alu_r,
     output logic [1:0]              vipt_load_wb_size_r,
@@ -454,14 +453,12 @@ always_ff @(posedge clk) begin
         vipt_load_wb_target_r <= 32'd0;
         vipt_load_wb_dst_r <= 3'd0;
         vipt_load_wb_dst_onehot_r <= 8'd0;
-        vipt_load_wb_fwd_mask_r <= 8'd0;
         vipt_load_wb_size_r <= 2'd2;
         vipt_load_wb_is_alu_r <= 1'b0;
         vipt_load_wb_alu_op_r <= 5'd0;
         vipt_load_overlap_r <= 1'b0;
     end else begin
         vipt_load_wb_valid_r <= 1'b0;
-        vipt_load_wb_fwd_mask_r <= 8'd0;
 
         if (vipt_load_wb_valid_r)
             vipt_load_overlap_r <= 1'b0;
@@ -524,7 +521,6 @@ always_ff @(posedge clk) begin
                 vipt_load_wb_target_r <= dcache_vipt_resolve_data;
                 vipt_load_wb_dst_r <= vipt_load_ex_r.dst;
                 vipt_load_wb_dst_onehot_r <= vipt_load_ex_r.dst_onehot;
-                vipt_load_wb_fwd_mask_r <= vipt_load_ex_r.is_alu ? 8'd0 : vipt_load_ex_r.dst_onehot;
                 vipt_load_wb_size_r <= vipt_load_ex_r.write_size;
                 vipt_load_wb_is_alu_r <= vipt_load_ex_r.is_alu;
                 vipt_load_wb_alu_op_r <= vipt_load_ex_r.alu_op;
@@ -593,7 +589,6 @@ always_ff @(posedge clk) begin
             vipt_load_wb_target_r <= OPR_R;
             vipt_load_wb_dst_r <= vipt_load_slow_r.dst;
             vipt_load_wb_dst_onehot_r <= vipt_load_slow_r.dst_onehot;
-            vipt_load_wb_fwd_mask_r <= vipt_load_slow_r.is_alu ? 8'd0 : vipt_load_slow_r.dst_onehot;
             vipt_load_wb_size_r <= vipt_load_slow_r.write_size;
             vipt_load_wb_is_alu_r <= vipt_load_slow_r.is_alu;
             vipt_load_wb_alu_op_r <= vipt_load_slow_r.alu_op;
@@ -605,7 +600,6 @@ always_ff @(posedge clk) begin
             vipt_load_slow_req_r <= 1'b0;
             vipt_load_slow_wait_r <= 1'b0;
             vipt_load_wb_valid_r <= 1'b0;
-            vipt_load_wb_fwd_mask_r <= 8'd0;
             vipt_load_ex_probed_r <= 1'b0;
             vipt_load_overlap_r <= 1'b0;
         end
