@@ -52,7 +52,7 @@ ALLOW = {
     **{("mul_div.sv", f): "microcode setup writes scratch before MUL/DIV iterations"
        for f in ("divtmp", "multmp", "result_r")},
     **{("paging_tlb.sv", f): "valid_q resets to 0; TLB insertion writes attributes"
-       for f in ("dirty_q", "pcd_q", "user_q", "vga_mem", "writable_q")},
+       for f in ("dirty_q", "pcd_q", "pwt_q", "user_q", "vga_mem", "writable_q")},
     ("prefetch.sv", "prefetch_queue"): "queue_count resets to 0; fill writes bytes",
     ("prefetch.sv", "spec_line"): "spec_valid resets to 0; speculative fill writes line",
     ("prefetch.sv", "spec_b_line"): "spec_b_valid resets to 0; speculative fill writes line",

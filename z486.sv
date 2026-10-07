@@ -55,6 +55,7 @@ module z486
     // remain) and the TR6/TR7 TLB test port (TR3-TR7 remain readable and
     // writable).  Both default on for the 486SX feature level.
     parameter        ENABLE_HW_BREAKPOINTS = 1,
+    parameter        ENABLE_TLB_TEST = 1,
 
     parameter [6:0] CLOCK_RATE_MHZ = 7'd85
 )
@@ -1758,6 +1759,8 @@ end
 wire        seg_align_fault;
 wire [31:0] seg_access_linear;
 wire [31:2] seg_access_dw_next;
+wire        tlbt_lookup_done;
+wire [31:0] tlbt_tr6_out, tlbt_tr7_out;
 wire [1:0]  mem_eff_size;            // data access width (0 byte, 1 word, 2 dword)
 reg         ac_fault_r;
 prot_transition_t prot_transition;
@@ -1970,6 +1973,15 @@ always @(posedge clk)
                uc_addr, uc_source, memory_write_source_value, source_value_live);
 // synthesis translate_on
 
+// TR5.CTL = 11 (cache test "flush") invalidates both L1s.
+reg tr5_flush_r;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        tr5_flush_r <= 1'b0;
+    else
+        tr5_flush_r <= xreg_tr_write && (xreg_index == 3'd5) && (IND[1:0] == 2'b11);
+end
+
 // INVLPG: decoder-registered action; its address is already in IND.
 wire invlpg_active = uc_active && i_first &&
     (i.ucode_action == RECIPE_ACTION_INVLPG);
@@ -1999,8 +2011,8 @@ always_ff @(posedge clk) begin
     else if (cache_flush_done)
         cache_flush_done_seen_r <= 1'b1;
 end
-assign cache_flush_insn_req = cache_flush_active && !cache_flush_priv_fault &&
-                              !cache_flush_done_seen_r;
+assign cache_flush_insn_req = tr5_flush_r || (cache_flush_active && !cache_flush_priv_fault &&
+                              !cache_flush_done_seen_r);
 assign stall_cache_flush = cache_flush_active && !cache_flush_priv_fault &&
                            !cache_flush_done_seen_r;
 // RD_FAST uses the authoritative segment checker only as a qualifier. A
@@ -2486,6 +2498,12 @@ paging_unit #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) paging_inst (
     .invlpg_req         (invlpg_request),
     .invlpg_linear      (ind_linear),
     .invlpg_ack         (invlpg_ack),
+    .tlbt_req           (ENABLE_TLB_TEST && xreg_tr_write && (xreg_index == 3'd6)),
+    .tlbt_tr6           (IND & 32'hFFFF_FFE1),
+    .tlbt_tr7           (TR7),
+    .tlbt_lookup_done   (tlbt_lookup_done),
+    .tlbt_tr6_out       (tlbt_tr6_out),
+    .tlbt_tr7_out       (tlbt_tr7_out),
 
     // Memory/IO request: current RD/WR/IACK uop is held by stall until accepted.
     .mem_req            (mem_req_to_paging),
@@ -3246,7 +3264,10 @@ always_ff @(posedge clk) begin
 
         end
 
-    // MOV TRn,r (IND holds the value).
+    // MOV TRn,r (IND holds the value).  A TR6 write runs a TLB test command;
+    // a lookup's result reloads TR6/TR7 when it completes.  TR5's CTL field
+    // 11 invalidates the caches; TR5 01/10 (cache line write/read) and the
+    // TR3/TR4 buffers are stored but do not reach the split L1s.
     if (xreg_tr_write)
         case (xreg_index)
             3'd3: TR3 <= IND;
@@ -3255,6 +3276,10 @@ always_ff @(posedge clk) begin
             3'd6: TR6 <= IND & 32'hFFFF_FFE1;
             default: TR7 <= IND & 32'hFFFF_FC1C;
         endcase
+    else if (tlbt_lookup_done) begin
+        TR6 <= tlbt_tr6_out;
+        TR7 <= tlbt_tr7_out;
+    end
 
     // Hardware breakpoint status: the #DB redirect edge records B0-B3 before
     // the delivery microcode reads DR6 (the TF entry ORs in BS next).

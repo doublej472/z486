@@ -27,6 +27,14 @@ module paging_unit
     input        [31:0] invlpg_linear,
     output              invlpg_ack,
 
+    // 486 TLB test registers (see paging_tlb)
+    input               tlbt_req,
+    input        [31:0] tlbt_tr6,
+    input        [31:0] tlbt_tr7,
+    output              tlbt_lookup_done,
+    output       [31:0] tlbt_tr6_out,
+    output       [31:0] tlbt_tr7_out,
+
     //=========================================================================
     // LA bus, requester 2 (segmentation, E stage): demand memory/IO request
     //=========================================================================
@@ -192,6 +200,7 @@ logic        tlb_update_writable;
 logic        tlb_update_user;
 logic        tlb_update_dirty;
 logic        tlb_update_pcd;
+logic        tlb_update_pwt;
 
 //=============================================================================
 // State Machine
@@ -280,9 +289,17 @@ paging_tlb #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) tlb_inst (
     .update_user    (tlb_update_user),
     .update_dirty   (tlb_update_dirty),
     .update_pcd     (tlb_update_pcd),
+    .update_pwt     (tlb_update_pwt),
     .invalidate_all (cr3_write),
     .invalidate_page(invlpg_fire),
-    .invalidate_vpn (invlpg_linear[31:12])
+    .invalidate_vpn (invlpg_linear[31:12]),
+    .tlbt_req       (tlbt_req),
+    .tlbt_tr6       (tlbt_tr6),
+    .tlbt_tr7       (tlbt_tr7),
+    .tlbt_done      (),
+    .tlbt_lookup_done(tlbt_lookup_done),
+    .tlbt_tr6_out   (tlbt_tr6_out),
+    .tlbt_tr7_out   (tlbt_tr7_out)
 );
 
 //=============================================================================
@@ -297,6 +314,7 @@ wire        walk_result_writable;
 wire        walk_result_user;
 wire        walk_result_dirty;
 wire        walk_result_pcd;
+wire        walk_result_pwt;
 wire        walker_mem_pcd;
 
 wire        walker_mem_rd;
@@ -355,6 +373,7 @@ paging_walker walker_inst (
     .result_user    (walk_result_user),
     .result_dirty   (walk_result_dirty),
     .result_pcd     (walk_result_pcd),
+    .result_pwt     (walk_result_pwt),
     .mem_rd         (walker_mem_rd),
     .mem_wr         (walker_mem_wr),
     .mem_addr       (walker_mem_addr),
@@ -645,6 +664,7 @@ always_comb begin
     tlb_update_user = walk_result_user;
     tlb_update_dirty = walk_result_dirty;
     tlb_update_pcd = walk_result_pcd;
+    tlb_update_pwt = walk_result_pwt;
 end
 
 function automatic [1:0] op_size_bytes_m1(input [1:0] op_size);
