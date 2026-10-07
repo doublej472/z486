@@ -27,6 +27,7 @@ module paging_walker
     output reg          result_user,
     output reg          result_dirty,
     output reg          result_pcd,     // PTE.PCD: the page's data/code is uncacheable
+    output reg          result_pwt,     // PTE.PWT (reported through TR7 only)
 
     // Memory interface for page table reads and write-backs
     output reg          mem_rd,
@@ -245,6 +246,7 @@ always_comb begin
     result_user = 1'b0;
     result_dirty = 1'b0;
     result_pcd = 1'b0;
+    result_pwt = 1'b0;
     // 486: CR3.PCD qualifies the page-directory access, PDE.PCD the page-table
     // access (the PTE's own PCD qualifies the translated page).
     mem_pcd = (state == PW_READ_PDE || state == PW_WAIT_PDE ||
@@ -314,6 +316,7 @@ always_comb begin
             result_user = combined_user;
             result_dirty = pte_dirty || saved_is_write;  // Updated after write-back
             result_pcd = pte[PTE_PCD];
+            result_pwt = pte[PTE_PWT];
         end
 
         PW_FAULT: begin

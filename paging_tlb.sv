@@ -58,13 +58,25 @@ module paging_tlb
     input               update_user,
     input               update_dirty,
     input               update_pcd,
+    input               update_pwt,     // PTE.PWT, for the TR7 readback only
 
     // Invalidate all entries (on CR3 write)
     input               invalidate_all,
 
     // Invalidate every cached translation for one linear page (INVLPG).
     input               invalidate_page,
-    input        [19:0] invalidate_vpn
+    input        [19:0] invalidate_vpn,
+
+    // 486 TLB test registers.  A TR6 write (TR6.C = 0) installs an entry
+    // from TR6/TR7; with C = 1 it looks one up and reports it through TR7
+    // (and the TR6 attribute pairs).  The result pulses tlbt_done.
+    input               tlbt_req,
+    input        [31:0] tlbt_tr6,
+    input        [31:0] tlbt_tr7,
+    output reg          tlbt_done,
+    output reg          tlbt_lookup_done,
+    output reg   [31:0] tlbt_tr6_out,
+    output reg   [31:0] tlbt_tr7_out
 );
 
 // 8 sets x 4 ways, one lookup port as on the i486: the registered lookup
@@ -80,6 +92,7 @@ reg user_q     [7:0][3:0];
 reg dirty_q    [7:0][3:0];
 reg vga_mem    [7:0][3:0];
 reg pcd_q      [7:0][3:0];
+reg pwt_q      [7:0][3:0];     // PTE.PWT, kept for the TR7 test readback only
 
 reg [2:0] plru [7:0];
 
@@ -96,8 +109,25 @@ wire [16:0] lookup_tag = lookup_vpn[19:3];       // Tag: VPN[19:3]
 wire [2:0]  update_set = update_vpn[2:0];
 wire [16:0] update_tag = update_vpn[19:3];
 wire [2:0]  invalidate_set = invalidate_vpn[2:0];
-wire        tlb_write = reset_n && !invalidate_all && !invalidate_page && update_valid;
+// A TR6 request waits for a cycle without a walker update or invalidation.
+reg         tlbt_pend_r;
+reg  [31:0] tlbt_tr6_r, tlbt_tr7_r;
+wire        tlbt_go = tlbt_pend_r && !update_valid && !invalidate_all && !invalidate_page;
+wire        tlbt_write = tlbt_go && !tlbt_tr6_r[0];
+wire        tlbt_lookup = tlbt_go && tlbt_tr6_r[0];
+wire [2:0]  tlbt_set = tlbt_tr6_r[14:12];
+wire [16:0] tlbt_tag = tlbt_tr6_r[31:15];
+wire [2:0]  tlbt_plru = plru[tlbt_set];
+wire [1:0]  tlbt_way = tlbt_tr7_r[4] ? tlbt_tr7_r[3:2] :
+                       tlbt_plru[0] ? (tlbt_plru[2] ? 2'd3 : 2'd2) :
+                                      (tlbt_plru[1] ? 2'd1 : 2'd0);
+wire        tlb_write = reset_n && !invalidate_all && !invalidate_page &&
+                        (update_valid || tlbt_write);
 wire [1:0]  victim_way;
+wire [1:0]  write_way = tlbt_write ? tlbt_way : victim_way;
+wire [2:0]  write_set = tlbt_write ? tlbt_set : update_set;
+wire [16:0] write_tag = tlbt_write ? tlbt_tag : update_tag;
+wire [19:0] write_pfn = tlbt_write ? tlbt_tr7_r[31:12] : update_pfn;
 
 logic [16:0] lookup_tag_q [4];
 logic [19:0] lookup_pfn_q [4];
@@ -108,20 +138,34 @@ logic [19:0] lookup_pfn_q [4];
 `Z486_DISTRIBUTED_RAM reg [36:0] lookup_copy1 [0:7];
 `Z486_DISTRIBUTED_RAM reg [36:0] lookup_copy2 [0:7];
 `Z486_DISTRIBUTED_RAM reg [36:0] lookup_copy3 [0:7];
+// TR6/TR7 lookup read port.
+`Z486_DISTRIBUTED_RAM reg [36:0] test_copy0   [0:7];
+`Z486_DISTRIBUTED_RAM reg [36:0] test_copy1   [0:7];
+`Z486_DISTRIBUTED_RAM reg [36:0] test_copy2   [0:7];
+`Z486_DISTRIBUTED_RAM reg [36:0] test_copy3   [0:7];
 always_ff @(posedge clk) begin
-    if (tlb_write && victim_way == 2'd0) begin
-        lookup_copy0[update_set] <= {update_tag, update_pfn};
+    if (tlb_write && write_way == 2'd0) begin
+        lookup_copy0[write_set] <= {write_tag, write_pfn};
+        test_copy0[write_set]   <= {write_tag, write_pfn};
     end
-    if (tlb_write && victim_way == 2'd1) begin
-        lookup_copy1[update_set] <= {update_tag, update_pfn};
+    if (tlb_write && write_way == 2'd1) begin
+        lookup_copy1[write_set] <= {write_tag, write_pfn};
+        test_copy1[write_set]   <= {write_tag, write_pfn};
     end
-    if (tlb_write && victim_way == 2'd2) begin
-        lookup_copy2[update_set] <= {update_tag, update_pfn};
+    if (tlb_write && write_way == 2'd2) begin
+        lookup_copy2[write_set] <= {write_tag, write_pfn};
+        test_copy2[write_set]   <= {write_tag, write_pfn};
     end
-    if (tlb_write && victim_way == 2'd3) begin
-        lookup_copy3[update_set] <= {update_tag, update_pfn};
+    if (tlb_write && write_way == 2'd3) begin
+        lookup_copy3[write_set] <= {write_tag, write_pfn};
+        test_copy3[write_set]   <= {write_tag, write_pfn};
     end
 end
+logic [36:0] test_q [4];
+assign test_q[0] = test_copy0[tlbt_set];
+assign test_q[1] = test_copy1[tlbt_set];
+assign test_q[2] = test_copy2[tlbt_set];
+assign test_q[3] = test_copy3[tlbt_set];
 assign {lookup_tag_q[0], lookup_pfn_q[0]} = lookup_copy0[lookup_set];
 assign {lookup_tag_q[1], lookup_pfn_q[1]} = lookup_copy1[lookup_set];
 assign {lookup_tag_q[2], lookup_pfn_q[2]} = lookup_copy2[lookup_set];
@@ -179,6 +223,7 @@ reg        vipt_hazard_r;
 reg [3:0]  vipt_epoch;
 reg        vipt_scrub;                 // sweeping INVALID over every index
 reg [VIPT_TLB_INDEX_BITS-1:0] vipt_scrub_index;
+wire       vipt_flush_all = invalidate_all || tlbt_write;
 // The write port: INVLPG, then a walker update, then a refill, then the scrub.
 wire vipt_scrub_write = vipt_scrub && !invalidate_page && !update_valid &&
                         !vipt_refill_write;
@@ -211,7 +256,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         vipt_scrub <= 1'b1;
         vipt_scrub_index <= '0;
     end else begin
-        if (invalidate_all) begin
+        if (vipt_flush_all) begin
             vipt_epoch <= (vipt_epoch == 4'd14) ? 4'd0 : vipt_epoch + 4'd1;
             if (vipt_epoch == 4'd14) begin
                 // Restart: entries written since the scrub began may carry
@@ -220,7 +265,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                 vipt_scrub_index <= '0;
             end
         end
-        if (vipt_scrub_write && !(invalidate_all && vipt_epoch == 4'd14)) begin
+        if (vipt_scrub_write && !(vipt_flush_all && vipt_epoch == 4'd14)) begin
             vipt_scrub_index <= vipt_scrub_index + 1'b1;
             if (&vipt_scrub_index)
                 vipt_scrub <= 1'b0;
@@ -278,7 +323,7 @@ always_ff @(posedge clk) begin
     if (!reset_n) begin
         vipt_valid_ref <= '0;
         vipt_valid_ref_q <= 1'b0;
-    end else if (invalidate_all)
+    end else if (vipt_flush_all)
         vipt_valid_ref <= '0;
     else if (invalidate_page)
         vipt_valid_ref[invalidate_vpn[7:0]] <= 1'b0;
@@ -370,19 +415,22 @@ always_ff @(posedge clk or negedge reset_n) begin
             endcase
         end
 
-        // Insert new entry from page walker
-        if (update_valid) begin
-            valid_q[update_set][victim_way]    <= 1'b1;
-            writable_q[update_set][victim_way] <= update_writable;
-            user_q[update_set][victim_way]     <= update_user;
-            dirty_q[update_set][victim_way]    <= update_dirty;
-            vga_mem[update_set][victim_way]    <= z486_page_in_window(update_pfn, VGA_BASE, VGA_TOP);
-            pcd_q[update_set][victim_way]      <= update_pcd;
-            case (victim_way)
-                2'd0: begin plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b1; end
-                2'd1: begin plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b0; end
-                2'd2: begin plru[update_set][0] <= 1'b0; plru[update_set][2] <= 1'b1; end
-                2'd3: begin plru[update_set][0] <= 1'b0; plru[update_set][2] <= 1'b0; end
+        // Insert new entry from page walker, or from a TR6 write (V/D/U/W
+        // from TR6, PFN/PCD/PWT from TR7; the walker's write has priority,
+        // so both share one write index).
+        if (update_valid || tlbt_write) begin
+            valid_q[write_set][write_way]    <= tlbt_write ? tlbt_tr6_r[11] : 1'b1;
+            writable_q[write_set][write_way] <= tlbt_write ? tlbt_tr6_r[6] : update_writable;
+            user_q[write_set][write_way]     <= tlbt_write ? tlbt_tr6_r[8] : update_user;
+            dirty_q[write_set][write_way]    <= tlbt_write ? tlbt_tr6_r[10] : update_dirty;
+            vga_mem[write_set][write_way]    <= z486_page_in_window(write_pfn, VGA_BASE, VGA_TOP);
+            pcd_q[write_set][write_way]      <= tlbt_write ? tlbt_tr7_r[11] : update_pcd;
+            pwt_q[write_set][write_way]      <= tlbt_write ? tlbt_tr7_r[10] : update_pwt;
+            case (write_way)
+                2'd0: begin plru[write_set][0] <= 1'b1; plru[write_set][1] <= 1'b1; end
+                2'd1: begin plru[write_set][0] <= 1'b1; plru[write_set][1] <= 1'b0; end
+                2'd2: begin plru[write_set][0] <= 1'b0; plru[write_set][2] <= 1'b1; end
+                2'd3: begin plru[write_set][0] <= 1'b0; plru[write_set][2] <= 1'b0; end
             endcase
 
             // synthesis translate_off
@@ -390,6 +438,62 @@ always_ff @(posedge clk or negedge reset_n) begin
                 $display("TLB UPDATE: vpn=%05x pfn=%05x writable=%b user=%b set=%0d victim_way=%0d",
                          update_vpn, update_pfn, update_writable, update_user, update_set, victim_way);
             // synthesis translate_on
+        end
+    end
+end
+
+// TR6/TR7 request and lookup result.  A pair of TR6 attribute bits matches a
+// clear entry bit (01), a set one (10), either (11) or neither (00).
+function automatic logic tlbt_attr_ok(input logic bit_v, input logic want_set,
+                                      input logic want_clear);
+    tlbt_attr_ok = bit_v ? want_set : want_clear;
+endfunction
+logic [3:0] tlbt_match;
+always_comb begin
+    for (int w = 0; w < 4; w++)
+        tlbt_match[w] = (valid_q[tlbt_set][w] == tlbt_tr6_r[11]) &&
+                        (test_q[w][36:20] == tlbt_tag) &&
+                        tlbt_attr_ok(dirty_q[tlbt_set][w], tlbt_tr6_r[10], tlbt_tr6_r[9]) &&
+                        tlbt_attr_ok(user_q[tlbt_set][w], tlbt_tr6_r[8], tlbt_tr6_r[7]) &&
+                        tlbt_attr_ok(writable_q[tlbt_set][w], tlbt_tr6_r[6], tlbt_tr6_r[5]);
+end
+wire       tlbt_one = (tlbt_match == 4'b0001) || (tlbt_match == 4'b0010) ||
+                      (tlbt_match == 4'b0100) || (tlbt_match == 4'b1000);
+wire [1:0] tlbt_hit_way = tlbt_match[0] ? 2'd0 : tlbt_match[1] ? 2'd1 :
+                          tlbt_match[2] ? 2'd2 : 2'd3;
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        tlbt_pend_r <= 1'b0;
+        tlbt_done <= 1'b0;
+        tlbt_lookup_done <= 1'b0;
+        tlbt_tr6_r <= 32'd0;
+        tlbt_tr7_r <= 32'd0;
+        tlbt_tr6_out <= 32'd0;
+        tlbt_tr7_out <= 32'd0;
+    end else begin
+        tlbt_done <= tlbt_go;
+        tlbt_lookup_done <= tlbt_lookup;
+        if (tlbt_req) begin
+            tlbt_pend_r <= 1'b1;
+            tlbt_tr6_r <= tlbt_tr6;
+            tlbt_tr7_r <= tlbt_tr7;
+        end else if (tlbt_go) begin
+            tlbt_pend_r <= 1'b0;
+        end
+        if (tlbt_lookup) begin
+            // LRU reports the state before the lookup; PL reports a single hit.
+            tlbt_tr7_out <= {tlbt_one ? test_q[tlbt_hit_way][19:0] : tlbt_tr7_r[31:12],
+                             tlbt_one ? pcd_q[tlbt_set][tlbt_hit_way] : 1'b0,
+                             tlbt_one ? pwt_q[tlbt_set][tlbt_hit_way] : 1'b0,
+                             tlbt_plru, 2'b00, tlbt_one,
+                             tlbt_one ? tlbt_hit_way : 2'b00, 2'b00};
+            tlbt_tr6_out <= tlbt_one
+                ? {tlbt_tr6_r[31:12], valid_q[tlbt_set][tlbt_hit_way],
+                   dirty_q[tlbt_set][tlbt_hit_way], !dirty_q[tlbt_set][tlbt_hit_way],
+                   user_q[tlbt_set][tlbt_hit_way], !user_q[tlbt_set][tlbt_hit_way],
+                   writable_q[tlbt_set][tlbt_hit_way], !writable_q[tlbt_set][tlbt_hit_way],
+                   4'b0000, tlbt_tr6_r[0]}
+                : tlbt_tr6_r;
         end
     end
 end
