@@ -481,8 +481,10 @@ wire cross2_can_translate = !pg_enable || (tlb_hit && slow_tlb_access_ok && cros
 wire pf_tlb_match = !pg_enable || (tlb_lookup_addr_r[31:12] == pf_linear_addr[31:12]);
 // Last prefetch translation. A demand capture reloads the shared registered
 // lookup address; this one-entry copy keeps code fetch translating in one
-// cycle meanwhile. Like the sidecar, it may outlive the four-way entry until
-// INVLPG or a CR3 write.
+// cycle meanwhile. Like the VIPT sidecar it holds a SUBSET of the four-way
+// TLB (see paging_tlb.sv): a walker refill into its set, which may evict its
+// page, and a TR6 write drop it with INVLPG and a CR3 write, so a code page
+// the four-way TLB no longer holds is walked again as on a 486.
 reg        pf_xlat_valid;
 reg [19:0] pf_xlat_vpn;
 reg [19:0] pf_xlat_pfn;
@@ -496,6 +498,7 @@ wire fast_pf_candidate = idle_pf_req && cache_lookup_granted &&
 wire [31:0] fast_pf_phys = !pg_enable ? pf_linear_addr :
                            pf_xlat_hit ? {pf_xlat_pfn, pf_linear_addr[11:0]} :
                                          {tlb_physical_addr[31:12], pf_linear_addr[11:0]};
+wire pf_xlat_evict = tlb_update_valid && (tlb_update_vpn[2:0] == pf_xlat_vpn[2:0]);
 
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
@@ -504,7 +507,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         pf_xlat_pfn <= 20'd0;
         pf_xlat_user <= 1'b0;
         pf_xlat_pcd <= 1'b0;
-    end else if (cr3_write || invlpg_fire) begin
+    end else if (cr3_write || invlpg_fire || tlbt_req || pf_xlat_evict) begin
         pf_xlat_valid <= 1'b0;
     end else if (pg_enable && idle_pf_req && pf_tlb_match && tlb_hit) begin
         pf_xlat_valid <= 1'b1;
