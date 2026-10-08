@@ -482,6 +482,29 @@ function automatic logic [31:0] read_gpr_load_forwarded(
     end
 endfunction
 
+// The same read with the SIZE applied last: both register views are indexed by
+// reg_sel alone and the size only picks among the formatted results.  For the
+// shifter's operand the size is shift_data_size, a late, high-fan-out select
+// (the fitted microcode q_shift_source_class_r -> use_captured_source ->
+// data_size -> gpr_ex_view index -> shifter -> sigma clk_sys cone); indexing by
+// it put that select in FRONT of the 8:1 view mux.  Bit-identical to
+// read_gpr_load_forwarded for every input.
+function automatic logic [31:0] read_gpr_load_forwarded_late(
+    input logic [2:0] reg_sel,
+    input logic [1:0] size
+);
+    logic [31:0] byte_src, full_src;
+    logic [7:0]  byte_val;
+    begin
+        byte_src = gpr_ex_view[{1'b0, reg_sel[1:0]}];
+        full_src = gpr_ex_view[reg_sel];
+        byte_val = reg_sel[2] ? byte_src[15:8] : byte_src[7:0];
+        read_gpr_load_forwarded_late = (size == 2'd0) ? {24'd0, byte_val} :
+                                       (size == 2'd1) ? {16'd0, full_src[15:0]} :
+                                                        full_src;
+    end
+endfunction
+
 // Every late GPR write landing on this edge (any direct-load WB included).
 assign pend_write_mask = pend_dly_mask | pend_shift_mask |
                          (load_wb_valid ? (8'h01 << load_wb_widx) : 8'h00);
@@ -1788,7 +1811,7 @@ shifter shifter_inst (
     .alu_dst(alu_dst),
     .alu_src(alu_src),
     .gpr_src_op_size(read_gpr_load_forwarded(src_reg_sel_r, op_size)),
-    .gpr_dst_shift_size(read_gpr_load_forwarded(dst_reg_sel_r, shift_data_size)),
+    .gpr_dst_shift_size(read_gpr_load_forwarded_late(dst_reg_sel_r, shift_data_size)),
     .gpr_src_shift_size(read_gpr_load_forwarded(src_reg_sel_r, shift_data_size)),
     .immediate(instr.immediate),
     .ecx(read_gpr_load_forwarded(3'd1, 2'd2)),
