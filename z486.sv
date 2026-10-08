@@ -1209,9 +1209,21 @@ always_ff @(posedge clk) begin
     else
         pf_flush_kill_r <= cache_flush_busy;
 end
+// The buffered line was fetched (and its page checked) at the CPL current
+// then; a privilege change makes that check stale, so a ring-3 branch could
+// otherwise adopt a supervisor-only line.  The kill lands the cycle after the
+// change, long before the far transfer's flushed queue reaches a branch.
+reg  [1:0]  pf_spec_cpl_r;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        pf_spec_cpl_r <= 2'd0;
+    else
+        pf_spec_cpl_r <= cpl;
+end
+wire        pf_spec_cpl_kill = pf_spec_cpl_r != cpl;
 assign pf_spec_global_kill = pf_snoop_kill_r || cr3_write ||
                              (uc_exec && (uc_dest == DEST_CR0)) ||
-                             pf_flush_kill_r;
+                             pf_flush_kill_r || pf_spec_cpl_kill;
 
 //=============================================================================
 // Unit 2: Decode1 (structural decode)
