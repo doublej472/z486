@@ -121,7 +121,17 @@ module gpr_write_merge
     output logic [255:0] pulse_wmask,   // byte lanes the recipe commits write
     output logic [255:0] ex_value,
     output logic [255:0] ea_value,
-    output logic [255:0] cap_value
+    output logic [255:0] cap_value,
+
+    // The capture view for two SELECTED registers. Value-identical to
+    // cap_value[sel*32 +: 32], but merged after the register is chosen (one
+    // 32-bit merge per reader instead of 256 bits followed by an 8:1 mux), so
+    // a consumer that only ever reads one register per port leaves the full
+    // cap_value unread and synthesis drops it.
+    input  logic [2:0]   cap_sel_a,
+    input  logic [2:0]   cap_sel_b,
+    output logic [31:0]  cap_a_value,
+    output logic [31:0]  cap_b_value
 );
 
 localparam logic [7:0] VIS_COMMIT = 8'h0F;   // shift, mem, rom, wb
@@ -241,6 +251,31 @@ wire [31:0] pv5 = producer_value(5);
 wire [31:0] pv6 = producer_value(6);
 wire [31:0] pv7 = producer_value(7);
 
+// The capture-view merge for one selected register: the same terms in the same
+// order as byte_cap below, with the register comparison folded into each hit.
+function automatic logic [31:0] cap_select(input logic [2:0] sel);
+    logic [3:0] en [8];
+    logic [31:0] cv;
+    logic [31:0] pvs [8];
+    pvs[0] = pv0; pvs[1] = pv1; pvs[2] = pv2; pvs[3] = pv3;
+    pvs[4] = pv4; pvs[5] = pv5; pvs[6] = pv6; pvs[7] = pv7;
+    for (int k = 0; k < 8; k++)
+        en[k] = (dst_norm(k) == sel) ? producer_lane(k) : 4'h0;
+    cv = cur[sel*32 +: 32];
+    for (int bb = 0; bb < 4; bb++) begin
+        // lowest priority first, so a later (younger, higher-priority) hit wins
+        for (int k = 0; k < 8; k++) begin
+            if (vis_cap[k] && producer_valid(k) && en[k][bb] &&
+                !((k == 3) && wb_is_alu))
+                cv[bb*8 +: 8] = pvs[k][bb*8 +: 8];
+        end
+    end
+    cap_select = cv;
+endfunction
+
+assign cap_a_value = cap_select(cap_sel_a);
+assign cap_b_value = cap_select(cap_sel_b);
+
 genvar r, b;
 generate
 for (r = 0; r < 8; r++) begin : g_reg
@@ -268,12 +303,17 @@ for (r = 0; r < 8; r++) begin : g_reg
 
         wire hitv3 = hit3 && !wb_is_alu;
 
+        // commit_value/pulse_value are defined ONLY in the lanes their wmask sets: the one
+        // consumer (data_unit's commit_merged) writes a byte lane only under its mask bit, and
+        // the mask is exactly the OR of the same hits, so the register's own byte (`cur`) can
+        // never be the selected arm of a written lane. Dropping that arm leaves the lowest-
+        // priority producer as the default, which is value-exact wherever the mask is set and
+        // removes one 8-bit input from 2 x 256 merge bits.
         always_comb begin : byte_commit
             commit_value[r*32 + b*8 +: 8] = (hit3 && VIS_COMMIT[3]) ? pv3[b*8 +: 8] :
                                             (hit2 && VIS_COMMIT[2]) ? pv2[b*8 +: 8] :
                                             (hit1 && VIS_COMMIT[1]) ? pv1[b*8 +: 8] :
-                                            (hit0 && VIS_COMMIT[0]) ? pv0[b*8 +: 8] :
-                                                                      cur[r*32 + b*8 +: 8];
+                                                                      pv0[b*8 +: 8];
             commit_wmask[r*32 + b*8 +: 8] = {8{(hit0 && VIS_COMMIT[0]) ||
                                                (hit1 && VIS_COMMIT[1]) ||
                                                (hit2 && VIS_COMMIT[2]) ||
@@ -283,8 +323,7 @@ for (r = 0; r < 8; r++) begin : g_reg
             // the original assignment order of the register file.
             pulse_value[r*32 + b*8 +: 8]   = (hit7 && VIS_PULSE[7]) ? pv7[b*8 +: 8] :
                                             (hit6 && VIS_PULSE[6]) ? pv6[b*8 +: 8] :
-                                            (hit5 && VIS_PULSE[5]) ? pv5[b*8 +: 8] :
-                                                                     cur[r*32 + b*8 +: 8];
+                                                                     pv5[b*8 +: 8];
             pulse_wmask[r*32 + b*8 +: 8]   = {8{((hit5 && VIS_PULSE[5]) ||
                                                  (hit6 && VIS_PULSE[6]) ||
                                                  (hit7 && VIS_PULSE[7]))}};
@@ -363,18 +402,32 @@ endfunction
 
 always_comb begin : merge_equiv_fuse
     for (int rr = 0; rr < 8; rr++) begin
-        if (commit_value[rr*32 +: 32] !== ref_chain(rr, VIS_COMMIT, 1'b0))
+        // commit/pulse are compared in their written lanes only (see byte_commit), and the
+        // mask itself is checked against the chain's own write set.
+        if ((commit_value[rr*32 +: 32] & commit_wmask[rr*32 +: 32]) !==
+            (ref_chain(rr, VIS_COMMIT, 1'b0) & commit_wmask[rr*32 +: 32]))
             $fatal(1, "GPR MERGE COMMIT MISMATCH reg %0d: %08x vs chain %08x",
                    rr, commit_value[rr*32 +: 32], ref_chain(rr, VIS_COMMIT, 1'b0));
-        if (pulse_value[rr*32 +: 32] !== ref_chain(rr, VIS_PULSE, 1'b0))
+        if ((pulse_value[rr*32 +: 32] & pulse_wmask[rr*32 +: 32]) !==
+            (ref_chain(rr, VIS_PULSE, 1'b0) & pulse_wmask[rr*32 +: 32]))
             $fatal(1, "GPR MERGE PULSE MISMATCH reg %0d: %08x vs chain %08x",
                    rr, pulse_value[rr*32 +: 32], ref_chain(rr, VIS_PULSE, 1'b0));
+        if ((ref_chain(rr, VIS_COMMIT, 1'b0) ^ cur[rr*32 +: 32]) & ~commit_wmask[rr*32 +: 32])
+            $fatal(1, "GPR MERGE COMMIT MASK MISMATCH reg %0d", rr);
+        if ((ref_chain(rr, VIS_PULSE, 1'b0) ^ cur[rr*32 +: 32]) & ~pulse_wmask[rr*32 +: 32])
+            $fatal(1, "GPR MERGE PULSE MASK MISMATCH reg %0d", rr);
         if (ex_value[rr*32 +: 32] !== ref_chain(rr, vis_ex, 1'b1))
             $fatal(1, "GPR MERGE EX VIEW MISMATCH reg %0d: %08x vs chain %08x",
                    rr, ex_value[rr*32 +: 32], ref_chain(rr, vis_ex, 1'b1));
         if (ea_value[rr*32 +: 32] !== ref_chain(rr, vis_ea, 1'b1))
             $fatal(1, "GPR MERGE EA VIEW MISMATCH reg %0d: %08x vs chain %08x",
                    rr, ea_value[rr*32 +: 32], ref_chain(rr, vis_ea, 1'b1));
+        if ((rr == int'(cap_sel_a)) && (cap_a_value !== ref_chain(rr, vis_cap, 1'b1)))
+            $fatal(1, "GPR MERGE SELECTED CAPTURE A MISMATCH reg %0d: %08x vs chain %08x",
+                   rr, cap_a_value, ref_chain(rr, vis_cap, 1'b1));
+        if ((rr == int'(cap_sel_b)) && (cap_b_value !== ref_chain(rr, vis_cap, 1'b1)))
+            $fatal(1, "GPR MERGE SELECTED CAPTURE B MISMATCH reg %0d: %08x vs chain %08x",
+                   rr, cap_b_value, ref_chain(rr, vis_cap, 1'b1));
         if (cap_value[rr*32 +: 32] !== ref_chain(rr, vis_cap, 1'b1))
             $fatal(1, "GPR MERGE CAPTURE VIEW MISMATCH reg %0d: %08x vs chain %08x",
                    rr, cap_value[rr*32 +: 32], ref_chain(rr, vis_cap, 1'b1));

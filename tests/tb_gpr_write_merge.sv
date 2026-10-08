@@ -28,6 +28,8 @@ module tb_gpr_write_merge;
     logic [31:0]  data_stos, data_sigsrc, data_esp;
     logic [255:0] commit_value, commit_wmask, pulse_value, pulse_wmask;
     logic [255:0] ex_value, ea_value, cap_value;
+    logic [2:0]   cap_sel_a = 3'd0, cap_sel_b = 3'd0;
+    logic [31:0]  cap_a_value, cap_b_value;
 
     integer failures = 0;
 
@@ -45,15 +47,48 @@ module tb_gpr_write_merge;
         .vis_ex(VIS_EX), .vis_ea(VIS_EA), .vis_cap(VIS_CAP),
         .commit_value(commit_value), .commit_wmask(commit_wmask),
         .pulse_value(pulse_value), .pulse_wmask(pulse_wmask),
-        .ex_value(ex_value), .ea_value(ea_value), .cap_value(cap_value)
+        .ex_value(ex_value), .ea_value(ea_value), .cap_value(cap_value),
+        .cap_sel_a(cap_sel_a), .cap_sel_b(cap_sel_b),
+        .cap_a_value(cap_a_value), .cap_b_value(cap_b_value)
     );
 
     function automatic [31:0] regval(input [255:0] v, input int r);
         regval = v[r*32 +: 32];
     endfunction
 
+    // The select-first capture ports must equal the full capture view for every
+    // register, in every state a check samples.
+    // What the register file holds after the commit (or recipe pulse): the merge's
+    // value in the lanes its mask writes, the register's own bytes elsewhere. The
+    // value outside the mask is not part of the contract (data_unit's
+    // commit_merged writes only masked lanes).
+    function automatic [31:0] committed(input int r);
+        committed = (regval(commit_value, r) & regval(commit_wmask, r)) |
+                    (regval(cur, r) & ~regval(commit_wmask, r));
+    endfunction
+    function automatic [31:0] pulsed(input int r);
+        pulsed = (regval(pulse_value, r) & regval(pulse_wmask, r)) |
+                 (regval(cur, r) & ~regval(pulse_wmask, r));
+    endfunction
+
+    task automatic check_cap_select(input string name);
+    begin
+        for (int i = 0; i < 8; i++) begin
+            cap_sel_a = 3'(i);
+            cap_sel_b = 3'(7 - i);
+            #1;
+            if (cap_a_value !== regval(cap_value, i) ||
+                cap_b_value !== regval(cap_value, 7 - i)) begin
+                $display("GPR MERGE FAIL %s: select-first capture reg %0d", name, i);
+                failures = failures + 1;
+            end
+        end
+    end
+    endtask
+
     task automatic check(input string name, input [31:0] got, input [31:0] want);
     begin
+        check_cap_select(name);
         if (got !== want) begin
             $display("GPR MERGE FAIL %s: got %08x want %08x", name, got, want);
             failures = failures + 1;
@@ -89,7 +124,7 @@ module tb_gpr_write_merge;
         v_wb  = 1'b1; dst_wb  = 3'd0; size_wb  = 2'd2;     data_wb  = 32'hBBBB_BBBB;
         #1;
         check("1 ex view",     regval(ex_value, 0),     32'hBBBB_BBBB);
-        check("1 commit",      regval(commit_value, 0), 32'hBBBB_BBBB);
+        check("1 commit",      committed(0), 32'hBBBB_BBBB);
 
         // 2. Older token owns byte 1 (AH), younger write-back owns byte 0 (AL).
         idle();
@@ -117,7 +152,7 @@ module tb_gpr_write_merge;
         v_wb  = 1'b1; dst_wb  = 3'd0; size_wb  = 2'd0;     data_wb  = 32'h0000_00EF;
         #1;
         check("3 younger byte wins", regval(ex_value, 0), 32'hAAAA_AAEF);
-        check("3 commit",            regval(commit_value, 0), 32'hAAAA_AAEF);
+        check("3 commit",            committed(0), 32'hAAAA_AAEF);
 
         // 4. Older byte token, younger dword write-back: the younger dword wins.
         idle();
@@ -137,7 +172,7 @@ module tb_gpr_write_merge;
         data_wb = 32'hCCCC_CCCC;
         #1;
         check("5 M3 not forwarded", regval(ex_value, 0),     32'hAAAA_AAAA);
-        check("5 M3 committed",     regval(commit_value, 0), 32'hCCCC_CCCC);
+        check("5 M3 committed",     committed(0), 32'hCCCC_CCCC);
 
         // 5b. M3 byte op into AH: the result is right-aligned, so it must be
         //     placed in byte 1 of the register, and still not forwarded.
@@ -146,7 +181,7 @@ module tb_gpr_write_merge;
         v_wb  = 1'b1; dst_wb  = 3'd4; size_wb  = 2'd0; wb_is_alu = 1'b1;
         data_wb = 32'h0000_0012;           // 0x10 + 2 in the operand width
         #1;
-        check("5b M3 AH committed",  regval(commit_value, 0), 32'h1234_1256);
+        check("5b M3 AH committed",  committed(0), 32'h1234_1256);
         check("5b M3 AH not forwarded", regval(ex_value, 0),  32'h1234_1056);
 
         // 6. Visibility: the EA view has no memory-token term (a D2 consumer of
@@ -168,7 +203,7 @@ module tb_gpr_write_merge;
         #1;
         check("7 ea: dly wins low word", regval(ea_value, 0),     32'h2222_3333);
         check("7 ea: wb wins upper",     regval(ea_value, 0) >> 16, 32'h2222);
-        check("7 commit: no dly",        regval(commit_value, 0),  32'h2222_2222);
+        check("7 commit: no dly",        committed(0),  32'h2222_2222);
 
         // 8. The commit's byte mask is the union of the applied lanes, and the
         //    ROM slot sits between the memory token and the write-back.
@@ -181,7 +216,7 @@ module tb_gpr_write_merge;
         // The write-back is younger than the ROM slot, so its byte 0 wins over
         // the slot's word, and the union of the three lanes is the whole register.
         check("8 commit wmask", commit_wmask[31:0], 32'h0000_FFFF);
-        check("8 wb byte wins over rom slot", regval(commit_value, 0), 32'h0000_CCBB);
+        check("8 wb byte wins over rom slot", committed(0), 32'h0000_CCBB);
 
         // 9. Different registers: producers must not cross lanes.
         idle();
@@ -205,9 +240,9 @@ module tb_gpr_write_merge;
         v_mem = 1'b1; dst_mem = 3'd0; mode_mem = EA_FWD_D; data_mem = 32'h0000_0044;
         v_sigsrc = 1'b1; dst_sigsrc = 3'd0; size_sigsrc = 2'd2; data_sigsrc = 32'h0000_0200;
         #1;
-        check("10 pulse value",      regval(pulse_value, 0), 32'h0000_0200);
+        check("10 pulse value",      pulsed(0), 32'h0000_0200);
         check("10 pulse wmask",      pulse_wmask[31:0],      32'hFFFF_FFFF);
-        check("10 token committed",  regval(commit_value, 0), 32'h0000_0044);
+        check("10 token committed",  committed(0), 32'h0000_0044);
         check("10 ex hides commit",  regval(ex_value, 0),    32'h0000_0044);
         check("10 ea hides token",   regval(ea_value, 0),    32'h0000_0000);
         check("10 cap hides commit", regval(cap_value, 0),   32'h0000_0044);
@@ -221,8 +256,8 @@ module tb_gpr_write_merge;
         v_sigsrc = 1'b1; dst_sigsrc = 3'd0; size_sigsrc = 2'd1; data_sigsrc = 32'hDDDD_CCCC;
         #1;
         check("11 pulse wmask word",    pulse_wmask[31:0],       32'h0000_FFFF);
-        check("11 pulse word merge",    regval(pulse_value, 0),  32'h0000_CCCC);
-        check("11 token committed",     regval(commit_value, 0), 32'hAAAA_AAAA);
+        check("11 pulse word merge",    pulsed(0),  32'h0000_CCCC);
+        check("11 token committed",     committed(0), 32'hAAAA_AAAA);
         check("11 ex hides word commit",regval(ex_value, 0),     32'hAAAA_AAAA);
 
         // 12. The ESP recipe commit is the youngest producer of all, and the
@@ -235,7 +270,7 @@ module tb_gpr_write_merge;
         v_dly  = 1'b1; dst_dly = 3'd4; mode_dly = EA_FWD_D; data_dly = 32'h3333_3333;
         v_esp  = 1'b1;                    data_esp = 32'h4444_4444;
         #1;
-        check("12 esp commit value",  regval(pulse_value, 4), 32'h4444_4444);
+        check("12 esp commit value",  pulsed(4), 32'h4444_4444);
         check("12 esp commit mask",   pulse_wmask[159:128],  32'hFFFF_FFFF);
         check("12 ex base wins wb",   regval(ex_value, 4),    32'h2222_2222);
         check("12 ea base wins dly",  regval(ea_value, 4),    32'h3333_3333);
@@ -248,7 +283,7 @@ module tb_gpr_write_merge;
         v_stos = 1'b1; size_stos = 2'd2; data_stos = 32'h5555_5555;
         v_sigsrc = 1'b1; dst_sigsrc = 3'd1; size_sigsrc = 2'd2; data_sigsrc = 32'h6666_6666;
         #1;
-        check("13 sigsrc younger than stos", regval(pulse_value, 1), 32'h6666_6666);
+        check("13 sigsrc younger than stos", pulsed(1), 32'h6666_6666);
 
         // 14. A lone REP STOS count is a word write to ECX (reg 1): it merges
         //     into the current value and does not appear in the deferred commit.
@@ -256,7 +291,7 @@ module tb_gpr_write_merge;
         cur = {192'd0, 32'h9999_9999, 32'h0000_0000};
         v_stos = 1'b1; size_stos = 2'd1; data_stos = 32'hEEEE_1234;
         #1;
-        check("14 stos word merge",    regval(pulse_value, 1), 32'h9999_1234);
+        check("14 stos word merge",    pulsed(1), 32'h9999_1234);
         check("14 stos wmask",         pulse_wmask[63:32],    32'h0000_FFFF);
         check("14 stos not in commit", commit_wmask[63:32],   32'h0000_0000);
 
@@ -265,10 +300,10 @@ module tb_gpr_write_merge;
         cur = 256'd0;
         v_sigsrc = 1'b1; dst_sigsrc = 3'd3; size_sigsrc = 2'd2; data_sigsrc = 32'h7777_7777;
         #1;
-        check("15 target commit",    regval(pulse_value, 3), 32'h7777_7777);
+        check("15 target commit",    pulsed(3), 32'h7777_7777);
         check("15 target mask only", pulse_wmask[127:96],    32'hFFFF_FFFF);
-        check("15 others clean",     regval(pulse_value, 0), 32'h0000_0000);
-        check("15 others clean",     regval(pulse_value, 7), 32'h0000_0000);
+        check("15 others clean",     pulsed(0), 32'h0000_0000);
+        check("15 others clean",     pulsed(7), 32'h0000_0000);
 
         $display("");
         if (failures == 0) begin

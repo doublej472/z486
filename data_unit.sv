@@ -375,6 +375,10 @@ wire pr_esp_valid = exec && recipe_rni && !recipe_commit_cancel &&
 
 logic [255:0] pr_commit_value, pr_commit_wmask, pr_ex_value, pr_ea_value, pr_cap_value;
 logic [255:0] pr_pulse_value, pr_pulse_wmask;
+// The capture view's two selected-register reads (gpr_merge cap_a/cap_b).
+wire [2:0]  load_capture_widx;
+wire [31:0] load_capture_base;
+wire [31:0] cap_src_value;
 
 gpr_write_merge gpr_merge (
     .cur({edi, esi, ebp, esp, ebx, edx, ecx, eax}),
@@ -432,7 +436,14 @@ gpr_write_merge gpr_merge (
     .pulse_wmask(pr_pulse_wmask),
     .ex_value(pr_ex_value),
     .ea_value(pr_ea_value),
-    .cap_value(pr_cap_value)
+    .cap_value(pr_cap_value),
+    // The two capture readers each select ONE register first (see
+    // read_gpr_capture and load_capture_base below), so they take the
+    // select-first ports and pr_cap_value is left to the bench.
+    .cap_sel_a(op_size == 2'd0 ? {1'b0, src_reg_sel_r[1:0]} : src_reg_sel_r),
+    .cap_sel_b(load_capture_widx),
+    .cap_a_value(cap_src_value),
+    .cap_b_value(load_capture_base)
 );
 
 // synthesis translate_off
@@ -518,7 +529,9 @@ function automatic logic [31:0] read_gpr_capture(
 );
     logic [31:0] merged;
     begin
-        merged = gpr_capture_view[(size == 2'd0) ? {1'b0, reg_sel[1:0]} : reg_sel];
+        // The register is selected by gpr_merge's cap_sel_a port; the one
+        // caller passes (src_reg_sel_r, op_size), the same operands as that port.
+        merged = cap_src_value;
         if (size == 2'd0)
             read_gpr_capture = reg_sel[2] ? {24'd0, merged[15:8]}
                                           : {24'd0, merged[7:0]};
@@ -542,10 +555,10 @@ endfunction
 // on this capture edge (a chained load's WB, a ROM load, a deferred shift, a
 // delay-slot write), so the base comes from the capture view. M3 uses the same
 // value as its private ALU destination.
-wire [2:0] load_capture_widx = (load_alu_dst_capture_size == 2'd0)
+assign load_capture_widx = (load_alu_dst_capture_size == 2'd0)
                              ? {1'b0, load_alu_dst_capture_dst[1:0]}
                              : load_alu_dst_capture_dst;
-wire [31:0] load_capture_base = gpr_capture_view[load_capture_widx];
+// load_capture_base is gpr_merge's cap_b_value (selected by load_capture_widx).
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
