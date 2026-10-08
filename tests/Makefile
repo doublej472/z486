@@ -148,7 +148,7 @@ PLA4_RTL := $(Z486_DIR)/protection.sv
 .PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-cache-coherence test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists check-pragmas check-rom-columns check-shift-ucode test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 .PHONY: test-release test-pc98-map test-protected-narrow check-generators test-data-access check-runner test-l1-tags-wide test-reset-restart test-fuzz
-.PHONY: test-addr-unit-reloc test-reset-sweep test-pc98-map-bus test-mem-resp
+.PHONY: test-addr-unit-reloc test-reset-sweep test-pc98-map-bus test-mem-resp test-protected-throttled
 
 all: build
 
@@ -159,7 +159,7 @@ test-release:
 	$(MAKE) -j1 check-reset-lists check-pragmas check-rom-columns check-shift-ucode check-generators check-runner
 	$(MAKE) -j1 test-l1-cache test-l1-icache test-memory-order test-mem-resp test-load-waw test-gpr-merge test-gpr-hazard test-data-access test-memmap-template test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-cache-coherence test-reset-restart
 	$(MAKE) -j1 test-addr-unit-reloc test-reset-sweep test-pc98-map-bus
-	$(MAKE) -j1 test-protected test-protected-narrow test-simple test-pc98-map test-l1-tags-wide test-fuzz
+	$(MAKE) -j1 test-protected test-protected-narrow test-protected-throttled test-simple test-pc98-map test-l1-tags-wide test-fuzz
 	$(MAKE) -j1 obj_dir_x87/Vtb_protected_mode
 	Z486_ENABLE_X87=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_x87/Vtb_protected_mode ./test_protected_mode.py --strict
 	$(MAKE) -j1 dhrystone
@@ -517,6 +517,14 @@ test-protected: obj_dir/Vtb_protected_mode
 test-protected-narrow: obj_dir/Vtb_protected_mode
 	SIM_PLUSARGS=+no_line_fill ./test_protected_mode.py --strict
 
+# A throttled CPU is the same CPU, only slower: the whole suite at each
+# throttle setting (the runner scales cycle budgets and cycle-placed
+# interrupts, and skips the programs that time themselves).
+test-protected-throttled: obj_dir/Vtb_protected_mode
+	SIM_PLUSARGS=+cpu_speed=1 ./test_protected_mode.py --strict
+	SIM_PLUSARGS=+cpu_speed=2 ./test_protected_mode.py --strict
+	SIM_PLUSARGS=+cpu_speed=3 ./test_protected_mode.py --strict
+
 test-pc98-map: obj_dir_pc98/Vtb_protected_mode
 	Z486_PC98_MAP=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_pc98/Vtb_protected_mode ./test_protected_mode.py --strict pc98_direct_code pc98_noalloc_code pc98_high_alias lock_window rmw_device_reads pc98_a20_bit20
 	SIM_PLUSARGS=+no_line_fill Z486_PC98_MAP=1 Z486_TESTBENCH=$(CURDIR)/obj_dir_pc98/Vtb_protected_mode ./test_protected_mode.py --strict pc98_direct_code pc98_noalloc_code pc98_high_alias lock_window rmw_device_reads pc98_a20_bit20
@@ -698,6 +706,7 @@ help:
 	@echo "  make test-release  - Run all self-contained release gates"
 	@echo "  make test-pc98-map - Execute/modify code in PC-98 DIRECT/NO_ALLOC windows"
 	@echo "  make test-pc98-map-bus - Check each PC-98 window's external-port access shape"
+	@echo "  make test-protected-throttled - The protected suite at throttle settings 1, 2 and 3"
 	@echo "  make test-mem-resp - Line fills and direct reads answered in, or after, their accept cycle"
 	@echo "  make test-addr-unit-reloc - address_unit relocation vs independent arithmetic"
 	@echo "  make test-reset-sweep - One-cycle reset at every offset through a program"
