@@ -14,6 +14,7 @@ module shifter
     input  logic [3:0]  source_class,       // Predecoded SHIFT1 operand source
     input  logic [1:0]  shift2_source,      // Predecoded SHIFT2 operand source
     input  logic        is_shift2,          // ROM-predecoded SHIFT2 control
+    input  logic        use_captured,       // ROM-predecoded use_captured_source (below)
     input  logic        capture_ce,         // q_mem -> q advance
     input  logic        capture_valid,      // Upcoming q word prereads its operand
     input  logic [31:0] capture_value,      // Forwarded upcoming shift operand
@@ -71,8 +72,20 @@ logic [31:0] source_value;
 logic [31:0] alu_value;
 logic [31:0] shift2_operand_r;
 
-wire use_captured_source = is_shift2 ||
-    ((aluop == ALUJMP_SHIFT) && (source_class == 4'd3));
+// SHIFT2, or a SHIFT whose source is SRCREG: the operand and its size come from
+// the captured registers.  The decode is a function of ROM-word fields only, so
+// the ROM output register carries it predecoded (ucode_rom q_shift_use_captured_r,
+// same word, same enable): data_size then selects from a flop instead of from a
+// compare on aluop/source_class, which put two LUT levels and a long route in
+// front of every data_size consumer.  The SIM-ONLY check below holds the identity.
+wire use_captured_source = use_captured;
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && (use_captured !== (is_shift2 ||
+                    ((aluop == ALUJMP_SHIFT) && (source_class == 4'd3)))))
+        $fatal(1, "shifter: predecoded use_captured %b disagrees with is_shift2=%b aluop=%02x source_class=%0d",
+               use_captured, is_shift2, aluop, source_class);
+// synthesis translate_on
 wire [5:0] width = op_size == 2'd0 ? 6'd8 :
                    op_size == 2'd1 ? 6'd16 : 6'd32;
 wire [31:0] width_mask = op_size == 2'd0 ? 32'h0000_00ff :

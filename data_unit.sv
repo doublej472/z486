@@ -30,6 +30,7 @@ module data_unit
     input  logic [3:0]  shift_source_class,      // Predecoded shifter source class
     input  logic [1:0]  shift2_source,           // Predecoded SHIFT2 source
     input  logic        shift_is_shift2,         // Registered ROM SHIFT2 decode
+    input  logic        shift_use_captured,      // Registered ROM decode: shifter uses its captured operand
     input  logic        shift2_capture_ce,       // Advance q_mem -> q operand capture
     input  logic        shift2_next_valid,       // q_mem word is SHIFT2
     input  logic [1:0]  shift2_next_source,      // q_mem SHIFT2 source class
@@ -1811,6 +1812,7 @@ shifter shifter_inst (
     .source_class(shift_source_class),
     .shift2_source(shift2_source),
     .is_shift2(shift_is_shift2),
+    .use_captured(shift_use_captured),
     .capture_ce(shift2_capture_ce),
     .capture_valid(shift2_next_valid),
     .capture_value(shift2_capture_value),

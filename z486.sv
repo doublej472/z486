@@ -869,6 +869,7 @@ wire [5:0]  uc_source_shift;
 wire [3:0]  uc_shift_source_class;
 wire [1:0]  uc_shift2_source;
 wire        uc_is_shift2;
+wire        uc_shift_use_captured;
 wire        uc_shift_uc_carry;
 wire [5:0]  uc_alu_src_shift;
 wire [6:0]  uc_aluop_shift;
@@ -3084,6 +3085,7 @@ microsequencer microsequencer_inst (
     .uc_shift_source_class(uc_shift_source_class),
     .uc_shift2_source(uc_shift2_source),
     .uc_is_shift2(uc_is_shift2),
+    .uc_shift_use_captured(uc_shift_use_captured),
     .uc_shift_uc_carry(uc_shift_uc_carry),
     .uc_alu_src_shift(uc_alu_src_shift),
     .uc_aluop_shift(uc_aluop_shift),
@@ -3540,6 +3542,7 @@ data_unit data_unit_inst (
     .shift_source_class(uc_shift_source_class),
     .shift2_source(uc_shift2_source),
     .shift_is_shift2(uc_is_shift2),
+    .shift_use_captured(uc_shift_use_captured),
     .shift2_capture_ce(microcode_rom_ce),
     .shift2_next_valid(uc_next_captures_shift_source),
     .shift2_next_source(uc_next_shift2_source),

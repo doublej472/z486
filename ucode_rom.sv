@@ -30,6 +30,7 @@ module ucode_rom
     output      [3:0]  q_shift_source_class,
     output      [1:0]  q_shift2_source,
     output             q_is_shift2,
+    output             q_shift_use_captured, // SHIFT2, or SHIFT from SRCREG: the shifter uses its captured operand/size
     output             q_shift_uc_carry,
     output      [5:0]  q_shift_alu_src,
     output      [6:0]  q_shift_aluop,
@@ -45,6 +46,7 @@ module ucode_rom
 `Z486_KEEP reg [3:0] q_shift_source_class_r;
 `Z486_KEEP reg [1:0] q_shift2_source_r;
 `Z486_KEEP reg q_is_shift2_r;
+`Z486_KEEP reg q_shift_use_captured_r;
 `Z486_KEEP reg q_shift_uc_carry_r;
 `Z486_KEEP reg [5:0] q_shift_alu_src_r;
 `Z486_KEEP reg [6:0] q_shift_aluop_r;
@@ -390,6 +392,12 @@ always_ff @(posedge clk) begin
         q_shift_source_class_r <= shift_source_predecode(q_mem[23:18]);
         q_shift2_source_r <= shift2_source_predecode(q_mem[23:18]);
         q_is_shift2_r <= (q_mem[17:11] == ALUJMP_SHIFT2);
+        // The shifter's use_captured_source, predecoded from the same word on the
+        // same enable (it is is_shift2 || (aluop == SHIFT && source_class == 3),
+        // all three fields of this register).
+        q_shift_use_captured_r <= (q_mem[17:11] == ALUJMP_SHIFT2) ||
+                                  ((q_mem[17:11] == ALUJMP_SHIFT) &&
+                                   (shift_source_predecode(q_mem[23:18]) == 4'd3));
         q_shift_uc_carry_r <= shift_uc_carry_predecode(q_mem[36:0]);
         q_shift_alu_src_r <= q_mem[36:31];
         q_shift_aluop_r <= q_mem[17:11];
@@ -411,6 +419,7 @@ assign q_shift_source = q_shift_source_r;
 assign q_shift_source_class = q_shift_source_class_r;
 assign q_shift2_source = q_shift2_source_r;
 assign q_is_shift2 = q_is_shift2_r;
+assign q_shift_use_captured = q_shift_use_captured_r;
 assign q_shift_uc_carry = q_shift_uc_carry_r;
 assign q_shift_alu_src = q_shift_alu_src_r;
 assign q_shift_aluop = q_shift_aluop_r;

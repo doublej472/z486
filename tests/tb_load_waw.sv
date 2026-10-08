@@ -190,6 +190,8 @@ module tb_load_waw;
         .shift_source_class(shift_source_class),
         .shift2_source(shift2_source),
         .shift_is_shift2(shift_is_shift2),
+        .shift_use_captured(shift_is_shift2 ||
+                            ((aluop == z486_pkg::ALUJMP_SHIFT) && (shift_source_class == 4'd3))),
         .shift2_capture_ce(shift2_capture_ce),
         .shift2_next_valid(shift2_next_valid),
         .shift2_next_source(shift2_next_source),
