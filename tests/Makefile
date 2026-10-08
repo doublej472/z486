@@ -147,7 +147,7 @@ PLA4_RTL := $(Z486_DIR)/protection.sv
 # Targets
 .PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-cache-coherence test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists check-pragmas check-rom-columns check-shift-ucode test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
-.PHONY: test-release test-pc98-map test-protected-narrow check-generators test-data-access check-runner test-l1-tags-wide test-reset-restart test-fuzz
+.PHONY: check-equiv test-release test-pc98-map test-protected-narrow check-generators test-data-access check-runner test-l1-tags-wide test-reset-restart test-fuzz
 .PHONY: test-addr-unit-reloc test-reset-sweep test-pc98-map-bus test-mem-resp test-protected-throttled
 
 all: build
@@ -156,7 +156,7 @@ all: build
 # share obj_dir and compile common support objects with different trace flags.
 # External SingleStepTests/test386 and vendor timing are separate requirements.
 test-release:
-	$(MAKE) -j1 check-reset-lists check-pragmas check-rom-columns check-shift-ucode check-generators check-runner
+	$(MAKE) -j1 check-reset-lists check-pragmas check-rom-columns check-shift-ucode check-generators check-runner check-equiv
 	$(MAKE) -j1 test-l1-cache test-l1-icache test-memory-order test-mem-resp test-load-waw test-gpr-merge test-gpr-hazard test-data-access test-memmap-template test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-cache-coherence test-reset-restart
 	$(MAKE) -j1 test-addr-unit-reloc test-reset-sweep test-pc98-map-bus
 	$(MAKE) -j1 test-protected test-protected-narrow test-protected-throttled test-simple test-pc98-map test-l1-tags-wide test-fuzz
@@ -166,6 +166,11 @@ test-release:
 
 check-runner:
 	python3 test_runner_contract.py
+
+# Combinational SAT proofs for zero-cycle rewrites (tests/equiv/), each with a
+# planted mutant that must be refuted.  Needs yosys.
+check-equiv:
+	python3 check_equiv.py
 
 # Seeded differential stress of the integer pipeline (self-checking programs,
 # three memory latencies each).  FUZZ_COUNT=200 for a longer soak.
@@ -710,6 +715,7 @@ help:
 	@echo "  make test-mem-resp - Line fills and direct reads answered in, or after, their accept cycle"
 	@echo "  make test-addr-unit-reloc - address_unit relocation vs independent arithmetic"
 	@echo "  make test-reset-sweep - One-cycle reset at every offset through a program"
+	@echo "  make check-equiv    - SAT-prove the zero-cycle rewrites in equiv/ (yosys)"
 	@echo "  make check-reset-lists - Audit always_ff reset branches"
 	@echo "  make test-memmap-template - Run memory-map template unit test"
 	@echo "  make test-interrupt-nmi - Run interrupt-controller NMI deferred-delivery bench"
