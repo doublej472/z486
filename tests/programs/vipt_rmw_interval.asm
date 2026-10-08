@@ -124,5 +124,7 @@ fail12: mov eax, 12
     jmp fail
 fail13: mov eax, 13
 fail:
+    out DATA_PORT, eax           ; failing check
+    mov al, 0xFF
     out STATUS_PORT, al
     hlt

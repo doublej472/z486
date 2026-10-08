@@ -1,5 +1,6 @@
 {
   "fast_paths_only": true,
+  "unthrottled_only": true,
   "asm": "vipt_rmw_interval.asm",
   "start_mode": "protected",
   "cr0": "0x80000001",
