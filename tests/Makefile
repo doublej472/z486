@@ -119,6 +119,7 @@ CPP_MEMMAP_SRCS := sim_main_memmap_template.cpp
 TB_INTERRUPT_NMI_SRCS := tb_interrupt_nmi.sv
 TB_PAGING_WALKER_SRCS := tb_paging_walker.sv
 TB_PAGING_TLB_SRCS := tb_paging_tlb_lru.sv
+TB_MEM_RESP_SRCS := tb_mem_resp.sv
 TB_CACHE_FLUSH_SRCS := tb_cache_flush.sv
 TB_ADDR_UNIT_RELOC_SRCS := tb_addr_unit_reloc_equiv.sv
 TB_RESET_SWEEP_SRCS := tb_reset_sweep.sv
@@ -147,7 +148,7 @@ PLA4_RTL := $(Z486_DIR)/protection.sv
 .PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache test-memory-order test-cache-coherence test-load-waw test-gpr-hazard test-gpr-merge test-memmap-template check-reset-lists check-pragmas check-rom-columns check-shift-ucode test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-x87-bridge test-x87-sequencer test-x87-executor test-x87-testfloat test-x87-fifo test-x87-core test-x87-integration test-x87-integer dhrystone clean help
 
 .PHONY: test-release test-pc98-map test-protected-narrow check-generators test-data-access check-runner test-l1-tags-wide test-reset-restart test-fuzz
-.PHONY: test-addr-unit-reloc test-reset-sweep test-pc98-map-bus
+.PHONY: test-addr-unit-reloc test-reset-sweep test-pc98-map-bus test-mem-resp
 
 all: build
 
@@ -156,7 +157,7 @@ all: build
 # External SingleStepTests/test386 and vendor timing are separate requirements.
 test-release:
 	$(MAKE) -j1 check-reset-lists check-pragmas check-rom-columns check-shift-ucode check-generators check-runner
-	$(MAKE) -j1 test-l1-cache test-l1-icache test-memory-order test-load-waw test-gpr-merge test-gpr-hazard test-data-access test-memmap-template test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-cache-coherence test-reset-restart
+	$(MAKE) -j1 test-l1-cache test-l1-icache test-memory-order test-mem-resp test-load-waw test-gpr-merge test-gpr-hazard test-data-access test-memmap-template test-interrupt-nmi test-paging-walker test-paging-tlb test-cache-flush test-cache-coherence test-reset-restart
 	$(MAKE) -j1 test-addr-unit-reloc test-reset-sweep test-pc98-map-bus
 	$(MAKE) -j1 test-protected test-protected-narrow test-simple test-pc98-map test-l1-tags-wide test-fuzz
 	$(MAKE) -j1 obj_dir_x87/Vtb_protected_mode
@@ -307,6 +308,15 @@ obj_dir/Vtb_paging_tlb_lru: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_p
 		$(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/paging_tlb.sv \
 		$(TB_PAGING_TLB_SRCS)
 	@echo "Build complete: obj_dir/Vtb_paging_tlb_lru"
+
+obj_dir/Vtb_mem_resp: $(Z486_DIR)/z486_cache_map_pkg.sv $(Z486_DIR)/z486_pkg.sv $(RTL_DEPS) $(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv $(TB_MEM_RESP_SRCS)
+	@echo "Building external-bus response-timing bench with Verilator..."
+	$(VERILATOR) --timing -Wall -Wno-fatal -Wno-UNOPTFLAT -Wno-SYNCASYNCNET \
+		--binary -O3 -j $(JOBS) -I$(Z486_DIR) \
+		-CFLAGS "-std=c++14 -O3" --top-module tb_mem_resp \
+		$(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/z486_cache_map_pkg.sv $(TB_MEM_RESP_SRCS) \
+		$(Z486_DIR)/memory.sv $(Z486_DIR)/bus_unit.sv $(Z486_DIR)/cache_unit.sv $(Z486_DIR)/l1_cache.sv $(Z486_DIR)/l1_icache.sv
+	@echo "Build complete: obj_dir/Vtb_mem_resp"
 
 obj_dir/Vtb_paging_walker: $(Z486_DIR)/z486_pkg.sv $(Z486_DIR)/paging_walker.sv $(TB_PAGING_WALKER_SRCS)
 	@echo "Building page-walker A/D write-back bench with Verilator..."
@@ -534,6 +544,12 @@ test-memory-order: obj_dir/Vtb_memory_order
 	@echo "Running device/store ordering unit test..."
 	./obj_dir/Vtb_memory_order
 
+# A read may be answered in its accept cycle, one cycle later or later still:
+# a line fill and a direct read must complete with the right data in each.
+test-mem-resp: obj_dir/Vtb_mem_resp
+	@echo "Running external-bus response-timing bench..."
+	./obj_dir/Vtb_mem_resp
+
 # A younger direct load's write-back must win the GPR bytes it writes against
 # an older hardwired load's deferred MEM token retiring in the same cycle.
 test-load-waw: obj_dir/Vtb_load_waw
@@ -682,6 +698,7 @@ help:
 	@echo "  make test-release  - Run all self-contained release gates"
 	@echo "  make test-pc98-map - Execute/modify code in PC-98 DIRECT/NO_ALLOC windows"
 	@echo "  make test-pc98-map-bus - Check each PC-98 window's external-port access shape"
+	@echo "  make test-mem-resp - Line fills and direct reads answered in, or after, their accept cycle"
 	@echo "  make test-addr-unit-reloc - address_unit relocation vs independent arithmetic"
 	@echo "  make test-reset-sweep - One-cycle reset at every offset through a program"
 	@echo "  make check-reset-lists - Audit always_ff reset branches"

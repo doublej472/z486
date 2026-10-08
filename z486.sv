@@ -67,7 +67,10 @@ module z486
     input              win0_unmapped,
     input      [31:0]  ram_cache_top,
 
-    // 32-bit bus interface (ready/valid handshake)
+    // 32-bit bus interface (ready/valid handshake).  One read is outstanding
+    // at a time; its response - burstcount beats on resp_valid, or a whole
+    // line on line_resp_valid when line_read is set - may start in the accept
+    // cycle (valid && ready) or any cycle after it.
     output     [31:2]  addr,        // Physical address [31:2]
     output      [3:0]  be,          // Byte enables
     output      [7:0]  burstcount,  // Burst length in DWORDs

@@ -261,10 +261,17 @@ assign inta       = ext_valid_r && ext_inta_r;
 
 assign dcache_mem_ready = ext_dcache_accept;
 assign icache_mem_ready = ext_icache_accept;
-assign dcache_mem_resp_valid = dcache_read_pending && resp_valid;
-assign icache_mem_resp_valid = icache_read_pending && resp_valid;
-assign dcache_mem_line_resp_valid = dcache_read_pending && line_resp_valid;
-assign icache_mem_line_resp_valid = icache_read_pending && line_resp_valid;
+// Bus contract: a read's response (a beat on resp_valid, or the whole line on
+// line_resp_valid) may arrive in the cycle the read is accepted (valid &&
+// ready) or in any later cycle; one read is outstanding at a time.  A beat in
+// the accept cycle belongs to the read being accepted, as for a DIRECT read.
+wire dcache_fill_accept = ext_dcache_accept && !ext_write_r;
+wire dcache_resp_window = dcache_read_pending || dcache_fill_accept;
+wire icache_resp_window = icache_read_pending || ext_icache_accept;
+assign dcache_mem_resp_valid = dcache_resp_window && resp_valid;
+assign icache_mem_resp_valid = icache_resp_window && resp_valid;
+assign dcache_mem_line_resp_valid = dcache_resp_window && line_resp_valid;
+assign icache_mem_line_resp_valid = icache_resp_window && line_resp_valid;
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
@@ -322,15 +329,18 @@ always_ff @(posedge clk) begin
             ext_inta_r <= 1'b0;
         end
 
-        if (ext_dcache_accept && !dcache_mem_write)
-            dcache_rd_pending <= dcache_mem_burstcount;
+        // The accept cycle's own response counts against the new read.
+        if (dcache_fill_accept)
+            dcache_rd_pending <= line_resp_valid ? 8'd0 :
+                                 ext_burstcount_r - {7'd0, resp_valid};
         else if (dcache_read_pending && line_resp_valid)
             dcache_rd_pending <= 8'd0;
         else if (dcache_read_pending && resp_valid)
             dcache_rd_pending <= dcache_rd_pending - 8'd1;
 
         if (ext_icache_accept)
-            icache_rd_pending <= icache_mem_burstcount;
+            icache_rd_pending <= line_resp_valid ? 8'd0 :
+                                 ext_burstcount_r - {7'd0, resp_valid};
         else if (icache_read_pending && line_resp_valid)
             icache_rd_pending <= 8'd0;
         else if (icache_read_pending && resp_valid)
