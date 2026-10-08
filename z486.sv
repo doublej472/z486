@@ -2239,8 +2239,14 @@ wire [33:0] cs_fetch_limit = desc_cache[SEG_CS].G
                            ? {2'b0, desc_cache[SEG_CS].limit, 12'hFFF}
                            : {14'd0, desc_cache[SEG_CS].limit};
 wire [33:0] cs_fetch_rem_w = cs_fetch_limit + 34'd1 - {2'b0, EIP};
+// Saturation as a second carry chain instead of a 27-input OR over the
+// difference: rem >= 64  <=>  limit - 63 - EIP >= 0, so the "far" verdict is
+// the sign of a parallel chain and arrives with rem's own sign, one LUT ahead
+// of the old OR tree (this sat on the fitted EIP -> fetch_limit_rem ->
+// k1q_avail -> entry-ROM address cone).  Bit-identical for every input.
+wire [33:0] cs_fetch_far_w = cs_fetch_limit - 34'd63 - {2'b0, EIP};
 assign fetch_limit_rem = cs_fetch_rem_w[33]        ? 6'd0  :
-                         (|cs_fetch_rem_w[32:6])   ? 6'd63 :
+                         !cs_fetch_far_w[33]       ? 6'd63 :
                          cs_fetch_rem_w[5:0];
 
 // CR3 write detection for TLB flush
