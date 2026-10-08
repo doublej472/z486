@@ -542,8 +542,18 @@ wire        req_is_vga_mem     = pg_enable ? tlb_is_vga_mem
 wire        early_wr_accept    = early_wr_present && dcache_req_accepted;
 // A read whose probe-path resolve found a TLB hit but no line presents its
 // registered physical address directly: no translation cycle.
-wire        pretrans_present   = idle_data_req && pretrans_valid && !mem_write &&
+// pretrans_valid implies mem_req: z486.sv ORs both slow-submit terms that qualify
+// pretrans_valid straight into mem_req_to_paging, past its fault gate. So
+// mem_req (and the segment-limit verdict it carries) is redundant here, and
+// keeping it put seg_fault in front of the request-address mux on the fitted
+// worst clk_sys path. The SIM-ONLY check below holds the implication.
+wire        pretrans_present   = s_idle && !mem_servicing && pretrans_valid && !mem_write &&
                                  !mem_is_io && !idle_mem_crossing;
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && pretrans_valid && !mem_req)
+        $fatal(1, "paging_unit: pretrans_valid without mem_req - pretrans_present relies on the implication");
+// synthesis translate_on
 wire        pretrans_accept    = pretrans_present && dcache_req_accepted;
 wire        early_present      = early_wr_present || pretrans_present;
 
