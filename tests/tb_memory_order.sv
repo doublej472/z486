@@ -63,7 +63,7 @@ module tb_memory_order;
         .dcache_req_is_inta(1'b0),
         .dcache_req_is_x87(1'b0),
         .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
-    .dcache_req_is_pcd(1'b0), .dcache_req_is_locked(1'b0), .dcache_stores_drained_out(), .cache_cd(1'b0), .cache_nw(1'b0), .bus_locked(1'b0),
+    .dcache_req_is_pcd(1'b0), .dcache_req_is_locked(1'b0), .dcache_stores_drained_out(), .cache_enable(1'b1), .x87_off(1'b0), .cache_cd(1'b0), .cache_nw(1'b0), .bus_locked(1'b0), .dcache_wr_ready(),
         .dcache_req_accepted(dcache_req_accepted),
         .dcache_req_complete(dcache_req_complete),
         .dcache_read_complete(dcache_read_complete),
