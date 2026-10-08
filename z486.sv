@@ -2628,6 +2628,7 @@ paging_unit #(.VGA_BASE(VGA_BASE), .VGA_TOP(VGA_TOP)) paging_inst (
                          (vipt_slow_submit && vipt_slow_phys_ok_r)),
     .pretrans_phys      (ucrd_slow_submit ? ucrd_phys_r : vipt_slow_phys_r),
     .cpl                (ucrd_slow_submit ? ucrd_cpl_r : pg_cpl),
+    .pf_cpl             (cpl),
     .mem_is_io          (paging_owned_submit ? 1'b0 : mem_is_io),
     .mem_be             (mem_be_now),
     .fast_off           (hardwired_off),

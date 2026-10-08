@@ -72,7 +72,8 @@ module paging_unit
     input               mem_locked,        // locked read: served from memory, never the L1
     input               pretrans_valid,    // this read is already translated (cache-only miss)
     input        [31:0] pretrans_phys,     //   at this physical address
-    input        [1:0]  cpl,               // Current privilege level
+    input        [1:0]  cpl,               // Demand access privilege (0 for implicit-supervisor accesses)
+    input        [1:0]  pf_cpl,            // Code fetch privilege: always the architectural CPL
     input               mem_is_io,         // This request is IO (skip translation)
     input        [3:0]  mem_be,            // Pre-computed byte enables (for IO and non-crossing mem)
 
@@ -403,7 +404,11 @@ wire live_store_posts = !pg_enable;
 reg  write_will_post; // registered live_store_posts, valid in the PG_MEM_TLB cycle
 
 // Prefetch is always a read at the current CPL, so only the U/S check matters.
-wire pf_tlb_user_ok = (cpl != 2'd3) || tlb_user;
+// It takes the architectural CPL, never the demand side's: an implicit
+// supervisor access (a descriptor read, a TSS access) leaves the demand CPL at
+// 0 until the next demand access, and a fetch checked with it would let ring 3
+// execute a supervisor-only page.
+wire pf_tlb_user_ok = (pf_cpl != 2'd3) || tlb_user;
 
 reg [31:0] req_linear;       // Linear address
 reg [1:0]  req_op_size;      // Operand size
@@ -491,7 +496,7 @@ reg [19:0] pf_xlat_pfn;
 reg        pf_xlat_user;
 reg        pf_xlat_pcd;
 wire pf_xlat_hit = !fast_off && pf_xlat_valid && (pf_xlat_vpn == pf_linear_addr[31:12]) &&
-                   ((cpl != 2'd3) || pf_xlat_user);
+                   ((pf_cpl != 2'd3) || pf_xlat_user);
 wire fast_pf_candidate = idle_pf_req && cache_lookup_granted &&
                          (!pg_enable || pf_xlat_hit ||
                           (pf_tlb_match && tlb_hit && pf_tlb_user_ok));
@@ -952,12 +957,12 @@ always_ff @(posedge clk or negedge reset_n) begin
                     end else if (pg_enable && pf_tlb_match && tlb_hit) begin
                         // Permission fail: silently fault, ack prefetch.
                         ack_prefetch_fault(pf_linear_addr,
-                                           {(cpl == 2'd3), 1'b0, 1'b1});
+                                           {(pf_cpl == 2'd3), 1'b0, 1'b1});
                     end else if (pf_tlb_match) begin
-                        // TLB miss: start page walk for prefetch
-                        // For prefetch walks, use supervisor read permissions
+                        // TLB miss: start page walk for prefetch, a read at
+                        // the fetch's privilege
                         req_is_write <= 1'b0;
-                        req_cpl <= cpl;
+                        req_cpl <= pf_cpl;
                         walk_request <= 1'b1;
                         state <= PG_PF_WALKING;
                     end
@@ -1158,7 +1163,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                         // Walked the old CR3: drop the result (or fault) and
                         // re-walk under the new CR3.
                         req_is_write <= 1'b0;
-                        req_cpl <= cpl;
+                        req_cpl <= pf_cpl;
                         walk_request <= 1'b1;
                     end else if (walk_fault) begin
                         // Prefetch page fault: silently ack with fault flag.
@@ -1184,7 +1189,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                 end else if (walk_stale) begin
                     // CR3 changed while waiting for a lookup slot: re-walk.
                     req_is_write <= 1'b0;
-                    req_cpl <= cpl;
+                    req_cpl <= pf_cpl;
                     walk_request <= 1'b1;
                     state <= PG_PF_WALKING;
                 end else if (cache_lookup_granted) begin
