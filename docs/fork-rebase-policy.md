@@ -124,7 +124,8 @@ carried 30 test/doc files that the 4bfdde0 rebase did not bring across, plus a
   `+signal_delay_active`, `+speed_wander`).  The liveness program
   (`vipt_load_interlocks` throttled) passes here, but it also passes with
   `throttle_atomic_chain` removed, so it guards nothing on this tree.
-- **`tb_mem_resp`:** fails; see the open defects below.
+- **`tb_mem_resp`:** carried with its fix, `fix(bus_unit): take a line
+  fill's response in the read's accept cycle` (`test-mem-resp`).
 - **`tb_perf_kernels` + `tests/perf/`:** a performance harness probing the
   pre-split `memory.sv` internals and `stall_d2`; a port is a rewrite, and
   Dhrystone is the cycle regression signal.
@@ -143,27 +144,43 @@ carried 30 test/doc files that the 4bfdde0 rebase did not bring across, plus a
   which this tree tracks, for the core's install-over workflow; it stays the
   core's own local patch.
 
-### Open defects found while folding (RTL unchanged)
+### Defects found while folding, and where they went
 
-- **A line fill cannot take its first response in the accept cycle.**
-  `bus_unit` loads the fill's pending-beat counter on the accept edge and
-  counts `resp_valid`/`line_resp_valid` only while it is non-zero, so a beat
-  (or whole line) presented with `ready` is lost and the fill never
-  completes; a DIRECT read does accept it (`!resp_valid` on its pending
-  set).  The core's `tb_mem_resp` (adapted to the current ports) passes its
-  one-cycle-later responder and fails all eight same-cycle fill cases.  The
-  PC-9821 platform avoids it by responding a cycle after accept; the bus
-  contract is undocumented either way.
-- **The protected suite fails throttled** (`+cpu_speed=1/2/3`; it passes at
-  0): `debug_bp`, `debug_bp2`, `debug_ibp`, `debug_task_ibp` stop on the sim
-  fuse "throttle parked without a resident D2 successor"
-  (`event_control.sv`); `spec_fetch_cpl_leak` reports FAIL at every setting
-  (also on upstream 4bfdde0 at setting 3), i.e. the ring-3 jump ran the
-  CPL-0-buffered line; `smc_spec_buffer` fails case 4 (the store through a
-  linear alias) at 1 and 3; `vipt_rmw_interval` never finishes (TIMEOUT at 20x
-  its budget).  `rep_stos_intr`, `rep_scas_intr_high_eip`, `vipt_alu_intr` and
-  `io_store_out_in` also fail at some settings, but their stimulus counts
-  clock cycles, so those may be harness premises rather than CPU state.
+- **A line fill could not take its first response in the accept cycle.**
+  Fixed by `fix(bus_unit): take a line fill's response in the read's accept
+  cycle`, which also writes the bus contract down at z486's port: a read's
+  response may start in its accept cycle or any cycle after.  The core's
+  `tb_mem_resp` is the bench (`test-mem-resp`).
+- **The protected suite failed throttled.**  It now passes at every setting
+  and `test-protected-throttled` (in `test-release`) keeps it so.  The
+  failures were:
+  - `debug_bp`, `debug_bp2`, `debug_ibp`, `debug_task_ibp`: an
+    instruction-breakpoint #DB dropped the parked D2 word without releasing
+    the park (the sim fuse in `event_control.sv`); folded into the hardware
+    breakpoint commit.
+  - `spec_fetch_cpl_leak`: the paging unit checked a code fetch with the
+    demand side's privilege, which stays 0 after an implicit-supervisor
+    access, so ring 3 fetched a supervisor-only page (`fix(paging_unit,z486):
+    check code fetches at the architectural CPL`).  Its sibling
+    `spec_fetch_cpl_buffer` (new) fails unthrottled: a branch-target line
+    buffered at CPL 0 survived the change to ring 3 (`fix(z486): drop the
+    branch-target lines when the CPL changes`).  Upstream 4bfdde0 has both.
+  - `smc_spec_buffer` case 3 (data 0x08; the earlier note called it case 4):
+    a store crossing into the buffered line reported only its first line;
+    folded into the store-kill commit.  Upstream reports the same single line.
+  - `vipt_rmw_interval`: a clock-count check, so the throttle legitimately
+    fails it, and its fail path wrote the check number as the status (a
+    TIMEOUT); it reports FAIL now and is `unthrottled_only`.
+  - `rep_stos_intr`, `rep_scas_intr_high_eip`, `vipt_alu_intr`,
+    `io_store_out_in` and a dozen TIMEOUTs were harness premises: cycle
+    budgets and cycle-placed interrupts that did not scale with the
+    throttle.  The runner scales both now.
+- **`tb_memory_order` and `tb_cache_coherence` ran with the L1s off.**
+  `memory`'s `cache_enable` was unconnected, which Verilator ties to 0.
+  `tb_cache_coherence` was vacuous for its own fix (CASES 2 and 3 pass with
+  it reverted unless the L1s are on); the connection is folded into the
+  commit that added it.  `tb_memory_order`'s fork case detects its fix with
+  the L1s on or off; it gets a `tests:` commit.
 
 ## Rebase procedure
 
@@ -190,6 +207,7 @@ make test-release            # preferred: all self-contained gates, serialized
 # Individual gates for triage:
 make test-protected          # strict directed programs, x87/PC-98 profiles separate
 make test-protected-narrow   # same programs with narrow responses
+make test-protected-throttled # same programs at throttle settings 1, 2, 3
 make test-pc98-map           # actual PC-98 windows, both response widths
 make test-pc98-map-bus       # each window's external-port shape, DIRECT I$ invalidate
 make test-l1-cache           # D$ snoop/fill/VIPT/patch-backpressure
@@ -199,6 +217,7 @@ make test-cache-flush        # whole-L1 flush controller
 make test-paging-walker      # A/D write-back elision
 make test-l1-icache          # fill/snoop races
 make test-memory-order       # device/store ordering
+make test-mem-resp           # responses in, and after, the accept cycle
 make test-load-waw           # deferred-token GPR write arbitration
 make test-gpr-merge          # shared GPR producer arbitration
 make test-gpr-hazard         # no new survey findings allowed
