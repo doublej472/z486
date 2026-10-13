@@ -25,6 +25,7 @@ UCODE_BITS = 37
 # Free words after upstream's XADD/CMPXCHG/INVD block (0x9D9-0x9F5).
 ALIGN_FAULT_ENTRY = 0x9F6     # 486 #AC fault entry (two words)
 CALL_STACK_FAULT = 0x9F8      # #SS(new SS selector) for a CALL gate's new stack (three words)
+REAL_INT_FLAGS = 0x9FB        # real-mode interrupt entry: EFLAGS high word cleared (three words)
 SRC_SLCTR = 0x35
 ALUJMP_AND = 0x08
 # The 80386 LOADALL routine (entry 0x8F6, words 0x8F7-0x931) is reached only
@@ -199,6 +200,32 @@ PATCHES = [
     # interrupt and fault delivery.
     Patch(0x7F3, "486 PUSHFD: keep AC, store VM and RF as 0, before architectural mask",
           fields=dict(alusrc=0x11)),
+    # Interrupt and exception entry: the 386 clears the whole high word of
+    # EFLAGS (MASK16) at 632 (more-privilege, including from V86) and 8D5
+    # (trap/interrupt gate), where it holds only VM and RF. The i486 PRM's INT
+    # pseudocode clears VM and TF (and IF/NT on the paths that do), not AC, so
+    # the handler keeps AC. A DOS extender's 386/486 test toggles AC with
+    # POPFD in V86 mode; a V86 interrupt then cleared it and the extender saw
+    # a 386 (Fistfight: ".INI file corrupt"). Mask with 0xFFFCFFFF instead.
+    Patch(0x632, "486 interrupt entry (more privilege): clear VM and RF, keep AC",
+          fields=dict(alusrc=0x11)),
+    Patch(0x8D5, "486 interrupt entry (trap/interrupt gate): clear VM and RF, keep AC",
+          fields=dict(alusrc=0x11)),
+    # Real-address-mode delivery shares 8D5 (8AE long-jumps to it), and there
+    # the i486 clears AC (Intel SDM INT n, real-address mode: "IF <- 0; TF <-
+    # 0; AC <- 0"; SingleStepTests 80386 real mode under the 486 expectation,
+    # e.g. F6.4[46]). The real-mode entry goes through its own copy of the
+    # 386 pair instead: AND EFLAGS with MASK16 (the 386's 8D5), then a long
+    # jump to 8D7 whose delay slot writes EFLAGS (the 386's 8D6). One cycle
+    # more than the shared pair, on the real-mode path only.
+    Patch(0x8AE, "real-mode interrupt entry: long jump to its own EFLAGS mask",
+          fields=longjump(REAL_INT_FLAGS)),
+    Patch(REAL_INT_FLAGS, "real-mode interrupt entry: EFLAGS AND MASK16 (the 386's 8D5)",
+          copy_from=0x8D5),
+    Patch(REAL_INT_FLAGS + 1, "real-mode interrupt entry: long jump to the vector read at 8D7",
+          word=uword(**longjump(0x8D7))),
+    Patch(REAL_INT_FLAGS + 2, "real-mode interrupt entry: EFLAGS <- SIGMA in the delay slot (the 386's 8D6)",
+          copy_from=0x8D6),
 
     # 0F C8-CF has no 80386 PLA entry. The decoder redirects it to this
     # otherwise unused word and selects the register through opcode[2:0].

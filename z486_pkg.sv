@@ -900,7 +900,7 @@ localparam ALUSRC_EFLAGS_PUSH = 6'h11; // 0xFFFCFFFF: PUSHFD's EFLAGS image with
 localparam ALUSRC_TMPG = 6'h12;
 localparam ALUSRC_TMPH = 6'h13;
 localparam ALUSRC_PROTUN = 6'h15;
-localparam ALUSRC_FLAGS_MASK = 6'h16;  // 0x37fd7 FLAGS mask for INT stack push
+localparam ALUSRC_FLAGS_MASK = 6'h16;  // 0x77fd7: the 386's 0x37fd7 FLAGS mask plus the 486 AC bit
 localparam ALUSRC_CONST_4000 = 6'h17;  // 0x4000
 localparam ALUSRC_CONST_N200 = 6'h18;  // ~0x200 = 0xFFFFFDFF
 localparam ALUSRC_CONST_8 = 6'h19;     // 8
