@@ -129,7 +129,8 @@ module segmentation_unit
     output logic [31:0] au_issue_ea,
     output logic [31:0] au_ea,
     output logic [31:0] au_ind,
-    output logic [31:0] au_ind_delta
+    output logic [31:0] au_ind_delta,
+    output logic        au_ind_delta_dword
 );
 
 reg [3:0]   desc_write_seg;     // Tracks target segment for SDES/SDEL
@@ -1062,6 +1063,7 @@ address_unit address_unit_inst (
     .cr3(au_cr3),
     .ind(au_ind),
     .ind_delta(au_ind_delta),
+    .ind_delta_dword(au_ind_delta_dword),
     .ind_linear(au_ind_linear),
     .ind_linear_valid(au_ind_linear_valid),
     .ea(au_ea),

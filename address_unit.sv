@@ -53,6 +53,7 @@ module address_unit
 
     output logic [31:0] ind,
     output logic [31:0] ind_delta,
+    output logic        ind_delta_dword,   // ind_delta is +4 or -4, registered with it
     output logic [31:0] ind_linear,          // Registered relocated IND
     output logic        ind_linear_valid,    // Relocation matches current IND
     output logic [31:0] ea,
@@ -369,11 +370,25 @@ assign issue_mem_linear = (instr.stack_op || instr.has_moffs)
                         ? relocate_issue(instr.stack_op ? issue_stack_offset : instr.immediate)
                         : effective_linear;
 
+// z486.sv sizes a RD W/WR W access by |IND_DELTA| == 4; the compare is formed
+// on the value as it is written, beside ind_delta, so the 32-bit compare is
+// not in front of mem_eff_size -> the paging request (tests/equiv/
+// ind_delta_dword.v; a translate_off fuse holds it every cycle).
+function automatic logic is_dword_stride(input logic [31:0] v);
+    is_dword_stride = (v == 32'd4) || (v == -32'd4);
+endfunction
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && (ind_delta_dword !== is_dword_stride(ind_delta)))
+        $fatal(1, "address_unit: ind_delta_dword %b disagrees with ind_delta %h", ind_delta_dword, ind_delta);
+// synthesis translate_on
+
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         issue_ind_r <= 32'd0;
         ind_owner_issue_r <= 1'b0;
         ind_delta <= 32'd4;
+        ind_delta_dword <= 1'b1;
         issue_linear_r <= 32'd0;
         linear_owner_issue_r <= 1'b0;
         ind_linear_valid <= 1'b0;
@@ -383,6 +398,7 @@ always_ff @(posedge clk) begin
         ind_delta <= !instr.stack_op ? 32'd2 :
                      !instr.stack_dir ? (instr.data32 ? -32'd4 : -32'd2) :
                                         (instr.data32 ? 32'd4 : 32'd2);
+        ind_delta_dword <= instr.stack_op && instr.data32;
         if (instr.stack_op) begin
             issue_ind_r <= issue_stack_offset;
             ind_owner_issue_r <= 1'b1;
@@ -405,8 +421,10 @@ always_ff @(posedge clk) begin
             INDOP_PLUS_ALU: begin
                 automatic logic [31:0] operand2;
                 operand2 = jcc_word ? alu_value_hold : alu_value;
-                if (alu_source != ALUSRC_ZERO)
+                if (alu_source != ALUSRC_ZERO) begin
                     ind_delta <= operand2;
+                    ind_delta_dword <= is_dword_stride(operand2);
+                end
                 ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b1;
             end
@@ -421,8 +439,10 @@ always_ff @(posedge clk) begin
             INDOP_PLUS: begin
                 ind_owner_issue_r <= 1'b0;
                 ind_linear_valid <= 1'b1;
-                if (alu_source != ALUSRC_ZERO)
+                if (alu_source != ALUSRC_ZERO) begin
                     ind_delta <= alu_value;
+                    ind_delta_dword <= is_dword_stride(alu_value);
+                end
             end
             INDOP_IN_PLUS_D: begin
                 ind_owner_issue_r <= 1'b0;

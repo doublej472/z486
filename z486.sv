@@ -189,6 +189,7 @@ wire [31:0] OPR_R;                  // Read operand register, owned by the pagin
 wire [31:0] OPR_W;                  // Bus operation data registers
 wire [31:0] IND;                    // Internal address register
 wire [31:0] IND_DELTA;              // Signed microcode address stride
+wire        ind_delta_dword;        // |IND_DELTA| == 4, registered with IND_DELTA (address_unit)
 wire [31:0] ind_linear;             // Relocated linear address of IND
 wire        ind_linear_valid;
 wire [31:0] ea_reg;                 // Current instruction EA, owned by address_unit
@@ -1952,7 +1953,8 @@ segmentation_unit seg_unit (
     .au_issue_ea(ea_early),
     .au_ea(ea_reg),
     .au_ind(IND),
-    .au_ind_delta(IND_DELTA)
+    .au_ind_delta(IND_DELTA),
+    .au_ind_delta_dword(ind_delta_dword)
 );
 
 // synthesis translate_off
@@ -2061,7 +2063,6 @@ end
 //=============================================================================
 
 // Access width: |IND_DELTA| for RD W/WR W, else the source width.
-wire ind_delta_dword = (IND_DELTA == 32'd4) || (IND_DELTA == -32'd4);
 assign mem_eff_size = uc_is_word_op
                           ? ((ind_delta_dword && !uc_force_word) ? 2'd2 : 2'd1) :
                           uc_is_dword_op ? 2'd2 : srcreg_size;
