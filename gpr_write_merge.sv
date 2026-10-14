@@ -256,35 +256,53 @@ function automatic logic [31:0] producer_value(input int step);
     endcase
 endfunction
 
-// One aligned value per producer, computed once.  Quartus 17 cannot part-select
-// the result of a function call, so the values are named wires.
-wire [31:0] pv0 = producer_value(0);
-wire [31:0] pv1 = producer_value(1);
-wire [31:0] pv2 = producer_value(2);
-wire [31:0] pv3 = producer_value(3);
-wire [31:0] pv4 = producer_value(4);
-wire [31:0] pv5 = producer_value(5);
-wire [31:0] pv6 = producer_value(6);
-wire [31:0] pv7 = producer_value(7);
+// The producer values the merge selects.  Every consumer takes byte b of a
+// producer only in that producer's own lanes (producer_lane: the views and the
+// capture merge under its hit, the commit and pulse values only where their
+// wmask is set), and within its lanes align_of_size/align_of_mode is the
+// datum's own byte b except lane 1 of an AH-type write (the low byte moved up).
+// So each value passes lanes 0, 2 and 3 straight through and selects lane 1
+// alone, and no size/mode decode is in front of the other lanes; the stos,
+// sigsrc and ESP producers are never AH-type and pass their datum unchanged.
+// tests/equiv/producer_lane_align.v proves both forms equal in every owned
+// lane; the reference chains below merge the fully aligned producer_value.
+function automatic logic [31:0] lane_of(input logic ah, input logic [31:0] data);
+    lane_of = {data[31:16], ah ? data[7:0] : data[15:8], data[7:0]};
+endfunction
+// Quartus 17 cannot part-select the result of a function call, so the values
+// are named wires.
+wire [31:0] pv0 = lane_of((size_shift == 2'd0) && dst_shift[2], data_shift);
+wire [31:0] pv1 = lane_of(mode_mem == EA_FWD_BHI, data_mem);
+wire [31:0] pv2 = lane_of((size_rom == 2'd0) && dst_rom[2], data_rom);
+wire [31:0] pv3 = lane_of((size_wb == 2'd0) && dst_wb[2], data_wb);
+wire [31:0] pv4 = lane_of(mode_dly == EA_FWD_BHI, data_dly);
+wire [31:0] pv5 = data_stos;
+wire [31:0] pv6 = data_sigsrc;
+wire [31:0] pv7 = data_esp;
 // Producer 3 as the views see it (see fwd_wb): equal to pv3 wherever hitv3.
-// A view takes byte b of pv3f only where hitv3 (b is one of the write-back's
-// be_of_size lanes), and there align_of_size(size_wb, dst_wb[2], fwd_wb) is
-// fwd_wb's own byte b except in lane 1 of an AH write (the low byte moved up).
-// So only lane 1 has a select, a one-LUT decode of the write-back's size and
-// AH bit, and the size compare is not in front of the other lanes.
-// tests/equiv/wb_view_align.v proves the lanes equal wherever a view can
-// select them.
-wire [31:0] pv3f = {fwd_wb[31:16],
-                    ((size_wb == 2'd0) && dst_wb[2]) ? fwd_wb[7:0] : fwd_wb[15:8],
-                    fwd_wb[7:0]};
+wire [31:0] pv3f = lane_of((size_wb == 2'd0) && dst_wb[2], fwd_wb);
 // synthesis translate_off
 wire [31:0] pv3f_aligned = align_of_size(size_wb, dst_wb[2], fwd_wb);
-wire [3:0]  pv3f_lanes   = be_of_size(size_wb, dst_wb[2]);
-always_comb
+always_comb begin : producer_lane_fuse
+    for (int k = 0; k < 8; k++) begin
+        logic [31:0] pvk;
+        logic [3:0]  lanes;
+        case (k)
+            0: pvk = pv0; 1: pvk = pv1; 2: pvk = pv2; 3: pvk = pv3;
+            4: pvk = pv4; 5: pvk = pv5; 6: pvk = pv6; default: pvk = pv7;
+        endcase
+        lanes = producer_lane(k);
+        for (int bb = 0; bb < 4; bb++)
+            if (producer_valid(k) && lanes[bb] &&
+                (pvk[bb*8 +: 8] !== producer_value(k)[bb*8 +: 8]))
+                $fatal(1, "GPR MERGE PRODUCER %0d LANE %0d: %02x, aligned %02x", k, bb,
+                       pvk[bb*8 +: 8], producer_value(k)[bb*8 +: 8]);
+    end
     for (int bb = 0; bb < 4; bb++)
-        if (v_wb && pv3f_lanes[bb] && (pv3f[bb*8 +: 8] !== pv3f_aligned[bb*8 +: 8]))
+        if (v_wb && producer_lane(3)[bb] && (pv3f[bb*8 +: 8] !== pv3f_aligned[bb*8 +: 8]))
             $fatal(1, "GPR MERGE PV3F: lane %0d %02x, aligned %02x", bb,
                    pv3f[bb*8 +: 8], pv3f_aligned[bb*8 +: 8]);
+end
 // synthesis translate_on
 
 // The capture-view merge for one selected register: the same terms in the same
@@ -449,7 +467,7 @@ function automatic logic [31:0] ref_chain(input int rr, input logic [7:0] vis,
         d32 = 32'd0;
         for (int bb = 0; bb < 4; bb++) begin
             be[8*bb +: 8]  = {8{hit_of(step, rr, bb, forwarding)}};
-            d32[8*bb +: 8] = (forwarding && step == 3) ? pv3f[bb*8 +: 8]
+            d32[8*bb +: 8] = (forwarding && step == 3) ? pv3f_aligned[bb*8 +: 8]
                                                        : producer_value(step)[bb*8 +: 8];
         end
         if (vis[step])
