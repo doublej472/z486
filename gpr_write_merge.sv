@@ -103,6 +103,9 @@ module gpr_write_merge
 
     // Producer 4: delay-slot bypass (views only).
     input  logic         v_dly,
+    // Producer 4's byte lanes per GPR [r*4 + b], registered by the caller:
+    // byte b of register dst_norm(4) in be_of_mode(mode_dly) (en4 below).
+    input  logic [31:0]  lanes_dly,
     input  logic [2:0]   dst_dly,
     input  logic [1:0]   mode_dly,
     input  logic [31:0]  data_dly,
@@ -362,7 +365,13 @@ for (r = 0; r < 8; r++) begin : g_reg
         // synthesis translate_on
         wire hit2 = v_rom   && en2[b];
         wire hit3 = v_wb    && en3[b];
-        wire hit4 = v_dly   && en4[b];
+        wire hit4 = v_dly && lanes_dly[r*4 + b];
+        // synthesis translate_off
+        always_comb
+            if (hit4 !== (v_dly && en4[b]))
+                $fatal(1, "GPR MERGE HIT4: reg %0d byte %0d registered %b, decoded %b",
+                       r, b, hit4, v_dly && en4[b]);
+        // synthesis translate_on
         wire hit5 = v_stos  && en5[b];
         wire hit6 = v_sigsrc && en6[b];
         wire hit7 = v_esp   && en7[b];

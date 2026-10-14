@@ -1586,16 +1586,44 @@ wire [5:0] dly_gpr_pre   = decode_dly_gpr(uc_next[30:24]);
 reg        dly_gpr_we_pre_r;
 reg [2:0]  dly_gpr_sel_pre_r;
 reg [1:0]  dly_gpr_mode_pre_r;
+// The delay-slot write's GPR byte lanes [r*4 + b] (gpr_write_merge's en4 for
+// producer 4: register dst_norm(4), lanes be_of_mode) and its pend_write_mask
+// one-hot, decoded from the same predecode on the same enable, so the merge's
+// hit and the split-EA mask are one AND with the valid (tests/equiv/
+// dly_lanes_reg.v).
+function automatic [31:0] dly_lanes_of(input [2:0] sel, input [1:0] mode);
+    logic [2:0] r;
+    logic [3:0] be;
+    begin
+        r  = ((mode == FWD_BLO) || (mode == FWD_BHI)) ? {1'b0, sel[1:0]} : sel;
+        be = (mode == FWD_BLO) ? 4'h1 : (mode == FWD_BHI) ? 4'h2 :
+             (mode == FWD_W)   ? 4'h3 : 4'hF;
+        dly_lanes_of = {28'h0, be} << {r, 2'b00};
+    end
+endfunction
+reg [31:0] dly_gpr_lanes_pre_r;
+reg [7:0]  dly_gpr_onehot_pre_r;
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         dly_gpr_we_pre_r <= 1'b0; dly_gpr_sel_pre_r <= 3'd0;
         dly_gpr_mode_pre_r <= FWD_D;
+        dly_gpr_lanes_pre_r <= dly_lanes_of(3'd0, FWD_D);
+        dly_gpr_onehot_pre_r <= 8'h01;
     end else if (microcode_rom_ce) begin
         dly_gpr_we_pre_r   <= dly_gpr_pre[5];
         dly_gpr_sel_pre_r  <= dly_gpr_pre[4:2];
         dly_gpr_mode_pre_r <= dly_gpr_pre[1:0];
+        dly_gpr_lanes_pre_r  <= dly_lanes_of(dly_gpr_pre[4:2], dly_gpr_pre[1:0]);
+        dly_gpr_onehot_pre_r <= 8'h01 << dly_gpr_pre[4:2];
     end
 end
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && ((dly_gpr_lanes_pre_r !== dly_lanes_of(dly_gpr_sel_pre_r, dly_gpr_mode_pre_r)) ||
+                    (dly_gpr_onehot_pre_r !== (8'h01 << dly_gpr_sel_pre_r))))
+        $fatal(1, "z486: the delay-slot lanes %h / one-hot %b disagree with sel %0d mode %0d",
+               dly_gpr_lanes_pre_r, dly_gpr_onehot_pre_r, dly_gpr_sel_pre_r, dly_gpr_mode_pre_r);
+// synthesis translate_on
 
 // Delay-slot GPR write descriptor (a stale recipe slot word writes nothing).
 assign dly_gpr_we = i_rni_delay_ea && !recipe_slot_stale &&
@@ -3694,6 +3722,8 @@ data_unit data_unit_inst (
     .load_alu_dst_capture_data(vipt_load_alu_dst_capture_data),
     // Shorters (US5142635): bypasses around the register file
     .dly_gpr_forward(dly_gpr_forward),
+    .dly_gpr_lanes(dly_gpr_lanes_pre_r),
+    .dly_gpr_onehot(dly_gpr_onehot_pre_r),
     .eflags_fwd(eflags_fwd),
     .branch_condition_true(branch_condition_true),
     // Segmentation: I-bus base/index reads and address registers

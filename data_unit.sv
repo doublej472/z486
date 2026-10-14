@@ -90,6 +90,8 @@ module data_unit
 
     // Shorters (US5142635): bypasses around the register file
     input  gpr_forward_t dly_gpr_forward,        // RNI-delay GPR bypass
+    input  logic [31:0] dly_gpr_lanes,           // its GPR byte lanes [r*4 + b], registered
+    input  logic [7:0]  dly_gpr_onehot,          // 8'h01 << its dst, registered
     output logic [31:0] eflags_fwd,               // Current-cycle flag forwarding
     output logic        branch_condition_true,    // Selected forwarded Jcc condition
 
@@ -319,7 +321,16 @@ wire [2:0] load_wb_widx = (load_wb_size == 2'd0)
 // A plain load's WB value is already merged with its destination's prior
 // value; an M3 ALU result is not forwarded (its readers are interlocked).
 wire [7:0] pend_shift_mask = recipe_shift_wmask_r;   // registered, see shift_hit_of
-wire [7:0] pend_dly_mask   = dly_gpr_forward.valid ? (8'h01 << dly_gpr_forward.dst) : 8'h00;
+wire [7:0] pend_dly_mask   = dly_gpr_forward.valid ? dly_gpr_onehot : 8'h00;
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && dly_gpr_forward.valid &&
+        ((dly_gpr_onehot !== (8'h01 << dly_gpr_forward.dst)) ||
+         (dly_gpr_lanes !== ({28'h0, gpr_lanes_of_mode(dly_gpr_forward.mode)} <<
+                             {(dly_gpr_forward.mode <= EA_FWD_BHI) ? {1'b0, dly_gpr_forward.dst[1:0]}
+                                                                    : dly_gpr_forward.dst, 2'b00}))))
+        $fatal(1, "data_unit: the delay-slot lanes/one-hot disagree with its descriptor");
+// synthesis translate_on
 
 // Producer arbitration.  Every deferred or in-flight register producer is
 // merged once, in architectural age order, by gpr_write_merge, and both the
@@ -416,6 +427,7 @@ gpr_write_merge gpr_merge (
     .hitv3_wb(load_wb_view_hit),
 
     .v_dly(dly_gpr_forward.valid),
+    .lanes_dly(dly_gpr_lanes),
     .dst_dly(dly_gpr_forward.dst),
     .mode_dly(dly_gpr_forward.mode),
     .data_dly(dly_gpr_forward.data),
@@ -997,6 +1009,10 @@ endtask
 
 // A younger producer writing the same bytes as a still-valid deferred token
 // retires the token's commit (and its forwarding) for the rest of the stall.
+function automatic [3:0] gpr_lanes_of_mode(input [1:0] mode);
+    gpr_lanes_of_mode = (mode == EA_FWD_BLO) ? 4'h1 : (mode == EA_FWD_BHI) ? 4'h2 :
+                        (mode == EA_FWD_W)   ? 4'h3 : 4'hF;
+endfunction
 // The memory token's (producer 1's) merge hit per GPR byte [r*4 + b]:
 // (recipe_memory_write.valid && !recipe_memory_killed) ? its lanes at register
 // dst_norm(1) : 0, registered on the edges those registers change so the

@@ -161,6 +161,18 @@ module tb_gpr_hazard;
         end
     endfunction
 
+    // The delay-slot write's lanes, which z486 registers with its descriptor
+    // (dly_gpr_lanes_pre_r); EA_FWD_BLO/BHI/W/D are 0/1/2/3.
+    function automatic [31:0] dly_lanes_of(input [2:0] dst, input [1:0] mode);
+        logic [2:0] r;
+        logic [3:0] be;
+        begin
+            r  = (mode <= 2'd1) ? {1'b0, dst[1:0]} : dst;
+            be = (mode == 2'd0) ? 4'h1 : (mode == 2'd1) ? 4'h2 : (mode == 2'd2) ? 4'h3 : 4'hF;
+            dly_lanes_of = {28'h0, be} << {r, 2'b00};
+        end
+    endfunction
+
     data_unit dut (
         .clk(clk),
         .reset_n(reset_n),
@@ -257,6 +269,8 @@ module tb_gpr_hazard;
         .ea_base(ea_base),
         .ea_index(ea_index),
         .dly_gpr_forward(dly_gpr_forward),
+        .dly_gpr_lanes(dly_lanes_of(dly_gpr_forward.dst, dly_gpr_forward.mode)),
+        .dly_gpr_onehot(8'h01 << dly_gpr_forward.dst),
         .sigma(sigma),
         .countr(countr),
         .alu_src_hold(alu_src_hold),
