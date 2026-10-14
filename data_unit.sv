@@ -498,24 +498,6 @@ for (gv = 0; gv < 8; gv++) begin : g_view
 end
 endgenerate
 
-// An EX operand read, formatted to its size.
-function automatic logic [31:0] read_gpr_load_forwarded(
-    input logic [2:0] reg_sel,
-    input logic [1:0] size
-);
-    logic [31:0] merged;
-    begin
-        merged = gpr_ex_view[(size == 2'd0) ? {1'b0, reg_sel[1:0]} : reg_sel];
-        if (size == 2'd0)
-            read_gpr_load_forwarded = reg_sel[2] ? {24'd0, merged[15:8]}
-                                                 : {24'd0, merged[7:0]};
-        else if (size == 2'd1)
-            read_gpr_load_forwarded = {16'd0, merged[15:0]};
-        else
-            read_gpr_load_forwarded = merged;
-    end
-endfunction
-
 // The same read with the SIZE applied last: both register views are indexed by
 // reg_sel alone and the size only picks among the formatted results.  For the
 // shifter's operand the size is shift_data_size, a late, high-fan-out select
@@ -538,6 +520,22 @@ function automatic logic [31:0] read_gpr_load_forwarded_late(
                                                         full_src;
     end
 endfunction
+
+// An EX operand read, formatted to its size: the read with the size applied
+// last (read_gpr_load_forwarded_late), for every caller. The sizes the callers
+// pass (op_size, op_size_src, srcreg_size_src, shift_data_size) are
+// high-fan-out registers and the shifter's size select; indexing the 8:1 view
+// by the size put them in FRONT of the view mux (the fitted op_size_du /
+// q_shift_use_captured_r -> data_size -> view index -> shifter ->
+// flags_value_r / sigma cone). tests/equiv/shift_src_late.v proves the
+// late form equal to the size-indexed one for every input.
+function automatic logic [31:0] read_gpr_load_forwarded(
+    input logic [2:0] reg_sel,
+    input logic [1:0] size
+);
+    read_gpr_load_forwarded = read_gpr_load_forwarded_late(reg_sel, size);
+endfunction
+
 
 // Every late GPR write landing on this edge (any direct-load WB included).
 // The write-back's term is data_access's registered one-hot (loaded on the
