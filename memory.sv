@@ -83,6 +83,8 @@ module memory
     input              dcache_req_split_sel,
     input              dcache_req_pre_sel,
     input      [31:0]  dcache_req_pre_phys,
+    input      [4:0]   dcache_req_route_m1,
+    input      [4:0]   dcache_req_route_m0,
     input      [11:0]  dcache_req_preread_offset,
     input              dcache_req_preread_priority,
     input              dcache_req_write,
@@ -218,6 +220,7 @@ wire ext_valid_r;
 wire icache_read_pending;
 wire icache_invalidate_valid;
 wire [31:0] icache_invalidate_addr;
+wire [1:0] dcache_req_cls_m1, dcache_req_cls_m0;   // the routing class on mem_req's arms
 cache_unit #(
     .PROTECT_UMA_ROM(PROTECT_UMA_ROM),
     .DCACHE_SET_BITS(DCACHE_SET_BITS),
@@ -272,6 +275,10 @@ cache_unit #(
     .dcache_req_split_sel(dcache_req_split_sel),
     .dcache_req_pre_sel(dcache_req_pre_sel),
     .dcache_req_pre_phys(dcache_req_pre_phys),
+    .dcache_req_route_m1(dcache_req_route_m1),
+    .dcache_req_route_m0(dcache_req_route_m0),
+    .dcache_req_cls_m1(dcache_req_cls_m1),
+    .dcache_req_cls_m0(dcache_req_cls_m0),
     .dcache_req_preread_offset(dcache_req_preread_offset),
     .dcache_req_preread_priority(dcache_req_preread_priority),
     .dcache_req_write(dcache_req_write),
@@ -355,7 +362,7 @@ cache_unit #(
     .icache_invalidate_valid(icache_invalidate_valid)
 );
 
-bus_unit #(.ENABLE_X87(ENABLE_X87)) bus_unit_inst (
+bus_unit #(.ENABLE_X87(ENABLE_X87), .SPLIT(CLASS_SPLIT)) bus_unit_inst (
     // Clock and reset
     .clk(clk),
     .reset_n(reset_n),
@@ -369,6 +376,11 @@ bus_unit #(.ENABLE_X87(ENABLE_X87)) bus_unit_inst (
     .dcache_req_is_inta(dcache_req_is_inta),
     .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
     .dcache_req_is_x87(dcache_req_is_x87),
+    .dcache_req_route_m1(dcache_req_route_m1),
+    .dcache_req_route_m0(dcache_req_route_m0),
+    .dcache_req_cls_m1(dcache_req_cls_m1),
+    .dcache_req_cls_m0(dcache_req_cls_m0),
+    .dcache_req_split_sel(dcache_req_split_sel),
     .dcache_req_accepted(dcache_req_accepted),
     .dcache_req_complete(dcache_req_complete),
     .dcache_read_complete(dcache_read_complete),

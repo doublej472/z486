@@ -89,6 +89,10 @@ module cache_unit
     input  logic dcache_req_split_sel,
     input  logic dcache_req_pre_sel,
     input  logic [31:0] dcache_req_pre_phys,
+    input  logic [4:0] dcache_req_route_m1,   // {valid, io, inta, vga, write} per mem_req arm
+    input  logic [4:0] dcache_req_route_m0,
+    output logic [1:0] dcache_req_cls_m1,     // {is_direct, is_uncached} per mem_req arm
+    output logic [1:0] dcache_req_cls_m0,
     input  logic [11:0] dcache_req_preread_offset,
     input  logic dcache_req_preread_priority,
     input  logic dcache_req_write,
@@ -293,6 +297,14 @@ if (Z486_TEMPLATE_WINDOWS) begin : g_memmap_windows
             NO_ALLOC_ENABLE, NO_ALLOC_CLASS, no_alloc_bound_eff);
         assign dcache_req_class = dcache_req_pre_sel   ? class_pre :
                                   dcache_req_split_sel ? class_m1 : class_m0;
+        // The routing class on each mem_req arm (the pretranslated arm folded
+        // in, as in the request), for the bus unit's split launch decision.
+        wire [1:0] class_r1 = dcache_req_pre_sel ? class_pre : class_m1;
+        wire [1:0] class_r0 = dcache_req_pre_sel ? class_pre : class_m0;
+        assign dcache_req_cls_m1 = {class_r1 == Z486_CACHE_DIRECT,
+                                    dcache_req_route_m1[1] || (class_r1 != Z486_CACHE_CACHEABLE)};
+        assign dcache_req_cls_m0 = {class_r0 == Z486_CACHE_DIRECT,
+                                    dcache_req_route_m0[1] || (class_r0 != Z486_CACHE_CACHEABLE)};
         // synthesis translate_off
         // The split's premise (the arms recombine to the request) and its
         // result (the class it replaced), on every cycle of every run.
@@ -313,6 +325,8 @@ if (Z486_TEMPLATE_WINDOWS) begin : g_memmap_windows
         // synthesis translate_on
     end else begin : g_class_whole
         assign dcache_req_class = dcache_req_class_whole;
+        assign dcache_req_cls_m1 = 2'b00;   // unused without CLASS_SPLIT
+        assign dcache_req_cls_m0 = 2'b00;
     end
     assign dcache_vipt_class = z486_classify_phys(
         dcache_vipt_resolve_phys_addr_raw, dcache_vipt_resolve_phys_addr,
@@ -347,6 +361,8 @@ end else begin : g_memmap_inert
     assign dcache_vipt_class = Z486_CACHE_CACHEABLE;
     assign dcache_req_is_uncached = dcache_req_is_vga_mem;
     assign dcache_req_is_direct = 1'b0;
+    assign dcache_req_cls_m1 = {1'b0, dcache_req_route_m1[1]};
+    assign dcache_req_cls_m0 = {1'b0, dcache_req_route_m0[1]};
     assign icache_req_is_no_alloc = 1'b0;
     assign icache_req_class_ram = 1'b1;
 end

@@ -143,6 +143,11 @@ module paging_unit
     output logic        dcache_req_is_io_m0,
     output logic        dcache_req_split_sel,
     output logic        dcache_req_pre_sel,     // pretrans_present: the request is _pre_phys (I/O 0)
+    // The request's routing attributes with mem_req fixed at 1 / 0 (all arms,
+    // the pretranslated one included): {valid, is_io, is_inta, is_vga_mem,
+    // write}, for the bus unit's split launch decision (CLASS_SPLIT).
+    output logic [4:0]  dcache_req_route_m1,
+    output logic [4:0]  dcache_req_route_m0,
     output logic [31:0] dcache_req_pre_phys,
 
     input               dcache_req_accepted,  // Demand-side request accepted this cycle
@@ -679,6 +684,25 @@ wire        early_is_vga_mem   = pretrans_present ?
 assign dcache_req_is_vga_mem = early_present ? early_is_vga_mem :
                                req_mem_present ? req_is_vga_mem :
                                z486_page_in_window(dcache_req_phys_addr_r[31:12], VGA_BASE, VGA_TOP);
+// The routing attributes on both mem_req arms (early_present at mem_req = 1
+// is early_wr_present_m1 || pretrans_present, at 0 pretrans_present), for
+// the bus unit's split direct-launch decision; tests/equiv/req_route_split.v.
+wire        early_present_r1  = early_wr_present_m1 || pretrans_present;
+wire        vga_rest          = req_mem_present ? req_is_vga_mem :
+                                z486_page_in_window(dcache_req_phys_addr_r[31:12], VGA_BASE, VGA_TOP);
+wire        write_rest        = req_mem_present ? req_is_write : dcache_req_write_r;
+assign dcache_req_route_m1 = {
+    dcache_req_valid_r || req_mem_dcache_candidate || early_present_r1,
+    (early_present_r1 || req_mem_present) ? 1'b0 : dcache_req_is_io_r,
+    (early_present_r1 || req_mem_present) ? 1'b0 : dcache_req_is_inta_r,
+    early_present_r1 ? early_is_vga_mem : vga_rest,
+    pretrans_present ? 1'b0 : early_wr_present_m1 ? 1'b1 : write_rest};
+assign dcache_req_route_m0 = {
+    dcache_req_valid_r || req_mem_dcache_candidate || pretrans_present,
+    (pretrans_present || req_mem_present) ? 1'b0 : dcache_req_is_io_r,
+    (pretrans_present || req_mem_present) ? 1'b0 : dcache_req_is_inta_r,
+    pretrans_present ? early_is_vga_mem : vga_rest,
+    pretrans_present ? 1'b0 : write_rest};
 assign icache_req_valid = icache_req_valid_r || fast_pf_candidate;
 assign icache_req_phys_addr = icache_req_valid_r ? icache_req_phys_addr_r : fast_pf_phys;
 // PCD only qualifies reads: they decide whether a miss may allocate.  The
