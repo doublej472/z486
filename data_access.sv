@@ -21,6 +21,10 @@ module data_access
     // store path below then has to classify the store instead of assuming the
     // hard-coded PC/AT map.
     input  logic                    memmap_windows,
+    // With windows: the sidecar page's posted-store verdict (z486.sv, from the
+    // compile-time template): the page is cacheable RAM now.
+    input  logic                    memmap_post_ok,
+    output logic [19:0]             sidecar_page,
     input  logic                    fast_store_accepted,
     output logic [11:0]             dcache_vipt_probe_offset,
     output logic                    dcache_vipt_probe_valid,
@@ -905,16 +909,21 @@ wire        st_route_pre = !hardwired_off && mem_op_eligible && uc_data_busreq &
     paging_demand_idle && !ucrd_busy && !vipt_load_slow_req_r &&
     !rmw_store_valid && dcache_wr_ready;
 wire        st_user = (pg_cpl == 2'd3);
+wire        st_tlb_ok = vipt_tlb_hit && !vipt_tlb_is_vga_mem && (!st_user || vipt_tlb_user) &&
+                        vipt_tlb_dirty && (vipt_tlb_writable || (!st_user && !CR0[16]));
 // A template window can put an uncached class anywhere, and a store to such a
-// window must not post into the D-cache (the device would never see it; the
-// template cannot fold into this condition, which data_access evaluates before
-// the memory unit has classified anything).  Every store takes the classifying
-// demand path when any window is enabled; with none enabled the hard-coded map
-// is exact and the posted path stays.
-wire        st_postable = !memmap_windows && (vipt_page_enabled
-    ? (vipt_tlb_hit && !vipt_tlb_is_vga_mem && (!st_user || vipt_tlb_user) &&
-       vipt_tlb_dirty && (vipt_tlb_writable || (!st_user && !CR0[16])))
-    : (ind_linear[31:17] != 15'h5));
+// window must not post into the D-cache's store queue: the queue merges stores
+// to one dword and drains behind the bus unit's VGA-ordered direct reads, so a
+// device would see fewer, later writes.  With windows the post is gated by the
+// sidecar page's verdict instead, which z486.sv derives from the compile-time
+// template (the physical page is cacheable RAM: the sidecar entry's PFN paged, the
+// linear page unpaged); every other store takes the classifying demand path.
+// The page is sidecar_page_r, which st_route_pre requires to be ind_linear's.
+// With no window the hard-coded map is exact.
+wire        st_postable = memmap_windows
+    ? (memmap_post_ok && (!vipt_page_enabled || st_tlb_ok))
+    : (vipt_page_enabled ? st_tlb_ok : (ind_linear[31:17] != 15'h5));
+assign sidecar_page = sidecar_page_r;
 assign st_route = st_route_pre && st_postable;
 assign st_take = st_route && !gp_fault_trigger &&
                  !(stall_wio || stall_x87_direct || stall_invlpg || stall_rmw_probe || stall_ucrd);

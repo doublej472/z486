@@ -43,6 +43,12 @@ module z486
     parameter [1:0]  NO_ALLOC_CLASS = Z486_CACHE_NO_ALLOC,
     parameter [31:0] NO_ALLOC_BOUND = 32'h0800_0000,   // L1 tag reach (128 MiB)
     parameter        RAM_BOUND_ENABLE = 0,
+    // With template windows, a store to a page the compile-time template
+    // classifies as cacheable RAM posts through the direct store port as it
+    // does without windows (data_access st_postable); 0 sends every store
+    // through the classifying demand path (the behaviour before this knob).
+    // No effect without windows.
+    parameter        TEMPLATE_STORE_POST = 1,
 
     // CR0 after reset.  A real 486 resets with CD=NW=1 (caching disabled until
     // firmware clears them); the default keeps this core's historical
@@ -541,6 +547,8 @@ wire        vipt_tlb_writable;
 wire        vipt_tlb_user;
 wire        vipt_tlb_dirty;
 wire        vipt_tlb_is_vga_mem;
+wire [19:0] st_sidecar_page;
+wire        memmap_post_ok;
 wire        icache_req_valid;
 wire [31:0] icache_req_phys_addr_raw;
 wire        icache_req_accepted;
@@ -2691,11 +2699,58 @@ localparam bit Z486_TEMPLATE_WINDOWS = VGA_ENABLE | APERTURE_ENABLE |
                                        ALIAS_ENABLE | WIN0_ENABLE |
                                        NO_ALLOC_ENABLE;
 
+// POSTED STORES UNDER THE TEMPLATE.  Every window is a compile-time constant,
+// so whether a 4 KB physical page is cacheable RAM is a constant function of
+// its PFN (z486_page_post_bits: {P, Wb}), up to two runtime inputs: window 0's
+// select (win0_unmapped) and the A20 gate.  The verdict is a few constant
+// range compares on the physical page: paged, the sidecar entry's PFN as the
+// TLB RAM returns it, beside the entry's tag compare (vipt_tlb_hit), which the
+// post decision already waits for; unpaged, the sidecar page register itself
+// (linear == physical).  CR0.PG selects the finished verdict last.  The A20
+// gate is qualified live: the verdict is the page's own, valid while the
+// active mask leaves the page unchanged (PC-98 and PC/AT: A20 on, or PFN bit 8
+// clear).  (Storing the verdict in a parallel sidecar RAM instead added an
+// M10K whose read address joined the D2 EA cone, and fitted worse.)  Off (and folded
+// away) without windows, with TEMPLATE_STORE_POST = 0, with the device-MMIO
+// window (a runtime base the template cannot see) or with a window that is not
+// page-aligned (the per-page verdict would not be exact).
+localparam bit Z486_MAP_PAGE_ALIGNED =
+    z486_window_page_aligned(VGA_ENABLE, VGA_BASE, VGA_TOP) &&
+    z486_window_page_aligned(APERTURE_ENABLE, APERTURE_BASE, APERTURE_TOP) &&
+    z486_window_page_aligned(ALIAS_ENABLE, ALIAS0_BASE, ALIAS0_TOP) &&
+    z486_window_page_aligned(ALIAS_ENABLE, ALIAS1_BASE, ALIAS1_TOP) &&
+    z486_window_page_aligned(ALIAS_ENABLE, ALIAS2_BASE, ALIAS2_TOP) &&
+    z486_window_page_aligned(WIN0_ENABLE, WIN0_BASE, WIN0_TOP) &&
+    (!NO_ALLOC_ENABLE || (NO_ALLOC_BOUND[11:0] == 12'h000));
+localparam bit Z486_STORE_POST = Z486_TEMPLATE_WINDOWS && TEMPLATE_STORE_POST &&
+                                 !ENABLE_DEVICE_MMIO && Z486_MAP_PAGE_ALIGNED;
+
+function automatic logic [1:0] page_post_bits(input logic [19:0] pfn);
+    page_post_bits = z486_page_post_bits(pfn,
+        VGA_ENABLE, VGA_CLASS, VGA_BASE, VGA_TOP,
+        APERTURE_ENABLE, APERTURE_CLASS, APERTURE_BASE, APERTURE_TOP,
+        ALIAS_ENABLE, ALIAS_CLASS,
+        ALIAS0_BASE, ALIAS0_TOP, ALIAS1_BASE, ALIAS1_TOP, ALIAS2_BASE, ALIAS2_TOP,
+        WIN0_ENABLE, WIN0_CLASS, WIN0_BASE, WIN0_TOP,
+        NO_ALLOC_ENABLE, NO_ALLOC_CLASS, NO_ALLOC_BOUND);
+endfunction
+
+wire        st_post_paged = CR0[31];
+wire [19:0] st_post_pfn = st_post_paged ? vipt_tlb_phys_hit_form[31:12] : st_sidecar_page;
+wire [1:0]  st_post_bits = st_post_paged ? page_post_bits(vipt_tlb_phys_hit_form[31:12])
+                                          : page_post_bits(st_sidecar_page);
+wire        st_post_a20_ok = a20_enable ? ((st_post_pfn & ~A20_MASK_ON[31:12]) == 20'd0)
+                                        : ((st_post_pfn & ~A20_MASK_OFF[31:12]) == 20'd0);
+assign memmap_post_ok = Z486_STORE_POST && st_post_bits[1] &&
+                        !(st_post_bits[0] && win0_unmapped) && st_post_a20_ok;
+
 data_access data_access_inst (
     // Clock and reset
     .clk(clk),
     .reset_n(reset_n),
     .memmap_windows(Z486_TEMPLATE_WINDOWS),
+    .memmap_post_ok(memmap_post_ok),
+    .sidecar_page(st_sidecar_page),
     // L1 data cache: probe/resolve port and direct store port
     .dcache_vipt_probe_accepted(dcache_vipt_probe_accepted),
     .dcache_vipt_probe_direct_accepted(dcache_vipt_probe_direct_accepted),
