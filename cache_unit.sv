@@ -353,6 +353,26 @@ if (Z486_TEMPLATE_WINDOWS) begin : g_memmap_windows
         ALIAS0_BASE, ALIAS0_TOP, ALIAS1_BASE, ALIAS1_TOP, ALIAS2_BASE, ALIAS2_TOP,
         WIN0_ENABLE && win0_unmapped, WIN0_CLASS, WIN0_BASE, WIN0_TOP,
         NO_ALLOC_ENABLE, NO_ALLOC_CLASS, no_alloc_bound_eff);
+    // synthesis translate_off
+    // A store taken by the direct store port (a posted store, or the cached
+    // RMW's write) must be one the demand path would have sent into the L1:
+    // cacheable under the template with window 0 as it is now.  The runtime
+    // RAM top is left out on purpose (z486_page_post_bits): above it nothing
+    // is cached and a store reaches the platform alike either way.
+    always @(posedge clk)
+        if (reset_n && fast_store_valid &&
+            (z486_classify_phys(
+                fast_store_phys_addr_raw, fast_store_phys_addr,
+                VGA_PRE_WRAP ? fast_store_phys_addr_raw : fast_store_phys_addr,
+                VGA_ENABLE, VGA_CLASS, VGA_BASE, VGA_TOP,
+                APERTURE_ENABLE, APERTURE_CLASS, APERTURE_BASE, APERTURE_TOP,
+                ALIAS_ENABLE, ALIAS_CLASS,
+                ALIAS0_BASE, ALIAS0_TOP, ALIAS1_BASE, ALIAS1_TOP, ALIAS2_BASE, ALIAS2_TOP,
+                WIN0_ENABLE && win0_unmapped, WIN0_CLASS, WIN0_BASE, WIN0_TOP,
+                NO_ALLOC_ENABLE, NO_ALLOC_CLASS, NO_ALLOC_BOUND) != Z486_CACHE_CACHEABLE))
+            $fatal(1, "cache_unit: direct-port store to %h, which the template does not classify cacheable (win0_unmapped %b, a20 %b)",
+                   fast_store_phys_addr_raw, win0_unmapped, a20_enable);
+    // synthesis translate_on
     assign dcache_req_is_uncached = dcache_req_is_vga_mem ||
                                     (dcache_req_class != Z486_CACHE_CACHEABLE);
     assign dcache_req_is_direct = (dcache_req_class == Z486_CACHE_DIRECT);
