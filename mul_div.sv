@@ -31,7 +31,7 @@ module mul_div
     output logic        div_overflow_cond,  // div_overflow without exec (== div_overflow when exec)
     output logic        div_quotient_zero,
     output logic [5:0]  div_flags,          // {OF,SF,ZF,AF,PF,CF} of the last divide step
-    output logic        mul_flag_overflow
+    output logic        mul_flag_overflow   // IMCS / SZ_EX2 / USTEP_IMUL_FLAGS CF=OF
 );
 
 localparam logic DIV_OP_MASK   = 1'b0;
@@ -303,6 +303,11 @@ always_comb begin
         endcase
     end
     mul_flag_overflow = mul_overflow_by_size(upper, target_sign, op_size);
+    // USTEP_IMUL_FLAGS retires IMUL r,r/m(,imm) straight from the DSP
+    // product: the high half (mul_upper) against the sign of the low half,
+    // which the product holds at bit 31 for every size.
+    if (aluop == ALUJMP_USTEP_IMUL_FLAGS)
+        mul_flag_overflow = mul_overflow_by_size(mul_upper, is_signed_mul && mul_product[31], op_size);
 end
 
 function automatic logic div_sign_bit(input [31:0] value, input [1:0] size);

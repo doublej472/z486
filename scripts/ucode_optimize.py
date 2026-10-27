@@ -69,6 +69,8 @@ ALUJMP_JTSSLIM = 0x4A       # Optimizer-owned: jump if the new TSS limit is too 
 ALUJMP_JNTSKS = 0x54
 ALUJMP_JMP = 0x5A
 ALUJMP_USTEP_AAD_SHIFT = 0x21 # Optimizer-owned: AAD barrel result and CF clear.
+ALUJMP_USTEP_IMUL_FLAGS = 0x1E # Optimizer-owned: IMUL CF/OF from the DSP product.
+SRC_MDTMP = 0x1D            # Multiplier low product / quotient.
 ALUJMP_USTEP_FAULT_DONE = 0x22 # Optimizer-owned: fault delivery completion.
 ALUJMP_PASS = 0x14
 SRC_USTEP_SEG_INDEX = 0x3A  # Optimizer-owned: decoded segment as legacy IRF selector.
@@ -596,6 +598,22 @@ PATCHES = [
     # address step while count remains nonzero and no interrupt is pending.
     Patch(0x268, "REP STOS: skip redundant per-element count check",
           fields=dict(alusrc=0x3D, aluop=0x47)),
+
+    # ---- IMUL r,r/m(,imm) 17 -> 12 cycles (upstream 3b27dd0) -----------
+    # The 80386 shift-and-add multiplier left the product split across
+    # SIGMA/MDTMP and realigned it in six words (1B6-1BB: LDBSRM, two SHIFTs,
+    # IMCS). The DSP multiplier delivers the low product (MDTMP source) and
+    # the high product (SIGMA) already aligned when the 1B5 IMUL4 repeat
+    # exits, so retire straight away: SRCREG takes the low product and the
+    # new micro-op sets CF = OF = (high product != sign extension of the low
+    # one), as IMCS did. SF/ZF/AF/PF stay unchanged as before.
+    #   patched:  1B5 IMUL4 RPT / 1B6 MDTMP->SRCREG IMUL_FLAGS RNI / 1B7 slot
+    #   was:      1B5 IMUL4 RPT / 1B6-1BB realign + IMCS + RNI / 1BC slot
+    Patch(0x1B6, "IMUL2_COMMON: low product -> SRCREG, CF/OF from the product, RNI",
+          copy_from=0x030, fields=dict(src=SRC_MDTMP, dst=DEST_SRCREG,
+                                       aluop=ALUJMP_USTEP_IMUL_FLAGS, op=0)),
+    Patch(0x1B7, "IMUL2_COMMON: blank RNI delay slot",
+          copy_from=0x030),
 
     # ---- direct ALU usteps -------------------------------------------
     # Every hardwired ALU retire word owns its architectural write through one

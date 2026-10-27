@@ -681,6 +681,7 @@ localparam ALUJMP_DIV7 = 7'h1f;      // Division main loop (non-restoring algori
 localparam ALUJMP_JDESCA = 7'h20;    // Optimized ustep: jump if descriptor A bit is set
 localparam ALUJMP_JTSSLIM = 7'h4A;   // Optimized ustep: jump if the new TSS limit is below 67h (2Bh for a 286 TSS)
 localparam ALUJMP_USTEP_AAD_SHIFT = 7'h21; // AAD shift step: barrel result plus CF clear
+localparam ALUJMP_USTEP_IMUL_FLAGS = 7'h1E; // IMUL r,r/m(,imm) retire: CF/OF from the DSP product
 localparam ALUJMP_USTEP_FAULT_DONE = 7'h22; // Fault/interrupt delivery completion marker
 localparam ALUJMP_DIV5 = 7'h1d;      // Division final correction
 localparam ALUJMP_LDCNTR = 7'h3E;    // Load COUNTR with iteration count
