@@ -174,6 +174,7 @@ module data_access
     input  logic                    uc_is_mem_busop,
     input  logic                    uc_is_write,
     input  logic                    uc_p_pure_dly,
+    input  logic                    uc_bus_or_dly,      // this uop is a bus op or a DLY (uc[38])
     input  logic                    x87_direct_mem_req,
     output logic                    pop_direct_r,
     output logic                    rd_fast_finish,
@@ -217,6 +218,35 @@ wire       vipt_load_retire;
 // live TLB lookup sits in the RD cycle. A miss goes to paging's registered
 // path.
 reg        ucrd_valid_r;               // probed last cycle; resolves now
+// A bus read updates OPR_R no earlier than the routine's next bus or DLY
+// uop, and the microcode relies on it: LD_DESCRIPTOR reads the second
+// descriptor dword while the uops before its DLY still use the first. A hit
+// resolving under any other uop holds its data and commits at that next bus
+// or DLY uop (or at the end of the instruction); a bus uop that finds it held
+// waits one cycle, as it would wait for the slow path's read (upstream 3b27dd0).
+reg        ucrd_held_r;
+reg [31:0] ucrd_held_data_r;
+// A first-uStep or x87 read stops every uop after a miss (its DLY may fold
+// the RNI), as does a read whose DLY passed the resolve cycle. Otherwise a
+// missed read in a routine is a bus read in flight: only bus and DLY uops,
+// and the instruction's delay slot, wait for OPR_R.
+reg        ucrd_strict_r;
+// The linear page of the last microcode read that missed the L1.  A read
+// past the first uStep (or a first-uStep read that is not its EA read, the
+// only kind that probed before) skips the probe on that page and enters
+// paging directly: a device window (VRAM, the PC-98 template's uncached
+// classes) never hits, and a cold page streams through paging's line fill,
+// so probing first would only add the probe/resolve cycles to every element
+// of a REP MOVS/LODS over it.  Any probe that hits that physical page (a direct
+// load, a first-uStep EA read) shows the page is cached again and clears the
+// entry.  Only a hint: either path is correct.
+reg        ucrd_nohit_valid_r;
+reg [19:0] ucrd_nohit_page_r;
+reg [19:0] ucrd_nohit_phys_r;          // its physical page: a later L1 hit there clears it
+wire       ucrd_old_class = i_first && i_ex.ind_is_ea;
+wire       ucrd_nohit_skip = !ucrd_old_class && ucrd_nohit_valid_r &&
+                             (ind_linear[31:12] == ucrd_nohit_page_r);
+wire       ucrd_miss_busy = ucrd_slow_req_r || ucrd_slow_wait_r;
 // In the resolve cycle a uop with side effects runs only when the read's
 // translation was already known good in the RD cycle (the sidecar held its
 // page), so no fault can follow; a bus operation always waits, keeping
@@ -228,8 +258,9 @@ reg        ucrd_tlbok_r;               // the read's translation was known good
 // uop, or a DLY that folds its instruction's RNI (MOV r,m) retires and the
 // delay slot copies a stale OPR_R before the slow path returns or faults.
 assign stall_ucrd = (ucrd_valid_r && (!ucrd_tlbok_r || (!uc_p_pure_dly && uc_busreq))) ||
-                        ucrd_slow_req_r || ucrd_slow_wait_r;
-wire       ucrd_busy = ucrd_valid_r || ucrd_slow_req_r || ucrd_slow_wait_r;
+                        (ucrd_held_r && uc_bus_or_dly && !uc_p_pure_dly) ||
+                        (ucrd_miss_busy && (ucrd_strict_r || uc_bus_or_dly || i_rni_delay));
+wire       ucrd_busy = ucrd_valid_r || ucrd_held_r || ucrd_miss_busy;
 reg        rd_fast_probed_r;            // D2 preread was accepted
 reg [31:0] rd_fast_linear_r;
 reg [1:0]  rd_fast_size_r;
@@ -757,12 +788,17 @@ wire rd_fast_hit = rd_fast_valid_r && rd_fast_probed_r &&
 assign rd_fast_finish = rd_fast_valid_r && i_first && uc_exec;
 // A microcode read hit writes OPR_R as paging does for a single access: the
 // operand shifted down from its byte lane and zero-extended from its size.
-assign fast_opr_commit = (rd_fast_finish && rd_fast_hit) || ucrd_hit;
-assign fast_opr_data = ucrd_valid_r
-    ? format_hardwired_load(dcache_vipt_resolve_data, ucrd_linear_r[1:0],
-                            ucrd_size_r, LOAD_RESULT_COPY)
-    : format_hardwired_load(dcache_vipt_resolve_data, rd_fast_lane_r,
-                            rd_fast_size_r, LOAD_RESULT_COPY);
+wire [31:0] ucrd_hit_data = format_hardwired_load(dcache_vipt_resolve_data, ucrd_linear_r[1:0],
+                                                  ucrd_size_r, LOAD_RESULT_COPY);
+wire        ucrd_hit_hold = ucrd_hit && !ucrd_x87_r && !uc_bus_or_dly && !i_rni_delay;
+wire        ucrd_held_commit = ucrd_held_r &&
+    (uc_bus_or_dly || i_rni_delay || !uc_active || q_flush || any_fault || interrupt_entry);
+assign fast_opr_commit = (rd_fast_finish && rd_fast_hit) || (ucrd_hit && !ucrd_hit_hold) ||
+                         ucrd_held_commit;
+assign fast_opr_data = ucrd_held_r ? ucrd_held_data_r
+                     : ucrd_valid_r ? ucrd_hit_data
+                     : format_hardwired_load(dcache_vipt_resolve_data, rd_fast_lane_r,
+                                             rd_fast_size_r, LOAD_RESULT_COPY);
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         rd_fast_valid_r <= 1'b0;
@@ -838,18 +874,21 @@ assign dir_access_size = rd_fast_valid_r
 // submission remains idle-gated above.  This keeps mem_servicing out of the
 // live-TLB/cache-address cone without changing request ordering.
 assign vipt_slow_addr_owned = vipt_load_slow_req_r;
-// A cacheable, non-crossing first-uStep EA read (or x87 direct operand read)
-// with paging idle probes the cache instead of entering paging; a missed one
-// enters paging from its token.
-// A locked read (LOCK prefix, XCHG with memory) must read memory, so it never
-// takes the cache-probing microcode-read path.
+// A cacheable, non-crossing microcode read from any uStep (or x87 direct
+// operand read) with paging idle probes the cache instead of entering paging;
+// a missed one enters paging from its token (upstream 3b27dd0; it was the
+// first-uStep EA read only).
+// A locked read (LOCK prefix, XCHG with memory, and the microcode's locked
+// descriptor/TSS read RD_OPR_WORD, z486.sv lock_read_uop) must read memory, so
+// it never takes the cache-probing microcode-read path.
 wire        ucrd_uc_read = uc_data_busreq && uc_is_mem_busop &&
     !uc_is_write && !uc_is_check_write && !mem_is_io && !locked_insn &&
-    (uc_buscode != BUSOP_RD_IND) && i_first && i_ex.ind_is_ea && !x87_direct_mem_req;
+    (uc_buscode != BUSOP_RD_IND) && (uc_buscode != BUSOP_RD_OPR_WORD) &&
+    !ucrd_nohit_skip && !x87_direct_mem_req;
 wire [1:0]  ucrd_size_now = x87_direct_mem_req ? 2'd2 : mem_eff_size;
 assign ucrd_route_pre = !hardwired_off && mem_op_eligible && (ucrd_uc_read || x87_direct_mem_req) &&
-    ind_linear_valid && !vipt_load_slow_req_r && !ucrd_valid_r &&
-    !ucrd_slow_req_r && !ucrd_slow_wait_r && paging_demand_idle &&
+    ind_linear_valid && !vipt_load_slow_req_r && !ucrd_valid_r && !ucrd_held_r &&
+    !ucrd_miss_busy && paging_demand_idle &&
     !access_crosses_dword(ucrd_size_now, ind_linear[1:0]) &&
     dcache_vipt_probe_ready && !ex_reprobe;
 // A held microcode uop must not probe twice; an x87 direct read is issued
@@ -900,8 +939,23 @@ always_ff @(posedge clk) begin
         ucrd_phys_r <= 32'd0;
         ucrd_slow_req_r <= 1'b0;
         ucrd_slow_wait_r <= 1'b0;
+        ucrd_held_r <= 1'b0;
+        ucrd_held_data_r <= 32'd0;
+        ucrd_strict_r <= 1'b0;
+        ucrd_nohit_valid_r <= 1'b0;
+        ucrd_nohit_page_r <= 20'd0;
+        ucrd_nohit_phys_r <= 20'd0;
     end else begin
+        if (dcache_vipt_resolve_valid && dcache_vipt_resolve_hit &&
+            (vipt_resolve_phys[31:12] == ucrd_nohit_phys_r))
+            ucrd_nohit_valid_r <= 1'b0;
         ucrd_valid_r <= ucrd_take;
+        if (ucrd_held_commit)
+            ucrd_held_r <= 1'b0;
+        if (ucrd_hit_hold) begin
+            ucrd_held_r <= 1'b1;
+            ucrd_held_data_r <= ucrd_hit_data;
+        end
         ucrd_tlbok_r <= ucrd_take && sidecar_valid_r &&
                         (sidecar_page_r == ind_linear[31:12]) && !vipt_tlb_is_vga_mem &&
                         (!vipt_page_enabled ||
@@ -911,9 +965,17 @@ always_ff @(posedge clk) begin
             ucrd_size_r <= ucrd_size_now;
             ucrd_cpl_r <= pg_cpl;
             ucrd_x87_r <= x87_direct_mem_req;
+            ucrd_strict_r <= i_first || x87_direct_mem_req;
         end
         if (ucrd_valid_r && !ucrd_hit) begin
             ucrd_slow_req_r <= 1'b1;
+            ucrd_nohit_valid_r <= 1'b1;
+            ucrd_nohit_page_r <= ucrd_linear_r[31:12];
+            ucrd_nohit_phys_r <= vipt_resolve_phys[31:12];
+            // A DLY that passed the resolve cycle leaves its wait to the
+            // uops after it.
+            if (uc_bus_or_dly)
+                ucrd_strict_r <= 1'b1;
             ucrd_phys_ok_r <= ucrd_translation_ok && !vipt_tlb_is_vga_mem;
             ucrd_phys_r <= vipt_resolve_phys;
         end
