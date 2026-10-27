@@ -1755,6 +1755,7 @@ always_ff @(posedge clk) begin
                 ALUJMP_SHIFT: ;
                 ALUJMP_USTEP_AAD_SHIFT: eflags[0] <= 1'b0;
                 ALUJMP_SZ_EX2,
+                ALUJMP_USTEP_IMUL_FLAGS,
                 ALUJMP_IMCS: begin
                     eflags[0]  <= muldiv_flag_overflow;
                     eflags[11] <= muldiv_flag_overflow;
