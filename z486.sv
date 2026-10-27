@@ -2839,6 +2839,7 @@ data_access data_access_inst (
     .uc_is_mem_busop(uc_is_mem_busop),
     .uc_is_write(uc_is_write),
     .uc_p_pure_dly(uc_p_pure_dly),
+    .uc_bus_or_dly(uc_bus_or_dly),
     .x87_direct_mem_req(x87_direct_mem_req),
     .pop_direct_r(pop_direct_r),
     .rd_fast_finish(rd_fast_finish),
