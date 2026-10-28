@@ -21,6 +21,23 @@ start:
     jmp short .pg
 .pg:
     call body
+    ; the paged verdict is the FRAME's: linear 0x200000 maps the GVRAM E-plane
+    ; at 0xE0000 (must not post; outside the TLB's own VGA bit, A0000-BFFFF),
+    ; linear 0x201000 maps RAM at 0x38000 (posts)
+    ; (a load walks the page into the TLB and the sidecar; the first store sets
+    ; the PTE's D bit through the demand path; the later stores may post)
+    mov eax, [0x200020]
+    mov dword [0x200020], 0x5A5A1234
+    mov dword [0x200024], 0x5A5A1234
+    mov dword [0x200028], 0x5A5A1234
+    cmp dword [0xE0024], 0x5A5A1234
+    jne fail
+    mov eax, [0x201040]
+    mov dword [0x201040], 0x0F0F1234
+    mov dword [0x201044], 0x0F0F1234
+    mov dword [0x201048], 0x0F0F1234
+    cmp dword [0x38048], 0x0F0F1234
+    jne fail
     mov eax, cr0
     and eax, 0x7FFFFFFF
     mov cr0, eax
