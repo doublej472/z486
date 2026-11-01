@@ -25,7 +25,7 @@ UCODE_BITS = 37
 # Free words after upstream's XADD/CMPXCHG/INVD block (0x9D9-0x9F5).
 ALIGN_FAULT_ENTRY = 0x9F6     # 486 #AC fault entry (two words)
 CALL_STACK_FAULT = 0x9F8      # #SS(new SS selector) for a CALL gate's new stack (three words)
-REAL_INT_FLAGS = 0x9FB        # real-mode interrupt entry: EFLAGS high word cleared (three words)
+REAL_INT_FLAGS = 0x91B        # real-mode interrupt entry: EFLAGS mask + its own delivery tail (16 words, in LOADALL_FREE)
 SRC_SLCTR = 0x35
 ALUJMP_AND = 0x08
 # The 80386 LOADALL routine (entry 0x8F6, words 0x8F7-0x931) is reached only
@@ -38,6 +38,7 @@ DESC_SET_ACCESSED = LOADALL_FREE + 0x04  # locked Accessed-bit RMW (8 words)
 TASK_SET_BUSY = LOADALL_FREE + 0x0C      # task switch: locked busy-bit RMW (8 words)
 LTR_SET_BUSY = LOADALL_FREE + 0x14       # LTR: locked busy-bit RMW (5 words)
 TASK_LIMIT_CHECK = LOADALL_FREE + 0x19   # task switch: TSS limit check (10 words)
+# REAL_INT_FLAGS = LOADALL_FREE + 0x23 (16 words) follows it.
 ALUSRC_CONST_8 = 0x19
 ALUSRC_CONST_4 = 0x33
 ALUSRC_CONST_NEG4 = 0x37
@@ -218,16 +219,24 @@ PATCHES = [
     # 0; AC <- 0"; SingleStepTests 80386 real mode under the 486 expectation,
     # e.g. F6.4[46]). The real-mode entry goes through its own copy of the
     # 386 pair instead: AND EFLAGS with MASK16 (the 386's 8D5), then a long
-    # jump to 8D7 whose delay slot writes EFLAGS (the 386's 8D6). One cycle
-    # more than the shared pair, on the real-mode path only.
-    Patch(0x8AE, "real-mode interrupt entry: long jump to its own EFLAGS mask",
+    # jump back to 8D7 whose delay slot wrote EFLAGS (the 386's 8D6): one
+    # cycle more than the shared pair.  The copy now carries the rest of the
+    # 386 delivery tail too (8D7 DESCOD .. 8E4, the three pushes, the eIP/eSP/CS
+    # writes and the completion marker), so the pair runs straight into it and
+    # the long jump back is gone: the real-mode path costs what the 386's did.
+    # Only 8AE enters it; 8DF's JNERRC keeps its relative target (8E3's copy)
+    # and 8E1's LJMPP (protected mode only) its absolute one.
+    Patch(0x8AE, "real-mode interrupt entry: long jump to its own EFLAGS mask and tail",
           fields=longjump(REAL_INT_FLAGS)),
     Patch(REAL_INT_FLAGS, "real-mode interrupt entry: EFLAGS AND MASK16 (the 386's 8D5)",
           copy_from=0x8D5),
-    Patch(REAL_INT_FLAGS + 1, "real-mode interrupt entry: long jump to the vector read at 8D7",
-          word=uword(**longjump(0x8D7))),
-    Patch(REAL_INT_FLAGS + 2, "real-mode interrupt entry: EFLAGS <- SIGMA in the delay slot (the 386's 8D6)",
+    Patch(REAL_INT_FLAGS + 1, "real-mode interrupt entry: EFLAGS <- SIGMA (the 386's 8D6)",
           copy_from=0x8D6),
+    *[Patch(REAL_INT_FLAGS + 2 + (a - 0x8D7),
+            f"real-mode interrupt entry: copy of the delivery tail word {a:03X}",
+            copy_from=a,
+            fields=(dict(aluop=ALUJMP_USTEP_FAULT_DONE) if a == 0x8E3 else None))
+      for a in range(0x8D7, 0x8E5)],
 
     # CLI/STI (entry 7F7, shared; the decoder supplies the flag op): the 386
     # routine's IOPL gate jumps to 7EC, which flushes the queue and refetches
