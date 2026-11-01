@@ -249,6 +249,28 @@ PATCHES = [
           copy_from=0x05C, fields=dict(op=0)),
     Patch(0x05E, "LOOP/LOOPcc not taken: blank RNI delay slot",
           copy_from=0x030),
+    # Real-mode/V86 far transfer tail (CALL/JMP ptr16:16 and m16:16, RETF,
+    # IRET: 2E3, the 2EA fall-through, 302 and 814 enter 2EB; 2FA enters
+    # 2ED).  The 386 reads the CS limit into IRF2 (2EB LLIM), keeps it in
+    # TMPB (2EC), loads the base (2ED SBRM) and writes the limit back (2EE
+    # SLIM) before SPCR (2EF) and the redirect (2F0 DESCOD, 2F1 PREF).  z486's
+    # SBRM leaves the limit and granularity alone (segmentation_unit.sv
+    # SEG_CMD_SBRM: "Limit and granularity are NOT reset"), so the write-back
+    # only restores the limit already there - and through LLIM's G-expanded
+    # value it would even change a G=1 limit, where a real-mode load keeps
+    # it.  Nothing after 2EE reads TMPB or that IRF2 value (2F0 reloads IND
+    # before the PREF; the tail retires at 2F3).  2EB/2EC/2ED become SBRM,
+    # SPCR with a jump to the PREF, and the DESCOD word in its delay slot;
+    # 2FA jumps to 2EB.  Three clocks off each of these (one off m16:16 JMP),
+    # the old 2EE/2EF are unreachable; 2F0/2F1 keep their other entries.
+    Patch(0x2EB, "real-mode far tail: CS base <- selector (the 386's 2ED SBRM); limit kept",
+          copy_from=0x2ED),
+    Patch(0x2EC, "real-mode far tail: SPCR (the 386's 2EF) + jump to the PREF at 2F1",
+          copy_from=0x2EF, fields=dict(aluop=ALUJMP_JMP, alusrc=reljump(0x2EC, 0x2F1))),
+    Patch(0x2ED, "real-mode far tail: DESCOD <- TMPG (the 386's 2F0) in the jump's delay slot",
+          copy_from=0x2F0),
+    Patch(0x2FA, "far JMP m16:16 (real mode): jump to the shortened tail at 2EB",
+          fields=dict(alusrc=reljump(0x2FA, 0x2EB))),
     # 0F C8-CF has no 80386 PLA entry. The decoder redirects it to this
     # otherwise unused word and selects the register through opcode[2:0].
     Patch(0x9C4, "BSWAP r32 extension: SRCREG -> byte-swapped SRCREG + RNI",
