@@ -229,6 +229,26 @@ PATCHES = [
     Patch(REAL_INT_FLAGS + 2, "real-mode interrupt entry: EFLAGS <- SIGMA in the delay slot (the 386's 8D6)",
           copy_from=0x8D6),
 
+    # CLI/STI (entry 7F7, shared; the decoder supplies the flag op): the 386
+    # routine's IOPL gate jumps to 7EC, which flushes the queue and refetches
+    # the next sequential instruction (7EC DESCOD <- EIP, 7ED PREF, 7EE DLY)
+    # before 7EF writes IF (FLGOPS) and 7F0 retires.  z486 needs no refetch:
+    # decode does not depend on IF, the STI shadow starts at the instruction's
+    # RNI from its boundary action (interrupt_controller shadow_start), and
+    # the boundary reads EFLAGS[9] after 7EF either way.  The gate jumps
+    # straight to 7EF; its not-taken (#GP) path is unchanged.  8 -> about 5
+    # clocks (i486: 5, MAME cycles.h CLI/STI 486 column).
+    Patch(0x7F7, "CLI/STI: IOPL gate jumps straight to the FLGOPS word 7EF (no 7EC/7ED refetch)",
+          fields=dict(alusrc=reljump(0x7F7, 0x7EF))),
+    # LOOP/LOOPcc not taken: JCNT1 (059) and LOOPnE (061) jump here, and a
+    # taken one already suppresses its delay-slot PREF (microsequencer
+    # pref_suppress_taken), so the 386's re-flush to EIP at 05D/05E refetches
+    # the next sequential instruction for nothing.  Write eCX and retire.
+    # 10 -> about 6.7 clocks (i486: 6).
+    Patch(0x05D, "LOOP/LOOPcc not taken: eCX <- COUNTR + RNI (no re-flush)",
+          copy_from=0x05C, fields=dict(op=0)),
+    Patch(0x05E, "LOOP/LOOPcc not taken: blank RNI delay slot",
+          copy_from=0x030),
     # 0F C8-CF has no 80386 PLA entry. The decoder redirects it to this
     # otherwise unused word and selects the register through opcode[2:0].
     Patch(0x9C4, "BSWAP r32 extension: SRCREG -> byte-swapped SRCREG + RNI",
