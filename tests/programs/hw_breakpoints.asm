@@ -65,7 +65,11 @@ bp_exec:
     jne fail
 
     ; 2. Dword write breakpoint on wvar (DR1, R/W 01, LEN 11, L1); DR3 on the
-    ; same dword for reads or writes but disabled: DR6 reports it too.
+    ; same dword for reads or writes but disabled.  DR6.B3 for that disabled
+    ; match is vendor-variant: the Intel486 PRM 11.2.3 sets it, AMD APM 24593
+    ; 13.1.1.3 and a real Am486DX4 do not (CPUSUITE-XE10-triage:
+    ; debug_bn_noenable data=00004000h), Intel SDM vol. 3 (DR6) says "may or
+    ; may not".  Either value passes.
     call clear_log
     mov eax, BASE + wvar
     mov dr1, eax
@@ -83,8 +87,11 @@ after_write:
     jne fail
     mov ecx, [log_dr6]
     and ecx, 0xF
-    cmp ecx, 0xA                    ; B1 and the disabled B3
+    cmp ecx, 0x2                    ; B1 only (AMD APM, Am486DX4, z486)
+    je hw_case2_b3_either
+    cmp ecx, 0xA                    ; B1 and the disabled B3 (Intel486 PRM)
     jne fail
+hw_case2_b3_either:
     test dword [log_flags], RF_FLAG ; traps do not set RF
     jnz fail
 
