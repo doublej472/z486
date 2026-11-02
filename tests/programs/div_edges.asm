@@ -11,6 +11,11 @@
 ; reports its case number in EBP via DATA_PORT (0xE4). A #DE handler installed
 ; at IVT[0] records the fault and resumes at the per-case label, the same
 ; pattern the suite's seg_stack_wrap_rm uses for real-mode #SS/#GP.
+;
+; Case 231 (IDIV r8 7F81h / 81h) follows the silicon instead: the 486 divider
+; completes it with AX=0180h (see the case).  Cases 569 (r16) and 927 (r32) are
+; the same pattern at the wider sizes; no capture covers them yet, so they keep
+; the documented #DE.
 
 BITS 16
 org 0
@@ -2815,7 +2820,12 @@ cases:
 .c230:
         cmp     word [faulted], 1
         jne     fail
-; case 231: idiv r8 0x7f81 / 0x81 -> #DE
+; case 231: idiv r8 0x7f81 / 0x81 -> q=0x80 r=0x1
+;   The real Am486DX4 (CPUSUITE-XE10 run, div_edges FAIL data=000000E7: cases
+;   0-230 matched, 231 completed without #DE) misses this overflow (true
+;   quotient -257): the 386/486 non-restoring divider's 7Fh quotient ripples to
+;   80h (US 5,689,721).  The remainder is the one SingleStepTests 386 captures
+;   give every such case: (dividend + 80h * divisor) mod 100h.
         mov     ebp, 231
         mov     word [resume_ip], .c231
         mov     word [faulted], 0
@@ -2823,7 +2833,11 @@ cases:
         mov     cl, 0x81
         idiv     cl
 .c231:
-        cmp     word [faulted], 1
+        cmp     word [faulted], 0
+        jne     fail
+        cmp     al, 0x80
+        jne     fail
+        cmp     ah, 0x1
         jne     fail
 ; case 232: idiv r8 0x80ff / 0x81 -> #DE
         mov     ebp, 232
