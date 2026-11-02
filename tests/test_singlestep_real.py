@@ -218,6 +218,10 @@ def apply_mask(value, mask):
     return value & mask
 
 
+# The arithmetic flags a CMPS/SCAS writes: OF SF ZF AF PF CF.
+REP_CMPS_FLAGS = 0x08D5
+
+
 def decode_opcode_and_width(nbytes, init_regs):
     """Return the opcode position and effective operand width."""
     prefixes = {0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3}
@@ -424,6 +428,23 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False, _repeat=0):
     # The final state is an interrupt/exception handler entry.
     delivered = (not completed and opcode is not None and
                  (is_fault_test(test) or opcode in (0xCC, 0xCD, 0xCE)))
+
+    # A REPE/REPNE CMPS/SCAS that faults on a later element (ECX already
+    # stepped, the frame's IP the instruction's own): the 386EX capture pushes
+    # the last completed compare's flags; the 486 restores the flags from
+    # before the instruction (Intel SDM vol. 2, REP/REPE/REPZ/REPNE/REPNZ:
+    # "When a fault occurs during the execution of a CMPS or SCAS instruction
+    # that is prefixed with REPE or REPNE, the EFLAGS value is restored to the
+    # state prior to the execution of the instruction"; a real Am486DX4 does,
+    # CPUSUITE-XE10-triage tri_rep_flags).  Its arithmetic flags (OF SF ZF AF
+    # PF CF) in EFLAGS and in the pushed FLAGS are the initial ones.
+    rep_cmps_fault_flags = None
+    if cpu_mode == '486' and delivered and opcode in (0xA6, 0xA7, 0xAE, 0xAF):
+        oi = decode_opcode_and_width(nbytes, init_regs)[0]
+        if (any(b in (0xF2, 0xF3) for b in nbytes[:oi]) and
+                fin_regs0.get('ecx', init_regs.get('ecx', 0)) !=
+                init_regs.get('ecx', 0)):
+            rep_cmps_fault_flags = init_regs.get('eflags', 0) & REP_CMPS_FLAGS
 
     # Real-mode IRETD loads all of EFLAGS from the popped image (Intel486 PRM,
     # IRET/IRETD Operation: "EFLAGS <- Pop()"), including the 486's AC.
@@ -646,6 +667,10 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False, _repeat=0):
             expected_val &= in_port_mask
             got_val &= in_port_mask
 
+        if reg == 'eflags' and rep_cmps_fault_flags is not None:
+            expected_val = ((expected_val & ~REP_CMPS_FLAGS) |
+                            rep_cmps_fault_flags)
+
         # A real-mode interrupt or exception delivery clears AC with IF and TF
         # (Intel SDM, INT n/INTO/INT3 Operation, REAL-ADDRESS-MODE: "AC <- 0";
         # the core's CROM masks EFLAGS to its low word).  The 386 has no AC, so
@@ -745,6 +770,22 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False, _repeat=0):
                 frame_flags_mask = {fl_addrs[0]: undef & 0xFF,
                                     fl_addrs[1]: (undef >> 8) & 0xFF}
 
+    # The pushed FLAGS of a REPE/REPNE CMPS/SCAS fault on a later element
+    # (see rep_cmps_fault_flags): the arithmetic flags from before it.
+    rep_cmps_frame = {}
+    if rep_cmps_fault_flags is not None and 'esp' in final_regs:
+        fin_mem = dict(final_ram)
+        ss_base = final_regs.get('ss', init_regs.get('ss', 0)) << 4
+        fsp = final_regs['esp'] & 0xFFFF
+        ip_addrs = [(ss_base + ((fsp + k) & 0xFFFF)) for k in range(2)]
+        if all(a in fin_mem for a in ip_addrs):
+            pushed_ip = fin_mem[ip_addrs[0]] | (fin_mem[ip_addrs[1]] << 8)
+            if pushed_ip == (init_regs.get('eip', 0) & 0xFFFF):
+                for k in range(2):
+                    a = ss_base + ((fsp + 4 + k) & 0xFFFF)
+                    rep_cmps_frame[a] = ((REP_CMPS_FLAGS >> (8 * k)) & 0xFF,
+                                         (rep_cmps_fault_flags >> (8 * k)) & 0xFF)
+
     # An AAM #DE frame holds FLAGS as the faulting AAM left them.
     if (cpu_mode == '486' and nbytes and 'esp' in final_regs and
             is_aam_fault(nbytes, init_regs, final_regs)):
@@ -773,6 +814,10 @@ def run_test(test, global_mask, cpu_mode='486', notrace=False, _repeat=0):
             if addr == ac_addr:
                 expected_val = ((expected_val & ~0x04) |
                                 ((init_regs.get('eflags', 0) >> 16) & 0x04))
+
+        if addr in rep_cmps_frame:
+            m, v = rep_cmps_frame[addr]
+            expected_val = (expected_val & ~m & 0xFF) | v
 
         if got_val is not None and addr in frame_flags_mask:
             expected_val &= frame_flags_mask[addr]
