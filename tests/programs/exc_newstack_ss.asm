@@ -1,14 +1,10 @@
 ; exc_newstack_ss - an exception (#GP from HLT at CPL3) delivered through a
 ; ring-0 interrupt gate whose ring-0 stack (TSS.ESP0 = 10h) cannot hold the
-; 24-byte frame raises #SS(0) with EXT=1 (error code 0001h), like INT n's
-; #SS(0): only a CALL through a call gate reports the new SS selector
-; (6afb783: ss_call_newstack requires interrupt_hw without external_event).
-; Original header (int_newstack_ss):
-; INT n from CPL3 through a DPL3 interrupt gate whose
-; ring-0 stack (TSS.ESP0 = 10h) cannot hold the 20-byte frame raises #SS(0)
-; with EXT=0 (software interrupt).  486 PRM INT pseudocode
-; (INTERRUPT-TO-INNER-PRIVILEGE): "New stack must have room for 20 bytes
-; else #SS(0)".  #SS is a task gate so its delivery does not need ESP0.
+; 24-byte frame raises #SS(new SS selector) with EXT=1: error code 39h.
+; A real Am486DX4 reports 39h (CPUSUITE-XE10 run 1: this program's FAIL
+; data 55000039h); Intel SDM INT n Operation, "#SS(error_code(NewSS,0,EXT))"
+; with EXT=1 for an exception.  #SS is a task gate so its delivery does not
+; need ESP0.  (derived from int_newstack_ss)
 ; (derived from callgate_newstack_ss)
 ; Fail (port E4): 0x5500xxxx = #SS with a wrong error code (low word = error
 ; code), 0x66xxxxxx = wrong vector/EIP, 0x77 = the call completed.
@@ -72,7 +68,7 @@ gate_target:
 
 ss_handler:                     ; runs as a task: [esp] = error code
     mov eax, [esp]
-    cmp eax, 1                  ; #SS(0), EXT=1
+    cmp eax, SEL_SMALLSS | 1    ; #SS(new SS selector), EXT=1
     jne .bad_err
     cmp dword [tss+0x10000+0x20], call_site ; the interrupted task's saved EIP
     jne .bad_eip
