@@ -1329,9 +1329,13 @@ function automatic logic irf_writes_gpr(input [31:0] countr, input logic has_0f,
 endfunction
 
 // 486 debug-register fixed bits.  DR6: bits 31-16 and 11-4 read as one, bit
-// 12 as zero.  DR7: bit 10 reads as one, bits 15-14 and 12-11 as zero.
+// 12 keeps the written value (Intel SDM vol. 3, Architecture Compatibility,
+// "Differences in Debug Register DR6": "it is possible to write a 1 in this
+// bit on the Intel486 processor"; a real Am486DX4 reads FFFFFFFFh back,
+// CPUSUITE-XE10-triage tri_dr6dr7).  DR7: bit 10 reads as one, bits 15-14
+// and 12-11 as zero.
 function automatic [31:0] dr6_value(input [31:0] value);
-    dr6_value = (value | 32'hFFFF_0FF0) & ~32'h0000_1000;
+    dr6_value = value | 32'hFFFF_0FF0;
 endfunction
 function automatic [31:0] dr7_value(input [31:0] value);
     dr7_value = (value & ~32'h0000_D800) | 32'h0000_0400;
