@@ -59,8 +59,8 @@ logic        div_dividend_neg;
 logic        div_divisor_neg;
 logic [31:0] prediv_q_in;
 logic [31:0] prediv_r_in;
-logic        idiv8_ripple;               // this PREDIV is a missed r8 overflow candidate
-logic        idiv8_ripple_r;             // registered at PREDIV, read at IDIV2
+logic        idiv_ripple;                // this PREDIV is a missed-overflow candidate
+logic        idiv_ripple_r;              // registered at PREDIV, read at IDIV2
 
 wire [63:0] mul_product;
 wire [31:0] mul_upper = op_size == 2'd0 ? {24'h0, mul_product[39:32]} :
@@ -97,7 +97,7 @@ always_ff @(posedge clk) begin
         idiv_dividend_neg   <= 1'b0;
         idiv_divisor_neg    <= 1'b0;
         div_first_cycle     <= 1'b0;
-        idiv8_ripple_r      <= 1'b0;
+        idiv_ripple_r       <= 1'b0;
         div_flags_r         <= 6'd0;
         divisor_abs_r       <= 32'd0;
         op_size_r           <= 2'd0;
@@ -139,7 +139,7 @@ always_ff @(posedge clk) begin
                     div_r_nonneg          <= div_iter_r_nonneg_next;
                     idiv_dividend_neg     <= div_dividend_neg;
                     idiv_divisor_neg      <= div_divisor_neg;
-                    idiv8_ripple_r        <= idiv8_ripple;
+                    idiv_ripple_r         <= idiv_ripple;
                     div_first_cycle       <= 1'b0;
                 end
                 ALUJMP_DIV5:
@@ -220,32 +220,32 @@ always_comb begin
         end
     endcase
 
-    // IDIV r8's missed overflow.  The 386/486 divider is a two's-complement
+    // IDIV's missed overflow.  The 386/486 divider is a two's-complement
     // non-restoring loop (US 5,689,721, "Detecting overflow conditions for
     // negative quotients in nonrestoring two's complement division"): for a
     // negative quotient it misses an overflow whose unadjusted quotient is
     // 01111111b, because the sign correction "ripples it to 10000000", a legal
-    // -128 ("these anomalous overflow conditions ... occur in 386- and
-    // 486-type microprocessors manufactured by Intel").  Run on its 8-bit
-    // registers, that loop completes exactly the signs-differ divides with
-    // |dividend| = 4000h + 80h * |divisor| + r, 0 <= r < |divisor| (r > 0
-    // for a negative dividend), |divisor| != 80h, and leaves AL=80h,
-    // AH = (dividend + 80h * divisor) mod 100h: the result of dividing
-    // |dividend| - 4000h instead (every 80386EX SingleStepTests capture of
-    // it, e.g. 67F6.7 idx 375 AX=741Eh / 98h -> 1E80h, and a real Am486DX4,
-    // AH=1Eh for the same operands; tests/programs/idiv_quotient_bounds).
-    // This absolute-value divider reproduces it by dropping bit 14 of
-    // |dividend| for a candidate; IDIV2 then faults unless the quotient
-    // is exactly 80h.  A candidate's own dividend always overflows, so no
-    // in-range divide is affected.  Byte only: the loop predicts the same
-    // pattern for r16/r32 (bit 30 / 62), which no capture covers yet.
-    idiv8_ripple = op_size == 2'd0 &&
-                   (div_dividend_neg ^ div_divisor_neg) &&
-                   full64[15:14] == 2'b01 &&
-                   divisor_abs_r[7:0] != 8'h80 &&
-                   !(div_dividend_neg && full64[13:0] == {divisor_abs_r[6:0], 7'h00});
-    if (idiv8_ripple)
-        prediv_r_in[6] = 1'b0;
+    // most-negative quotient ("these anomalous overflow conditions ... occur
+    // in 386- and 486-type microprocessors manufactured by Intel").  Run on
+    // its n-bit registers (the loop is width-generic), it completes exactly
+    // the signs-differ divides with |dividend| = 2^(2n-2) + 2^(n-1)*|divisor|
+    // + r, 0 <= r < |divisor| (r > 0 for a negative dividend), |divisor| !=
+    // 2^(n-1), leaving quotient 2^(n-1) and remainder (dividend + 2^(n-1) *
+    // divisor) mod 2^n: the result of dividing |dividend| - 2^(2n-2) instead.
+    // Evidence: every 80386EX SingleStepTests capture of it at r8 (e.g.
+    // 67F6.7 idx 375 AX=741Eh / 98h -> 1E80h), and a real Am486DX4 at r8
+    // (741Eh / 98h -> AH=1Eh), r16 (7FFF8001h / 8001h -> AX=8000h, DL=01h;
+    // BFCBFFE2h / 68h -> AX=8000h, DL=E2h) and r32 (the same patterns,
+    // EAX=80000000h), with #DE just outside the pattern
+    // (tests/programs/idiv_quotient_bounds).  This absolute-value divider
+    // reproduces it by dropping bit 2n-2 of |dividend| (bit n-2 of its upper
+    // half, always set in a candidate) at PREDIV; IDIV2 then faults unless
+    // the quotient is exactly 2^(n-1).  A candidate's own dividend always
+    // overflows, so no in-range divide is affected.  The candidate test reads
+    // the masked registers, not full64 (idiv_ripple_by_size).
+    idiv_ripple = idiv_ripple_by_size(sigma, divtmp, op_size, divisor_abs_r, div_divisor_neg);
+    if (idiv_ripple)
+        prediv_r_in = prediv_r_in & ~div_ripple_bit_by_size(op_size);
 end
 
 always_comb begin
@@ -280,10 +280,10 @@ always_comb begin
            (div_divisor_masked == 32'd0 ||
             div_op_by_size(DIV_OP_MASK, sigma, op_size) >= div_divisor_masked)) ||
           (aluop == ALUJMP_PREDIV &&
-           (idiv8_ripple ? prediv_r_in[7:0] >= divisor_abs_r[7:0]
-                         : prediv_overflow_by_size(sigma, divtmp, op_size, divisor_abs_r))))) ||
+           (idiv_ripple ? prediv_ripple_overflow_by_size(sigma, divtmp, op_size, divisor_abs_r)
+                        : prediv_overflow_by_size(sigma, divtmp, op_size, divisor_abs_r))))) ||
         (aluop == ALUJMP_IDIV2 &&
-         (idiv8_ripple_r ? quotient != signed_max :
+         (idiv_ripple_r ? quotient != signed_max :
           signs_differ ? quotient > signed_max : quotient >= signed_max)));
     div_overflow = exec && div_overflow_cond;
 end
@@ -400,6 +400,83 @@ function automatic logic prediv_overflow_by_size(input logic [31:0] h_raw,
     prediv_overflow_by_size = (d == 32'd0) || (hx >= d) ||
         (neg && (div_op_by_size(DIV_OP_MASK, l_raw, size) == 32'd0) &&
          (hx == d - 32'd1));
+endfunction
+
+// Bit n-2 of an n-bit operand: the bit of |dividend|'s upper half (2^(2n-2)
+// of the whole) a missed-overflow candidate drops.
+function automatic logic [31:0] div_ripple_bit_by_size(input logic [1:0] size);
+    case (size)
+        2'd0: div_ripple_bit_by_size = 32'h0000_0040;
+        2'd1: div_ripple_bit_by_size = 32'h0000_4000;
+        default: div_ripple_bit_by_size = 32'h4000_0000;
+    endcase
+endfunction
+
+// The missed-overflow candidate (see idiv_ripple above), from the masked
+// sigma (H) / divtmp (L) registers instead of the 64-bit negator's output, as
+// prediv_overflow_by_size does.  n = the operand width, d = |divisor|
+// (divisor_abs_r), d_neg its sign.  The upper half of |{H, L}| is
+// U = hx + c, hx = (H negative ? ~H : H), c = H negative && L == 0 (no wrap:
+// a negative H has hx < 2^(n-1)).  The candidate needs U[n-1:n-2] == 01b:
+// for c = 0, hx[n-1:n-2] == 01b; for c = 1, hx in [2^(n-2) - 1, 2^(n-1) - 2].
+// It excludes the negative dividend whose |dividend| - 2^(2n-2) is exactly
+// d * 2^(n-1) (remainder 0): then |dividend|'s lower half is d[0] * 2^(n-1)
+// (so L == d[0] * 2^(n-1), and c == !d[0]), and U[n-3:0] == d[n-2:1], i.e.
+// hx[n-3:0] == (d - 1)[n-2:1] for either parity of d.
+// tests/equiv/idiv_ripple_fast.v proves it equal to the full64 form for
+// every sigma, divtmp, size and divisor.
+function automatic logic idiv_ripple_by_size(input logic [31:0] h_raw,
+                                             input logic [31:0] l_raw,
+                                             input logic [1:0]  size,
+                                             input logic [31:0] d,
+                                             input logic        d_neg);
+    logic        neg;
+    logic        c;
+    logic        top_ok;
+    logic        excl;
+    logic [31:0] hx;
+    logic [31:0] lx;
+    logic [31:0] top;
+    logic [31:0] low;
+    logic [31:0] smax;
+    logic [31:0] dm1;
+    neg  = div_sign_bit(h_raw, size);
+    hx   = div_op_by_size(DIV_OP_MASK, neg ? ~h_raw : h_raw, size);
+    lx   = div_op_by_size(DIV_OP_MASK, l_raw, size);
+    top  = div_ripple_bit_by_size(size);
+    low  = top - 32'd1;
+    smax = top << 1;
+    dm1  = d - 32'd1;
+    c    = neg && (lx == 32'd0);
+    top_ok = ((hx & ~low) == top && !(c && (hx & low) == low)) ||
+             (c && hx == low);
+    excl = neg && (lx == (d[0] ? smax : 32'd0)) &&
+           ((hx & low) == ((dm1 >> 1) & low));
+    idiv_ripple_by_size = (neg ^ d_neg) && top_ok && (d != smax) && !excl;
+endfunction
+
+// The PREDIV overflow test for a candidate: d == 0, or the reduced upper half
+// U - 2^(n-2) >= d.  U[n-2] is set in a candidate, so U - 2^(n-2) is U with
+// that bit cleared: hr + c, hr = hx with bit n-2 cleared, when hx[n-2] is set;
+// when it is not (c = 1, hx = 2^(n-2) - 1), U - 2^(n-2) = 0 < d.  As in
+// prediv_overflow_by_size, hr + c >= d <=> hr >= d || (c && hr == d - 1).
+// tests/equiv/idiv_ripple_fast.v proves it equal to the full64 form.
+function automatic logic prediv_ripple_overflow_by_size(input logic [31:0] h_raw,
+                                                        input logic [31:0] l_raw,
+                                                        input logic [1:0]  size,
+                                                        input logic [31:0] d);
+    logic        neg;
+    logic        c;
+    logic [31:0] hx;
+    logic [31:0] hr;
+    logic [31:0] top;
+    neg = div_sign_bit(h_raw, size);
+    hx  = div_op_by_size(DIV_OP_MASK, neg ? ~h_raw : h_raw, size);
+    c   = neg && (div_op_by_size(DIV_OP_MASK, l_raw, size) == 32'd0);
+    top = div_ripple_bit_by_size(size);
+    hr  = hx & ~top;
+    prediv_ripple_overflow_by_size = (d == 32'd0) ||
+        ((hx & top) != 32'd0 && ((hr >= d) || (c && hr == d - 32'd1)));
 endfunction
 
 function automatic logic mul_overflow_by_size(
