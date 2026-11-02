@@ -59,6 +59,8 @@ logic        div_dividend_neg;
 logic        div_divisor_neg;
 logic [31:0] prediv_q_in;
 logic [31:0] prediv_r_in;
+logic        idiv8_ripple;               // this PREDIV is a missed r8 overflow candidate
+logic        idiv8_ripple_r;             // registered at PREDIV, read at IDIV2
 
 wire [63:0] mul_product;
 wire [31:0] mul_upper = op_size == 2'd0 ? {24'h0, mul_product[39:32]} :
@@ -95,6 +97,7 @@ always_ff @(posedge clk) begin
         idiv_dividend_neg   <= 1'b0;
         idiv_divisor_neg    <= 1'b0;
         div_first_cycle     <= 1'b0;
+        idiv8_ripple_r      <= 1'b0;
         div_flags_r         <= 6'd0;
         divisor_abs_r       <= 32'd0;
         op_size_r           <= 2'd0;
@@ -136,6 +139,7 @@ always_ff @(posedge clk) begin
                     div_r_nonneg          <= div_iter_r_nonneg_next;
                     idiv_dividend_neg     <= div_dividend_neg;
                     idiv_divisor_neg      <= div_divisor_neg;
+                    idiv8_ripple_r        <= idiv8_ripple;
                     div_first_cycle       <= 1'b0;
                 end
                 ALUJMP_DIV5:
@@ -215,6 +219,33 @@ always_comb begin
             prediv_q_in = full64[31:0];
         end
     endcase
+
+    // IDIV r8's missed overflow.  The 386/486 divider is a two's-complement
+    // non-restoring loop (US 5,689,721, "Detecting overflow conditions for
+    // negative quotients in nonrestoring two's complement division"): for a
+    // negative quotient it misses an overflow whose unadjusted quotient is
+    // 01111111b, because the sign correction "ripples it to 10000000", a legal
+    // -128 ("these anomalous overflow conditions ... occur in 386- and
+    // 486-type microprocessors manufactured by Intel").  Run on its 8-bit
+    // registers, that loop completes exactly the signs-differ divides with
+    // |dividend| = 4000h + 80h * |divisor| + r, 0 <= r < |divisor| (r > 0
+    // for a negative dividend), |divisor| != 80h, and leaves AL=80h,
+    // AH = (dividend + 80h * divisor) mod 100h: the result of dividing
+    // |dividend| - 4000h instead (every 80386EX SingleStepTests capture of
+    // it, e.g. 67F6.7 idx 375 AX=741Eh / 98h -> 1E80h, and a real Am486DX4,
+    // AH=1Eh for the same operands; tests/programs/idiv_quotient_bounds).
+    // This absolute-value divider reproduces it by dropping bit 14 of
+    // |dividend| for a candidate; IDIV2 then faults unless the quotient
+    // is exactly 80h.  A candidate's own dividend always overflows, so no
+    // in-range divide is affected.  Byte only: the loop predicts the same
+    // pattern for r16/r32 (bit 30 / 62), which no capture covers yet.
+    idiv8_ripple = op_size == 2'd0 &&
+                   (div_dividend_neg ^ div_divisor_neg) &&
+                   full64[15:14] == 2'b01 &&
+                   divisor_abs_r[7:0] != 8'h80 &&
+                   !(div_dividend_neg && full64[13:0] == {divisor_abs_r[6:0], 7'h00});
+    if (idiv8_ripple)
+        prediv_r_in[6] = 1'b0;
 end
 
 always_comb begin
@@ -249,9 +280,11 @@ always_comb begin
            (div_divisor_masked == 32'd0 ||
             div_op_by_size(DIV_OP_MASK, sigma, op_size) >= div_divisor_masked)) ||
           (aluop == ALUJMP_PREDIV &&
-           prediv_overflow_by_size(sigma, divtmp, op_size, divisor_abs_r)))) ||
+           (idiv8_ripple ? prediv_r_in[7:0] >= divisor_abs_r[7:0]
+                         : prediv_overflow_by_size(sigma, divtmp, op_size, divisor_abs_r))))) ||
         (aluop == ALUJMP_IDIV2 &&
-         (signs_differ ? quotient > signed_max : quotient >= signed_max)));
+         (idiv8_ripple_r ? quotient != signed_max :
+          signs_differ ? quotient > signed_max : quotient >= signed_max)));
     div_overflow = exec && div_overflow_cond;
 end
 

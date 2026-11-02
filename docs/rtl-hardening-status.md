@@ -207,7 +207,7 @@ Run with `tests/prepare.sh` data, `--cpu 486`, on the RTL at commit 1c3f590:
 
 | suite | result |
 | --- | --- |
-| SingleStepTests 80386 real mode, all 1,758,700 vectors | 1,758,700/1,758,700 after the fixes above; the remaining differences are documented 386-vs-486 rules in `test_singlestep_real.py` (EFLAGS AC and reserved bits, AC cleared by real-mode interrupts, undefined flags of a faulting AAM and of a trailing fault's frame, IDIV quotients the 386 completed out of range, a RET returning to itself, the 386EX's on-chip REMAPCFG ports) |
+| SingleStepTests 80386 real mode, all 1,758,700 vectors | 1,758,700/1,758,700 after the fixes above; the remaining differences are documented 386-vs-486 rules in `test_singlestep_real.py` (EFLAGS AC and reserved bits, AC cleared by real-mode interrupts, undefined flags of a faulting AAM and of a trailing fault's frame, a RET returning to itself, the 386EX's on-chip REMAPCFG ports) |
 | SingleStepTests protected mode (86Box), 6100 vectors | 6100/6100 (`--cpu 486`: RF=1 in fault frames, i486 PRM 11.3.1.1) |
 | test386.asm (CPU_FAMILY=4) | complete: every self-checking POST (00h-1Ch, E0h) passes, POST 0xFF reached, and all 44,926 POST 0xEE result lines match `test386-EE-reference.txt` |
 
