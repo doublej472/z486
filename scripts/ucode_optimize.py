@@ -24,7 +24,7 @@ ROM_DEPTH = 2560
 UCODE_BITS = 37
 # Free words after upstream's XADD/CMPXCHG/INVD block (0x9D9-0x9F5).
 ALIGN_FAULT_ENTRY = 0x9F6     # 486 #AC fault entry (two words)
-CALL_STACK_FAULT = 0x9F8      # #SS(new SS selector) for a CALL gate's new stack (three words)
+CALL_STACK_FAULT = 0x9F8      # #SS(new SS selector) for a privilege switch's new stack (three words)
 REAL_INT_FLAGS = 0x91B        # real-mode interrupt entry: EFLAGS mask + its own delivery tail (16 words, in LOADALL_FREE)
 SRC_SLCTR = 0x35
 ALUJMP_AND = 0x08
@@ -753,11 +753,14 @@ PATCHES = [
 
     # A CALL through a gate to a more privileged level whose new stack has no
     # room for the parameters plus the return frame raises #SS(new SS
-    # selector) (i486 PRM, CALL), where INT n raises #SS(0).  The new SS
-    # selector is still in SLCTR (loaded at 607h) while the parameter copy and
-    # frame pushes run; event_control enters here for the stack-limit fault
-    # of such a CALL.  The #SS(0) entry 863h/864h passes SIGMA into TMPE, so
-    # form SIGMA = SLCTR & ~3 (EXT = 0) first, as the #TS entry does with TR.
+    # selector) (i486 PRM, CALL); so do INT n and an exception through an
+    # interrupt/trap gate whose new stack cannot hold the frame (a real
+    # Am486DX4: 38h for INT n, 39h with EXT for an exception).  The new SS
+    # selector is still in SLCTR (loaded at 607h) while the pushes run;
+    # event_control enters here for the stack-limit fault of such a privilege
+    # switch.  The #SS(0) entry 863h/864h passes SIGMA into TMPE, so form
+    # SIGMA = SLCTR & ~3 first (the fault body adds EXT), as the #TS entry
+    # does with TR.
     Patch(CALL_STACK_FAULT, "#SS(new SS selector): SIGMA = SLCTR & ~3",
           word=uword(src=SRC_SLCTR, aluop=ALUJMP_AND, alusrc=ALUSRC_CONST_NEG4)),
     Patch(CALL_STACK_FAULT + 1, "#SS(new SS selector): long jump into the shared fault body",
