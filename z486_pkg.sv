@@ -1092,6 +1092,12 @@ localparam [11:0] UADDR_DESC_SKIP_DATA = 12'h8F8;
 localparam [11:0] UADDR_DESC_SKIP_CS   = 12'h8FA;
 localparam [11:0] UADDR_TSS_PROBLEM    = 12'h85D;  // #TS path used by protected-mode descriptor checks
 localparam [11:0] UADDR_FPU_STORE_TAIL = 12'h57B;  // Final 16-bit word of an m80 store
+// The error-code pushes of exception delivery: the privilege-switch tail
+// (62A), the task-switch tail (7D6) and the same-privilege tail (8E7).  Each
+// is a `WR w` after an IND step of the stack width.
+localparam [11:0] UADDR_ERRC_PUSH_PRIV = 12'h62A;
+localparam [11:0] UADDR_ERRC_PUSH_TASK = 12'h7D6;
+localparam [11:0] UADDR_ERRC_PUSH      = 12'h8E7;
 localparam [11:0] UADDR_RPTI_RNI       = 12'h20F;  // REP interrupt restart boundary
 localparam [11:0] UADDR_PAGE_FAULT     = 12'h8E9;  // #PF(14) - page fault
 localparam [11:0] UADDR_INVALID_LOCK   = 12'h82B;  // #UD for invalid LOCK usage
