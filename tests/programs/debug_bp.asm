@@ -7,8 +7,12 @@
 ; set for every fault "except a debug exception generated in response to an
 ; instruction breakpoint"; AMD APM 24593 8.2.2).  Data
 ; breakpoints are traps after the accessing instruction.  DR6.B0-B3 report
-; every matching breakpoint, enabled or not; LEN masks the address; a
-; breakpoint matches any byte of an access, including a dword-crossing one.
+; every matching enabled breakpoint; LEN masks the address; a breakpoint
+; matches any byte of an access, including a dword-crossing one.
+; DR6.Bn for a match that DR7 does not enable is vendor-variant (see
+; debug_bn_noenable): the Intel486 PRM 11.2.3 sets it, AMD APM 24593
+; 13.1.1.3 and a real Am486DX4 do not (CPUSUITE-XE10-triage), Intel SDM
+; vol. 3 (DR6) says "may or may not".  Either value passes.
 BITS 32
 ORG 0
 CODE_BASE equ 0x10000
@@ -133,7 +137,8 @@ rd2_next:
     LOGCHK 0, 0x0004, rd1_next, 10
     LOGCHK 1, 0x0004, rd2_next, 11
 
-    ; 4: B bits report a disabled match too; disabled ones never trap.
+    ; 4: disabled breakpoints never trap; B3 for the disabled match may be
+    ; set or clear (vendor-variant, see the header).
     xor ebp, ebp
     mov eax, 0x9200
     mov dr1, eax
@@ -147,7 +152,14 @@ both_next:
     mov eax, [0x9200]
     DR7SET 0
     EXPECT ebp, 1, 12
-    LOGCHK 0, 0x000a, both_next, 13
+    mov eax, [LOG]
+    and eax, 0xe00f
+    cmp eax, 0x0002                   ; B1 only (AMD APM, Am486DX4, z486)
+    je bp_case4_b3_either
+    EXPECT eax, 0x000a, 13            ; B1 and the disabled B3 (Intel486 PRM)
+bp_case4_b3_either:
+    mov eax, [LOG + 4]
+    EXPECT eax, both_next, 13
 
     ; 5: TF and a data breakpoint report together (BS + B1).
     xor ebp, ebp
