@@ -1842,14 +1842,14 @@ always_ff @(posedge clk) begin
         flags_backup_active <= 1'b1;
         // The issue edge also clears RF for the instruction that just
         // completed (clear_rf); the new instruction's backup must see it.
+        // A REPE/REPNE CMPS/SCAS keeps this image across its elements: a
+        // fault on a later element pushes the flags from before the
+        // instruction (Intel SDM vol. 2, REP/REPE/REPZ/REPNE/REPNZ: "the
+        // EFLAGS value is restored to the state prior to the execution of
+        // the instruction"; a real Am486DX4 does so, CPUSUITE-XE10-triage
+        // tri_rep_flags), while ECX and the index registers stay committed.
         flags_backup <= {eflags_fwd[31:17], eflags_fwd[16] && !clear_rf,
                          eflags_fwd[15:0]};
-    end else if (exec && aluop == ALUJMP_LOOPnE && dest == DEST_eCX) begin
-        // REPE/REPNE CMPS/SCAS retire an element when its count reaches eCX
-        // (21E/227/23B/243).  A fault on a later element restarts at that
-        // element, so the pushed FLAGS must carry this element's comparison,
-        // not the instruction-start image.
-        flags_backup <= eflags_fwd;
     end else if (flags_backup_refresh) begin
         flags_backup <= eflags_fwd;
     end else if (flag2_older_p && flags_backup_active) begin
