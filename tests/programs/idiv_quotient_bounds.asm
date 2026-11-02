@@ -8,8 +8,8 @@
 ;     with its remainder;
 ;   - a +max+1 quotient (negative / -1 and positive / 2), which faults and
 ;     leaves the dividend registers unchanged;
-;   - byte only: a quotient far below -max-1 that the 386/486 divider does
-;     NOT fault.  Its non-restoring loop leaves an unadjusted quotient of 7Fh,
+;   - a quotient far below -max-1 that the 386/486 divider does NOT fault
+;     (byte cases here; the word and dword forms below).  Its non-restoring loop leaves an unadjusted quotient of 7Fh,
 ;     which the sign correction ripples to 80h (US 5,689,721, "Detecting
 ;     overflow conditions for negative quotients in nonrestoring two's
 ;     complement division": the anomalous overflows "occur in 386- and
@@ -17,7 +17,12 @@
 ;     (CPUSUITE-XE10 run 1, idiv_quotient_bounds data=00001E07) completes
 ;     AX=741Eh / CL=98h with AH=1Eh and no #DE, as the 80386EX does
 ;     (SingleStepTests 67F6.7 idx 375: AX=1E80h).  Every such 386 capture
-;     leaves AL=80h and AH = (dividend + 80h * divisor) mod 100h.
+;     leaves AL=80h and AH = (dividend + 80h * divisor) mod 100h.  The
+;     loop is width-generic and the Am486DX4 completes the word and dword
+;     forms the same way (CPUSUITE-XE10 triage run, tri_idiv1632
+;     data=01E201E2 eax=F00300FF: cases 15h, 16h, 25h, 26h below complete
+;     with quotient 8000h / 80000000h and remainder low byte 01h, E2h, 01h,
+;     E2h; 17h and 18h, just outside the pattern, raise #DE).
 ;   - a quotient just below -max-1, which faults on every width.
 ; The #DE handler counts faults and resumes at [resume]; an unexpected #DE
 ; reports the case number with bit 7 set.
@@ -206,7 +211,53 @@ start:
     jne fail
     test ax, ax
     jne fail
-    cmp word [de_count], 5
+    ; 15h-18h: the 7FFFh -> 8000h ripple at r16 (Xe10 tri_idiv1632 A, B, E, F).
+    ; It completes a signs-differ divide with |dividend| = 40000000h +
+    ; 8000h * |divisor| + r, 0 <= r < |divisor| (r > 0 for a negative
+    ; dividend), as AX=8000h, DX = (dividend + 8000h * divisor) mod 10000h.
+    inc bl                      ; 15h: 7FFF8001h / 8001h (div_edges 569)
+    mov dx, 0x7FFF
+    mov ax, 0x8001
+    mov cx, 0x8001
+    idiv cx
+    cmp ax, 0x8000
+    jne fail
+    cmp dx, 0x0001
+    jne fail
+    inc bl                      ; 16h: BFCBFFE2h / 68h (negative dividend)
+    mov dx, 0xBFCB
+    mov ax, 0xFFE2
+    mov cx, 0x0068
+    idiv cx
+    cmp ax, 0x8000
+    jne fail
+    cmp dx, 0xFFE2
+    jne fail
+    inc bl                      ; 17h: BFCC0000h / 68h: r = 0 for a negative
+    EXPECT_DE .w7               ;      dividend, outside the pattern -> #DE
+    mov dx, 0xBFCC
+    xor ax, ax
+    mov cx, 0x0068
+    idiv cx
+    jmp fail
+.w7:
+    cmp dx, 0xBFCC
+    jne fail
+    test ax, ax
+    jne fail
+    inc bl                      ; 18h: 40340068h / FF98h: r = |divisor|,
+    EXPECT_DE .w8               ;      outside the pattern -> #DE
+    mov dx, 0x4034
+    mov ax, 0x0068
+    mov cx, 0xFF98
+    idiv cx
+    jmp fail
+.w8:
+    cmp dx, 0x4034
+    jne fail
+    cmp ax, 0x0068
+    jne fail
+    cmp word [de_count], 7
     jne fail
 
     ;=== dword: EDX:EAX / r/m32 ===
@@ -252,7 +303,27 @@ start:
     jne fail
     test eax, eax
     jne fail
-    cmp word [de_count], 7
+    ; 25h-26h: the ripple at r32 (Xe10 tri_idiv1632 C, D): EAX=80000000h,
+    ; EDX = (dividend + 80000000h * divisor) mod 2^32.
+    inc bl                      ; 25h: 7FFFFFFF80000001h / 80000001h (div_edges 927)
+    mov edx, 0x7FFFFFFF
+    mov eax, 0x80000001
+    mov ecx, 0x80000001
+    idiv ecx
+    cmp eax, 0x80000000
+    jne fail
+    cmp edx, 0x00000001
+    jne fail
+    inc bl                      ; 26h: BFFFFFCBFFFFFFE2h / 68h (negative dividend)
+    mov edx, 0xBFFFFFCB
+    mov eax, 0xFFFFFFE2
+    mov ecx, 0x00000068
+    idiv ecx
+    cmp eax, 0x80000000
+    jne fail
+    cmp edx, 0xFFFFFFE2
+    jne fail
+    cmp word [de_count], 9
     jne fail
 
     mov al, 0x01
