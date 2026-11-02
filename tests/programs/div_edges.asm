@@ -12,10 +12,9 @@
 ; at IVT[0] records the fault and resumes at the per-case label, the same
 ; pattern the suite's seg_stack_wrap_rm uses for real-mode #SS/#GP.
 ;
-; Case 231 (IDIV r8 7F81h / 81h) follows the silicon instead: the 486 divider
-; completes it with AX=0180h (see the case).  Cases 569 (r16) and 927 (r32) are
-; the same pattern at the wider sizes; no capture covers them yet, so they keep
-; the documented #DE.
+; Cases 231 (IDIV r8 7F81h / 81h), 569 (r16 7FFF8001h / 8001h) and 927 (r32
+; 7FFFFFFF80000001h / 80000001h) follow the silicon instead: the 486 divider
+; completes each with the most negative quotient (see the cases).
 
 BITS 16
 org 0
@@ -7072,7 +7071,12 @@ cases:
 .c568:
         cmp     word [faulted], 1
         jne     fail
-; case 569: idiv r16 0x7fff8001 / 0x8001 -> #DE
+; case 569: idiv r16 0x7fff8001 / 0x8001 -> q=0x8000 r=0x1
+;   The r16 form of case 231: the real Am486DX4 (CPUSUITE-XE10 triage run,
+;   tri_div_edges data=000300E7: three failing cases, the first 231; and
+;   tri_idiv1632 case A, these operands: no #DE, AX=8000h, DL=01h) completes
+;   it, the non-restoring divider's 7FFFh quotient rippling to 8000h
+;   (US 5,689,721).  Remainder (dividend + 8000h * divisor) mod 10000h.
         mov     ebp, 569
         mov     word [resume_ip], .c569
         mov     word [faulted], 0
@@ -7081,7 +7085,11 @@ cases:
         mov     cx, 0x8001
         idiv     cx
 .c569:
-        cmp     word [faulted], 1
+        cmp     word [faulted], 0
+        jne     fail
+        cmp     ax, 0x8000
+        jne     fail
+        cmp     dx, 0x1
         jne     fail
 ; case 570: idiv r16 0x8000ffff / 0x8001 -> #DE
         mov     ebp, 570
@@ -11622,7 +11630,10 @@ cases:
 .c926:
         cmp     word [faulted], 1
         jne     fail
-; case 927: idiv r32 0x7fffffff80000001 / 0x80000001 -> #DE
+; case 927: idiv r32 0x7fffffff80000001 / 0x80000001 -> q=0x80000000 r=0x1
+;   The r32 form of case 231 (CPUSUITE-XE10 triage run: tri_idiv1632 case C,
+;   these operands: no #DE, EAX=80000000h, DL=01h; tri_div_edges: three
+;   failing cases, the last one 300h-3FFh, i.e. 231, 569 and this one).
         mov     ebp, 927
         mov     word [resume_ip], .c927
         mov     word [faulted], 0
@@ -11631,7 +11642,11 @@ cases:
         mov     ecx, 0x80000001
         idiv     ecx
 .c927:
-        cmp     word [faulted], 1
+        cmp     word [faulted], 0
+        jne     fail
+        cmp     eax, 0x80000000
+        jne     fail
+        cmp     edx, 0x1
         jne     fail
 ; case 928: idiv r32 0x80000000ffffffff / 0x80000001 -> #DE
         mov     ebp, 928
