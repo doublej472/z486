@@ -1,7 +1,11 @@
 ; debug_bp - 486 hardware breakpoints (DR0-DR3, DR6, DR7)
 ;
 ; Instruction breakpoints are faults: #DB is taken before the instruction,
-; with RF=1 in the saved EFLAGS so the IRET resumes it once.  Data
+; with RF=0 in the saved EFLAGS; the handler sets RF in the frame so the IRET
+; resumes it once (a real Am486DX4 pushes RF=0 and re-breaks forever on a
+; handler that does not, CPUSUITE-XE10; Intel SDM vol. 3 17.3.1.1, the RF
+; set for every fault "except a debug exception generated in response to an
+; instruction breakpoint"; AMD APM 24593 8.2.2).  Data
 ; breakpoints are traps after the accessing instruction.  DR6.B0-B3 report
 ; every matching breakpoint, enabled or not; LEN masks the address; a
 ; breakpoint matches any byte of an access, including a dword-crossing one.
@@ -51,6 +55,7 @@ db_handler:
     xor eax, eax
     mov dr6, eax
     inc ebp
+    or dword [esp + 16], 0x10000      ; RF: resume a breakpointed instruction
     pop ebx
     pop eax
     iretd
@@ -90,8 +95,8 @@ bp_insn:
     EXPECT ebp, 2, 2                  ; one fault per pass
     LOGCHK 0, 0x0001, bp_insn, 3
     mov eax, [LOG + 8]
-    test eax, 0x10000                 ; RF in the saved EFLAGS
-    jz fail_4
+    test eax, 0x10000                 ; the pushed EFLAGS has RF=0
+    jnz fail_4
 
     ; 2: write breakpoint DR1 on dword 0x9000 (trap after the write).
     xor ebp, ebp
