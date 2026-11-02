@@ -3935,9 +3935,15 @@ data_unit data_unit_inst (
     .interrupt_entry(interrupt_entry),
     .any_fault(any_fault_r),
     .clear_rf(clear_rf),
-    .set_rf(ibp_fault_taken),
+    // Every fault pushes RF=1 except a debug exception: an instruction
+    // breakpoint and the DR7.GD general detect push the EFLAGS image with
+    // RF=0 (a real Am486DX4, CPUSUITE-XE10: fault_rf_gd's GD frame has RF=0,
+    // and the ibp handlers that IRET without setting RF re-break forever;
+    // AMD APM 24593 8.2.2, "When a #DB exception occurs, the processor
+    // clears RFLAGS.RF to 0 in the rFLAGS image"; Intel SDM vol. 3 17.3.1.1,
+    // "except a debug exception generated in response to an instruction
+    // breakpoint").  The #DB body (943h) never passes the RF set at 899h.
     .fault_set_rf(uc_exec && ((uc_addr == UADDR_FAULT_SET_RF) ||
-                              (uc_addr == UADDR_DEBUG_GD_FAULT) ||
                               ((uc_addr == UADDR_FAULT_TSS_SKIP) && tss_access_flag))),
     .gate_detect(gate_detect_now),
     .flags_backup_active(flags_backup_active),

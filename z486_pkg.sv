@@ -1073,9 +1073,6 @@ localparam [11:0] UADDR_FAULT_SET_RF   = 12'h899;
 // Fault body word whose JTSSAF skips 894-899 (EIP restore and the RF set)
 // for a fault raised during a task switch's TSS accesses.
 localparam [11:0] UADDR_FAULT_TSS_SKIP = 12'h893;
-// MOV DRn general-detect branch (DR7.GD=1): restores EIP, sets DR6.BD and
-// enters the #DB body at 943h, which never passes 899h.
-localparam [11:0] UADDR_DEBUG_GD_FAULT = 12'h3A5;
 // Far CALL system-descriptor dispatch: its SINTHW marks a CALL for the task
 // switch's nesting test (JSTSKL), not an external event.
 localparam [11:0] UADDR_CALL_GATE_SINTHW = 12'h5B9;
