@@ -561,11 +561,20 @@ function automatic seg_desc_t seg_desc_reset_cs();
     return desc;
 endfunction
 
-// IDT/IVT descriptor for real mode - base=0, limit=0x3FF (256 vectors * 4 bytes)
+// The IDTR and GDTR limit after reset (both bases 0). A PC-9821Xe10 (i486DX2)
+// reads IDTR and GDTR FFFF:00000000 at the DOS prompt after a boot that, on a
+// core resetting both to 03FFh, leaves 03FF:00000000 in both (neither register
+// is loaded on the way), so FFFFh is the machine's reset value; NP2kai
+// i386c/ia32/interface.c resets CPU_GDTR_LIMIT and CPU_IDTR_LIMIT to 0xffff.
+// The Intel486 PRM (1992) Table 10-1 and the Intel486 DX2 data sheet Table 6.2
+// give "IDTR Base = 0, Limit=3FFh" (GDTR not listed); the machine is followed.
+localparam logic [19:0] DTR_RESET_LIMIT = 20'h0FFFF;
+
+// IDTR/GDTR descriptor at reset: base 0, limit DTR_RESET_LIMIT (the IVT at 0)
 function automatic seg_desc_t seg_desc_idt_real_mode();
     seg_desc_t desc;
     desc.base       = 32'h00000000;               // IVT at linear address 0
-    desc.limit      = 20'h003FF;                  // 1KB limit (256 * 4 bytes)
+    desc.limit      = DTR_RESET_LIMIT;
     desc.seg_type   = 4'b0010;                    // Data, readable
     desc.S          = 1'b1;
     desc.DPL        = 2'b00;
