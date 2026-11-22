@@ -68,6 +68,9 @@ module protection_unit
     output              result_now,
     output              redirect_taken,
     output              redirect_prev,
+    output              sel_limit_block,  // the selector-limit #GP redirect is
+                                          // taken now: cancel this word's
+                                          // (the descriptor read's) bus cycle
     output              is_ptovrr,
 
     // Protection transition commands and effective privilege state.
@@ -146,6 +149,10 @@ assign test_inflight = test_inflight_r;
 assign result_now = result_valid && test_inflight_r;
 assign redirect_taken = uc_exec && result_now && jump_valid;
 assign redirect_prev = redirect_prev_r;
+// The result arrives with the second word after the selector test, which is
+// the descriptor's first read (5CA/5C5); the redirect replaces only the words
+// after it, so that read is cancelled here.  Registered terms only.
+assign sel_limit_block = result_now && s2_sel_limit_fault;
 // SLCTR is a microcode scratch register and may be overwritten by later
 // descriptor operations.  Preserve the transition CPL until it is committed.
 wire [1:0] cpl_live = cpl_transition_r ? pending_cpl_r : cpl;
@@ -203,6 +210,7 @@ logic [1:0] s1_cpl;             // Pipelined CPL for CPL guards
 logic [1:0] s1_desc_dpl;        // Pipelined descriptor DPL for CPL guards
 logic       s1_desc_low16_nonzero;
 logic       s1_selector_oob;
+logic       s1_sel_limit_test;   // selector test ahead of a descriptor read
 
 //==============================================================================
 // Stage 2 Pipeline Registers (PLA4 outputs)
@@ -212,6 +220,7 @@ logic        s2_jump_valid;
 logic [3:0]  s2_flags;
 logic        s2_valid;
 logic        s2_cpl_transition;
+logic        s2_sel_limit_fault;
 logic        s2_is_checking_test;
 logic [5:0]  s2_test_const;     // For debug display
 
@@ -333,6 +342,34 @@ assign state_vector_comb = {p1_comb, p2_comb, b13_comb, b12_comb, p_comb,
 // Stage 1: Register Tiny PLA outputs (posedge clk when pipe_en)
 wire s0_is_checking = test_en && (aluop_type != 4'hB);
 
+// The selector tests (PTSELE/PTSELA) that the microcode issues just before it
+// reads a selector's descriptor: MOV/POP Sreg (00, 0C), LES/LDS/LFS/LGS/LSS
+// (26-28), far JMP/CALL, gate and interrupt targets (01), RETF/IRET (02, 03),
+// task gates and IRET's back link (0A, 06), LTR (06), LLDT (07), the TSS stack
+// of an inner call (09) and a task switch's LDT, SS, CS and data selectors
+// (0D, 09, 01, 0B).  The descriptor is read through the GDT/LDT pseudo-segment
+// with a precomputed linear address, which the segment unit cannot limit-check,
+// so the table limit is checked here.  i486 PRM (240486), MOV/POP/LDS
+// pseudo-code: "Selector index must be within its descriptor table limits
+// else #GP(selector)", with the same test in JMP/CALL, RET/IRET, INT, LLDT and
+// LTR; in a task switch (Table 7-1) it raises #TS(selector).  It precedes the
+// descriptor read.  A null selector keeps its
+// own handling (it has no descriptor).  LAR/LSL/VERR/VERW (08) clear ZF
+// instead, in their own term.
+function automatic logic sel_limit_checked(input logic [5:0] tc);
+    case (tc)
+        TST_SEL_NONSS, TST_SEL_CS, TST_SEL_RET, TST_SEL_RET_OL,
+        TST_SEL_GDT, TST_SEL_LLDT, TST_SEL_MOREPR, TST_SEL_TASKGT,
+        TST_SEL_TASKFI, TST_SEL_SS, TST_SEL_TR_TSF,
+        TST_SEL_LES, TST_SEL_LDS, TST_SEL_LFSLGS:
+            sel_limit_checked = 1'b1;
+        default:
+            sel_limit_checked = 1'b0;
+    endcase
+endfunction
+wire s0_sel_limit_test = (aluop_type == 4'hE || aluop_type == 4'hA) &&
+                         sel_limit_checked(test_const);
+
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         s1_valid <= 1'b0;
@@ -344,6 +381,7 @@ always_ff @(posedge clk) begin
         s1_desc_dpl <= 2'b0;
         s1_desc_low16_nonzero <= 1'b0;
         s1_selector_oob <= 1'b0;
+        s1_sel_limit_test <= 1'b0;
         p1 <= 1'b0;
         p2 <= 1'b0;
         b13 <= 1'b0;
@@ -364,6 +402,7 @@ always_ff @(posedge clk) begin
         s1_desc_dpl <= desc_dpl;
         s1_desc_low16_nonzero <= descriptor_low16_nonzero;
         s1_selector_oob <= selector_oob;
+        s1_sel_limit_test <= s0_sel_limit_test;
         p1 <= p1_comb;
         p2 <= p2_comb;
         b13 <= b13_comb;
@@ -387,12 +426,14 @@ assign pla_test_input = {p1, p2, b13, b12, p,
 logic [11:0] pla_test_addr;
 logic [3:0]  pla_test_flags;
 logic        pla_test_cpl_transition;
+logic        pla_sel_limit_fault;
 
 always_comb begin
     // Default: test passes (continue execution)
     pla_test_addr  = 12'h000;
     pla_test_flags = 4'b0000;
     pla_test_cpl_transition = 1'b0;
+    pla_sel_limit_fault = 1'b0;
 
     case (s1_test_const)
         //----------------------------------------------------------------------
@@ -1289,6 +1330,17 @@ always_comb begin
         end
     endcase
 
+    // A non-null selector beyond its table's limit: #GP/#TS(selector) through
+    // the selector-error-code fault path (85D), before the descriptor read,
+    // which the redirect cancels (sel_limit_block).  p is the selector's null
+    // test here.
+    if (s1_sel_limit_test && s1_selector_oob && !p) begin
+        pla_sel_limit_fault = 1'b1;
+        pla_test_addr  = UADDR_TSS_PROBLEM;
+        pla_test_flags = 4'b0000;
+        pla_test_cpl_transition = 1'b0;
+    end
+
     // The descriptor-load tails 5D5/5DA set the Accessed bit with a locked
     // read-modify-write.  A 486 writes the descriptor only when that bit of a
     // code/data descriptor is clear; otherwise continue at the same tail
@@ -1318,6 +1370,7 @@ always_ff @(posedge clk) begin
         s2_flags <= 4'b0000;
         s2_valid <= 1'b0;
         s2_cpl_transition <= 1'b0;
+        s2_sel_limit_fault <= 1'b0;
         s2_is_checking_test <= 1'b0;
         s2_test_const <= 6'h0;
     end else if (pipe_en) begin
@@ -1330,6 +1383,7 @@ always_ff @(posedge clk) begin
         s2_flags <= pla_test_flags;
         s2_valid <= s1_valid;
         s2_cpl_transition <= pla_test_cpl_transition;
+        s2_sel_limit_fault <= pla_sel_limit_fault;
         s2_is_checking_test <= s1_is_checking_test;
         s2_test_const <= s1_test_const;
     end

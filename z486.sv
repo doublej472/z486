@@ -719,6 +719,7 @@ wire        pf_spec_tlb_kill;
 wire        tlbt_done;               // a TR6 access has reached the TLB
 wire        prot_redirect_prev;
 wire        prot_redirect_taken;
+wire        prot_sel_limit_block;
 
 // Empty D2 may launch directly from D1. Otherwise the resident D2 skeleton
 // supplies a registered entry address when the current instruction ends.
@@ -2511,8 +2512,10 @@ wire iack_busop = uc_p_iack;        // IACK bus operation (interrupt acknowledge
 assign mem_op_eligible = core_live && !mem_servicing && !recipe_slot_stale && !stall_ucrd &&
                          !vipt_load_exec_block && !rmw_fallback_delay_r &&
                          !(i_rni_delay && (d2_vipt_candidate || d2_vipt_rmw_candidate));
-// A failed protection test blocks bus operations in its delay slots.
-wire uc_data_busreq = !prot_redirect_prev &&
+// A failed protection test blocks bus operations in its delay slots; a
+// selector beyond its descriptor table's limit also blocks the read issued in
+// the redirect cycle itself (the descriptor's, beyond the table).
+wire uc_data_busreq = !prot_redirect_prev && !prot_sel_limit_block &&
                       ((uc_is_mem_busop && !mem_is_io) ||
                        io_busop_rd || io_busop_wr);
 assign uc_busreq = uc_data_busreq || iack_busop;
@@ -3084,9 +3087,15 @@ wire prot_jump_valid;               // Status outputs retained for debug visibil
 wire prot_validation_ok;
 wire prot_result_valid;
 wire [15:0] selector_desc_end = {slctr_fwd[15:3], 3'b111};
-// The LDT limit is page-granular when its descriptor's G is set.
+// The LDT limit is page-granular when its descriptor's G is set.  A null
+// LDTR (as after reset, or LLDT 0) leaves no LDT: i486 PRM (240486) LLDT, "If
+// the source operand is 0, the LDTR is marked invalid and all descriptor
+// references (except by LAR, VERR, VERW or LSL) cause a #GP fault"; those
+// four report the selector invalid (ZF=0), as for one past the limit.
+wire ldt_null = (LDTR[15:3] == 13'h0);
 wire selector_oob_wire = slctr_fwd[2]
-    ? (seg_effective_limit(desc_cache[7]) < {16'h0, selector_desc_end})
+    ? (ldt_null ||
+       seg_effective_limit(desc_cache[7]) < {16'h0, selector_desc_end})
     : (gdt_limit[15:0] < selector_desc_end);
 
 wire [1:0]  prot_desc_dpl;
@@ -3138,6 +3147,7 @@ protection_unit protection_unit_inst (
     .result_now(prot_result_now),
     .redirect_taken(prot_redirect_taken),
     .redirect_prev(prot_redirect_prev),
+    .sel_limit_block(prot_sel_limit_block),
     .is_ptovrr(prot_is_ptovrr),
     .effective_cpl(prot_cpl),
     .transition(prot_transition)
