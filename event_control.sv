@@ -105,6 +105,7 @@ module event_control
     output logic gate_detect_now,
     output logic gate_detect_cond,
     output logic double_fault_start,
+    output logic fault_begin_r,           // registered: a fault delivery began last cycle
 
     // Macro-instruction lifecycle and delivery state
     output logic uc_active,
@@ -369,11 +370,16 @@ always_ff @(posedge clk) begin
     if (!reset_n) begin
         fault_delivery_state <= FAULT_IDLE;
         fault_seen_r <= 1'b0;
+        fault_begin_r <= 1'b0;
         fault_combine_active <= 1'b0;
         gp_fault_double_r <= 1'b0;
         triple_fault_reset <= 1'b0;
     end else begin
         fault_seen_r <= any_fault;
+        // The events that start a delivery (below), one cycle late.  Not the
+        // delivery state itself: a failing LAR/LSL/VERR/VERW probe also lands
+        // in the entry cluster (uc 86C-86F) and leaves that state set.
+        fault_begin_r <= fault_start || microcode_fault_entry;
         triple_fault_reset <= 1'b0;
 
         if (gp_fault_trigger)

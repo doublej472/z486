@@ -775,6 +775,10 @@ always_ff @(posedge clk) begin
             if (transition.conform_dpl)
                 desc_cache[1].DPL <= transition.conform_dpl_value;
         end
+        // A faulting outer-level return restores the SS DPL its early CPL
+        // commit replaced (protection.sv, outer_rb_*).
+        if (transition.rollback)
+            desc_cache[2].DPL <= transition.rollback_ss_dpl;
     end
 end
 

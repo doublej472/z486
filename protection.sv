@@ -43,6 +43,9 @@ module protection_unit
     input               cs_descriptor_exec,
     input               cs_descriptor_conforming,
     input        [1:0]  cs_selector_rpl,
+    input        [1:0]  ss_descriptor_dpl,
+    input               entry_cpl_zero,   // z486.sv pe_entry_cpl_zero
+    input               fault_begin,      // a fault delivery began (registered, one cycle late)
 
 
     // Test mode for verification (bypasses Tiny PLA preprocessing)
@@ -98,6 +101,11 @@ logic        write_rpl_s1, write_rpl_s2;
 logic        arpl_update_s1, arpl_update_s2;
 logic        cpl_transition_r;
 logic  [1:0] pending_cpl_r;
+logic        outer_rb_r;
+logic  [1:0] outer_rb_cs_rpl_r;
+logic  [1:0] outer_rb_ss_dpl_r;
+logic        outer_rb_entry0_r;
+logic        outer_rb_fault_r;
 
 wire is_6x = (uc_aluop[6:4] == 3'b110);
 wire is_ptsav = is_6x && !uc_aluop[3];
@@ -165,6 +173,55 @@ assign transition.conform_dpl = conform_dpl_s2;
 assign transition.conform_dpl_value = conform_dpl_value_s2;
 assign transition.write_rpl = write_rpl_s2;
 assign transition.active = cpl_transition_r;
+
+// An outer-level RET/IRET commits its new CPL at PTGEN 2Eh (uc 68D, the copy
+// of the return CS's DPL into CS RPL and the SS DPL) so that the return SS
+// and the data segments are checked at the new level, but its CS is loaded
+// only later (uc 6A5).  i486 PRM, RET and IRET, "return to outer privilege
+// level": every return-SS check (null, table limit, RPL, type, DPL -> #GP,
+// not present -> #SS) comes before "Set CPL to the RPL of the return code
+// segment selector", so a fault there is raised at the old CPL.  The first
+// cycle of the commit records the old CS RPL / SS DPL / entry-CPL0 state;
+// a fault delivery that begins after the PTGEN 2Eh word executes and before
+// the CS load puts them back and drops the transition still in flight.  A
+// same-level or inner commit (gate, interrupt) is not recorded.
+wire copy_stack_exec = uc_exec && pe_mode &&
+                       (uc_aluop == ALUJMP_PTGEN) && (uc_alu_src == 6'h2E);
+wire outer_rb_arm  = copy_stack_dpl_s2 && cpl_transition_r && !outer_rb_r &&
+                     (copy_dpl_s2 > cpl);
+wire outer_rb_fire = outer_rb_r && (outer_rb_fault_r || fault_begin);
+assign transition.rollback = outer_rb_fire;
+assign transition.rollback_cs_rpl = outer_rb_cs_rpl_r;
+assign transition.rollback_ss_dpl = outer_rb_ss_dpl_r;
+assign transition.rollback_entry_cpl_zero = outer_rb_entry0_r;
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        outer_rb_r <= 1'b0;
+        outer_rb_cs_rpl_r <= 2'b00;
+        outer_rb_ss_dpl_r <= 2'b00;
+        outer_rb_entry0_r <= 1'b0;
+        outer_rb_fault_r <= 1'b0;
+    end else if (outer_rb_fire) begin
+        outer_rb_r <= 1'b0;
+    end else if (outer_rb_arm) begin
+        outer_rb_r <= 1'b1;
+        outer_rb_cs_rpl_r <= cs_selector_rpl;
+        outer_rb_ss_dpl_r <= ss_descriptor_dpl;
+        outer_rb_entry0_r <= entry_cpl_zero;
+    end else if (uc_exec && (uc_dest == DEST_CS || uc_dest == DEST_USTEP_TASK_CS)) begin
+        outer_rb_r <= 1'b0;
+    end
+    // A fault that begins once the commit word has executed (its stage-2
+    // copy can still land after the fault started) is remembered until the
+    // record is armed.
+    if (reset_n) begin
+        if (fault_begin)
+            outer_rb_fault_r <= 1'b1;
+        else if (copy_stack_exec || outer_rb_fire)
+            outer_rb_fault_r <= 1'b0;
+    end
+end
 
 // Combinational Tiny PLA outputs (computed same cycle as test)
 logic [9:0] state_vector_comb;
@@ -1457,6 +1514,13 @@ always_ff @(posedge clk) begin
         end
         if (copy_stack_dpl_s2)
             cpl_transition_r <= 1'b0;
+    end
+    // A rolled-back return is abandoned: the commit still in flight must not
+    // re-apply the new CPL (z486.sv repeats it while the stage is held).
+    if (reset_n && outer_rb_fire) begin
+        copy_stack_dpl_s1 <= 1'b0;
+        copy_stack_dpl_s2 <= 1'b0;
+        cpl_transition_r <= 1'b0;
     end
 end
 

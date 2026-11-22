@@ -136,6 +136,12 @@ typedef struct packed {
     logic [1:0] conform_dpl_value;
     logic       write_rpl;
     logic       active;
+    // Undo of an outer-level return's early CPL commit (protection.sv): the
+    // CS RPL and the SS DPL before it, restored when the return faults.
+    logic       rollback;
+    logic [1:0] rollback_cs_rpl;
+    logic [1:0] rollback_ss_dpl;
+    logic       rollback_entry_cpl_zero;
 } prot_transition_t;
 
 // Split base/index scaling into two operands so each caller can retain its

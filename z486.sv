@@ -453,6 +453,7 @@ always @(posedge clk)
 wire        page_fault;             // Page fault (declared fully at paging unit instantiation)
 wire        data_page_fault;
 wire [1:0]  prot_cpl;               // CPL for protection unit (declared fully near protection logic)
+wire        fault_begin_r;          // event_control: a fault delivery began last cycle
 
 // Paging and memory interconnect.
 wire        mem_servicing;          // memory request in flight
@@ -3132,6 +3133,9 @@ protection_unit protection_unit_inst (
     .cs_descriptor_exec(desc_cache[SEG_CS].seg_type[3]),
     .cs_descriptor_conforming(desc_cache[SEG_CS].seg_type[2]),
     .cs_selector_rpl(CS[1:0]),
+    .ss_descriptor_dpl(desc_cache[SEG_SS].DPL),
+    .entry_cpl_zero(pe_entry_cpl_zero),
+    .fault_begin(fault_begin_r),
 
     .test_mode(1'b0),
     .test_state_vector(10'h000),
@@ -3253,6 +3257,7 @@ event_control #(.ENABLE_X87(ENABLE_X87)) event_control_inst (
     .gate_detect_now(gate_detect_now),
     .gate_detect_cond(gate_detect_cond),
     .double_fault_start(double_fault_start),
+    .fault_begin_r(fault_begin_r),
     // Macro-instruction lifecycle and delivery state
     .uc_active(uc_active),
     .halted(halted),
@@ -3767,6 +3772,13 @@ always_ff @(posedge clk) begin
         if (prot_transition.copy_stack_dpl && prot_transition.active) begin
             CS[1:0] <= prot_transition.copy_dpl;
             pe_entry_cpl_zero <= 1'b0;
+        end
+        // An outer-level return that faults before its CS load gives the
+        // early CPL commit back (protection.sv, outer_rb_*): the fault is
+        // raised at the old CPL with the old CS image.
+        if (prot_transition.rollback) begin
+            CS[1:0] <= prot_transition.rollback_cs_rpl;
+            pe_entry_cpl_zero <= prot_transition.rollback_entry_cpl_zero;
         end
 
         // WRITE_RPL: write new CPL into SLCTR[1:0] from loaded CS descriptor's DPL
