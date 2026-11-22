@@ -3300,6 +3300,11 @@ reg [31:0] ucrd_restart_eip;        // TMPeIP/TMPeSP when a microcode read probe
 reg [31:0] ucrd_restart_esp;        // fault after younger instructions have issued
 reg [31:0] wr_restart_esp;          // and the writer's instruction-start ESP
 reg [31:0] TMPeSP;                  // Saved ESP for fault handling
+// A demand write handed to paging, and a data write #PF that rewinds to it
+// (TMPeIP/TMPeSP here, the FLAGS backup in data_unit).
+wire       wr_fault_capture = mem_req_to_paging && (mem_write_now || paging_is_write_access) &&
+                              mem_accepted;
+wire       wr_fault_restore = page_fault && pg_fault_code[1];
 
 // Hardwired relative-branch target and microcode PREF restart (from IND).
 wire [31:0] pf_flush_ip = IND;
@@ -3808,7 +3813,7 @@ always_ff @(posedge clk) begin
     // not that of a successor issued meanwhile. In the writer's first cycle
     // TMPeSP is still loading, so take ESP directly. A check-write (CW, e.g.
     // ENTER's probe of the new stack) faults with a write code too.
-    if (mem_req_to_paging && (mem_write_now || paging_is_write_access) && mem_accepted) begin
+    if (wr_fault_capture) begin
         wr_restart_eip <= TMPeIP;
         wr_restart_esp <= i_first ? ESP : TMPeSP;
     end
@@ -3816,7 +3821,7 @@ always_ff @(posedge clk) begin
         ucrd_restart_eip <= TMPeIP;
         ucrd_restart_esp <= i_first ? ESP : TMPeSP;
     end
-    if (page_fault && pg_fault_code[1]) begin
+    if (wr_fault_restore) begin
         TMPeIP <= wr_restart_eip;
         TMPeSP <= wr_restart_esp;
     end else if (data_page_fault && ucrd_slow_wait_r) begin
@@ -3940,6 +3945,8 @@ data_unit data_unit_inst (
     .interrupt_entry(interrupt_entry),
     .any_fault(any_fault_r),
     .clear_rf(clear_rf),
+    .wr_fault_capture(wr_fault_capture),
+    .wr_fault_restore(wr_fault_restore),
     // Every fault pushes RF=1 except a debug exception: an instruction
     // breakpoint and the DR7.GD general detect push the EFLAGS image with
     // RF=0 (a real Am486DX4, CPUSUITE-XE10: fault_rf_gd's GD frame has RF=0,

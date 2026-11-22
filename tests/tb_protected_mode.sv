@@ -798,6 +798,10 @@ module tb_protected_mode #(
     bit pf_irq_requested = 1'b0;
     bit pf_irq_entered = 1'b0;
     bit pf_irq_handler_issued = 1'b0;
+    // Opt-in: count data write faults that rewind past an issued successor
+    // (+expect_wr_fault_older=N requires at least N); no DUT state is forced.
+    int wr_fault_older_count = 0;
+    int wr_fault_older_min = 0;
 
     // Configurable memory latency (default 1 cycle, +mem_latency=N for more)
     int mem_latency = 1;
@@ -1359,6 +1363,12 @@ module tb_protected_mode #(
                                     $fclose(fd);
                                 end
                             end
+                            if (wr_fault_older_count < wr_fault_older_min)
+                                $fatal(1, "only %0d of %0d write faults rewound past an issued successor",
+                                       wr_fault_older_count, wr_fault_older_min);
+                            if (wr_fault_older_min > 0)
+                                $display("[TB] write faults past an issued successor: %0d",
+                                         wr_fault_older_count);
                             if ($test$plusargs("check_pf_irq_entry") &&
                                 !(pf_irq_requested && pf_irq_entered && pf_irq_handler_issued))
                                 $fatal(1, "#PF -> IRQ regression did not exercise the required entry boundary");
@@ -1760,6 +1770,11 @@ module tb_protected_mode #(
             $display("[TB] Whole-line fill: DISABLED (narrow-only model)");
         end else if (LINE_FILL)
             $display("[TB] Whole-line fill: ENABLED (16-byte line_resp_valid)");
+        void'($value$plusargs("expect_wr_fault_older=%d", wr_fault_older_min));
+        // With the hardwired recipes off no successor issues beside a store.
+        if ($test$plusargs("z486_fast_off") || $test$plusargs("z486_hardwired_off") ||
+            $test$plusargs("z486_fast_toggle"))
+            wr_fault_older_min = 0;
         if ($value$plusargs("pf_irq_entry=%d", pf_irq_entry_eip))
             $display("[TB] #PF handler entry EIP: %08x", pf_irq_entry_eip);
         if ($test$plusargs("continue_on_hlt"))
@@ -2262,6 +2277,12 @@ module tb_protected_mode #(
                     $display("[TB] INTR asserted during hardwired load at cycle %0d",
                              cycle);
             end
+
+            // A data write #PF whose restart EIP (the writer's) differs from
+            // the issued instruction's: a successor had issued past the write.
+            if (dut.page_fault && dut.pg_fault_code[1] &&
+                dut.TMPeIP != dut.wr_restart_eip)
+                wr_fault_older_count <= wr_fault_older_count + 1;
 
             // Leave INTR pending throughout #PF delivery. Exercise this core's
             // IRQ acceptance before the trap handler's first instruction.

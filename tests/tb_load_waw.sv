@@ -178,6 +178,8 @@ module tb_load_waw;
         .interrupt_entry(interrupt_entry),
         .repeat_active(repeat_active),
         .clear_rf(clear_rf),
+        .wr_fault_capture(1'b0),
+        .wr_fault_restore(1'b0),
         .pipeline_advance(pipeline_advance),
         .stack_op(stack_op),
         .stack_dir(stack_dir),

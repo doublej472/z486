@@ -45,6 +45,8 @@ module data_unit
     input  logic        any_fault,
     input  logic        clear_rf,
     input  logic        fault_set_rf,     // fault delivery: the pushed FLAGS image carries RF=1
+    input  logic        wr_fault_capture, // a demand write is handed to paging (z486.sv wr_restart_eip)
+    input  logic        wr_fault_restore, // a data write #PF: TMPeIP/TMPeSP rewind to that writer
     input  logic        gate_detect,
     output logic        flags_backup_active,
 
@@ -1827,12 +1829,48 @@ always_ff @(posedge clk) begin
     end
 end
 
+// A posted demand write can fault after its instruction's last word, once a
+// successor has issued and taken its own backup (a hardwired RMW recipe ends
+// on its store word, 046, and the successor issues beside it).  z486.sv
+// rewinds EIP/ESP to the writer (wr_restart_eip/esp); the flags image must
+// rewind with them: a fault leaves the state from before the faulting
+// instruction (i486 PRM chapter 9: a fault is restarted; 9.8.14: the saved
+// CS:EIP point to the instruction that faulted), so the frame carries
+// the writer's backup and the restarted ADC/SBB sees the carry it began with.
+// wr_flags_backup follows the writer's backup while the writer is current
+// and freezes at the next boundary; a write fault after that restores it.
+logic [31:0] wr_flags_backup;
+logic        wr_writer_current_r;    // the last demand write belongs to the current instruction
+wire         wr_writer_current = wr_fault_capture || wr_writer_current_r;
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        wr_writer_current_r <= 1'b0;
+        wr_flags_backup <= 32'd0;
+    end else begin
+        // In the cycle after the writer's issue its backup is still due
+        // its refresh (flags_backup_refresh, below); a successor issuing in
+        // that cycle takes the backup branch instead, so sample what the
+        // refresh would have written.
+        if (wr_writer_current)
+            wr_flags_backup <= flags_backup_refresh ? eflags_fwd : flags_backup;
+        wr_writer_current_r <= wr_writer_current && !(instr_start && !halted);
+    end
+end
+wire wr_fault_older = wr_fault_restore && !wr_writer_current_r;
+
 always_ff @(posedge clk) begin
     flags_backup_refresh <= reset_n && instr_start && !halted && !interrupt_entry;
     if (!reset_n) begin
         flags_backup_refresh <= 1'b0;
         flags_backup_active <= 1'b0;
         flags_backup <= 32'd0;
+    end else if (wr_fault_older) begin
+        // The faulting write is an older instruction's: the successor's
+        // backup (and its pending refresh) belongs to an instruction that
+        // never happened.
+        flags_backup_refresh <= 1'b0;
+        flags_backup_active <= 1'b1;
+        flags_backup <= wr_flags_backup;
     end else if (ifetch_page_fault) begin
         flags_backup_active <= 1'b1;
         flags_backup <= eflags;
