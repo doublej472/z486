@@ -713,6 +713,7 @@ function automatic logic [15:0] pla_group_entry_lookup(
 );
     casez (addr_in)
         13'b?101110001101: pla_group_entry_lookup = 16'b0000100111000111;
+        13'b?111100111100: pla_group_entry_lookup = 16'b0000010011000001;
         13'b?000000001?01: pla_group_entry_lookup = 16'b0000000000000000;
         13'b?0001?0001?01: pla_group_entry_lookup = 16'b0000000000000000;
         13'b?001?00001?01: pla_group_entry_lookup = 16'b0000000000000000;

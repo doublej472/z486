@@ -182,7 +182,7 @@ function automatic logic [5:0] group_ov_hits(input logic [9:0] grom_addr);
             10'b10101?001?: group_ov_hits = 6'b000010;
             10'b1101110011: group_ov_hits = 6'b000010;
             10'b101100001?: group_ov_hits = 6'b000010;
-            10'b1101111001: group_ov_hits = 6'b000010;
+            10'b1101111?01: group_ov_hits = 6'b000010;  // DB /4 m, DB /6 m
             10'b101010?01?: group_ov_hits = 6'b000010;
             10'b11011101?1: group_ov_hits = 6'b000100;
             10'b10101101?1: group_ov_hits = 6'b000100;

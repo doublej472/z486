@@ -2,7 +2,9 @@
 """Regenerate the PLA in scratch and compare the COMMITTED image, not itself."""
 from pathlib import Path
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +38,26 @@ def main():
             print('PLA IMAGE FAIL: committed pla_entry_rom.hex differs from pla_entry_lookup')
             return 1
         print('PLA IMAGE PASS: 1024 committed words, all 4096 mode lanes verified')
+        # The group PLA and its ROM image: regenerate from copies of the
+        # sources and require the committed files byte for byte.
+        group = work / 'group'
+        group.mkdir()
+        for name in ('pla_entry.svh', 'pla_control.svh'):
+            shutil.copy(ROOT / name, group / name)
+        ran = subprocess.run([sys.executable, str(ROOT / 'scripts/gen_pla_group.py'),
+                              '--core', str(group)], capture_output=True, text=True,
+                             timeout=120)
+        if ran.returncode:
+            print(ran.stdout + ran.stderr)
+            print('PLA GROUP IMAGE FAIL: scripts/gen_pla_group.py failed')
+            return 1
+        for name in ('pla_entry.svh', 'pla_group_entry.hex'):
+            if (group / name).read_bytes() != (ROOT / name).read_bytes():
+                print(f'PLA GROUP IMAGE FAIL: committed {name} differs from '
+                      'scripts/gen_pla_group.py output')
+                return 1
+        print('PLA GROUP IMAGE PASS: pla_entry.svh group block and pla_group_entry.hex '
+              'match scripts/gen_pla_group.py')
         return 0
 
 

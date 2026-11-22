@@ -192,6 +192,8 @@ test-fuzz: obj_dir/Vtb_protected_mode
 check-generators:
 	python3 $(Z486_DIR)/scripts/ucode_optimize.py --check
 	VERILATOR=$(VERILATOR) JOBS=$(JOBS) python3 check_pla_image.py
+	python3 check_pla_zero_entry.py
+	python3 check_pla_zero_entry.py --selftest
 
 # Build all testbenches
 build: obj_dir/Vtb_z486 obj_dir/Vtb_protected_mode

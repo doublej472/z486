@@ -19,6 +19,7 @@ pla_entry.svh and pla_control.svh in the directory above this script.
 Run from anywhere:
 
     ./gen_pla_group.py            # also writes ../pla_group_entry.hex
+    ./gen_pla_group.py --core DIR # the same on copies in DIR
 """
 
 from __future__ import annotations
@@ -29,6 +30,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CORE = HERE.parent
+
+# {data32, group[5:4], modrm.reg, group[3:0], memory, 0, has_0f} of ESC DB
+# (group 37h) /6 with a memory operand, and the 80386 dump's word for DB /1 m
+# and DB /4 m (13'b?110010111100 and 13'b?111000111100 in pla_entry.svh).
+DB_GROUP = 0x37
+DB6_MEM_PAT = "?11" + "110" + "0111" + "100"
+DB_RESERVED_MEM_WORD = 0x04C1
 
 
 def parse_casez(path: Path, func_name: str, width: int):
@@ -88,6 +96,14 @@ def build_group_entry_rom(group_map, group_entry_pats):
 
 
 def main():
+    global CORE
+    if len(sys.argv) == 3 and sys.argv[1] == "--core":
+        # Regenerate into another directory holding copies of pla_entry.svh
+        # and pla_control.svh (tests/check_pla_image.py compares the result
+        # with the committed files).
+        CORE = Path(sys.argv[2]).resolve()
+    elif len(sys.argv) != 1:
+        sys.exit("usage: gen_pla_group.py [--core DIR]")
     entry_pats = parse_casez(CORE / "pla_entry.svh", "pla_entry_lookup", 13)
     ctl_pats = parse_casez(CORE / "pla_control.svh",
                            "pla_control_opcode_lookup", 9)
@@ -172,6 +188,15 @@ def main():
     # to every decoded microcode entry bit. Address fields are
     # {data32, group[5:4], modrm.reg, group[3:0], memory, 0, has_0f}.
     body.append("        13'b?101110001101: pla_group_entry_lookup = 16'b0000100111000111;")
+    # The 80386 decoder dump has no term for ESC DB /6 with a memory operand
+    # (group 37h, reg 6, memory): no row matched, so the word fell through to
+    # `default: 0` and the instruction dispatched to microcode entry 000, the
+    # reset routine.  The i486 PRM's floating-point encoding table defines no
+    # DB /6 memory form, exactly like DB /1 m and DB /4 m, and section 9.9.7
+    # makes every ESC raise #NM under CR0.EM or CR0.TS.  Give DB /6 m the
+    # dump's own word for its reserved neighbours DB /1 m and DB /4 m: entry
+    # 4C1, the no-operand ESC routine.
+    body.append(f"        13'b{DB6_MEM_PAT}: pla_group_entry_lookup = 16'b{DB_RESERVED_MEM_WORD:016b};")
     ge_count = 0
     for pat, val in entry_pats:
         if pat[11] in ("0", "?"):          # bit[1]: group rows (0) or shared (?)
@@ -214,6 +239,15 @@ def main():
         assert casez_eval(group_entry_pats, register_addr, 13) == 0x082B
     group_entry_rom, group_entry_valid = build_group_entry_rom(
         group_map, group_entry_pats)
+    # The reserved DB memory forms /1, /4 and /6 share one word, and no
+    # reachable {group, reg, memory} word is entry 000 (the reset routine).
+    for reg in (1, 4, 6):
+        assert group_entry_rom[(DB_GROUP << 4) | (reg << 1) | 1] == \
+            DB_RESERVED_MEM_WORD, f"DB /{reg} m"
+    zero = [key for key, ok in enumerate(group_entry_valid)
+            if ok and (group_entry_rom[key] & 0xFFF) == 0]
+    assert not zero, "reachable group entries dispatch to 000: " + \
+        ", ".join(f"{key:03x}" for key in zero)
     rom_out = CORE / "pla_group_entry.hex"
     rom_out.write_text("".join(f"{entry:04x}\n" for entry in group_entry_rom))
     assert sum(group_entry_valid) == 944

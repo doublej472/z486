@@ -223,7 +223,7 @@ make test-gpr-merge          # shared GPR producer arbitration
 make test-gpr-hazard         # no new survey findings allowed
 make test-data-access        # stale-token slow-path contract
 make check-reset-lists       # checker self-tests plus named reset exceptions
-make check-generators        # microcode/recipes and committed PLA equivalence
+make check-generators        # microcode/recipes, committed PLA and group-PLA images, no PLA entry 000
 make test-interrupt-nmi      # NMI latch
 make test-addr-unit-reloc    # address_unit relocation vs independent arithmetic
 make test-reset-sweep        # one-cycle reset at every offset of a program
