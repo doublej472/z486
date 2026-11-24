@@ -126,4 +126,5 @@ work builds on Intel microcode disassembly and silicon reverse-engineering by
 Copyright 2026 nand2mario. The SystemVerilog, Python, and Markdown files
 (`*.sv`, `*.svh`, `*.py`, and `*.md`) are licensed under the
 [Apache License 2.0](LICENSE). See [License Scope](LICENSE-SCOPE.md) for
-details. The recovered microcode image is not covered by this license.
+details. The recovered microcode image is not covered by this license, nor is
+the test-only lockstep harness in `tests/lockstep/` (GPL-3.0-or-later).

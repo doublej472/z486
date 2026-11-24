@@ -765,6 +765,50 @@ dhrystone-pc98:
 	cd dhrystone && ./run_dhrystone.py --pc98-map --iters 200
 
 # Clean build artifacts
+# Lockstep against 86Box (tests/lockstep/, GPL-3, test-only: never synthesized).
+# The first run fetches Tetrium and 86Box at pinned commits into LOCKSTEP_CACHE
+# and builds the reference model there, so these targets are not part of
+# test-release.  Known divergences: lockstep/known-divergences.txt.
+LOCKSTEP_DIR := lockstep
+LOCKSTEP_CACHE ?= $(abspath $(LOCKSTEP_DIR)/build)
+LOCKSTEP_X86REF := $(LOCKSTEP_CACHE)/tetrium/build/x86ref/libx86ref.a
+LOCKSTEP_BIN := $(LOCKSTEP_CACHE)/obj/Vtb_lock
+LOCKSTEP_HARNESS := $(LOCKSTEP_DIR)/harness/tb_lock.sv $(LOCKSTEP_DIR)/harness/lock.cpp
+LOCKSTEP_JOBS ?= 4
+LOCKSTEP_ARGS ?=
+export LOCKSTEP_CACHE
+
+.PHONY: lockstep lockstep-quick lockstep-build lockstep-fetch
+lockstep-fetch:
+	JOBS=$(LOCKSTEP_JOBS) ./$(LOCKSTEP_DIR)/fetch.sh
+
+$(LOCKSTEP_X86REF):
+	JOBS=$(LOCKSTEP_JOBS) ./$(LOCKSTEP_DIR)/fetch.sh
+
+# (--build does not track the library given in LDFLAGS: the binary is relinked)
+$(LOCKSTEP_BIN): $(RTL_SRCS) $(RTL_DEPS) $(LOCKSTEP_HARNESS) $(LOCKSTEP_X86REF)
+	@mkdir -p $(LOCKSTEP_CACHE)/obj
+	@rm -f $@
+	$(VERILATOR) --timing -Wno-fatal -Wno-lint -Wno-style -Wno-UNOPTFLAT -Wno-SYNCASYNCNET \
+		-cc --exe --build -O3 -j $(LOCKSTEP_JOBS) \
+		-I$(Z486_DIR) -I$(X87_DIR) -I$(X87_REF_DIR) \
+		-CFLAGS "-std=c++17 -O2 -I$(LOCKSTEP_CACHE)/tetrium/tb/x86ref" \
+		-LDFLAGS "$(LOCKSTEP_X86REF) -lm -lstdc++" \
+		--Mdir $(LOCKSTEP_CACHE)/obj --top-module tb_lock -o Vtb_lock \
+		$(LOCKSTEP_DIR)/harness/tb_lock.sv $(RTL_SRCS) $(abspath $(LOCKSTEP_DIR)/harness/lock.cpp) \
+		> $(LOCKSTEP_CACHE)/obj/build.log 2>&1 || { tail -40 $(LOCKSTEP_CACHE)/obj/build.log; exit 1; }
+
+lockstep-build: $(LOCKSTEP_BIN)
+
+# The hand-written reproducers plus a small seeded random batch (~1 min).
+lockstep-quick: $(LOCKSTEP_BIN)
+	python3 $(LOCKSTEP_DIR)/run.py --set quick --bin $(LOCKSTEP_BIN) --jobs $(LOCKSTEP_JOBS) $(LOCKSTEP_ARGS)
+
+# Everything: reproducers, hazard programs, Tetrium's pm1-pm24 and the
+# 1,010 seeded random programs of the original evaluation (~12 min at 4 jobs).
+lockstep: $(LOCKSTEP_BIN)
+	python3 $(LOCKSTEP_DIR)/run.py --set full --bin $(LOCKSTEP_BIN) --jobs $(LOCKSTEP_JOBS) $(LOCKSTEP_ARGS)
+
 clean:
 	rm -rf obj_dir_tags32
 	rm -rf obj_dir_reset_sweep
@@ -816,5 +860,7 @@ help:
 	@echo "  make test-x87-testfloat - Check arithmetic with Berkeley TestFloat"
 	@echo "  make test-x87-integration - Run x87-enabled CPU protocol test"
 	@echo "  make dhrystone      - Compare released z386 and current z486 on Dhrystone"
+	@echo "  make lockstep-quick - Lockstep vs 86Box: reproducers + seeded random batch (fetches once)"
+	@echo "  make lockstep       - Lockstep vs 86Box: the full set (hours; not in test-release)"
 	@echo "  make clean          - Remove build artifacts"
 	@echo "  make help           - Show this help message"
