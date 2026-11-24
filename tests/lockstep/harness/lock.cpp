@@ -507,15 +507,30 @@ static long cyc = 0, last_act = 0, last_iss = 0;
 static bool started = false;
 static long max_cycles = 200000000;
 
+// external interrupt acknowledged by the DUT: deliver it to the model at this boundary.
+// Called at the next issue and, stepwise, before the compare at a settled boundary: the
+// DUT delivers the interrupt at the boundary it recognises it at (the INTA pair and the
+// frame) and then settles before the handler's first issue, so the compare there sees
+// the handler entry already done. There (v given) the instruction's undefined flags are
+// synced into the model first, from the DUT's EFLAGS (the entry changes none of the
+// arithmetic flags), so the model's frame holds the values the DUT pushed - as the
+// pipelined replay of the .sync file does right after the step.
+static void deliver_inta(const int *v = nullptr) {
+    if (inta_pending_vec < 0) return;
+    if (v && mode_step && last_um) {
+        ref_set_flags(last_um, (uint32_t)v[9]);
+        if (syncf) fprintf(syncf, "%ld %x %x\n", ref_steps, last_um, (uint32_t)v[9] & last_um);
+        last_um = 0;
+    }
+    ref_state_t p0; ref_get(&p0); last_pre = p0;
+    ref_interrupt(inta_pending_vec);
+    ref_store_log(ref_steps);
+    inta_pending_vec = -1;
+}
+
 // one issued instruction: check its EIP against the model and step the model
 static bool take_issue(uint32_t ieip) {
-    if (inta_pending_vec >= 0) {
-        // external interrupt acknowledged by the DUT: deliver it to the model at this boundary
-        ref_state_t p0; ref_get(&p0); last_pre = p0;
-        ref_interrupt(inta_pending_vec);
-        ref_store_log(ref_steps);
-        inta_pending_vec = -1;
-    }
+    deliver_inta();
     ref_state_t pre; ref_get(&pre);
     if (ss_pending) {
         ss_pending = false;
@@ -616,7 +631,7 @@ extern "C" int ls_tick(int issue, int ieip, int hst, int tfr, int done, int ssv,
         if (since_cmp || defer_cmp) {
             bool mid_rep = last_rep && (uint32_t)v[8] == last_eip;
             defer_cmp = false;
-            if (!(ss_pending || mid_rep)) compare_state(v, false);
+            if (!(ss_pending || mid_rep)) { deliver_inta(v); compare_state(v, false); }
             since_cmp = false;
             if (finished) return 4;
         }

@@ -12,7 +12,7 @@
 #
 # Fixed and no longer listed: B1 (dir/esc3, dir/esc4), B6 (pmd/b6*, rand/g25, g118),
 # B15 (pmd/gdtlim_p58only, gdtlim_jmp, ldtlim, rand/g164, g301); B4's frame/CPL half
-# (pmd/retf_fault, iret_fault: see B4a).
+# (pmd/retf_fault, iret_fault: see B4a); B5 (dir/intr1).
 
 # B2: ENABLE_X87=0, ESC memory forms make 386 coprocessor I/O cycles (800000F8h/FCh)
 # and touch the operand (a #PF on a not-present page)
@@ -25,7 +25,6 @@ B2   rand/g10       step,pipe  # FMUL m32 on a not-present page takes #PF on z48
 # before the SS checks (86Box: not written)
 B4a  pmd/retf_fault step,pipe
 B4a  pmd/iret_fault step,pipe
-
 
 # B7: transfer to an EIP beyond the CS limit faults at the target (pushed IP = target)
 B7   dir/xferlim    step,pipe
