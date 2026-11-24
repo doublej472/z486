@@ -2480,24 +2480,44 @@ wire [31:0] pg_cr2_out = data_page_fault ? data_cr2_out : ifetch_fault_addr;
 assign page_fault = data_page_fault || ifetch_page_fault;
 assign frontend_fault = page_fault || ifetch_limit_fault;
 
-// CS limit for instruction fetch.  EIP is the pop cursor's offset (it names
-// the oldest unissued instruction), so the bytes still inside the code segment
-// are limit + 1 - EIP.  Saturate at 63: the prefetch queue holds 32 bytes.
-// limit + 1 reaches 2^32 for a 4 GB segment, so the difference needs 34 bits
-// (bit 33 is the sign).
+// CS limit for instruction fetch.  The bound is relative to the pop cursor's
+// offset, the oldest unissued instruction: normally EIP.  A redirect moves the
+// pop cursor before EIP names its target - a transfer's microcode PREF (far
+// JMP/CALL, RETF, IRET, INT n, JMP/CALL r/m) and the early CALL rel redirect
+// write EIP words later - and the target's bytes may already be decoding
+// (a code-cache hit).  Between the redirect and that EIP write the bound is
+// taken from the redirect's own offset (fetch_redir_off_r), so no byte beyond
+// the target's limit reaches D1/D2 (Intel486 PRM: an instruction any byte of
+// which lies beyond the code-segment limit raises #GP(0); JMP/CALL/RET/IRET/
+// INT n: "IF instruction pointer not within code segment limit THEN #GP(0)").
+// The CS descriptor is loaded before the PREF word in every such transfer
+// (e.g. INT n: uc 8D2-8D3 before 8D8), so cs_fetch_limit is already the new one.
+// Bytes inside the segment are limit + 1 - offset.  Saturate at 63: the
+// prefetch queue holds 32 bytes.  limit + 1 reaches 2^32 for a 4 GB segment,
+// so the difference needs 34 bits (bit 33 is the sign).
+reg         fetch_redir_v;          // the pop cursor is at fetch_redir_off_r, not EIP
+reg  [31:0] fetch_redir_off_r;
 wire [33:0] cs_fetch_limit = desc_cache[SEG_CS].G
                            ? {2'b0, desc_cache[SEG_CS].limit, 12'hFFF}
                            : {14'd0, desc_cache[SEG_CS].limit};
-wire [33:0] cs_fetch_rem_w = cs_fetch_limit + 34'd1 - {2'b0, EIP};
 // Saturation as a second carry chain instead of a 27-input OR over the
-// difference: rem >= 64  <=>  limit - 63 - EIP >= 0, so the "far" verdict is
-// the sign of a parallel chain and arrives with rem's own sign, one LUT ahead
-// of the old OR tree (this sat on the fitted EIP -> fetch_limit_rem ->
-// k1q_avail -> entry-ROM address cone).  Bit-identical for every input.
-wire [33:0] cs_fetch_far_w = cs_fetch_limit - 34'd63 - {2'b0, EIP};
-assign fetch_limit_rem = cs_fetch_rem_w[33]        ? 6'd0  :
-                         !cs_fetch_far_w[33]       ? 6'd63 :
-                         cs_fetch_rem_w[5:0];
+// difference: rem >= 64  <=>  limit - 63 - offset >= 0, so the "far" verdict
+// is the sign of a parallel chain and arrives with rem's own sign, one LUT
+// ahead of the old OR tree (this sat on the fitted EIP -> fetch_limit_rem ->
+// k1q_avail -> entry-ROM address cone).  Bit-identical for every input.  The
+// EIP and redirect-offset bounds are computed side by side and selected last.
+function automatic logic [5:0] cs_fetch_rem(input logic [33:0] lim,
+                                            input logic [31:0] off);
+    logic [33:0] rem_w, far_w;
+    rem_w = lim + 34'd1 - {2'b0, off};
+    far_w = lim - 34'd63 - {2'b0, off};
+    cs_fetch_rem = rem_w[33]  ? 6'd0  :
+                   !far_w[33] ? 6'd63 :
+                   rem_w[5:0];
+endfunction
+wire [5:0] fetch_limit_rem_eip   = cs_fetch_rem(cs_fetch_limit, EIP);
+wire [5:0] fetch_limit_rem_redir = cs_fetch_rem(cs_fetch_limit, fetch_redir_off_r);
+assign fetch_limit_rem = fetch_redir_v ? fetch_limit_rem_redir : fetch_limit_rem_eip;
 
 // CR3 write detection for TLB flush
 assign cr3_write = uc_exec && uc_buscode == BUSOP_SPCR && uc_dest == DEST_PDBR;
@@ -3335,6 +3355,28 @@ wire [31:0] pf_other_addr  = ret_redirect        ? (CS_base + vipt_load_wb_targe
                              pe_mode_toggle_now  ? (CS_base + EIP) :
                                                    (CS_base + pf_flush_ip);
 assign pf_flush_addr = branch_ustep_redirect ? pf_branch_addr : pf_other_addr;
+// The offset half of pf_flush_addr, same priority: the pop cursor's offset
+// after a redirect, until EIP is next written (fetch_limit_rem above).
+wire [31:0] pf_flush_off = branch_ustep_redirect ? ea_reg :
+                           ret_redirect          ? vipt_load_wb_target_r :
+                           early_call_redirect   ? br_target :
+                           pe_mode_toggle_now    ? EIP :
+                                                   pf_flush_ip;
+// Every EIP write (the EIP block below) that is not itself a redirect: from
+// then on EIP is the pop cursor's offset again.  eip_write_other's redirect
+// term (ret_redirect) is a q_flush, which takes priority.
+wire fetch_redir_clear = (i_issue && !halted) || eip_write_other;
+always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        fetch_redir_v <= 1'b0;
+        fetch_redir_off_r <= 32'h0;
+    end else if (q_flush) begin
+        fetch_redir_v <= 1'b1;
+        fetch_redir_off_r <= pf_flush_off;
+    end else if (fetch_redir_clear) begin
+        fetch_redir_v <= 1'b0;
+    end
+end
 `ifdef Z486_DEBUG_BRANCH_TARGET
 // synthesis translate_off
 always @(posedge clk) begin
