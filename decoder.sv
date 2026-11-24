@@ -53,7 +53,8 @@ module decoder
     output dec_entry_t  d1_issue_entry, // live structural entry for empty-pipe launch
     output       [31:0] d2_branch_disp, // a relative branch's displacement, as
                                         //   (branch_rel8 ? sext8 : ) d2_entry's
-    output              fetch_blocked   // decoder is waiting for unfetched bytes
+    output              fetch_blocked,  // decoder is waiting for unfetched bytes
+    output              len_fault       // the oldest unissued instruction is over 15 bytes
 );
 
 typedef enum logic [1:0] {
@@ -95,7 +96,7 @@ logic        prefix_66;
 logic        prefix_67;
 logic        prefix_0f;
 logic        prefix_rep;
-logic [3:0]  prefix_count;
+logic [3:0]  prefix_count;         // saturates at 15 (see the length limit below)
 logic [1:0]  prefix_rep_lock;
 logic [2:0]  prefix_seg;
 reg         code32_r;     // Local CS.D copy; frontend flush hides its one-cycle update latency.
@@ -226,6 +227,22 @@ wire d1_preread_handoff = !consume_prefix && !consume_0f && d1_struct_ready;
 wire d1_handoff = !consume_prefix && !consume_0f && d1_slot_ready &&
                   d1_struct_ready;
 
+// The 15-byte instruction length limit. i486 PRM, interrupt 13 (general
+// protection): "Exceeding the instruction length limit of 15 bytes (this only
+// can occur when redundant prefixes are placed before an instruction)"; the
+// fault is reported before the instruction executes, at its first byte.
+// D1 takes prefixes freely (prefix_count saturates, so it cannot wrap) and
+// an over-long instruction hands off like any other; its skeleton then never
+// completes D2, so it never issues, and len_fault reports it to prefetch,
+// which raises #GP(0) through the fetch-limit path once the instruction is
+// the oldest and its first 15 bytes are buffered. Nothing here is on a
+// non-faulting path: an instruction of 15 bytes or less sees no change.
+// d1_pfx_over: 15 or more prefix and 0F bytes are consumed, so whatever
+// follows makes the instruction 16 bytes or longer (D1 may wait forever on
+// a byte the 32-byte queue never fetches: 18+ bytes cannot be in view).
+wire d1_pfx_over = (prefix_count == 4'd15) ||
+                   ((prefix_count == 4'd14) && prefix_0f);
+
 // Preread the macro-entry PLA from M10K one cycle before D1 handoff. The
 // speculative cursor deliberately ignores D2 backpressure; when D1 cannot
 // advance, retain the entry corresponding to its current window. This removes
@@ -285,6 +302,11 @@ always_comb begin
     handoff_work = struct_work.need_sib ? capture_sib(struct_work, sib_b)
                                         : struct_work;
 end
+// At handoff: prefix bytes + body over 15, i.e. body_len > 15 - prefixes.
+// The room is register-derived, the compare sits beside handoff_raw_valid's.
+wire [3:0] d1_len_room = 4'd15 - prefix_count - {3'b000, prefix_0f};
+wire handoff_len_over = d1_pfx_over ||
+                        (handoff_work.body_len > {1'b0, d1_len_room});
 // A LOCK-prefixed RMW keeps its original routine: the RMW_FAST overlays read
 // the operand from the L1 and write it through the direct store port, while a
 // locked RMW must read memory under LOCK# (lock_insn, the locked-read path).
@@ -394,6 +416,10 @@ always @(posedge clk)
          handoff_work.body_len + {1'b0, prefix_count} + (prefix_0f ? 5'd1 : 5'd0)))
         $fatal(1, "D1 body length %0d + prefixes disagrees with length %0d",
                handoff_work.body_len, handoff_work.entry.length);
+always @(posedge clk)
+    if (reset_n && d1_handoff && (handoff_len_over != handoff_work.entry.length[4]))
+        $fatal(1, "D1 length-limit verdict %b disagrees with length %0d",
+               handoff_len_over, handoff_work.entry.length);
 always @(posedge clk)
     if (reset_n && (d1_handoff || d1_preread_handoff) &&
         (handoff_adv != handoff_work.body_len))
@@ -526,7 +552,8 @@ always_ff @(posedge clk or negedge reset_n) begin
             if (consume_0f) begin
                 prefix_0f <= 1'b1;
             end else begin
-                prefix_count <= prefix_count + 4'd1;
+                if (prefix_count != 4'd15)
+                    prefix_count <= prefix_count + 4'd1;
                 unique case (opcode)
                     8'h66: prefix_66 <= 1'b1;
                     8'h67: prefix_67 <= 1'b1;
@@ -646,7 +673,10 @@ wire       finishing = d2_phaseB || skel.fields_fit;
 wire [3:0] need_now  = d2_phaseB ? {1'b0, sizeB} :
                        !has_litA ? 4'd0 :
                        skel.fields_fit ? sizeAB : {1'b0, sizeA};
-wire       bytes_ok  = (k2q_avail >= {2'b00, need_now});
+// An over-long skeleton (length >= 16; the 5-bit length holds up to 27)
+// never captures its literals, so it stays blocked until the #GP(0) flush.
+wire       skel_len_over = skel.entry.length[4];
+wire       bytes_ok  = (k2q_avail >= {2'b00, need_now}) && !skel_len_over;
 wire       d2_can    = skel_v && d2_window_valid;
 wire       d2_complete = d2_can && finishing;
 assign     d2_done   = i_issue;
@@ -661,6 +691,7 @@ wire d1_bytes_blocked = !skel_v && !consume_prefix && !consume_0f &&
                         !d1_struct_ready;
 wire d2_bytes_blocked = skel_v && !d2_window_valid && !bytes_ok;
 assign fetch_blocked = d1_bytes_blocked || d2_bytes_blocked;
+assign len_fault = skel_v ? skel_len_over : d1_pfx_over;
 
 decoder_work_t d2_final;
 always_comb begin
@@ -698,7 +729,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         skel_lit_r <= k1q[31:0];
         skel_raw_hi_r <= k1q[63:32];
         skel_raw_lit_off_r <= handoff_raw_lit_off;
-        skel_window_valid_r <= handoff_raw_valid;
+        skel_window_valid_r <= handoff_raw_valid && !handoff_len_over;
         skel_window_raw_r <= 1'b1;
     end else if (d2_stepA) begin
         skel_lit_r <= k2q;

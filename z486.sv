@@ -477,7 +477,7 @@ wire        pf_spec;
 wire [2:0]  pf_fault_code;
 wire [31:0] pf_fault_addr;
 wire        ifetch_page_fault;
-wire        ifetch_limit_fault;     // fetch beyond the CS limit: #GP(0) before the instruction
+wire        ifetch_limit_fault;     // fetch beyond the CS limit, or an instruction over 15 bytes: #GP(0) before it
 // A fetch-side fault (page fault, or #GP(0) for a CS-limit violation) replaces
 // the next instruction: both take the same boundary and sequencer gating.
 wire        frontend_fault;
@@ -485,6 +485,7 @@ wire [5:0]  fetch_limit_rem;        // bytes from EIP through the CS limit (satu
 wire [2:0]  ifetch_fault_code;
 wire [31:0] ifetch_fault_addr;
 wire        decoder_fetch_blocked;
+wire        decoder_len_fault;      // the oldest unissued instruction is over 15 bytes
 
 // Physical cache channels connect paging, memory arbitration, and x87.
 wire        dcache_req_valid;
@@ -1206,6 +1207,7 @@ prefetch prefetch_inst (
     .ifetch_fault_code(ifetch_fault_code),
     .ifetch_fault_addr(ifetch_fault_addr),
     .fetch_limit_rem(fetch_limit_rem),
+    .len_fault(decoder_len_fault),
     .ifetch_limit_fault(ifetch_limit_fault),
     // Control
     .pf_suspend(page_fault),
@@ -1445,7 +1447,8 @@ decoder decoder_inst (
     .d1_issue_direct(d1_issue_direct),
     .d1_issue_entry(d1_issue_entry),
     .d2_branch_disp(d2_branch_disp),
-    .fetch_blocked(decoder_fetch_blocked)
+    .fetch_blocked(decoder_fetch_blocked),
+    .len_fault(decoder_len_fault)
 );
 
 // The local mode replicas lag architectural state by one cycle. A far

@@ -57,6 +57,9 @@ module prefetch
     // decode never sees a byte beyond the limit, and an instruction that needs
     // one takes #GP(0) once it is the oldest unissued instruction.
     input      [5:0]  fetch_limit_rem,
+    // The oldest unissued instruction is over 15 bytes (decoder len_fault):
+    // the same #GP(0), once its first 15 bytes are buffered.
+    input             len_fault,
     output reg        ifetch_limit_fault, // registered one-shot #GP(0)
 
     // Control
@@ -190,6 +193,10 @@ assign k2q_avail = (k2q_avail_raw > k2_lim) ? k2_lim : k2q_avail_raw;
 // beyond it.  The limit check precedes paging, so this also keeps a retained
 // prefetch page fault on a line past the limit from being reported.
 wire limit_reached = (pf_byte_count >= fetch_limit_rem);
+// The 15-byte length limit acts as a limit at EIP + 15: the bytes inside it
+// are fetched first (so a fetch fault among them is reported), and past it
+// a blocked decode takes #GP(0) on the fetch-limit path.
+wire len_reached = len_fault && (pf_byte_count >= 6'd15);
 
 wire pf_inflight = (pf_req_toggle != pf_ack_toggle);
 
@@ -701,11 +708,11 @@ always_ff @(posedge clk or negedge reset_n) begin
         end
 
         if (pf_suspended && !pf_fault_reported && fetch_blocked && !q_flush &&
-            !limit_reached) begin
+            !limit_reached && !len_reached) begin
             ifetch_fault <= 1'b1;
             pf_fault_reported <= 1'b1;
         end
-        if (limit_reached && !pf_limit_reported && fetch_blocked && !q_flush) begin
+        if ((limit_reached || len_reached) && !pf_limit_reported && fetch_blocked && !q_flush) begin
             ifetch_limit_fault <= 1'b1;
             pf_limit_reported <= 1'b1;
         end
