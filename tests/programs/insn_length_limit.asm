@@ -2,9 +2,9 @@
 ;
 ; i486 Programmer's Reference Manual: an instruction is at most 15 bytes long
 ; (instruction format, prefixes), and the general-protection exception list
-; (interrupt 13) includes "exceeding the instruction length limit of 15 bytes
-; (this only can occur when redundant prefixes are placed before an
-; instruction)".  In real-address mode the same condition is interrupt 13.
+; (interrupt 13; 80386 PRM 9.8.13, item 15) includes "Exceeding the
+; instruction length limit of 15 bytes".  In real-address mode the same
+; condition is interrupt 13.
 ; The fault is reported before the instruction does anything, so the saved
 ; CS:IP is the instruction's first (prefix) byte and no register or memory
 ; operand changes.

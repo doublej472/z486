@@ -227,10 +227,10 @@ wire d1_preread_handoff = !consume_prefix && !consume_0f && d1_struct_ready;
 wire d1_handoff = !consume_prefix && !consume_0f && d1_slot_ready &&
                   d1_struct_ready;
 
-// The 15-byte instruction length limit. i486 PRM, interrupt 13 (general
-// protection): "Exceeding the instruction length limit of 15 bytes (this only
-// can occur when redundant prefixes are placed before an instruction)"; the
-// fault is reported before the instruction executes, at its first byte.
+// The 15-byte instruction length limit. 80386 PRM 9.8.13 (interrupt 13, general
+// protection), list item 15: "Exceeding the instruction length limit of 15
+// bytes"; a fault, so it is reported before the instruction executes, at its
+// first byte.
 // D1 takes prefixes freely (prefix_count saturates, so it cannot wrap) and
 // an over-long instruction hands off like any other; its skeleton then never
 // completes D2, so it never issues, and len_fault reports it to prefetch,
