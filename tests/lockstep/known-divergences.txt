@@ -12,7 +12,8 @@
 #
 # Fixed and no longer listed: B1 (dir/esc3, dir/esc4), B6 (pmd/b6*, rand/g25, g118),
 # B15 (pmd/gdtlim_p58only, gdtlim_jmp, ldtlim, rand/g164, g301); B4's frame/CPL half
-# (pmd/retf_fault, iret_fault: see B4a); B5 (dir/intr1).
+# (pmd/retf_fault, iret_fault: see B4a); B5 (dir/intr1); B9 (pmd/intlim3 now shows only
+# B7). B3's over-15-byte programs are listed as D-len15: 86Box has no length limit.
 
 # B2: ENABLE_X87=0, ESC memory forms make 386 coprocessor I/O cycles (800000F8h/FCh)
 # and touch the operand (a #PF on a not-present page)
