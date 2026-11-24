@@ -79,7 +79,11 @@ Every program runs twice:
 
 - **stepwise** (`-s`): issue is serialised through the core's instruction-breakpoint hold;
   at every settled boundary the full state is compared, the instruction's undefined flags
-  are masked, copied into the model and written to a `.sync` file;
+  are masked, copied into the model and written to a `.sync` file. An external
+  interrupt the core acknowledged is handed to the model before that compare (the core
+  enters the handler before it settles): in both modes the model takes each interrupt at
+  the boundary where the core acknowledged it, so the harness checks that INTR was still
+  asserted at the acknowledge (`intr` below), not which boundary recognised it;
 - **pipelined** (`-p`): the core runs freely on a randomised bus (0-6 wait reads, whole-line
   or beat fills, write holds); every issued EIP is checked against the model, and at the
   stop the full state and the whole memory image are compared. The `.sync` file replays
