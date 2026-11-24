@@ -23,3 +23,5 @@ tests/ucode*.hex
 tests/pla_entry_rom.hex
 tests/pla_group_entry.hex
 tests/singlestep_result.txt
+# lockstep harness: fetched Tetrium / 86Box, libx86ref, Vtb_lock, generated programs
+tests/lockstep/build/
