@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Divergences the lockstep still expects (run.py; README.md "Known divergences").
+#
+#   FINDING  PROGRAM  MODES  [counter=NAME]   # note
+#
+# MODES: step, pipe or step,pipe - the runs that must show it.  counter=NAME: the
+# finding is judged on the harness counter NAME being nonzero (the harness tolerates
+# and counts it everywhere else).  A run that diverges and is not listed fails the
+# target; a listed one that no longer shows is reported GONE: remove its line with
+# the fix.  B* are z486 bugs (numbers of the original lockstep evaluation), D* are
+# documented implementation differences, H* harness limits.
+#
+# Fixed and no longer listed: B1 (dir/esc3, dir/esc4), B6 (pmd/b6*, rand/g25, g118),
+# B15 (pmd/gdtlim_p58only, gdtlim_jmp, ldtlim, rand/g164, g301); B4's frame/CPL half
+# (pmd/retf_fault, iret_fault: see B4a).
+
+# B2: ENABLE_X87=0, ESC memory forms make 386 coprocessor I/O cycles (800000F8h/FCh)
+# and touch the operand (a #PF on a not-present page)
+B2   dir/esc2       step,pipe  counter=cpio
+B2   rand/g10       step,pipe  # FMUL m32 on a not-present page takes #PF on z486 only
+
+# B3: no 15-byte limit; long prefix runs hang the front end or are mis-decoded
+B3   dir/len17      step,pipe
+B3   dir/len17b     step,pipe
+B3   dir/len18      step,pipe
+B3   dir/lp13_add_word__0x1234__0x5678_  step,pipe
+B3   dir/lp14_add_word__0x1234__0x5678_  step,pipe
+B3   dir/lp15_inc_word__0__  step,pipe
+B3   dir/lp16_inc_bx_  step,pipe
+B3   dir/lp16_nop_  step,pipe
+B3   dir/lp17_nop_  step,pipe
+B3   dir/lp20_nop_  step,pipe
+B3   dir/lq12       step,pipe
+
+# B4a: outer-level RETF / IRETD whose new SS faults: the #GP is now delivered at the
+# old CPL (B4 fixed), but the ring-3 code descriptor's accessed bit is still set
+# before the SS checks (86Box: not written)
+B4a  pmd/retf_fault step,pipe
+B4a  pmd/iret_fault step,pipe
+
+# B5: INTR withdrawn before the boundary is still acknowledged
+B5   dir/intr1      step,pipe
+
+# B7: transfer to an EIP beyond the CS limit faults at the target (pushed IP = target)
+B7   dir/xferlim    step,pipe
+B7   pmd/intlim     step,pipe
+B7   pmd/intlim2    step,pipe
+
+# B8: o32 PUSH Sreg straddling the 16-bit stack wrap: no #SS
+B8   dir/stkwrap2   step,pipe
+
+# B9: code beyond the CS limit executes after an earlier faulting transfer to it
+# (the stepwise run stops at its B7 first difference)
+B9   pmd/intlim3    step,pipe
+
+# B10: error code through a 32-bit gate written as a word (upper half stale).  The
+# stepwise run tolerates it (errpad, synced into the model); the pipelined end state
+# shows it in the handler's register / memory copy of the error code.  The gdtlim
+# programs are B15's reproducers: their #GP is now correct, its error code is B10.
+B10  pmd/errcode    pipe
+B10  pmd/errcode32  pipe
+B10  pmd/errcode32b pipe
+B10  pmd/gdtlim     pipe
+B10  pmd/gdtlim_b007    pipe
+B10  pmd/gdtlim_b007ss  pipe
+B10  pmd/gdtlim_ds  pipe
+B10  pmd/gdtlim_esc_fadd   pipe
+B10  pmd/gdtlim_esc_fld80  pipe
+B10  pmd/gdtlim_esc_fldq   pipe
+B10  pmd/gdtlim_esc_fstp80 pipe
+B10  pmd/gdtlim_inv     pipe
+B10  pmd/gdtlim_inv2    pipe
+B10  pmd/gdtlim_p   pipe
+B10  pmd/gdtlim_p58 pipe
+B10  pmd/gdtlim_pg  pipe
+B10  pmd/gdtlim_ss  pipe
+
+# B11: INTO / SALC right after a REP string instruction test stale flags (pipelined)
+B11  dir/into       pipe
+B11  dir/rc_into_   pipe
+B11  dir/io_mov_al_0x80_repe_scasb_  pipe
+B11  dir/io_rep_scasb_   pipe
+B11  dir/io_repe_cmpsb_  pipe
+B11  dir/io_repe_cmpsw_  pipe
+B11  dir/io_repne_cmpsb_ pipe
+B11  dir/rc2_cx3    pipe
+B11  dir/rc3_lods   pipe
+B11  dir/rc3_stos   pipe
+B11  dir/rc3_stos0  pipe
+B11  dir/salc_50    pipe
+B11  dir/sl_clc_rep pipe
+B11  dir/sl_stc_nop_rep pipe
+B11  dir/sl_subflag_rep pipe
+
+# B14: data breakpoint hit by INT n's frame push: no #DB before the handler
+B14  pmd/dbint      step,pipe
+
+# D-shift0: SHRD / SHL m with count 0 on a not-present page: z486 reads the operand
+# and takes #PF, 86Box makes no access (i486 PRM silent; the 80386 microcode reads)
+D-shift0  rand/g9   step,pipe
+
+# ---- full set only (make -C tests lockstep) ----
+B2   rand/r224      step,pipe  # FLD m32 beyond the DS limit faults on z486
+B2   rand/g102      step,pipe
+B2   rand/g114      step,pipe
+B7   pm/pm8         step       # pipelined: B9 (executes the HLT beyond the limit and hangs)
+B9   pm/pm8         pipe
+B8   rand/g20       step,pipe
+B10  pm/pm2         pipe
+B10  pm/pm24        pipe
+B11  rand/r139      pipe
+B11  rand/r141      pipe
+B11  rand/g150      pipe
+B11  rand/g193      pipe       # SALC
+B12  pm/pm7         step       # 286-TSS switch clears the GPR upper halves (pipelined end state hides it)
+B13  rand/g90       step       # REPNE SCASW #PF after a completed element: frame FLAGS
+B13  rand/g428      step       # REPNE CMPSB
+B14  pm/pm15        step,pipe
+D-shift0  rand/g11  step,pipe
+D-shift0  rand/g353 step,pipe
+D-shift0  rand/g356 step,pipe
+D-shift0  rand/g437 step,pipe
+# D-cr2blk: a fetch #PF's CR2 is the 16-byte prefetch block on z486 (the instruction
+# byte on 86Box); tolerated by the compare, but a later MOV r32,CR2 reads it back
+D-cr2blk  rand/g229 pipe
+D-cr2blk  rand/g439 pipe
+# D-tlbtest: TR6/TR7 TLB test reads differ (implementation-specific replacement)
+D-tlbtest pm/pm10   step,pipe
+# D-cpuid: pm12 assumes CPUID; z486 is a 486SX without it (signature 0420h)
+D-cpuid   pm/pm12   step,pipe
+# D-nw: CR0.NW=1 write hits stay in the L1 (correct i486 behaviour; 86Box has no cache)
+D-nw      pm/pm13   step,pipe
+# D-dr6: DR6 bit 12 reads 0 on z486, 1 on 86Box (unverified on an i486)
+D-dr6     pm/pm14   step,pipe
+# D-pusha: PUSHA faulting at the 64 KB wrap: z486 has written the low slots first
+D-pusha   pm/pm19   step,pipe
+# D-abit: 86Box's look-ahead fetch of the next code page sets its PTE A bit
+D-abit    pm/pm22   step
+# H-port: a word / dword OUT at DX=FFFFh: the harness numbers the next byte's port
+# 10000h for the model and 0000h for the core
+H-port    rand/r97  step,pipe
+H-port    rand/r207 step,pipe
