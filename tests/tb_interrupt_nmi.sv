@@ -202,6 +202,31 @@ module tb_interrupt_nmi;
               "edge after SETNMI does not latch (nmi_blocked gates nmi_edge)");
 
         // ---------------------------------------------------------------------
+        // Scenario D: INTR is a level. A request withdrawn before the boundary
+        // is gone (Intel486 DX data sheet, Oct 1992, 6.4.1: "The interrupt
+        // will not be serviced ... if the INTR signal does not remain
+        // active"); one held high keeps its latch, across an IF=0 stretch too
+        // (the STI-shadow case: latched with IF=1, still pending after CLI).
+        // ---------------------------------------------------------------------
+        $display("");
+        $display("[D] INTR withdrawn before the boundary:");
+        apply_reset();
+        iflag = 1'b1;
+        intr = 1'b1;
+        tick();
+        check(intr_pending === 1'b1, "INTR high with IF=1 latches the request");
+        iflag = 1'b0;
+        tick();
+        check(intr_pending === 1'b1, "a held request stays latched while IF=0");
+        check(interrupt_pending === 1'b0, "IF=0 masks the held request");
+        intr = 1'b0;
+        tick();
+        check(intr_pending === 1'b0, "INTR withdrawn: the latch clears");
+        iflag = 1'b1;
+        tick();
+        check(interrupt_pending === 1'b0, "IF=1 again: nothing to deliver");
+
+        // ---------------------------------------------------------------------
         // Verdict.
         // ---------------------------------------------------------------------
         $display("");

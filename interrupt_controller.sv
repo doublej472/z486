@@ -71,10 +71,23 @@ always_ff @(posedge clk) begin
         // INTR then stays high with IF=1 and is never taken again. While IF is
         // clear nothing latches, so for an interrupt gate (or real mode) the
         // boundary re-arm changes nothing until IRET/STI sets IF.
+        //
+        // The latch is the request's LEVEL, not an event: it holds only while
+        // INTR stays high, so a request the device withdraws before the
+        // boundary (an 8259 whose IRQ was masked through OCW1, or whose line
+        // fell) is not acknowledged. Intel486 DX data sheet (Oct 1992) 6.4.1:
+        // "The INTR Signal is level sensitive and must remain active for the
+        // instruction execution unit to recognize it: The interrupt will not
+        // be serviced by the Intel486 Microprocessor if the INTR signal does
+        // not remain active." While INTR stays high the next state is the old
+        // sticky set (intr_pending implies !intr_latch_inhibit: the latch is
+        // set only while the inhibit is clear, and CINTLA clears the latch in
+        // the cycle it sets the inhibit), so recognising a held request takes
+        // exactly the cycles it did; only a withdrawn one changes, cleared on
+        // the first clock that samples INTR low.
         if (!intr || i_rni)
             intr_latch_inhibit <= 1'b0;
-        if (intr && iflag && !intr_latch_inhibit)
-            intr_pending <= 1'b1;
+        intr_pending <= intr && (intr_pending || (iflag && !intr_latch_inhibit));
 
         if (shadow_start)
             inhibit_interrupts <= 1'b1;
@@ -94,5 +107,12 @@ always_ff @(posedge clk) begin
         end
     end
 end
+
+// synthesis translate_off
+// The invariant the held-request equivalence above rests on.
+always @(posedge clk)
+    if (reset_n && intr_pending && intr_latch_inhibit)
+        $fatal(1, "interrupt_controller: intr_pending set while the CINTLA inhibit is active");
+// synthesis translate_on
 
 endmodule
