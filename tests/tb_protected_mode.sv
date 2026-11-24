@@ -786,6 +786,13 @@ module tb_protected_mode #(
     // request just acknowledged, which must not be taken a second time).
     int unsigned intr_drop_delay = 0;
     int unsigned intr_drop_count = 0;
+    // INTR pulse port (0xDC): bits 31:16 = delay, bits 15:0 = width, both in
+    // platform cycles. INTR rises after the delay (at once for 0) and falls
+    // after the width unless an acknowledge drops it first - a request the
+    // device withdraws on its own, e.g. one the PIC masks before the CPU
+    // acknowledges it.
+    int unsigned intr_pulse_wait = 0;
+    int unsigned intr_pulse_width = 0;
     initial begin
         void'($value$plusargs("intr_drop_delay=%d", intr_drop_delay));
         void'($value$plusargs("intr_rerequest=%d", intr_rerequest));
@@ -1062,6 +1069,16 @@ module tb_protected_mode #(
         end
         if (async_stall > 0)
             async_stall <= async_stall - 1;
+        if (intr_pulse_wait > 0) begin
+            intr_pulse_wait <= intr_pulse_wait - 1;
+            if (intr_pulse_wait == 1) begin
+                intr <= 1'b1;
+                intr_drop_count <= intr_pulse_width;
+                if ($test$plusargs("trace_io"))
+                    $display("[TB] INTR pulse: high for %0d cycles at cycle %0d",
+                             intr_pulse_width, cycle);
+            end
+        end
         if (intr_drop_count > 0) begin
             intr_drop_count <= intr_drop_count - 1;
             if (intr_drop_count == 1)
@@ -1474,6 +1491,20 @@ module tb_protected_mode #(
                     test_data <= dout;
                     if ($test$plusargs("trace_io") || $test$plusargs("check_pf_irq_entry"))
                         $display("TEST DATA: 0x%08X", dout);
+                end
+
+                // INTR pulse (0xDC): delay in bits 31:16, width in 15:0.
+                if (port == 16'h00DC) begin
+                    if (dout[31:16] == 16'd0) begin
+                        intr <= 1'b1;
+                        intr_drop_count <= (dout[15:0] == 16'd0) ? 1 : 32'(dout[15:0]);
+                    end else begin
+                        intr_pulse_wait <= 32'(dout[31:16]);
+                    end
+                    intr_pulse_width <= (dout[15:0] == 16'd0) ? 1 : 32'(dout[15:0]);
+                    if ($test$plusargs("trace_io"))
+                        $display("SIGNAL: INTR pulse delay=%0d width=%0d",
+                                 dout[31:16], dout[15:0]);
                 end
 
                 // Signal port (0xE8) - trigger hardware interrupts
