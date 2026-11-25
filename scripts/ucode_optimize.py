@@ -45,6 +45,7 @@ TASK_LIMIT_CHECK = LOADALL_FREE + 0x19   # task switch: TSS limit check (10 word
 # and in the unreachable 2EE/2EF (see the 2EB patch).
 RET_SS_TAIL_WRITE_A = LOADALL_FREE + 0x33   # 0x92B; z486_pkg.sv UADDR_RET_SS_WRITE_A
 RET_SS_TAIL_KEEP_A = LOADALL_FREE + 0x34    # 0x92C; z486_pkg.sv UADDR_RET_SS_KEEP_A
+IRET_TSS_TAIL = 0x932       # IRET back-link TSS tail (4 words); z486_pkg.sv UADDR_IRET_TSS_TAIL
 RET_CS_SET_A = 0x9FB
 RET_CS_SET_A_END = 0x2EE
 DEST_SLCTR = 0x35
@@ -638,6 +639,34 @@ PATCHES = [
           word=uword(**longjump(0x868))),
     Patch(TASK_LIMIT_CHECK + 9, "TSS limit check: delay slot SIGMA = TMP_TR & ~3 (= 85D)",
           copy_from=0x85D),
+    # An IRET with NT set (673 -> 65C-662, the outgoing save 724-73E, 663-667)
+    # reads its back-link TSS descriptor through 5C9-5CD and does not pass
+    # 74C: the protection PLA (TST_DES_TSSTSR) sent it to the 5D3 tail, and a
+    # back-link TSS with a short limit raised #GP(0) at its first read beyond
+    # the limit (75A), after 5D4/5D8/668 had already written the new TSS
+    # into TR's descriptor cache.  i486 PRM 7.5 lists IRET with NT set among
+    # the task switches; Table 7-1 step 4 and 9.9.10 Table 9-5: a TSS limit
+    # below 67h (2Bh for a 286 TSS) -> #TS(TSS selector), in the context of
+    # the original task.  The PLA now sends that check to a copy of the tail
+    # whose 5D3 tests JTSSLIM (OPR_R = the descriptor's low dword since 5D0,
+    # desc_raw_hi its high dword) instead of JDESCA (always taken for a TSS:
+    # Type bit 0 is set in every busy TSS type), branching to the #TS stub
+    # TASK_LIMIT_CHECK + 8 (error code TMP_TR & ~3 = the back-link selector).
+    # The taken branch annuls the SDEH of its delay slot (z486.sv
+    # tsslim_annul), so the old task's TR cache is left as it was.  The tail
+    # is as long as the one it replaces.  The words are the end of the 80386
+    # LOADALL routine (932-93B: entered only by falling through from 931 and
+    # by its own jump at 93A, neither of which can happen now).
+    Patch(IRET_TSS_TAIL + 0, "IRET back-link TSS tail: 5D3 with JTSSLIM -> #TS stub (TMPC <- SIGMA)",
+          copy_from=0x5D3,
+          fields=dict(aluop=ALUJMP_JTSSLIM,
+                      alusrc=reljump(IRET_TSS_TAIL, TASK_LIMIT_CHECK + 8))),
+    Patch(IRET_TSS_TAIL + 1, "IRET back-link TSS tail: delay slot 5D4 (SDEH DESPTR; annulled when taken)",
+          copy_from=0x5D4),
+    Patch(IRET_TSS_TAIL + 2, "IRET back-link TSS tail: 5D8 (SDES + return)",
+          copy_from=0x5D8),
+    Patch(IRET_TSS_TAIL + 3, "IRET back-link TSS tail: return delay slot 5D9",
+          copy_from=0x5D9),
     # A null selector loaded by a task switch reaches 7E5 after reading GDT[0];
     # 7E6 wrote that dword back to GDT[0]+4.  A 486 does not touch GDT[0].
     Patch(0x7E6, "null selector in a task switch: no write-back to GDT[0]",
