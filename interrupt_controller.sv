@@ -12,6 +12,7 @@ module interrupt_controller
     input  logic       iflag,
     input  logic       i_rni,
     input  logic       shadow_start,
+    input  logic       shadow_ss,      // shadow_start is a MOV SS / POP SS
     input  logic       uc_exec,
     input  logic [6:0] uc_aluop,
     input  logic       nmi_accept_boundary,
@@ -25,13 +26,28 @@ logic intr_latch_inhibit;
 logic nmi_pending;
 logic nmi_blocked;
 logic nmi_prev;
+logic nmi_ss_shadow;
+
+// MOV SS / POP SS hold NMI to the boundary after the next instruction; STI's
+// shadow holds INTR only. Intel486 PRM (1992) 9.3.4, p. 9-5: "the Intel486
+// processor inhibits interrupts, debug exceptions, and single-step trap
+// exceptions after either a MOV to SS instruction or a POP to SS instruction,
+// until the instruction boundary following the next instruction is reached."
+// POP, p. 26-231: "A POP SS instruction inhibits all interrupts, including
+// NMI, until after execution of the next instruction." STI, p. 26-271: "The
+// processor then responds to external interrupts after executing the next
+// instruction" (IF governs INTR only, 9.3.2). The edge still latches in
+// nmi_pending (no accept while the shadow holds it), and interrupt_pending
+// keeps the ungated request so a shadowed HLT or REP string still sees it.
+wire nmi_request_raw;
 
 wire nmi_edge = nmi && !nmi_prev && !nmi_blocked;
 
 // nmi_blocked also gates the pending latch: a window edge stays queued and is
 // delivered only after CLRNMI (post-IRET).
-assign nmi_request_active = (nmi_pending && !nmi_blocked) || nmi_edge;
-assign interrupt_pending = nmi_request_active || (intr_pending && iflag);
+assign nmi_request_raw    = (nmi_pending && !nmi_blocked) || nmi_edge;
+assign nmi_request_active = nmi_request_raw && !nmi_ss_shadow;
+assign interrupt_pending = nmi_request_raw || (intr_pending && iflag);
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
@@ -41,6 +57,7 @@ always_ff @(posedge clk) begin
         intr_pending         <= 1'b0;
         intr_latch_inhibit   <= 1'b0;
         inhibit_interrupts   <= 1'b0;
+        nmi_ss_shadow        <= 1'b0;
     end else begin
         nmi_prev <= nmi;
         // Single-cycle event discipline for the NMI latch: writing the set and
@@ -93,6 +110,10 @@ always_ff @(posedge clk) begin
             inhibit_interrupts <= 1'b1;
         else if (i_rni && inhibit_interrupts)
             inhibit_interrupts <= 1'b0;
+        // Same set/clear points as inhibit_interrupts (shadow_start implies
+        // i_rni), so an STI that follows MOV SS ends the NMI hold on time.
+        if (i_rni)
+            nmi_ss_shadow <= shadow_start && shadow_ss;
 
         if (uc_exec) begin
             case (uc_aluop)

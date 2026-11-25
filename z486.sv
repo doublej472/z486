@@ -4220,6 +4220,7 @@ interrupt_controller interrupts (
     .shadow_start(i_rni &&
                   ((i.boundary_action == BOUNDARY_ACTION_STI) ||
                    (i.boundary_action == BOUNDARY_ACTION_LOAD_SS))),
+    .shadow_ss(i.boundary_action == BOUNDARY_ACTION_LOAD_SS),
     .uc_exec(uc_exec),
     .uc_aluop(uc_aluop),
     .nmi_accept_boundary(nmi_accept_boundary),
