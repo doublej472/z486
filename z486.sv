@@ -482,6 +482,9 @@ wire        ifetch_limit_fault;     // fetch beyond the CS limit, or an instruct
 // the next instruction: both take the same boundary and sequencer gating.
 wire        frontend_fault;
 wire [5:0]  fetch_limit_rem;        // bytes from EIP through the CS limit (saturated)
+wire        xfer_limit_gp;          // a microcoded transfer's target is beyond the CS limit: #GP(0)
+wire        xfer_limit_rewind;      // a fetch-limit #GP at a hardwired transfer's target names the transfer
+reg         xfer_limit_gp_r;        // xfer_limit_gp, one cycle late
 wire [2:0]  ifetch_fault_code;
 wire [31:0] ifetch_fault_addr;
 wire        decoder_fetch_blocked;
@@ -2318,7 +2321,8 @@ assign stall_cache_flush = cache_flush_active && !cache_flush_priv_fault &&
 // rejection re-enters the original routine, which owns precise fault delivery.
 assign gp_fault_trigger = (seg_gp_fault && !rd_fast_valid_r) ||
                           vipt_slow_seg_trigger ||
-                          invlpg_priv_fault || cache_flush_priv_fault;
+                          invlpg_priv_fault || cache_flush_priv_fault ||
+                          xfer_limit_gp;
 
 //=============================================================================
 // 486 debug breakpoints (DR0-DR3, DR7)
@@ -2518,6 +2522,75 @@ endfunction
 wire [5:0] fetch_limit_rem_eip   = cs_fetch_rem(cs_fetch_limit, EIP);
 wire [5:0] fetch_limit_rem_redir = cs_fetch_rem(cs_fetch_limit, fetch_redir_off_r);
 assign fetch_limit_rem = fetch_redir_v ? fetch_limit_rem_redir : fetch_limit_rem_eip;
+
+// A transfer to an offset beyond the CS limit is the transfer's own #GP(0)
+// (Intel486 PRM: JMP / CALL / RET / IRET / INT n "Instruction pointer must
+// be in code segment limit ELSE #GP(0)", checked before the transfer
+// completes; a fault leaves the registers as they were before the
+// instruction, 9.2).  The bound measured from the redirect offset is 0
+// exactly when that offset is beyond the limit, so this is
+// fetch_limit_rem_redir's own compare; nothing new is added on the fetch or
+// EIP path.
+//
+// Microcoded transfers: the PREF word redirects with the new CS descriptor
+// already loaded (fetch_limit_rem above).  In the cycle after it the bound
+// is read and, beyond the limit, the transfer takes #GP(0) as from a
+// microcode access fault: the word after the PREF still executes (scratch,
+// EIP or ESP, which the fault body rewinds; for an outer RET / IRET, 691h,
+// the return SS descriptor, which the fault body reloads from SS at 890h),
+// the words behind it are squashed (fault_suppress_delay_slot), so a later
+// push, CS / SS / segment-register load, ECX update or the frame writes of
+// INT n never happen.  An early CPL commit (the inner commit of an
+// interrupt or call gate, 62Bh; the outer commit of RET / IRET, 68Dh) is
+// given back by protection.sv's rollback record.  Excluded PREF words, which keep the
+// fetch-time #GP at the target: 7D1h (the end of a task switch: the PRM
+// checks the new task's EIP after the switch and faults in the new task),
+// 651h (IRET to V86, whose segment-register loads follow the PREF), and the
+// PREFs that refetch at the current EIP rather than transfer (20Dh RPTI
+// restart, 3D5h, 7EDh, 935h).
+wire xfer_pref_site = !((uc_addr == 12'h7D1) || (uc_addr == 12'h651) ||
+                        (uc_addr == 12'h20D) || (uc_addr == 12'h3D5) ||
+                        (uc_addr == 12'h7ED) || (uc_addr == 12'h935));
+reg  xfer_pref_r;                   // last cycle's q_flush was a checked microcode PREF
+always_ff @(posedge clk or negedge reset_n)
+    if (!reset_n) xfer_pref_r <= 1'b0;
+    else          xfer_pref_r <= uc_exec && uc_ctl_pref && !uc_pref_suppress_prev &&
+                                 !early_redirected && xfer_pref_site;
+// Protected mode only.  The PRM states the target check in the protected-
+// mode operations and exception lists; for real and V86 mode it lists only
+// operand overruns and, for interrupt 13, "An attempt to execute past the
+// end of CS segment" (Real-Address Mode exception table), which the
+// fetch-time #GP at the target already raises.
+wire xfer_check_mode = pe && !vm;
+wire xfer_redir_beyond = (fetch_limit_rem_redir == 6'd0);
+assign xfer_limit_gp = xfer_pref_r && core_live && xfer_redir_beyond && xfer_check_mode;
+// Aligned with event_control's fault_begin_r: a transfer-limit #GP gives back
+// an inner-level CPL commit as well (protection.sv, outer_rb_inner_r).
+always_ff @(posedge clk or negedge reset_n)
+    if (!reset_n) xfer_limit_gp_r <= 1'b0;
+    else          xfer_limit_gp_r <= xfer_limit_gp;
+
+// Hardwired transfers (JMP / Jcc rel, CALL rel, RET) retire before their
+// target is fetched, and change only EIP and ESP.  Their #GP stays the
+// fetch-limit fault at the target, but when no instruction has issued since
+// the redirect and the target offset itself is beyond the limit (bound 0,
+// not an instruction that merely straddles it) the fault keeps the
+// transfer's TMPeIP / TMPeSP, so the fault body's EIP / ESP rewind names the
+// transfer and undoes a CALL's push or a RET's pop of ESP.
+reg  xfer_hw_r;                     // the pop cursor is a hardwired redirect's target
+reg  fetch_limit_rem_zero_r;        // last cycle's bound was 0 (stable while no issue)
+always_ff @(posedge clk or negedge reset_n)
+    if (!reset_n) begin
+        xfer_hw_r <= 1'b0;
+        fetch_limit_rem_zero_r <= 1'b0;
+    end else begin
+        if (q_flush)
+            xfer_hw_r <= early_redirect;
+        else if (i_issue)
+            xfer_hw_r <= 1'b0;
+        fetch_limit_rem_zero_r <= (fetch_limit_rem == 6'd0);
+    end
+assign xfer_limit_rewind = xfer_hw_r && fetch_limit_rem_zero_r && xfer_check_mode;
 
 // CR3 write detection for TLB flush
 assign cr3_write = uc_exec && uc_buscode == BUSOP_SPCR && uc_dest == DEST_PDBR;
@@ -3159,6 +3232,7 @@ protection_unit protection_unit_inst (
     .ss_descriptor_dpl(desc_cache[SEG_SS].DPL),
     .entry_cpl_zero(pe_entry_cpl_zero),
     .fault_begin(fault_begin_r),
+    .xfer_fault_begin(xfer_limit_gp_r),
 
     .test_mode(1'b0),
     .test_state_vector(10'h000),
@@ -3818,18 +3892,22 @@ always_ff @(posedge clk) begin
             CS[1:0] <= prot_transition.copy_dpl;
             pe_entry_cpl_zero <= 1'b0;
         end
-        // An outer-level return that faults before its CS load gives the
-        // early CPL commit back (protection.sv, outer_rb_*): the fault is
-        // raised at the old CPL with the old CS image.
-        if (prot_transition.rollback) begin
-            CS[1:0] <= prot_transition.rollback_cs_rpl;
-            pe_entry_cpl_zero <= prot_transition.rollback_entry_cpl_zero;
-        end
-
         // WRITE_RPL: write new CPL into SLCTR[1:0] from loaded CS descriptor's DPL
         if (prot_transition.write_rpl)
             SLCTR[1:0] <= desc_raw_hi[14:13];
 
+        end
+
+        // A privilege transition that faults before its CS load gives the
+        // early CPL commit back (protection.sv, outer_rb_*): the fault is
+        // raised at the old CPL with the old CS image.  The record fires in
+        // the cycle after the delivery begins, which is a squashed word
+        // (fault_suppress_delay_slot) when the fault came from a request
+        // rather than from a microcode entry, so it is not gated by uc_exec
+        // (as the SS DPL half in segmentation_unit is not).
+        if (prot_transition.rollback) begin
+            CS[1:0] <= prot_transition.rollback_cs_rpl;
+            pe_entry_cpl_zero <= prot_transition.rollback_entry_cpl_zero;
         end
 
     // MOV TRn,r (IND holds the value).  A TR6 write runs a TLB test command;
@@ -3891,10 +3969,11 @@ always_ff @(posedge clk) begin
         if (vipt_load_slow_r.restore_esp)
             TMPeSP <= vipt_load_slow_r.esp_restore;
     end
-    else if (ifetch_page_fault || ifetch_limit_fault) begin
+    else if (ifetch_page_fault || (ifetch_limit_fault && !xfer_limit_rewind)) begin
         // A cross-page (or past-the-limit) instruction can fault before i_issue
         // captures its restart state. The architectural registers still
-        // describe that boundary.
+        // describe that boundary.  A hardwired transfer beyond the limit
+        // keeps its own (xfer_limit_rewind above).
         TMPeIP <= EIP;
         TMPeSP <= ESP;
     end

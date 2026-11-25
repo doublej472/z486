@@ -12,8 +12,9 @@
 #
 # Fixed and no longer listed: B1 (dir/esc3, dir/esc4), B6 (pmd/b6*, rand/g25, g118),
 # B15 (pmd/gdtlim_p58only, gdtlim_jmp, ldtlim, rand/g164, g301); B4's frame/CPL half
-# (pmd/retf_fault, iret_fault: see B4a); B5 (dir/intr1); B9 (pmd/intlim3 now shows only
-# B7). B3's over-15-byte programs are listed as D-len15: 86Box has no length limit.
+# (pmd/retf_fault, iret_fault: see B4a); B5 (dir/intr1); B9 (pmd/intlim3); B7 in
+# protected mode (pmd/intlim2, intlim3; pmd/intlim and pm/pm8 now show B4a / B7-DF).
+# B3's over-15-byte programs are listed as D-len15: 86Box has no length limit.
 
 # B2: ENABLE_X87=0, ESC memory forms make 386 coprocessor I/O cycles (800000F8h/FCh)
 # and touch the operand (a #PF on a not-present page)
@@ -26,11 +27,15 @@ B2   rand/g10       step,pipe  # FMUL m32 on a not-present page takes #PF on z48
 # before the SS checks (86Box: not written)
 B4a  pmd/retf_fault step,pipe
 B4a  pmd/iret_fault step,pipe
+# The INT n form: since B7's fix the #GP(0) for a gate offset beyond the new CS limit
+# is taken at the INT, but the target code descriptor's accessed bit (selector 50h) is
+# already set by its load before the offset check (86Box: not written)
+B4a  pmd/intlim     step,pipe
 
-# B7: transfer to an EIP beyond the CS limit faults at the target (pushed IP = target)
+# B7: transfer to an EIP beyond the CS limit faults at the target (pushed IP = target).
+# Fixed in protected mode; real and V86 mode keep the fetch-time #GP at the target
+# (the i486 PRM states the transfer-time check only for protected mode)
 B7   dir/xferlim    step,pipe
-B7   pmd/intlim     step,pipe
-B7   pmd/intlim2    step,pipe
 
 # B8: o32 PUSH Sreg straddling the 16-bit stack wrap: no #SS
 B8   dir/stkwrap2   step,pipe
@@ -102,9 +107,11 @@ D-shift0  rand/g9   step,pipe
 B2   rand/r224      step,pipe  # FLD m32 beyond the DS limit faults on z486
 B2   rand/g102      step,pipe
 B2   rand/g114      step,pipe
-B7   pm/pm8         step       # pipelined: B9 (executes the HLT beyond the limit and hangs)
-B7   pmd/intlim3    step,pipe   # was B9; since the B9 fix only the B7 frame (fault taken at the target) differs
-B9   pm/pm8         pipe
+# B7-DF: #DE through a gate whose offset is beyond the CS limit: #GP(0) instead of #DF
+# (the #DE entry's contributory mark, uc 824h SCNTFF, is the squashed first word of
+# an immediate redirect).  Stepwise this is the first difference (every earlier
+# transfer of pm8 matches since B7's fix); the pipelined flow difference is not analysed
+B7-DF pm/pm8        step,pipe
 B8   rand/g20       step,pipe
 B10  pm/pm2         pipe
 B10  pm/pm24        pipe

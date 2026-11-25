@@ -46,6 +46,7 @@ module protection_unit
     input        [1:0]  ss_descriptor_dpl,
     input               entry_cpl_zero,   // z486.sv pe_entry_cpl_zero
     input               fault_begin,      // a fault delivery began (registered, one cycle late)
+    input               xfer_fault_begin, // ... and it is a transfer-limit #GP(0) (z486.sv xfer_limit_gp)
 
 
     // Test mode for verification (bypasses Tiny PLA preprocessing)
@@ -106,6 +107,7 @@ logic  [1:0] outer_rb_cs_rpl_r;
 logic  [1:0] outer_rb_ss_dpl_r;
 logic        outer_rb_entry0_r;
 logic        outer_rb_fault_r;
+logic        outer_rb_inner_r;
 
 wire is_6x = (uc_aluop[6:4] == 3'b110);
 wire is_ptsav = is_6x && !uc_aluop[3];
@@ -184,12 +186,19 @@ assign transition.active = cpl_transition_r;
 // cycle of the commit records the old CS RPL / SS DPL / entry-CPL0 state;
 // a fault delivery that begins after the PTGEN 2Eh word executes and before
 // the CS load puts them back and drops the transition still in flight.  A
-// same-level or inner commit (gate, interrupt) is not recorded.
+// same-level commit is not recorded.  An inner commit (an interrupt or call
+// gate to a more privileged level, uc 62Bh) is recorded too, but given back
+// only by a transfer-limit #GP(0): that transfer's PREF (uc 635h) follows the
+// commit, and its "Instruction pointer must be in CS limit, else #GP(0)"
+// precedes the switch to the new level (INT n, CALL), so that #GP is
+// delivered from the old level.  Every other fault keeps the existing
+// behaviour on the inner path.
 wire copy_stack_exec = uc_exec && pe_mode &&
                        (uc_aluop == ALUJMP_PTGEN) && (uc_alu_src == 6'h2E);
 wire outer_rb_arm  = copy_stack_dpl_s2 && cpl_transition_r && !outer_rb_r &&
-                     (copy_dpl_s2 > cpl);
-wire outer_rb_fire = outer_rb_r && (outer_rb_fault_r || fault_begin);
+                     (copy_dpl_s2 != cpl);
+wire outer_rb_fire = outer_rb_r && (outer_rb_inner_r ? xfer_fault_begin
+                                                     : (outer_rb_fault_r || fault_begin));
 assign transition.rollback = outer_rb_fire;
 assign transition.rollback_cs_rpl = outer_rb_cs_rpl_r;
 assign transition.rollback_ss_dpl = outer_rb_ss_dpl_r;
@@ -202,10 +211,12 @@ always_ff @(posedge clk) begin
         outer_rb_ss_dpl_r <= 2'b00;
         outer_rb_entry0_r <= 1'b0;
         outer_rb_fault_r <= 1'b0;
+        outer_rb_inner_r <= 1'b0;
     end else if (outer_rb_fire) begin
         outer_rb_r <= 1'b0;
     end else if (outer_rb_arm) begin
         outer_rb_r <= 1'b1;
+        outer_rb_inner_r <= (copy_dpl_s2 < cpl);
         outer_rb_cs_rpl_r <= cs_selector_rpl;
         outer_rb_ss_dpl_r <= ss_descriptor_dpl;
         outer_rb_entry0_r <= entry_cpl_zero;
