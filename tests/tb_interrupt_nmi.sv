@@ -1,8 +1,8 @@
 `timescale 1ns/1ns
 
 // Unit test for interrupt_controller: an NMI edge latched in the
-// accept-to-SETNMI window must not re-dispatch nested, and must be delivered
-// only after CLRNMI (post-IRET).
+// accept-to-SETNMI window, or inside the handler, must not re-dispatch
+// nested, and must be delivered only after CLRNMI (post-IRET).
 module tb_interrupt_nmi;
     import z486_pkg::*;
 
@@ -177,10 +177,14 @@ module tb_interrupt_nmi;
               "clean window delivers nothing after CLRNMI");
 
         // ---------------------------------------------------------------------
-        // Scenario C: an edge AFTER SETNMI must be gated by nmi_blocked.
+        // Scenario C: an edge AFTER SETNMI (inside the handler) is held, not
+        // delivered, and is delivered after CLRNMI. Intel486 DX data sheet
+        // (Oct 1992) 2.7.4: "If NMI occurs while currently servicing an NMI,
+        // its presence will be saved for servicing after executing the first
+        // IRET instruction."
         // ---------------------------------------------------------------------
         $display("");
-        $display("[C] Third NMI edge after SETNMI is gated:");
+        $display("[C] NMI edge after SETNMI is held until CLRNMI:");
         apply_reset();
         nmi = 1'b1;
         tick();
@@ -198,9 +202,20 @@ module tb_interrupt_nmi;
         tick();
         nmi = 1'b1;
         tick();
-        blocked_edge_latched = nmi_request_active;
-        check(blocked_edge_latched === 1'b0,
-              "edge after SETNMI does not latch (nmi_blocked gates nmi_edge)");
+        blocked_edge_latched = dut.nmi_pending;
+        check(nmi_request_active === 1'b0,
+              "edge after SETNMI is not delivered while nmi_blocked");
+        check(blocked_edge_latched === 1'b1,
+              "edge after SETNMI is held in nmi_pending");
+        nmi = 1'b0;
+        repeat (3) tick();
+        check(nmi_request_active === 1'b0, "still held while the handler runs");
+        uc_exec = 1'b1;
+        uc_aluop = ALUJMP_CLRNMI;
+        tick();
+        uc_exec = 1'b0;
+        uc_aluop = 7'd0;
+        check(nmi_request_active === 1'b1, "held edge delivered after CLRNMI");
 
         // ---------------------------------------------------------------------
         // Scenario D: INTR is a level. A request withdrawn before the boundary
@@ -237,8 +252,8 @@ module tb_interrupt_nmi;
             $fatal(1, "TB_INTERRUPT_NMI: FAIL");
         end else if (nested_window === 1'b0 && post_iret_window === 1'b1 &&
                  nested_control === 1'b0 && post_iret_control === 1'b0 &&
-                 blocked_edge_latched === 1'b0)
-            $display("  TB_INTERRUPT_NMI: PASS - window edge deferred, delivered only after IRET");
+                 blocked_edge_latched === 1'b1)
+            $display("  TB_INTERRUPT_NMI: PASS - window and in-handler edges deferred, delivered only after IRET");
         else begin
             $display("  TB_INTERRUPT_NMI: FAIL - unexpected NMI dispatch sequence");
             $fatal(1, "TB_INTERRUPT_NMI: FAIL");

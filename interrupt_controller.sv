@@ -41,11 +41,15 @@ logic nmi_ss_shadow;
 // keeps the ungated request so a shadowed HLT or REP string still sees it.
 wire nmi_request_raw;
 
-wire nmi_edge = nmi && !nmi_prev && !nmi_blocked;
+wire nmi_edge = nmi && !nmi_prev;
 
-// nmi_blocked also gates the pending latch: a window edge stays queued and is
-// delivered only after CLRNMI (post-IRET).
-assign nmi_request_raw    = (nmi_pending && !nmi_blocked) || nmi_edge;
+// nmi_blocked (SETNMI at handler entry, CLRNMI at IRET) gates delivery, not
+// the latch: an edge while it is set is held in nmi_pending and delivered
+// after CLRNMI. Intel486 DX data sheet (Oct 1992) 2.7.4, p. 46: "If NMI
+// occurs while currently servicing an NMI, its presence will be saved for
+// servicing after executing the first IRET instruction." (Embedded Intel486
+// Processor Family Developer's Manual 3.15.4, the same words.)
+assign nmi_request_raw    = !nmi_blocked && (nmi_pending || nmi_edge);
 assign nmi_request_active = nmi_request_raw && !nmi_ss_shadow;
 assign interrupt_pending = nmi_request_raw || (intr_pending && iflag);
 
