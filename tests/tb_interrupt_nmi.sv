@@ -32,6 +32,7 @@ module tb_interrupt_nmi;
         .iflag(iflag),
         .i_rni(i_rni),
         .shadow_start(shadow_start),
+        .shadow_ss(1'b0),
         .uc_exec(uc_exec),
         .uc_aluop(uc_aluop),
         .nmi_accept_boundary(nmi_accept_boundary),
