@@ -459,15 +459,19 @@ wire write_fault = pe && is_write && !seg_writable && !is_dtable;
 
 // Reads need a readable descriptor: data, or code with R set. A null selector
 // loads type 0 with S=0 (a system type no data register can hold otherwise),
-// so this also makes any use of a null ES/DS/FS/GS #GP(0).
+// so this also makes any use of a null ES/DS/FS/GS #GP(0).  A data read
+// through CS (a CS override) of a code segment needs R: i486 PRM (240486)
+// 6.2.1, "No instruction may read an executable segment unless the readable
+// bit is set"; 9.9.13 lists "Reading from an execute-only code segment".
 function automatic logic desc_readable(input seg_desc_t d);
     desc_readable = d.S && (!d.seg_type[3] || d.seg_type[1]);
 endfunction
 wire seg_readable = (seg_sel == SEG_ES) ? desc_readable(desc_cache[SEG_ES]) :
+                    (seg_sel == SEG_CS) ? desc_readable(desc_cache[SEG_CS]) :
                     (seg_sel == SEG_DS) ? desc_readable(desc_cache[SEG_DS]) :
                     (seg_sel == SEG_FS) ? desc_readable(desc_cache[SEG_FS]) :
                     (seg_sel == SEG_GS) ? desc_readable(desc_cache[SEG_GS]) :
-                    1'b1;  // CS/SS: checked at load; TR/IDT/GDT/IO: none
+                    1'b1;  // SS: writable data, checked at load; TR/IDT/GDT/IO: none
 wire read_fault = pe && !vm && !is_write && !seg_readable && !is_dtable;
 
 // Ungated direct-load verdict: the data-segment limit/protection verdict is a

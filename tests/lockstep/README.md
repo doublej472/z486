@@ -50,7 +50,7 @@ These targets are not part of `test-release`: they need a network fetch the firs
 | set | programs | where they come from |
 |---|---|---|
 | `dir/*` | directed real-mode reproducers (ESC forms, instruction length, INTR withdrawal, flags after REP strings, stack wrap, transfers beyond the CS limit) | `progs/dir/*.asm` |
-| `pmd/*` | directed protected-mode reproducers (outer RETF/IRET faults, RMW #PF, descriptor-table and IDT limits, error-code width, data breakpoints, ARPL) | `progs/pmd/*.asm`, prologues `pmhead*.inc` |
+| `pmd/*` | directed protected-mode reproducers (outer RETF/IRET faults, RMW #PF, descriptor-table and IDT limits, error-code width, data breakpoints, ARPL, execute-only CS reads) | `progs/pmd/*.asm`, prologues `pmhead*.inc` |
 | `haz/*` (full) | pipeline-hazard programs (ADC/SBB, flag readers, SHLD/SHRD), 12 x 150 cases | `progs/haz/gen_haz.py KIND N 150` |
 | `pm/*` (full) | Tetrium's directed PM / paging / V86 / task / debug tests pm1-pm24 | the fetched Tetrium `tests/pm/*.s` |
 | `rand/rN`, `pN`, `gN` | 3000-instruction random programs: real mode, 16-bit PM, PM with paging and a demand-paging #PF handler | `progs/rgen386.py OUT SEED 3000 [--pm|--pg]` |
