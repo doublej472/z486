@@ -484,6 +484,8 @@ logic [11:0] pla_test_addr;
 logic [3:0]  pla_test_flags;
 logic        pla_test_cpl_transition;
 logic        pla_sel_limit_fault;
+logic        pla_ret_cs_defer;
+logic        ret_cs_a_pend_r;
 
 always_comb begin
     // Default: test passes (continue execution)
@@ -491,6 +493,7 @@ always_comb begin
     pla_test_flags = 4'b0000;
     pla_test_cpl_transition = 1'b0;
     pla_sel_limit_fault = 1'b0;
+    pla_ret_cs_defer = 1'b0;
 
     case (s1_test_const)
         //----------------------------------------------------------------------
@@ -1407,6 +1410,44 @@ always_comb begin
             pla_test_addr = UADDR_DESC_SKIP_DATA;
         else if (pla_test_addr == 12'h5DA)
             pla_test_addr = UADDR_DESC_SKIP_CS;
+    end
+
+    // An outer-level RET/IRET examines its return CS (uc 687, TST_DES_RETF
+    // with the CPL transition pending) before its return SS, and loads both
+    // only after every SS check: i486 PRM, RET / IRET, "return to outer
+    // privilege level" ("Examine return SS selector and associated
+    // descriptor ... Load the CS register with the return CS descriptor").
+    // The Accessed bit is set when a segment register is loaded (PRM 5.3,
+    // 5.1.3.1), so a return whose SS check faults must leave it clear.  The
+    // CS check therefore takes the tail without the write and records that
+    // the write is owed; the SS check (uc 5CD, TST_DES_RTOLSS) that passes
+    // then takes a tail that also sets the CS descriptor's Accessed bit
+    // (scripts/ucode_optimize.py RET_SS_TAIL_*).
+    if ((s1_test_const == TST_DES_RETF) && cpl_transition_r &&
+        (pla_test_addr == 12'h5D5)) begin
+        pla_test_addr = UADDR_DESC_SKIP_DATA;
+        pla_ret_cs_defer = 1'b1;
+    end
+    if ((s1_test_const == TST_DES_RTOLSS) && ret_cs_a_pend_r) begin
+        if (pla_test_addr == 12'h5D5)
+            pla_test_addr = UADDR_RET_SS_WRITE_A;
+        else if (pla_test_addr == UADDR_DESC_SKIP_DATA)
+            pla_test_addr = UADDR_RET_SS_KEEP_A;
+    end
+end
+
+// The return CS descriptor's Accessed-bit write is owed from its check until
+// the return SS check consumes it; a fault delivery drops it with the return.
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        ret_cs_a_pend_r <= 1'b0;
+    else if (fault_begin || outer_rb_fire)
+        ret_cs_a_pend_r <= 1'b0;
+    else if (pipe_en && s1_valid) begin
+        if (pla_ret_cs_defer)
+            ret_cs_a_pend_r <= 1'b1;
+        else if (s1_test_const == TST_DES_RTOLSS)
+            ret_cs_a_pend_r <= 1'b0;
     end
 end
 
