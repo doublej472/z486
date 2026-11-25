@@ -8,13 +8,14 @@
 // from mem_req and must be refuted.
 module pretrans_no_memreq #(parameter MUTANT = 0)
   (input mem_op_eligible, input uc_data_busreq, input x87_direct_mem_req,
-   input gp_fault_trigger, input ucrd_route_pre, input st_route,
+   input gp_fault_trigger, input seg_idt_limit_fault, input ucrd_route_pre, input st_route,
    input vipt_slow_submit, input ucrd_slow_submit,
    input ucrd_phys_ok_r, input vipt_slow_phys_ok_r,
    input s_idle, input mem_servicing, input mem_write, input mem_is_io,
    input idle_mem_crossing, output mismatch);
   wire mem_req = (mem_op_eligible && (uc_data_busreq || x87_direct_mem_req) &&
-                  !gp_fault_trigger && !ucrd_route_pre && !st_route) ||
+                  !gp_fault_trigger && !seg_idt_limit_fault &&
+                  !ucrd_route_pre && !st_route) ||
                  (MUTANT ? 1'b0 : vipt_slow_submit) || ucrd_slow_submit;
   wire pretrans_valid = (ucrd_slow_submit && ucrd_phys_ok_r) ||
                         (vipt_slow_submit && vipt_slow_phys_ok_r);

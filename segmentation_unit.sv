@@ -61,6 +61,7 @@ module segmentation_unit
     input              check_en,           // Limit check enabled this cycle
     input              is_mem_op,          // Memory operation (needs limit check)
     input              is_write,           // Write operation (needs writable check)
+    input              uc_mem_op,          // a microcode memory bus op, RD_D included
 
     output     [31:0]  seg_base_pending,   // Next seg_base_r (this cycle's pending base),
                                            // so z486 can pre-register linear_address = base+IND
@@ -72,6 +73,8 @@ module segmentation_unit
     output             dir_seg_fault,
     output             dir_rmw_fault,      // as above plus the write check (RD_FAST)
     output             seg_fault,          // Segment limit/protection fault
+    output             idt_limit_fault,    // PM gate read beyond IDTR.limit: cancel it
+    output reg         idt_gate_oob,       // ... seen in this delivery (PTF gate test fails)
     // 486 alignment check (#AC): CR0.AM, EFLAGS.AC and CPL3 qualify ac_check;
     // align_size is the access width (0=byte, 1=word, 2=dword).
     input              ac_check,
@@ -415,11 +418,35 @@ wire dir_ed_limit_violated = ed_start_fault | dir_ed_high_fault;
 
 // Real mode: a boundary-crossing access always faults (even SS -> #SS, e.g.
 // POPAD at SP=0xFFFE); only start-out-of-bounds keeps the 16-bit-stack wrap.
-wire rm_limit_fault = !pe && (size_fault ||
+wire rm_limit_fault = !pe && !is_dtable && (size_fault ||
                       (start_out_of_bounds && !(is_stack_fault && !addr_size)));
 
 wire pm_limit_fault = pe && !is_dtable &&
                       (seg_ed_r ? ed_limit_violated : limit_violated);
+
+// A protected-mode interrupt or exception whose gate lies beyond IDTR.limit:
+// i486 PRM (240486), INT/INTO pseudo-code (p. 26-166), which applies "also to
+// external interrupts and exceptions": "Interrupt vector must be within IDT
+// table limits, else #GP(vector number * 8+2+EXT)".  The gate reads (uc 8B3,
+// 8B5; IND = vector*8 and vector*8+4, dwords) are cancelled, as a 486 does
+// not read beyond a table (9.9.13: "Exceeding the segment limit when
+// referencing a descriptor table"), and idt_gate_oob makes the gate-type
+// test fail, which takes the microcode's own #GP(vector*8+2+EXT) path (8BE
+// JMP_GFAULT_INT -> 865) with its double-fault classification.  This is not
+// a #GP(0) segment fault (pm_limit_fault excludes the descriptor tables).
+// The gate reads are BUSOP_RD_D, which is_mem_op leaves out (z486.sv
+// gp_fault_mem_op), hence uc_mem_op.
+assign idt_limit_fault = check_en && uc_mem_op && pe && (seg_sel == SEG_IDT) &&
+                         limit_violated;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        idt_gate_oob <= 1'b0;
+    else if (idt_limit_fault)
+        idt_gate_oob <= 1'b1;
+    else if (exec_cmd_valid && exec_seg_cmd == SEG_CMD_UPDATE_SEG &&
+             exec_seg_target == SEG_IDT)
+        idt_gate_oob <= 1'b0;      // the next delivery's gate address (8B2)
+end
 
 wire seg_writable = (seg_sel == SEG_ES) ? (!desc_cache[SEG_ES].seg_type[3] && desc_cache[SEG_ES].seg_type[1]) :
                     (seg_sel == SEG_CS) ? vm :
@@ -546,6 +573,9 @@ function automatic [31:0] seg_limit_for(input [3:0] sel, input dsw);
     case (sel)
         SEG_ES, SEG_CS, SEG_SS, SEG_DS, SEG_FS, SEG_GS, SEG_TR:
             seg_limit_for = expand_raw_limit(raw_limit_for(sel, dsw));
+        // The gate reads of a protected-mode interrupt are checked against
+        // IDTR.limit (idt_limit_fault below); real mode keeps no IVT check.
+        SEG_IDT: seg_limit_for = {12'h0, idt_limit};
         default: seg_limit_for = 32'hFFFFFFFF;
     endcase
 endfunction
