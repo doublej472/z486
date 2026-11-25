@@ -979,7 +979,10 @@ always_comb begin
                 if (!p) begin
                     pla_test_addr = 12'h870;  // TSS busy
                 end else begin
-                    pla_test_addr = 12'h5D3;  // TSS available
+                    // TSS available: the 5D3 tail with the new TSS's limit
+                    // check (IRET with NT set; i486 PRM Table 7-1 step 4,
+                    // 9.9.10 Table 9-5: limit below 67h -> #TS(TSS selector))
+                    pla_test_addr = UADDR_IRET_TSS_TAIL;
                 end
             end
             // else: 0x000 (pass)

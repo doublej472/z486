@@ -1111,6 +1111,9 @@ localparam [11:0] UADDR_DESC_SKIP_CS   = 12'h8FA;
 // descriptor's locked A-bit RMW.
 localparam [11:0] UADDR_RET_SS_WRITE_A = 12'h92B;  // SS A clear: SS RMW first
 localparam [11:0] UADDR_RET_SS_KEEP_A  = 12'h92C;  // SS A already set (the LCALL's delay slot)
+// Optimizer-owned back-link TSS descriptor tail of an IRET with NT set
+// (scripts/ucode_optimize.py IRET_TSS_TAIL): 5D3-5D9 with the TSS limit check.
+localparam [11:0] UADDR_IRET_TSS_TAIL  = 12'h932;
 localparam [11:0] UADDR_TSS_PROBLEM    = 12'h85D;  // #TS path used by protected-mode descriptor checks
 localparam [11:0] UADDR_FPU_STORE_TAIL = 12'h57B;  // Final 16-bit word of an m80 store
 // The error-code pushes of exception delivery: the privilege-switch tail

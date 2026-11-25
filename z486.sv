@@ -2164,6 +2164,21 @@ always_ff @(posedge clk) begin
 end
 // synthesis translate_on
 
+// An IRET with NT set reads its back-link TSS descriptor and takes the TSS
+// tail at 932 (scripts/ucode_optimize.py IRET_TSS_TAIL), whose JTSSLIM word
+// replaces the always-taken JDESCA of 5D3 and whose delay slot is 5D4's SDEH,
+// the first write of the new TSS into TR's descriptor cache.  When JTSSLIM is
+// taken (a TSS limit below its minimum: #TS in the old task's context, i486
+// PRM 9.9.10), that SDEH is annulled, so the old task keeps its TR cache.
+reg  tsslim_prev_r;                 // the last executed word was a JTSSLIM
+wire tsslim_annul;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        tsslim_prev_r <= 1'b0;
+    else if (uc_exec)
+        tsslim_prev_r <= (uc_aluop == ALUJMP_JTSSLIM);
+end
+
 // Execution-relocation view of the microcode segment command.
 always_comb begin
     uc_seg_cmd = SEG_CMD_NONE;
@@ -2200,7 +2215,7 @@ always_comb begin
                     uc_seg_cmd = SEG_CMD_SBAS;
             end
             BUSOP_SDEH: begin
-                if (pe && !gate_detect_cond)   // use cond, not _now (uc_exec already in valid)
+                if (pe && !gate_detect_cond && !tsslim_annul)   // use cond, not _now (uc_exec already in valid)
                     uc_seg_cmd = SEG_CMD_SDEH;
             end
             BUSOP_SDES: begin
@@ -3321,6 +3336,7 @@ assign uc_p_pure_dly     = uc[48];
 assign uc_p_rpt          = uc[49];
 assign uc_p_wio          = uc[50];
 wire       uc_jump_taken_prev;          // Jump taken last cycle (for RNi: terminate only in delay slot)
+assign tsslim_annul = tsslim_prev_r && uc_jump_taken_prev;
 
 reg [31:0] TMPeIP;                  // Saved EIP for RPTI (repeat instruction)
 reg [31:0] wr_restart_eip;          // TMPeIP at each demand-write issue, for late write faults
