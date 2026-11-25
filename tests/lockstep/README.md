@@ -100,8 +100,8 @@ difference, to `$LOCKSTEP_CACHE/run-<set>/results.txt`:
 
 ```
 program                      step                   pipe                   listed         verdict
-dir/esc2                     ok cpio=20             ok cpio=20             B2             known
-dir/len18                    hang                   hang                   B3             known
+dir/xferlim                  state                  final                  B7             known
+dir/len18                    state                  flow                   D-len15        known
 pmd/b6min                    ok                     ok                     -              pass
 ```
 
@@ -117,7 +117,7 @@ pmd/b6min                    ok                     ok                     -    
 - Counters on an `ok` line are tolerated differences (the harness syncs them): `rfmask`
   (RF in a fault frame), `selpad` / `errpad` (upper word of a pushed selector or error
   code), `cr0res`, `cr2` / `cr2blk` (CR2 of a multi-byte access / a fetch #PF), `cpio`
-  (386 coprocessor I/O cycles, B2), `fetchf` / `squash` / `defer` (harness alignment).
+  (386 coprocessor I/O cycles; nonzero only before the B2 fix), `fetchf` / `squash` / `defer` (harness alignment).
 - To dig in: `cd $LOCKSTEP_CACHE/run-quick/run && ../../obj/Vtb_lock -s -v ../progs/dir/esc2.com`
   (`LOCKST=1` prints the store logs, `LOCKPRE=1` the state before a mismatching
   instruction, `LOCKIO=1` the OUT cycles).
