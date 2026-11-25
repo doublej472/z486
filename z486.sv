@@ -251,6 +251,8 @@ wire        uc_is_rpt;
 wire        cr3_write;
 wire [1:0]  pg_cpl;
 wire        seg_gp_fault;
+wire        seg_idt_limit_fault;    // PM IDT gate read beyond IDTR.limit (not a #GP(0))
+wire        seg_idt_gate_oob;
 wire [31:0] issue_ind_linear;
 wire [1:0]  issue_ind_linear_low;
 wire [31:0] issue_mem_linear;          // issuing instruction's memory address (stack, moffs, ModR/M)
@@ -2077,12 +2079,15 @@ segmentation_unit seg_unit (
     .dir_seg_fault    (dir_seg_fault),
     .dir_rmw_fault    (dir_rmw_fault),
     .is_mem_op        (gp_fault_mem_op),
+    .uc_mem_op        (uc_is_mem_busop),
     .is_write         (gp_fault_wr_op),
     .seg_base_pending (seg_base_pending),
     .eff_mask_pending (eff_mask_pending),
     .seg_base_exec    (seg_base_exec),
     .eff_mask_exec    (eff_mask_exec),
     .seg_fault        (seg_gp_fault),
+    .idt_limit_fault  (seg_idt_limit_fault),
+    .idt_gate_oob     (seg_idt_gate_oob),
     .access_linear    (seg_access_linear),
     .access_dw_next   (seg_access_dw_next),
     .ac_check         (ac_check_mode),
@@ -2581,7 +2586,8 @@ reg         ss_fault_newstack_r;   // the #SS hit the new stack of a privilege s
 
 wire        mem_req_to_paging = (mem_op_eligible &&
                                  (uc_data_busreq || x87_direct_mem_req) &&
-                                 !gp_fault_trigger && !ucrd_route_pre && !st_route) ||
+                                 !gp_fault_trigger && !seg_idt_limit_fault &&
+                                 !ucrd_route_pre && !st_route) ||
                                 vipt_slow_submit || ucrd_slow_submit;
 
 wire        iack_req_to_paging = mem_op_eligible && iack_busop && !gp_fault_trigger;
@@ -2894,7 +2900,9 @@ data_access data_access_inst (
     .vipt_issue_load(vipt_issue_load),
     // Microsequencer and core control
     .any_fault(any_fault),
-    .gp_fault_trigger(gp_fault_trigger),
+    // Cancels a microcode read's direct probe: a segment fault, or a gate
+    // read beyond IDTR.limit (which is not a #GP(0) redirect).
+    .gp_fault_trigger(gp_fault_trigger || seg_idt_limit_fault),
     .i_ex(i),
     .i_first(i_first),
     .i_rni_delay(i_rni_delay),
@@ -3143,6 +3151,7 @@ protection_unit protection_unit_inst (
     .selector_ti(slctr_fwd[2]),
     .selector_null(selector_null_wire),
     .selector_oob(selector_oob_wire),
+    .idt_gate_oob(seg_idt_gate_oob),
 
     .cpl(cpl),
     .transition_rpl(SLCTR[1:0]),

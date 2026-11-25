@@ -25,6 +25,7 @@ module protection_unit
     input               selector_ti,      // Table Indicator (0=GDT, 1=LDT)
     input               selector_null,    // Null selector (TI=0 AND Index=0)
     input               selector_oob,     // Selector exceeds GDT/LDT limit
+    input               idt_gate_oob,     // this delivery's IDT gate lies beyond IDTR.limit
 
     // Processor State
     input        [1:0]  cpl,              // Current Privilege Level
@@ -268,6 +269,7 @@ logic [1:0] s1_desc_dpl;        // Pipelined descriptor DPL for CPL guards
 logic       s1_desc_low16_nonzero;
 logic       s1_selector_oob;
 logic       s1_sel_limit_test;   // selector test ahead of a descriptor read
+logic       s1_idt_gate_oob;     // gate-type test of a gate beyond IDTR.limit
 
 //==============================================================================
 // Stage 2 Pipeline Registers (PLA4 outputs)
@@ -426,6 +428,10 @@ function automatic logic sel_limit_checked(input logic [5:0] tc);
 endfunction
 wire s0_sel_limit_test = (aluop_type == 4'hE || aluop_type == 4'hA) &&
                          sel_limit_checked(test_const);
+// The interrupt gate-type tests (PTF 22h at uc 8B9, 21h at 8C1) of a gate the
+// segment unit found beyond IDTR.limit (segmentation_unit.sv idt_gate_oob).
+wire s0_idt_gate_oob = idt_gate_oob && (aluop_type == 4'hF) &&
+                       (test_const == TST_DES_INT_HW || test_const == TST_DES_INT_SW);
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
@@ -439,6 +445,7 @@ always_ff @(posedge clk) begin
         s1_desc_low16_nonzero <= 1'b0;
         s1_selector_oob <= 1'b0;
         s1_sel_limit_test <= 1'b0;
+        s1_idt_gate_oob <= 1'b0;
         p1 <= 1'b0;
         p2 <= 1'b0;
         b13 <= 1'b0;
@@ -460,6 +467,7 @@ always_ff @(posedge clk) begin
         s1_desc_low16_nonzero <= descriptor_low16_nonzero;
         s1_selector_oob <= selector_oob;
         s1_sel_limit_test <= s0_sel_limit_test;
+        s1_idt_gate_oob <= s0_idt_gate_oob;
         p1 <= p1_comb;
         p2 <= p2_comb;
         b13 <= b13_comb;
@@ -1397,6 +1405,16 @@ always_comb begin
         pla_test_flags = 4'b0000;
         pla_test_cpl_transition = 1'b0;
     end
+
+    // A gate beyond IDTR.limit matches no gate type: the test falls through to
+    // the invalid-gate path (8BA-8BE, PTGEN JMP_GFAULT_INT -> 865), which
+    // raises #GP(vector*8+2+EXT), a double fault when it follows a
+    // contributory exception.  i486 PRM (240486), INT/INTO pseudo-code:
+    // "Interrupt vector must be within IDT table limits, else #GP(vector
+    // number * 8+2+EXT)", tested before the gate type, which raises the same
+    // #GP.  The gate reads were cancelled (no data).
+    if (s1_idt_gate_oob)
+        pla_test_addr = 12'h000;
 
     // The descriptor-load tails 5D5/5DA set the Accessed bit with a locked
     // read-modify-write.  A 486 writes the descriptor only when that bit of a
