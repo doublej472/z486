@@ -318,7 +318,7 @@ always_comb begin
     if (ifetch_limit_fault) begin
         seq_fault_redirect.valid = 1'b1;
         seq_fault_redirect.target = double_fault_start
-                                  ? UADDR_DOUBLE_FAULT : UADDR_GENERAL_FAULT1;
+                                  ? UADDR_DOUBLE_FAULT : UADDR_GENERAL_FAULT_FETCH;
     end
     if (page_fault) begin
         seq_fault_redirect.valid = 1'b1;

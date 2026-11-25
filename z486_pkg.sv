@@ -1077,6 +1077,15 @@ localparam BUSOP_IACK = 6'h28;        // IACK - Interrupt acknowledge bus cycle
 // Fault entry points - these set SIGMA to vector-9, then at FAULT_ERR_CODE adds 9 to get vector
 // Vector calculation: SIGMA + 9 = vector (GP: 4+9=13, SS: 3+9=12)
 localparam [11:0] UADDR_GENERAL_FAULT1 = 12'h85B;  // #GP(0) - sets SIGMA=4, error code=0
+// The fetch-limit #GP(0) enters one word early.  Its redirect is taken in
+// the cycle the prefetcher raises the fault, not from a registered request
+// like gp_fault_r's, so the first word fetched at the target executes while
+// fault_suppress_delay_slot still covers the redirect (any_fault_r) and is
+// squashed.  Entered at 85Bh that word is the entry's LJUMP 874h: the body
+// falls through 85Ch-873h into the selector path (861h: TMPE <- SIGMA) and
+// pushes a stale error code.  85Ah is the squashed word instead, and 85Bh
+// runs as from a microcode #GP.
+localparam [11:0] UADDR_GENERAL_FAULT_FETCH = UADDR_GENERAL_FAULT1 - 12'd1;
 localparam [11:0] UADDR_STACK_FAULT    = 12'h863;  // #SS(0) - sets SIGMA=3, error code=0
 localparam [11:0] UADDR_DIVIDE_ERROR   = 12'h824;  // #DE(0) - divide error (vector 0)
 localparam [11:0] UADDR_DOUBLE_FAULT   = 12'h83F;  // #DF - vector 8, zero error code
