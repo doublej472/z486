@@ -166,6 +166,11 @@ module tb_protected_mode #(
     reg        tb_a20 = 1'b1;
     reg [31:0] a20_bit21_writes = 32'd0;
     reg [31:0] a20_masked_bit20_writes = 32'd0;
+    // I/O writes to ports F8h-FFh, decoded from address bits 15:2 only, as the
+    // PC-9821 core's I/O fabric decodes them (A31 ignored): a 386 coprocessor-
+    // protocol cycle to 800000F8h/800000FCh lands here.  Read back with IN at
+    // 0xD8.
+    reg [31:0] cpio_writes = 32'd0;
 
     // Instrument the feature itself: an ordinary-map binary must not make a
     // PC-98 test green, and a NO_ALLOC fetch must never install a line.
@@ -883,6 +888,7 @@ module tb_protected_mode #(
                       (a[15:0] == 16'h00C0) ? {31'h0, flush_complete} :
                       (a[15:0] == 16'h00D0) ? a20_bit21_writes :
                       (a[15:0] == 16'h00D4) ? a20_masked_bit20_writes :
+                      (a[15:0] == 16'h00D8) ? cpio_writes :
                       32'hFFFFFFFF;
         else begin
             if (a >= MEM_SIZE) a = a & (MEM_SIZE - 1);
@@ -1166,6 +1172,7 @@ module tb_protected_mode #(
                 din <= (rd_byte_addr[15:0] == 16'h00FC) ? cycle :
                        (rd_byte_addr[15:0] == 16'h00D0) ? a20_bit21_writes :
                        (rd_byte_addr[15:0] == 16'h00D4) ? a20_masked_bit20_writes :
+                       (rd_byte_addr[15:0] == 16'h00D8) ? cpio_writes :
                        32'hFFFFFFFF;
             end else begin
                 din <= {mem[byte_addr+3], mem[byte_addr+2],
@@ -1273,6 +1280,7 @@ module tb_protected_mode #(
                            ({addr[15:2], 2'b00} == 16'h00C0) ? {31'h0, flush_complete} :
                            ({addr[15:2], 2'b00} == 16'h00D0) ? a20_bit21_writes :
                            ({addr[15:2], 2'b00} == 16'h00D4) ? a20_masked_bit20_writes :
+                           ({addr[15:2], 2'b00} == 16'h00D8) ? cpio_writes :
                            32'hFFFFFFFF;
                 end
                 rd_remaining <= (fast && burst_len > 8'd1) ?
@@ -1578,6 +1586,9 @@ module tb_protected_mode #(
                         $display("SIGNAL CFG: NMI pulse cycles=%0d",
                                  (dout[15:0] == 0) ? 1 : dout[15:0]);
                 end
+
+                if (port[15:3] == 13'h001F)
+                    cpio_writes <= cpio_writes + 1;
 
                 if ($test$plusargs("trace_io"))
                     $display("IO WR port=%04x data=%08x", port, dout);

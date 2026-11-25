@@ -1491,8 +1491,20 @@ assign pla_test_output = {pla_test_flags, pla_test_addr, 2'b00};
 // Stage 2: Register PLA4 outputs (posedge clk when pipe_en)
 //==============================================================================
 localparam logic [11:0] UADDR_WAIT_DONE = 12'h3C8;   // nop, RNI
+// Without an FPU, an ESC instruction that raises no #NM does nothing.  Its CR0
+// test either passes (pla_test_addr 0: control and register forms) or, for the
+// memory forms' load/store tests (39h FPU_LOAD_3264, 3Bh FPU_LOAD_80, 3Ch
+// FPU_STORE_3264, 3Dh FPU_STORE_80), selects the 80287/80387 transfer routine
+// when TS=0 and EM=0 (!x && !ce).  That routine is the 386 coprocessor protocol:
+// I/O cycles to 800000F8h/800000FCh and a read of the operand, which an i486
+// never performs.  A 486SX with EM=0 is undefined ("If EM bit is 0 for the
+// Intel486 SX and IntelSX2 processors, the system will hang", Intel486
+// Microprocessors and Related Products 1995, p. 2-53); the no-op is z486's
+// choice, the same for every ESC form.  EM=1 or TS=1 still raises #NM.
+wire sx_esc_xfer_test = (s1_test_const[2:0] == 3'd1) || (s1_test_const[2:0] == 3'd3) ||
+                        (s1_test_const[2:0] == 3'd4) || (s1_test_const[2:0] == 3'd5);
 wire sx_esc_nop = x87_off && s1_valid && (s1_test_const[5:3] == 3'b111) &&
-                  (pla_test_addr == 12'h000);
+                  ((pla_test_addr == 12'h000) || (sx_esc_xfer_test && !x && !ce));
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         s2_jump_addr <= 12'h000;

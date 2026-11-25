@@ -10,17 +10,12 @@
 # the fix.  B* are z486 bugs (numbers of the original lockstep evaluation), D* are
 # documented implementation differences, H* harness limits.
 #
-# Fixed and no longer listed: B1 (dir/esc3, dir/esc4), B6 (pmd/b6*, rand/g25, g118),
+# Fixed and no longer listed: B1 (dir/esc3, dir/esc4), B2 (dir/esc2, rand/g10, r224, g102,
+# g114), B6 (pmd/b6*, rand/g25, g118),
 # B15 (pmd/gdtlim_p58only, gdtlim_jmp, ldtlim, rand/g164, g301); B4 and B4a
 # (pmd/retf_fault, iret_fault); B5 (dir/intr1); B9 (pmd/intlim3); B7 in protected mode
 # (pmd/intlim2, intlim3; pmd/intlim and pm/pm8 now show B4a-int / B7-DF).
 # B3's over-15-byte programs are listed as D-len15: 86Box has no length limit.
-
-# B2: ENABLE_X87=0, ESC memory forms make 386 coprocessor I/O cycles (800000F8h/FCh)
-# and touch the operand (a #PF on a not-present page)
-B2   dir/esc2       step,pipe  counter=cpio
-B2   rand/g10       step,pipe  # FMUL m32 on a not-present page takes #PF on z486 only
-
 
 # B4a-int: the INT n form of B4a: since B7's fix the #GP(0) for a gate offset beyond the
 # new CS limit is taken at the INT, but the target code descriptor's accessed bit
@@ -99,9 +94,6 @@ D-len15   dir/lq12                           step,pipe
 D-shift0  rand/g9   step,pipe
 
 # ---- full set only (make -C tests lockstep) ----
-B2   rand/r224      step,pipe  # FLD m32 beyond the DS limit faults on z486
-B2   rand/g102      step,pipe
-B2   rand/g114      step,pipe
 # B7-DF: #DE through a gate whose offset is beyond the CS limit: #GP(0) instead of #DF
 # (the #DE entry's contributory mark, uc 824h SCNTFF, is the squashed first word of
 # an immediate redirect).  Stepwise this is the first difference (every earlier
