@@ -1105,6 +1105,12 @@ localparam [11:0] UADDR_DEBUG_TRAP     = 12'h941;
 // (scripts/ucode_optimize.py DESC_SKIP_DATA / DESC_SKIP_CS).
 localparam [11:0] UADDR_DESC_SKIP_DATA = 12'h8F8;
 localparam [11:0] UADDR_DESC_SKIP_CS   = 12'h8FA;
+// Optimizer-owned return-SS descriptor tails of an outer-level RET/IRET whose
+// return CS descriptor still needs its Accessed bit (scripts/ucode_optimize.py
+// RET_SS_TAIL_WRITE_A / RET_SS_TAIL_KEEP_A): the SS tail, then the CS
+// descriptor's locked A-bit RMW.
+localparam [11:0] UADDR_RET_SS_WRITE_A = 12'h92B;  // SS A clear: SS RMW first
+localparam [11:0] UADDR_RET_SS_KEEP_A  = 12'h92C;  // SS A already set (the LCALL's delay slot)
 localparam [11:0] UADDR_TSS_PROBLEM    = 12'h85D;  // #TS path used by protected-mode descriptor checks
 localparam [11:0] UADDR_FPU_STORE_TAIL = 12'h57B;  // Final 16-bit word of an m80 store
 // The error-code pushes of exception delivery: the privilege-switch tail

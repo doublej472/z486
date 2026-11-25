@@ -39,6 +39,20 @@ TASK_SET_BUSY = LOADALL_FREE + 0x0C      # task switch: locked busy-bit RMW (8 w
 LTR_SET_BUSY = LOADALL_FREE + 0x14       # LTR: locked busy-bit RMW (5 words)
 TASK_LIMIT_CHECK = LOADALL_FREE + 0x19   # task switch: TSS limit check (10 words)
 # REAL_INT_FLAGS = LOADALL_FREE + 0x23 (16 words) follows it.
+# Outer-level RET/IRET: return-SS tails that also set the return CS
+# descriptor's Accessed bit (LOADALL_FREE + 0x33 to its end at 0x931), the
+# rest of that RMW in the free words after CALL_STACK_FAULT (0x9FB-0x9FE)
+# and in the unreachable 2EE/2EF (see the 2EB patch).
+RET_SS_TAIL_WRITE_A = LOADALL_FREE + 0x33   # 0x92B; z486_pkg.sv UADDR_RET_SS_WRITE_A
+RET_SS_TAIL_KEEP_A = LOADALL_FREE + 0x34    # 0x92C; z486_pkg.sv UADDR_RET_SS_KEEP_A
+RET_CS_SET_A = 0x9FB
+RET_CS_SET_A_END = 0x2EE
+DEST_SLCTR = 0x35
+DEST_TMPE = 0x0E
+SRC_TMPE = 0x0E
+SRC_TMPH = 0x11
+SRC_TMP_TR = 0x13
+ALUJMP_NOPMOVE = 0x7F
 ALUSRC_CONST_8 = 0x19
 ALUSRC_CONST_4 = 0x33
 ALUSRC_CONST_NEG4 = 0x37
@@ -504,6 +518,48 @@ PATCHES = [
                      sub=SUB_DLY)),
     Patch(DESC_SET_ACCESSED + 7, "A-bit RMW: blank return delay slot",
           word=uword()),
+    # An outer-level RET/IRET checked its return CS (687) before its return SS
+    # (691-693, 5CD) and set the CS descriptor's Accessed bit in the CS tail,
+    # so a return whose SS check faulted had already written it.  i486 PRM,
+    # RET / IRET, "return to outer privilege level": every SS check comes
+    # before "Load the CS register with the return CS descriptor", and the
+    # Accessed bit is set when a segment register is loaded (5.3, 5.1.3.1).
+    # The protection PLA now sends that CS check to the tail without the write
+    # (protection.sv, ret_cs_a_pend_r) and the passing SS check to one of
+    # these tails: the SS tail (5D5 or DESC_SKIP_DATA, then 5D7-5D9), then the
+    # CS descriptor's locked RMW.  SLCTR (the SS selector, which 694 loads
+    # into SS and whose TI bit picks GDT/LDT for DESSDT) holds the CS selector
+    # (TMPH, loaded into CS at 6A5) for the RMW's address and is restored from
+    # TMPE.  OPR_R and IND are dead after 5D9 (694 SDEL takes TMPC, 695-6A4
+    # read the descriptor caches); the CS tail's low-dword re-read is not
+    # needed.  The words fit the free 92B-931, 9FB-9FE and 2EE-2EF; neither
+    # path is longer than the CS write plus the SS tail it replaces.
+    Patch(RET_SS_TAIL_WRITE_A, "outer return, SS A clear: call the locked A-bit RMW (= 5D5)",
+          word=uword(**longjump(DESC_SET_ACCESSED, ALUJMP_LCALL))),
+    Patch(RET_SS_TAIL_KEEP_A, "outer return SS tail: delay slot / SS A set entry (= 5D5 base)",
+          copy_from=0x5D5),
+    Patch(RET_SS_TAIL_KEEP_A + 1, "outer return SS tail: 5D7 (SDEH DESPTR)",
+          copy_from=0x5D7),
+    Patch(RET_SS_TAIL_KEEP_A + 2, "outer return SS tail: 5D8 SDES without the return; TMPE <- SS selector",
+          copy_from=0x5D8, fields=dict(aluop=ALUJMP_NOPMOVE, dst=DEST_TMPE, src=SRC_TMP_TR)),
+    Patch(RET_SS_TAIL_KEEP_A + 3, "outer return SS tail: 5D9 (TMPC <- OPR_R)",
+          copy_from=0x5D9),
+    Patch(RET_SS_TAIL_KEEP_A + 4, "outer return: jump to the CS A-bit RMW",
+          word=uword(**longjump(RET_CS_SET_A))),
+    Patch(RET_SS_TAIL_KEEP_A + 5, "outer return: delay slot SLCTR <- TMPH (return CS selector)",
+          word=uword(src=SRC_TMPH, dst=DEST_SLCTR)),
+    Patch(RET_CS_SET_A + 0, "outer return CS A-bit RMW: IND -> CS descriptor high dword (= 5C9)",
+          copy_from=0x5C9),
+    Patch(RET_CS_SET_A + 1, "outer return CS A-bit RMW: locked read of the high dword",
+          word=uword(bus=BUSOP_RD_OPR_WORD)),
+    Patch(RET_CS_SET_A + 2, "outer return CS A-bit RMW: DLY for the read data, jump on",
+          word=uword(sub=SUB_DLY, **longjump(RET_CS_SET_A_END))),
+    Patch(RET_CS_SET_A + 3, "outer return CS A-bit RMW: delay slot SIGMA = OPR_R | 0x100",
+          word=uword(src=SRC_OPR_R, aluop=ALUJMP_OR, alusrc=ALUSRC_CONST_100)),
+    Patch(RET_CS_SET_A_END + 0, "outer return CS A-bit RMW: write the high dword back + return to 694",
+          word=uword(src=SRC_SIGMA, dst=DEST_OPR_W, bus=BUSOP_WR_WORD, aluop=ALUJMP_RETURN)),
+    Patch(RET_CS_SET_A_END + 1, "outer return CS A-bit RMW: return delay slot SLCTR <- TMPE",
+          word=uword(src=SRC_TMPE, dst=DEST_SLCTR)),
     # Setting a TSS descriptor's Busy bit (task switch 74C, LTR 6CB) was an
     # unlocked write of the descriptor's high dword as read earlier, so
     # another bus master's write in between was lost.  Read the dword locked
