@@ -463,11 +463,21 @@ wire write_fault = pe && is_write && !seg_writable && !is_dtable;
 // through CS (a CS override) of a code segment needs R: i486 PRM (240486)
 // 6.2.1, "No instruction may read an executable segment unless the readable
 // bit is set"; 9.9.13 lists "Reading from an execute-only code segment".
+// CS faults only for an execute-only code segment (S=1, executable, R=0),
+// the only CS a protected-mode load can leave unreadable.  A real-mode CS
+// load writes attributes with S=0 (seen after a real-mode far JMP), and code
+// that sets CR0.PE and reads through CS before reloading it must keep
+// working: the real Xe10 passes pe_cs_visible entered by a real-mode far JMP
+// (docs/probes/CPUSUITE-XE10-run4.TXT in the PC-9821 core: "pe_cs_visible
+// PASS"); test pe_cs_visible_far.
 function automatic logic desc_readable(input seg_desc_t d);
     desc_readable = d.S && (!d.seg_type[3] || d.seg_type[1]);
 endfunction
+function automatic logic cs_readable(input seg_desc_t d);
+    cs_readable = !(d.S && d.seg_type[3] && !d.seg_type[1]);
+endfunction
 wire seg_readable = (seg_sel == SEG_ES) ? desc_readable(desc_cache[SEG_ES]) :
-                    (seg_sel == SEG_CS) ? desc_readable(desc_cache[SEG_CS]) :
+                    (seg_sel == SEG_CS) ? cs_readable(desc_cache[SEG_CS]) :
                     (seg_sel == SEG_DS) ? desc_readable(desc_cache[SEG_DS]) :
                     (seg_sel == SEG_FS) ? desc_readable(desc_cache[SEG_FS]) :
                     (seg_sel == SEG_GS) ? desc_readable(desc_cache[SEG_GS]) :
