@@ -4311,8 +4311,15 @@ x87_unit #(.ENABLE_X87(ENABLE_X87)) x87 (
 // Miscellaneous control modules
 //=============================================================================
 
+// The NMI is consumed only at a boundary that delivers it: a TF or data-
+// breakpoint trap pending at the same boundary wins (the boundary redirect in
+// event_control.sv), and the NMI stays latched for the next boundary.  SDM
+// Vol. 3A 6.9, Table 6-2: debug traps on the previous instruction rank above
+// NMI, and "lower priority interrupts are held pending"; test
+// nmi_tf_trap_pending.
 wire nmi_accept_boundary = i_rni_delay && !stall && !frontend_fault &&
-                           nmi_request_active && !single_step;
+                           nmi_request_active && !single_step &&
+                           !tf_trap_pending;
 
 interrupt_controller interrupts (
     .clk(clk),
