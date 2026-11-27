@@ -387,6 +387,49 @@ module tb_l1_cache;
         $display("D-cache CD/PCD/NW operating modes PASS");
     end
     endtask
+
+    // An EADS# snoop invalidates the line (Intel486 Microprocessor Data Book,
+    // "Cache Invalidations"), so a PCD/CD read whose snoop lands on its first
+    // lookup cycle misses and reads memory, even while it waits behind a
+    // posted store; it must still be answered.
+    task automatic uc_read_snoop_wait();
+        integer waited;
+    begin
+        mem_put32(32'h400, 32'h0bad_0400);
+        cache_read(32'h400, 4'hF, 32'h0bad_0400);         // allocate set 0
+        mem_put32(32'h400, 32'h7777_0400);                // the external write
+        mem_stall = 1'b1;
+        cache_write(32'h310, 4'hF, 32'h3100_0310);        // held in the queue
+        tb_uncacheable = 1'b1;
+        do @(negedge clk); while (!cpu_ready);
+        cpu_addr = 32'h400;
+        cpu_be = 4'hF;
+        cpu_write = 1'b0;
+        cpu_valid = 1'b1;
+        snoop_addr = 32'h400;
+        snoop_valid = 1'b1;
+        @(negedge clk);
+        cpu_valid = 1'b0;
+        snoop_valid = 1'b0;
+        if (dut.state != 3'd2 || !dut.snoop_valid_r || dut.storeq_count == 0)
+            $fatal(1, "D-cache uncacheable read/snoop wait was not exercised");
+        waited = 0;
+        while (!cpu_resp_valid) begin
+            if (waited == 8) mem_stall = 1'b0;
+            if (waited == 200)
+                $fatal(1, "D-cache uncacheable read after a first-lookup snoop got no response (state=%0d)",
+                       dut.state);
+            @(negedge clk);
+            waited = waited + 1;
+        end
+        if (cpu_dout !== 32'h7777_0400)
+            $fatal(1, "D-cache uncacheable read after a snoop returned %08x, expected 77770400",
+                   cpu_dout);
+        mem_stall = 1'b0;
+        tb_uncacheable = 1'b0;
+        $display("D-cache uncacheable read behind a first-lookup snoop PASS");
+    end
+    endtask
     initial begin
         fork
             begin
@@ -564,6 +607,7 @@ module tb_l1_cache;
         cpu_write = 0;
         cache_read(32'h1C0, 4'hF, 32'h8765_4321);
         cache_modes();
+        uc_read_snoop_wait();
 
         $display("L1 PIPT cache unit test PASS");
         $finish;

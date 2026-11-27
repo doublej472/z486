@@ -1067,7 +1067,7 @@ always_ff @(posedge clk) begin
                         state <= S_IDLE;
                         ready_r <= (storeq_count_wr_next != STOREQ_DEPTH_VALUE);
                     end
-                end else if (lookup_hit) begin
+                end else if (lookup_hit && req_valid_r) begin
                     plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
                     state <= S_IDLE;
                     ready_r <= ready_when_idle;
