@@ -1206,7 +1206,9 @@ prefetch prefetch_inst (
     .pf_fault_code(pf_fault_code),
     .pf_fault_addr(pf_fault_addr),
     // A retained fetch fault becomes precise once older instructions retire.
-    .fetch_blocked(decoder_fetch_blocked &&
+    // SDM Vol. 3A 6.9, Table 6-2: a debug trap, NMI or INTR taken at the
+    // boundary ranks above a fault from fetching the next instruction.
+    .fetch_blocked(decoder_fetch_blocked && !boundary_take &&
                    (!uc_active || (i_rni_delay && !stall))),
     .ifetch_fault(ifetch_page_fault),
     .ifetch_fault_code(ifetch_fault_code),
