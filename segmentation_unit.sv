@@ -619,6 +619,13 @@ function automatic [1:0] ed_big_for(input [3:0] sel, input dsw);
                                         : ed_big_nodsw(sel);
 endfunction
 
+function automatic seg_desc_t null_seg_desc();
+    null_seg_desc = '0;
+    null_seg_desc.base = 32'hFFFFFFFF;
+    null_seg_desc.limit = 20'hFFFFF;
+    null_seg_desc.P = 1'b1;
+endfunction
+
 function automatic [3:0] effective_target(input [3:0] target);
     effective_target = (target == SEG_NONE) ? desc_write_seg : target;
 endfunction
@@ -761,6 +768,13 @@ always_ff @(posedge clk) begin
                     end
                 end
 
+                SEG_CMD_SNULL: begin
+                    automatic logic [3:0] snull_seg;
+                    snull_seg = effective_target(exec_seg_target);
+                    if (desc_target_valid(snull_seg))
+                        desc_cache[desc_index(snull_seg)] <= null_seg_desc();
+                end
+
                 SEG_CMD_SDES: begin
                     automatic logic [2:0] sdes_idx;
                     sdes_idx = desc_index(desc_write_seg);
@@ -774,12 +788,7 @@ always_ff @(posedge clk) begin
 
                 SEG_CMD_SDEL: begin
                     if (slctr[15:2] == 14'b0) begin
-                        automatic seg_desc_t null_desc;
-                        null_desc = '0;
-                        null_desc.base = 32'hFFFFFFFF;
-                        null_desc.limit = 20'hFFFFF;
-                        null_desc.P = 1'b1;
-                        desc_cache[desc_index(desc_write_seg)] <= null_desc;
+                        desc_cache[desc_index(desc_write_seg)] <= null_seg_desc();
                     end else begin
                         desc_cache[desc_index(desc_write_seg)].limit[15:0] <= seg_data[15:0];
                         if (desc_write_seg == SEG_TR)

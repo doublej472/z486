@@ -2162,13 +2162,13 @@ always_ff @(posedge clk) begin
                uc_addr, uc_ind_ctrl[3:0]);
 end
 // The descriptor-cache writes (SBRM, SAR, SLIM, SLIM_TABLE, SBAS, SDEH, SDES,
-// SDEL, DESC) are keyed by the microcode command and target, not by
+// SDEL, SNULL, DESC) are keyed by the microcode command and target, not by
 // seg_cmd/seg_cmd_target (INIT_SEG in an issue cycle, which drops them). That
 // is exact only while no word carrying one executes in a D2 issue cycle.
 always_ff @(posedge clk) begin
     if (reset_n && uc_exec && i_issue &&
         ((uc_seg_cmd >= SEG_CMD_SBRM && uc_seg_cmd <= SEG_CMD_SDEL) ||
-         uc_seg_cmd == SEG_CMD_DESC))
+         uc_seg_cmd == SEG_CMD_SNULL || uc_seg_cmd == SEG_CMD_DESC))
         $fatal(1, "descriptor-cache write executes in a D2 issue cycle: uc_addr=%h seg_cmd=%0d",
                uc_addr, uc_seg_cmd);
 end
@@ -2226,7 +2226,9 @@ always_comb begin
             end
             BUSOP_SDEH: begin
                 if (pe && !gate_detect_cond && !tsslim_annul)   // use cond, not _now (uc_exec already in valid)
-                    uc_seg_cmd = SEG_CMD_SDEH;
+                    // i486 PRM (1992) RET, return to outer level (p. 26-249):
+                    // "set the register to null (selector <- AR <- 0)"
+                    uc_seg_cmd = (uc_dest == DEST_IRF) ? SEG_CMD_SNULL : SEG_CMD_SDEH;
             end
             BUSOP_SDES: begin
                 if (pe && !gate_detect_cond) begin
