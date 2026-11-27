@@ -392,7 +392,10 @@ always_ff @(posedge clk) begin
             case (fault_delivery_state)
                 FAULT_IDLE: begin
                     fault_delivery_state <= FAULT_DELIVERING;
-                    fault_combine_active <= 1'b0;
+                    // i486 PRM (1992) Table 9-4 (p. 9-17): Divide Error is a
+                    // contributory exception.  Its redirect squashes the
+                    // entry's first word, 824h SCNTFF.
+                    fault_combine_active <= div_overflow;
                 end
                 FAULT_DELIVERING: begin
                     if (fault_combine_active) begin
