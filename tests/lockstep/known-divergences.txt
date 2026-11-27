@@ -14,13 +14,8 @@
 # g114), B6 (pmd/b6*, rand/g25, g118),
 # B15 (pmd/gdtlim_p58only, gdtlim_jmp, ldtlim, rand/g164, g301); B4 and B4a
 # (pmd/retf_fault, iret_fault); B5 (dir/intr1); B9 (pmd/intlim3); B7 in protected mode
-# (pmd/intlim2, intlim3; pmd/intlim and pm/pm8 now show B4a-int / B7-DF).
+# (pmd/intlim2, intlim3); B4a-int (pmd/intlim); B7-DF (pm/pm8).
 # B3's over-15-byte programs are listed as D-len15: 86Box has no length limit.
-
-# B4a-int: the INT n form of B4a: since B7's fix the #GP(0) for a gate offset beyond the
-# new CS limit is taken at the INT, but the target code descriptor's accessed bit
-# (selector 50h) is already set by its load before the offset check (86Box: not written)
-B4a-int  pmd/intlim     step,pipe
 
 # B7: transfer to an EIP beyond the CS limit faults at the target (pushed IP = target).
 # Fixed in protected mode; real and V86 mode keep the fetch-time #GP at the target
@@ -100,11 +95,6 @@ D-len15   dir/lq12                           step,pipe
 D-shift0  rand/g9   step,pipe
 
 # ---- full set only (make -C tests lockstep) ----
-# B7-DF: #DE through a gate whose offset is beyond the CS limit: #GP(0) instead of #DF
-# (the #DE entry's contributory mark, uc 824h SCNTFF, is the squashed first word of
-# an immediate redirect).  Stepwise this is the first difference (every earlier
-# transfer of pm8 matches since B7's fix); the pipelined flow difference is not analysed
-B7-DF pm/pm8        step,pipe
 B8   rand/g20       step,pipe
 D-errc16  pm/pm2    pipe
 D-errc16  pm/pm24   pipe
