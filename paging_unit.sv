@@ -741,9 +741,11 @@ wire walk_cross_lookup_load = (state == PG_WALKING) &&
 // never runs PG_CROSS_PREP2; load the second-page lookup address here or
 // PG_CROSS_TLB2 re-reads the first page's already-hit TLB entry.
 // A finished page-crossing write precheck re-looks up the first page.  Only
-// leave the lookup on page 2 while it may still be walked (TLB2 miss).
+// leave the lookup on page 2 while it may still be walked (a TLB2 miss, or a
+// TLB2 hit whose clear D flag the write walks to set).
 wire cross_pre_relookup = req_cross_pre &&
-                          (((state == PG_CROSS_TLB2) && tlb_hit) ||
+                          (((state == PG_CROSS_TLB2) && tlb_hit &&
+                            (cross2_tlb_dirty_ok || !slow_tlb_access_ok)) ||
                            ((state == PG_CROSS_WALK2) && walk_done));
 wire cross2_lookup_load = (state == PG_CROSS_PREP2) ||
                           ((state == PG_MEM_TLB) && req_can_translate &&
