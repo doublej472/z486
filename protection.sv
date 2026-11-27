@@ -77,6 +77,8 @@ module protection_unit
                                           // taken now: cancel this word's
                                           // (the descriptor read's) bus cycle
     output              is_ptovrr,
+    output              gate_dest_test,   // the descriptor test is a gate's target CS
+    input               gate_cs_a_restore,// PROTUN keeps the descriptor's own Accessed bit (z486.sv)
 
     // Protection transition commands and effective privilege state.
     output       [1:0]  effective_cpl,
@@ -155,6 +157,8 @@ wire       descriptor_low16_nonzero = is_ptovrr ? |opr_r[15:0] :
 
 assign protun_value = protun_r;
 assign desc_raw_hi = desc_raw_hi_r;
+assign gate_dest_test = (saved_test_const_r == TST_DES_CGDEST) ||
+                        (saved_test_const_r == TST_DES_JGDEST);
 assign descriptor_dpl_live = descriptor_dpl;
 assign test_inflight = test_inflight_r;
 assign result_now = result_valid && test_inflight_r;
@@ -1624,6 +1628,8 @@ always_ff @(posedge clk) begin
             protun_r <= protun_next;
         else if (uc_exec && arpl_update_s2 && validation_ok)
             protun_r[1:0] <= arpl_rpl_r;
+        else if (gate_cs_a_restore)
+            protun_r[8] <= desc_raw_hi_r[8];
 
         if (uc_exec_writeback) begin
             if (is_6x && pe_mode) begin

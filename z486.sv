@@ -237,6 +237,7 @@ wire [31:0] protun_write_value;
 wire [15:0] cs_source_value;
 wire        uc_exec;
 wire        prot_is_ptovrr;
+wire        prot_gate_dest_test;
 wire [11:0] uc_addr;
 wire [6:0]  uc_dest;
 wire [5:0]  uc_source;
@@ -2189,6 +2190,23 @@ always_ff @(posedge clk) begin
         tsslim_prev_r <= (uc_aluop == ALUJMP_JTSSLIM);
 end
 
+// i486 PRM (1992) INT n (p. 26-167, 26-168) and CALL (p. 26-47): the new
+// instruction pointer is checked against the new CS limit ("else #GP(O)")
+// before the CS descriptor is loaded, the load that sets its Accessed bit
+// (5.1.3.1).
+wire [19:0] gate_cs_limit = {desc_raw_hi[19:16], TMPC[15:0]};
+wire        gate_off_beyond = desc_raw_hi[23] ? (TMPG[31:12] > gate_cs_limit)
+                                              : ((|TMPG[31:20]) || (TMPG[19:0] > gate_cs_limit));
+reg         gate_cs_a_annul_r;
+always_ff @(posedge clk) begin
+    if (!reset_n || fault_begin_r)
+        gate_cs_a_annul_r <= 1'b0;
+    else if (uc_exec && uc_addr == 12'h5DA)
+        gate_cs_a_annul_r <= prot_gate_dest_test && gate_off_beyond;
+    else if (uc_exec && uc_aluop == ALUJMP_OR && uc_alu_src == ALUSRC_CONST_100)
+        gate_cs_a_annul_r <= 1'b0;
+end
+
 // Execution-relocation view of the microcode segment command.
 always_comb begin
     uc_seg_cmd = SEG_CMD_NONE;
@@ -3278,6 +3296,8 @@ protection_unit protection_unit_inst (
     .redirect_prev(prot_redirect_prev),
     .sel_limit_block(prot_sel_limit_block),
     .is_ptovrr(prot_is_ptovrr),
+    .gate_dest_test(prot_gate_dest_test),
+    .gate_cs_a_restore(uc_exec && uc_addr == 12'h5FB && prot_gate_dest_test && gate_off_beyond),
     .effective_cpl(prot_cpl),
     .transition(prot_transition)
 );
@@ -4191,6 +4211,7 @@ data_unit data_unit_inst (
     .tr(TR),
     .seg_reg_sel(i.seg_reg_sel),
     .desc_raw_hi(desc_raw_hi),
+    .accessed_or_annul(gate_cs_a_annul_r),
     .slctr(SLCTR),
     .protun(PROTUN),
     .pe(pe),
